@@ -1367,8 +1367,8 @@ fn emit_generator_kind_test(
 /// `argc`, through the out-of-line generic method call — or, when `key` is a
 /// `String.prototype` builtin, straight into that builtin for a string
 /// receiver while `%String.prototype%` is clean (the `call_indirect` slot is a
-/// `select`); when the arguments already have the types the builtin coerces
-/// to, that string receiver runs the builtin's host op inline instead.
+/// `select`); `localeCompare` of a string literal runs `__str_cmp` inline on
+/// that string receiver instead.
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_proto_guard<S: Sink>(
     node: &IrNode,
@@ -1410,13 +1410,11 @@ pub(super) fn emit_proto_guard<S: Sink>(
     };
     let string = realm::method_of(realm::prototype_of(BuiltinCtor::String), key);
     let mut opened = 0;
-    // Arguments already of the types the builtin coerces to: on a string
-    // receiver the builtin is exactly its host op, inline.
-    let inline_string = match string {
-        Some(Builtin::StringMethod(op)) => builtins::inline_host_op(op, args),
-        _ => None,
-    };
-    if let Some(flag) = inline_string {
+    // A string-literal argument needs no coercion: on a string receiver
+    // `localeCompare` is exactly `__str_cmp`, inline.
+    let inline_string =
+        matches!(string, Some(Builtin::StringMethod(op)) if builtins::inline_str_cmp(op, args));
+    if inline_string {
         // A primitive keeps its kind: the early read decides.
         if callee.is_some() {
             found(function, STRING_SLOT);
@@ -1426,16 +1424,12 @@ pub(super) fn emit_proto_guard<S: Sink>(
         function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
         enter_frame(helpers);
         function.instruction(&Instruction::LocalGet(local));
-        function.instruction(&Instruction::I32Const(flag));
-        for slot in 0..2 {
-            match args.get(slot) {
-                Some(arg) => emit_operand(arg, function, scratch, strings, helpers),
-                None => {
-                    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-                }
-            }
-        }
-        function.instruction(&Instruction::Call(helpers.method));
+        function.instruction(&Instruction::I32WrapI64);
+        emit_operand(&args[0], function, scratch, strings, helpers);
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::Call(helpers.str_cmp));
+        function.instruction(&Instruction::F64ConvertI32S);
+        function.instruction(&Instruction::I64ReinterpretF64);
         function.instruction(&Instruction::Else);
         opened += 1;
     }
@@ -1521,7 +1515,7 @@ pub(super) fn emit_proto_guard<S: Sink>(
     function.instruction(&Instruction::I64Const(env));
     emit_argc(call_argc(args.len(), helpers), function);
     match string {
-        Some(builtin) if inline_string.is_none() => {
+        Some(builtin) if !inline_string => {
             let slot = |b: Builtin| Instruction::I32Const(helpers.builtin_slot(b).cast_signed());
             function.instruction(&slot(builtin));
             function.instruction(&slot(generic));

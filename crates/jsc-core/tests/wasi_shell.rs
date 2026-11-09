@@ -45,7 +45,6 @@ fn module_imports_only_wasi_and_env_remainder() {
         (preview1, "clock_time_get"),
         (preview1, "random_get"),
         (preview1, "proc_exit"),
-        ("env", "__method"),
         ("env", "__promise"),
         ("env", "__then"),
     ]

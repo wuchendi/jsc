@@ -10,7 +10,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store};
 
-use super::host::method_dispatch;
 use super::promise::{self, Host};
 use crate::abi;
 
@@ -206,7 +205,6 @@ fn execute(wasm: &[u8], sinks: Sinks, fuel: Option<u64>) -> anyhow::Result<Finis
     }
     let mut linker = Linker::new(&engine);
     link_wasi(&mut linker)?;
-    link_method(&mut linker)?;
     link_promises(&mut linker)?;
     let instance = linker.instantiate(&mut store, &module)?;
     let start = instance.get_typed_func::<(), ()>(&mut store, abi::START_EXPORT_NAME)?;
@@ -393,35 +391,6 @@ fn link_wasi(linker: &mut Linker<Host>) -> anyhow::Result<()> {
         abi::WASI_MODULE,
         abi::WASI_PROC_EXIT_NAME,
         |code: i32| -> wasmtime::Result<()> { Err(wasmtime::Error::new(Exit(code))) },
-    )?;
-    Ok(())
-}
-
-/// The `__method` import.
-fn link_method(linker: &mut Linker<Host>) -> anyhow::Result<()> {
-    linker.func_wrap(
-        abi::IMPORT_MODULE,
-        abi::METHOD_IMPORT_NAME,
-        |mut caller: Caller<'_, Host>,
-         recv: i64,
-         op: i32,
-         arg0: i64,
-         arg1: i64|
-         -> wasmtime::Result<i64> {
-            let mut failed = None;
-            let result = method_dispatch(
-                &mut caller,
-                &mut failed,
-                recv.cast_unsigned(),
-                op,
-                arg0,
-                arg1,
-            );
-            if let Some(err) = failed {
-                return Err(err);
-            }
-            Ok(result.unwrap_or(abi::UNDEFINED).cast_signed())
-        },
     )?;
     Ok(())
 }

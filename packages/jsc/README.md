@@ -42,17 +42,14 @@ Both `compile` and `run` are async: the wasm-bindgen glue (wasm-pack
   `clock_time_get`, `random_get`, `proc_exit`) that captures stdout and stderr.
   Console output, the `Uncaught ...` reports and the completion value are
   rendered inside the module, so there is no formatter on the JS side.
-- `src/shim.ts` ports the six `env` imports (`__convert` / `__method` /
-  `__promise` / `__then` / `__now` / `__parse_int`) and the promise engine
-  (microtask queue) from `crates/jsc-core/src/run/host.rs` + `run/promise.rs`.
-  Every heap block it creates is allocated by the guest's exported constructors
-  (`__new_string` / `__new_promise`).
-- `src/value.ts` ports the NaN-box decoder and `ToString` text those imports
-  need from `crates/jsc-core/src/run/value.rs`.
+- `src/shim.ts` ports the two remaining `env` imports (`__promise` / `__then`)
+  and the promise engine (microtask queue) from
+  `crates/jsc-core/src/run/promise.rs`. Every heap block it creates is
+  allocated by the guest's exported `__new_promise` constructor.
 - `src/abi.ts` copies the runtime ABI constants from
   `crates/jsc-core/src/abi.rs`.
 
-Every module imports those four WASI functions and six `env` functions, so it
+Every module imports those four WASI functions and two `env` functions, so it
 instantiates here and under the Rust runner, but not yet under a plain WASI
 host. The Rust files are the source of truth for the `env` side; the TS ports
 are maintained by hand, so a Rust-side change to the ABI, value encoding, or

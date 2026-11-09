@@ -225,8 +225,8 @@ pub enum ConvertOp {
 }
 
 /// The inline fast path of an `Array.prototype` search/join method on an
-/// array receiver (DESIGN.md §6.4), run host-side through the `__method`
-/// import (`join`: the guest `__array_join`).
+/// array receiver (DESIGN.md §6.4), run by the guest `__array_search`
+/// (`join`: `__array_join`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodOp {
     /// `arr.indexOf(x)` — first index where element `=== x`, else `-1`.

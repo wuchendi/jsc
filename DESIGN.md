@@ -150,9 +150,7 @@ jsc/
 │   │   │   │   └── runtime.rs         # __alloc, strings, Map/Set, equality, trampolines
 │   │   │   └── run/               # wasmtime runner: four WASI imports + the remaining env
 │   │   │       ├── harness.rs         # Linker (preview 1 + env), _start call, proc_exit -> exit code
-│   │   │       ├── host.rs            # __method dispatch, allocation through guest exports
-│   │   │       ├── promise.rs         # promise engine + microtask queue + async driver
-│   │   │       └── value.rs           # jsval decode + ToString text for the env imports
+│   │   │       └── promise.rs         # promise engine + microtask queue + async driver
 │   │   └── tests/             # integration tests by theme (arrays, properties, intrinsics,
 │   │                          #   intrinsic_guards, to_primitive, wrappers, ...) and the
 │   │                          #   opcount snapshot gate (opcount.rs + opcount/)
@@ -160,7 +158,7 @@ jsc/
 │   ├── jsc-test262/           # test262 conformance runner (§10)
 │   └── jsc-wasm/              # wasm-bindgen boundary: `compile(src, options?) -> Uint8Array`
 ├── packages/jsc/              # @cdlab/jsc: compile() + run() in JS, WASI polyfill, env shim
-│   └── src/  index.ts  wasi.ts  shim.ts  abi.ts  value.ts
+│   └── src/  index.ts  wasi.ts  shim.ts  abi.ts
 ├── apps/jsc-web/              # browser playground (Vite + React + CodeMirror)
 ├── scripts/                   # build-wasm.sh, ensure-wasm.sh, test262-fetch.sh
 └── tests/test262/             # unsupported-features denylist, baseline, history
@@ -189,12 +187,12 @@ sets `print_completion`, §4.2); a spanned error becomes the caret block labelle
 **`@cdlab/jsc`** (`packages/jsc`). `compile(src)` returns module bytes from the
 wasm-bindgen artifact; `run(src, options?)` compiles, instantiates the module
 against an in-memory `wasi_snapshot_preview1` polyfill (`wasi.ts`) and a
-TypeScript shim for the `env` imports (`shim.ts`, which implements the same six
+TypeScript shim for the `env` imports (`shim.ts`, which implements the same two
 imports and promise engine as `run/`), calls `_start`, and returns
 `{ stdout, stderr, exitCode, completion? }`. An uncaught exception or unhandled
 rejection is the `Uncaught …` text on `stderr` with `exitCode` 1; `run` rejects
 on a compile error or a guest trap.
-`abi.ts` and `value.ts` are ports of `abi.rs` and the decoder of `run/value.rs`; a Rust test
+`abi.ts` is a port of `abi.rs`; a Rust test
 (`abi_drift_tests.rs`) parses `abi.ts` and fails when any of its constants
 differs from `abi.rs`. The wasm artifact is gitignored;
 `scripts/ensure-wasm.sh` rebuilds it (via `scripts/build-wasm.sh` →
@@ -296,9 +294,9 @@ jsval, or the **construct marker** `-(n + 1)` when the callee runs under `new`
 | index | function |
 |---|---|
 | `0`–`3` | WASI imports `fd_write`, `clock_time_get`, `random_get`, `proc_exit` (§6.1) |
-| `4`–`6` | `env` imports `__method`, `__promise`, `__then` (§6.1) |
-| `7` | `main` (not exported) |
-| `8 … 7+n` | the `n` user functions |
+| `4`–`5` | `env` imports `__promise`, `__then` (§6.1) |
+| `6` | `main` (not exported) |
+| `7 … 6+n` | the `n` user functions |
 | then | runtime helpers in a fixed order (§6.2): `__alloc` … `__to_number` |
 | then | `__invoke1`, `__async_step`, the two `new Promise` settlers, `__new_string`, `__new_array`, `__new_promise`, `__has_own` |
 | then | the builtin bodies, one per `Builtin::ALL` entry (`emit/realm.rs`, 142 entries) |
@@ -755,9 +753,8 @@ declares enough initial pages to hold that region):
 4. If both fail (the 8192-page / 512 MiB maximum is reached), write the static
    line `abi::OOM_LINE` to fd 2 through its static iovec and call `proc_exit(1)`.
 
-Host-built values (strings returned by `__method`, promises
-created by the promise engine) are allocated by calling the exported guest
-constructors (§6.8), never by bumping the pointer host-side, so they reach the
+Host-built values (promises created by the promise engine) are allocated by
+calling the exported guest constructors (§6.8), never by bumping the pointer host-side, so they reach the
 same path; `proc_exit` from inside a host re-entry unwinds through the host
 import to the runner.
 
@@ -820,7 +817,7 @@ The layouts above are chosen so a collector can be added without relayout:
 
 ### 6.1 Host imports
 
-Every module imports ten functions, declared in this order. The first four
+Every module imports six functions, declared in this order. The first four
 come from `wasi_snapshot_preview1` (`abi::WASI_MODULE`):
 
 | # | import | signature | backs |
@@ -830,30 +827,19 @@ come from `wasi_snapshot_preview1` (`abi::WASI_MODULE`):
 | 2 | `random_get` | `(buf: i32, buf_len: i32) -> i32` | the `Math.random` seed |
 | 3 | `proc_exit` | `(code: i32) -> ()` | exit code `1` after a report or a failed write |
 
-The other three are interim imports from `"env"` (`abi::IMPORT_MODULE`), still
+The other two are interim imports from `"env"` (`abi::IMPORT_MODULE`), still
 backed by the hosts:
 
 | # | import | signature | backs |
 |---|---|---|---|
-| 4 | `__method` | `(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64` | array search, `localeCompare` |
-| 5 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | promise primitives, top-level `await`, `async` spawn, the final drain |
-| 6 | `__then` | `(p: i64, on_f: i64, on_r: i64) -> i64` | `then` / `catch` |
+| 4 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | promise primitives, top-level `await`, `async` spawn, the final drain |
+| 5 | `__then` | `(p: i64, on_f: i64, on_r: i64) -> i64` | `then` / `catch` |
 
-Because of these three, a module does not run under a plain WASI host yet. The
+Because of these two, a module does not run under a plain WASI host yet. The
 native host is `run/harness.rs` (`Linker::func_wrap` for the four WASI imports
 and `env`); the browser and Node host is `packages/jsc/src/wasi.ts` plus
-`shim.ts`. Both decode jsvals with the same rules (`run/value.rs` /
-`value.ts`).
+`shim.ts`.
 
-- **`__method` ops.** `0` `indexOf` / `1` `includes` (an array receiver:
-  element search), `22` `localeCompare` (code-unit order, not locale
-  collation). Every other `String.prototype` method and `String.fromCharCode` /
-  `fromCodePoint` run in the guest on code units (§7.9). Both hosts read a
-  string receiver losslessly (the native host through `string_units`, the
-  shim as JS strings). The
-  calling string builtin coerces the receiver (`ToString`) and its arguments
-  in the guest first, so user `toString`/`valueOf` run in the guest and the
-  host only sees primitives.
 - **`__promise` ops.** `0` resolve, `1` reject, `2` await, `3` finally,
   `4` new pending promise, `5` settle-fulfill, `6` settle-reject,
   `7` async spawn, `8` drain the queue and return the first unhandled rejected
@@ -866,6 +852,7 @@ function-index order:
 
 | group | helpers |
 |---|---|
+| array search | `__array_search(recv, needle, includes)`: the guest scan behind the `indexOf` / `includes` fast path; `SameValueZero` over the `TYPE_ELEMS` store and a sparse array's index keys, without allocating |
 | allocation, strings | `__alloc`, `__concat`, `__str_eq`, `__str_cmp`, `__str_index` (all on code units, below) |
 | interning (§5.3) | `__str_hash`, `__intern_slot`, `__intern_find`, `__intern`, `__index_value`, `__index_string`, `__str_exotic_index(o, key)`, `__to_key` |
 | property tables (§6.3) | `__prop_find(o, key)`, `__define(o, key, v, attrs)`, `__fn_materialize(o)`, `__get(recv, key)`, `__set(recv, key, v)`, `__has(key, obj)`, `__delete(obj, key)`, `__own_keys(obj, mode)`, `__for_in_keys(obj)`, `__copy_data(dst, src, excl)` |
@@ -1351,31 +1338,18 @@ each promise's reaction list and the FIFO microtask queue — lives in the host
 ### 6.8 Host boundary
 
 The host reads layouts but never builds object-family blocks by hand: every
-string and promise the Rust host or the shim creates is allocated by
-re-entering the exported `__new_string(len, two_byte)` (header, `TWO_BYTE`
-flag and length in code units written; the host fills `len` Latin-1 bytes or
-UTF-16LE units, choosing the width from the content so the block is
-canonical, §5.2) or `__new_promise()` (pending, `%Promise.prototype%`). Layout
-knowledge lives in the emitter plus read-only decoders.
+promise the Rust host or the shim creates is allocated by re-entering the
+exported `__new_promise()` (pending, `%Promise.prototype%`). Layout knowledge
+lives in the emitter.
 
 Host reads, all through `abi.rs` constants (and `abi.ts`, kept equal by the
-drift test): string `len @4` (`STR_LEN_OFFSET`) / data `@8`
-(`STR_DATA_OFFSET`) at the width of `TWO_BYTE`; array `len @16` and the
-`TYPE_ELEMS` store (and a sparse array's index keys); promise `state @16` /
-`value @24`; generator `done @24`; Map/Set `size @16`; Date `ms @16`; property
-tables, the function info table, and `class` bytes for rendering. The Rust
-decoder `string_units` is lossless (a Latin-1 byte is its own unit), and the
-string host op `localeCompare` reads its operands through it.
+drift test): promise `state @16` / `value @24` and generator `done @24`.
 `String.prototype.normalize` runs in the guest over the generated Unicode
 tables (`emit/unicode.rs`): full decomposition, canonical ordering, then
 canonical composition for NFC / NFKC, with lone surrogates passing through and
-an unknown form throwing `RangeError` directly. `alloc_units` allocates a result through
-`__new_string`, narrowing when every unit is `<= 0xFF`. The shim's
-`stringText` builds the JS string with `String.fromCharCode` over chunked
-`Uint8Array` / `Uint16Array` views (no `TextDecoder`: `latin1` would be
-windows-1252 and `utf-16le` would replace lone surrogates). Console output
-reads no layouts from the host side: the guest writes UTF-8 (§6.9). Host-held
-jsvals (reaction lists, the job queue) stay valid because no block moves.
+an unknown form throwing `RangeError` directly. Console output reads no layouts
+from the host side: the guest writes UTF-8 (§6.9). Host-held jsvals (reaction
+lists, the job queue) stay valid because no block moves.
 
 ### 6.9 Value rendering
 
@@ -2614,11 +2588,14 @@ Each item below is current behaviour of this tree.
 
 **Runtime**
 
-- The emitted module imports four WASI functions and six host functions from
+- The emitted module imports four WASI functions and two host functions from
   `env` (§6.1); it is not self-contained and cannot run without jsc's wasmtime
-  host or the `@cdlab/jsc` polyfill and shim. The semantics behind the six
+  host or the `@cdlab/jsc` polyfill and shim. The semantics behind the two
   `env` imports are implemented three times (guest wasm, the Rust host, the
   TypeScript shim).
+- Case-mapping tables are Unicode 17.0.0 (Rust std) and normalization tables
+  Unicode 18.0.0 (`icu_normalizer` 2.4.0), so behaviour can differ only on code
+  points new in 18.0.
 - An `Error` whose `name` or `message` is a non-string object closing a cycle
   gets no `<ref *N>` marker.
 - The renderer's `Error` `name` / `message` lookup materializes a lazy

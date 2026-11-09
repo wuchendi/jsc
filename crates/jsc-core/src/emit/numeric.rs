@@ -1064,11 +1064,9 @@ fn emit_to_string_jsval(function: &mut impl Sink, local: u32, helpers: Helpers<'
 }
 
 /// Emit the array fast path `IrNode::MethodCall`, leaving its result jsval
-/// on the stack: the receiver, then (`indexOf`/`includes`) the `METHOD_OP_*`
-/// flag, the argument (`undefined` when missing) and an unused `undefined`
-/// slot, then a `call` of the host `__method` import. `join` runs in the guest
-/// (`__array_join`) so an element's `ToString` can call a user `toString`
-/// (which may throw).
+/// on the stack: the receiver and the argument (`undefined` when missing),
+/// then `__array_search` (`indexOf`/`includes`) or `__array_join` (`join`,
+/// which may run a throwing user `toString`).
 pub(super) fn emit_method_call(
     op: MethodOp,
     recv: &IrNode,
@@ -1079,26 +1077,18 @@ pub(super) fn emit_method_call(
     helpers: Helpers<'_>,
 ) {
     emit_operand(recv, function, scratch, strings, helpers);
-    let flag = match op {
-        MethodOp::Join => None,
-        MethodOp::IndexOf => Some(METHOD_OP_INDEX_OF),
-        MethodOp::Includes => Some(METHOD_OP_INCLUDES),
-    };
-    if let Some(flag) = flag {
-        function.instruction(&Instruction::I32Const(flag));
-    }
     match args.first() {
         Some(arg) => emit_node(arg, function, scratch, strings, helpers),
         None => {
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
     }
-    if flag.is_some() {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::Call(helpers.method));
-    } else {
+    if op == MethodOp::Join {
         function.instruction(&Instruction::Call(helpers.array_join()));
         emit_propagate_if_pending(function, helpers);
+    } else {
+        function.instruction(&Instruction::I32Const(i32::from(op == MethodOp::Includes)));
+        function.instruction(&Instruction::Call(helpers.array_search));
     }
 }
 

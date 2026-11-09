@@ -55,6 +55,10 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         (helpers.index_value, vec![]),
         (helpers.str_exotic_index(), vec![helpers.index_value]),
         (helpers.same_value_zero, vec![helpers.str_eq]),
+        (
+            helpers.array_search,
+            vec![helpers.same_value_zero, helpers.index_value],
+        ),
         (helpers.map_find, vec![helpers.same_value_zero]),
         (helpers.map_get, vec![helpers.map_find]),
         (helpers.map_has, vec![helpers.map_find]),
