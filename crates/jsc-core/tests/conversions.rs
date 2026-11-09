@@ -5,7 +5,7 @@ use common::{
     assert_bool, assert_nan, assert_number, assert_output, assert_string, assert_type_str,
 };
 
-/// `String(42)` yields the string `"42"` (same form as `format_number`), and its
+/// `String(42)` yields the string `"42"` (the canonical number form), and its
 /// runtime type is "string".
 #[test]
 fn string_conversion() {

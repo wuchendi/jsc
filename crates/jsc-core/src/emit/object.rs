@@ -933,7 +933,7 @@ pub(super) fn date_ms_slot() -> MemArg {
 /// handle jsval on the stack. The time value is computed first — `value`'s
 /// own time value when it is a Date (`thisTimeValue`, not `ToPrimitive`),
 /// else `ToPrimitive(value)` parsed by [`emit_date_parse_call`] when a
-/// string and `ToNumber` of it otherwise; when `arg` is `None`, the host wall clock (`__now`,
+/// string and `ToNumber` of it otherwise; when `arg` is `None`, the WASI wall clock (guest `__now`,
 /// already an f64) — and passed through [`emit_time_clip`], the single point
 /// every stored Date time value goes through. Only then is a
 /// [`DATE_BLOCK_SIZE`] block bump-allocated, its object-family prefix
@@ -1067,7 +1067,7 @@ pub(super) fn emit_time_clip(function: &mut Function, out: u32) {
     function.instruction(&Instruction::LocalSet(out));
 }
 
-/// Emit `Date.now()`: the host `__now` clock (an f64 ms count) through
+/// Emit `Date.now()`: the guest `__now` clock (an f64 ms count) through
 /// [`emit_time_clip`] (a time value is integral), boxed as a number jsval.
 pub(super) fn emit_date_now_node(function: &mut Function, scratch: u32, helpers: Helpers<'_>) {
     let time = scratch + 24;

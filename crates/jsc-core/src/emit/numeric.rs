@@ -216,8 +216,9 @@ pub(super) fn emit_math_call(
             emit_math_spread(op, &spread, function, scratch, strings, helpers);
         }
         MathOp::Random => {
-            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-            emit_host_math(abi::MATH_FN_RANDOM, None, function, helpers);
+            // In `[0, 1)`, so never NaN: the f64 bits are the jsval.
+            function.instruction(&Instruction::Call(helpers.random()));
+            function.instruction(&Instruction::I64ReinterpretF64);
         }
         MathOp::Atan2 | MathOp::Imul => {
             let (s0, s1) = (scratch, scratch + 1);
@@ -1358,4 +1359,206 @@ pub(super) fn emit_strict_eq(
     }
     // Box the resulting i1 as TRUE/FALSE.
     function.instruction(&Instruction::Select);
+}
+
+/// The precision passed to `clock_time_get`: one millisecond, in nanoseconds.
+const CLOCK_PRECISION_NS: i64 = 1_000_000;
+
+/// The `splitmix64` increment.
+const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// The natural-alignment memarg of an i64 load or store at `offset`.
+fn i64_mem(offset: u64) -> MemArg {
+    MemArg {
+        offset,
+        align: 3,
+        memory_index: 0,
+    }
+}
+
+/// `__now() -> f64`: the WASI realtime clock in (fractional) milliseconds
+/// since the Unix epoch, `0` when the clock fails. The callers apply `TimeClip`.
+pub(super) fn emit_now() -> Function {
+    use Instruction as I;
+    let clock = abi::WASI_CLOCK.cast_signed();
+    let mut f = Function::new(vec![]);
+    for op in [
+        I::I32Const(0),
+        I::I64Const(CLOCK_PRECISION_NS),
+        I::I32Const(clock),
+        I::Call(CLOCK_TIME_GET_IMPORT),
+        I::I32Eqz,
+        I::If(BlockType::Result(ValType::F64)),
+        I::I32Const(clock),
+        I::I64Load(i64_mem(0)),
+        I::F64ConvertI64U,
+        I::F64Const(Ieee64::from(1e6)),
+        I::F64Div,
+        I::Else,
+        I::F64Const(Ieee64::from(0.0)),
+        I::End,
+        I::End,
+    ] {
+        f.instruction(&op);
+    }
+    f
+}
+
+/// Push `splitmix64(x)` of the i64 local `x`, using the i64 local `z`.
+fn emit_splitmix(f: &mut Function, x: u32, z: u32) {
+    use Instruction as I;
+    let xor_shift = |f: &mut Function, shift: i64| {
+        for op in [
+            I::LocalGet(z),
+            I::LocalGet(z),
+            I::I64Const(shift),
+            I::I64ShrU,
+            I::I64Xor,
+        ] {
+            f.instruction(&op);
+        }
+    };
+    for op in [
+        I::LocalGet(x),
+        I::I64Const(SPLITMIX_GAMMA.cast_signed()),
+        I::I64Add,
+        I::LocalSet(z),
+    ] {
+        f.instruction(&op);
+    }
+    for (shift, factor) in [
+        (30, 0xBF58_476D_1CE4_E5B9_u64),
+        (27, 0x94D0_49BB_1331_11EB_u64),
+    ] {
+        xor_shift(f, shift);
+        for op in [I::I64Const(factor.cast_signed()), I::I64Mul, I::LocalSet(z)] {
+            f.instruction(&op);
+        }
+    }
+    xor_shift(f, 31);
+}
+
+/// `__random() -> f64`: one xorshift128+ step over `$__rng0/$__rng1`, uniform
+/// in `[0, 1)` with 52 bits. The first call seeds the state with `random_get`,
+/// or from the clock through `splitmix64` when that fails; an all-zero seed
+/// (a fixed point of the generator) is replaced by a non-zero constant.
+pub(super) fn emit_random() -> Function {
+    use Instruction as I;
+    let (s1, s0, x, z) = (0, 1, 2, 3);
+    let seed = abi::WASI_SEED.cast_signed();
+    let clock = abi::WASI_CLOCK.cast_signed();
+    let state_is_zero = [
+        I::GlobalGet(RNG0_GLOBAL),
+        I::GlobalGet(RNG1_GLOBAL),
+        I::I64Or,
+        I::I64Eqz,
+    ];
+    let mut f = Function::new(vec![(4, ValType::I64)]);
+    for op in &state_is_zero {
+        f.instruction(op);
+    }
+    for op in [
+        I::If(BlockType::Empty),
+        I::I32Const(seed),
+        I::I32Const(16),
+        I::Call(RANDOM_GET_IMPORT),
+        I::I32Eqz,
+        I::If(BlockType::Empty),
+        I::I32Const(seed),
+        I::I64Load(i64_mem(0)),
+        I::GlobalSet(RNG0_GLOBAL),
+        I::I32Const(seed),
+        I::I64Load(i64_mem(8)),
+        I::GlobalSet(RNG1_GLOBAL),
+        I::Else,
+        // Reads as 0 ns if the clock fails too.
+        I::I32Const(clock),
+        I::I64Const(0),
+        I::I64Store(i64_mem(0)),
+        I::I32Const(0),
+        I::I64Const(CLOCK_PRECISION_NS),
+        I::I32Const(clock),
+        I::Call(CLOCK_TIME_GET_IMPORT),
+        I::Drop,
+        I::I32Const(clock),
+        I::I64Load(i64_mem(0)),
+        I::LocalSet(x),
+    ] {
+        f.instruction(&op);
+    }
+    emit_splitmix(&mut f, x, z);
+    f.instruction(&I::GlobalSet(RNG0_GLOBAL));
+    for op in [
+        I::LocalGet(x),
+        I::I64Const(SPLITMIX_GAMMA.cast_signed()),
+        I::I64Add,
+        I::LocalSet(x),
+    ] {
+        f.instruction(&op);
+    }
+    emit_splitmix(&mut f, x, z);
+    f.instruction(&I::GlobalSet(RNG1_GLOBAL));
+    f.instruction(&I::End);
+    for op in &state_is_zero {
+        f.instruction(op);
+    }
+    for op in [
+        I::If(BlockType::Empty),
+        I::I64Const(SPLITMIX_GAMMA.cast_signed()),
+        I::GlobalSet(RNG0_GLOBAL),
+        I::I64Const(1),
+        I::GlobalSet(RNG1_GLOBAL),
+        I::End,
+        I::End,
+    ] {
+        f.instruction(&op);
+    }
+    emit_rng_step(&mut f, s1, s0);
+    f
+}
+
+/// Emit one xorshift128+ step over the RNG globals and push the next `f64`,
+/// ending the function. `s1` and `s0` are i64 locals.
+fn emit_rng_step(f: &mut Function, s1: u32, s0: u32) {
+    use Instruction as I;
+    for op in [
+        // s1 = state0, s0 = state1, state0 = s0.
+        I::GlobalGet(RNG0_GLOBAL),
+        I::LocalSet(s1),
+        I::GlobalGet(RNG1_GLOBAL),
+        I::LocalTee(s0),
+        I::GlobalSet(RNG0_GLOBAL),
+        // s1 ^= s1 << 23
+        I::LocalGet(s1),
+        I::LocalGet(s1),
+        I::I64Const(23),
+        I::I64Shl,
+        I::I64Xor,
+        I::LocalSet(s1),
+        // s1 ^= s1 >> 17, then ^= s0, then ^= s0 >> 26; state1 = s1.
+        I::LocalGet(s1),
+        I::LocalGet(s1),
+        I::I64Const(17),
+        I::I64ShrU,
+        I::I64Xor,
+        I::LocalGet(s0),
+        I::I64Xor,
+        I::LocalGet(s0),
+        I::I64Const(26),
+        I::I64ShrU,
+        I::I64Xor,
+        I::GlobalSet(RNG1_GLOBAL),
+        // Bits 12.. of state0 as the mantissa of a double in [1, 2), minus 1.
+        I::GlobalGet(RNG0_GLOBAL),
+        I::I64Const(12),
+        I::I64ShrU,
+        I::I64Const(0x3FF0_0000_0000_0000),
+        I::I64Or,
+        I::F64ReinterpretI64,
+        I::F64Const(Ieee64::from(1.0)),
+        I::F64Sub,
+        I::End,
+    ] {
+        f.instruction(&op);
+    }
 }
