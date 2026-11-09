@@ -3039,15 +3039,21 @@ pub(super) fn emit_spread_argc(len: u32, function: &mut Function) {
     function.instruction(&Instruction::I64ReinterpretF64);
 }
 
+/// End a `console.log` line: the newline, then one `fd_write` of the buffer.
+fn emit_end_line(function: &mut Function, helpers: Helpers<'_>) {
+    function.instruction(&Instruction::I32Const(0x0A));
+    function.instruction(&Instruction::Call(helpers.out_byte()));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::Call(helpers.out_flush()));
+}
+
 /// Emit a `console.log(a0, .., a_{n-1})` expression, leaving the
 /// `undefined` jsval (its expression value) on the stack.
 ///
-/// Each argument is evaluated left-to-right and passed to the host `print`
-/// import as `print(jsval_bits, flag)`: every argument but the last uses
-/// `PRINT_FLAG_SEP` (value + a single space) and the last uses `PRINT_FLAG_END`
-/// (value + newline). A zero-argument call emits one `print(undefined,
-/// PRINT_FLAG_NEWLINE)` so the line is just a newline. The host formats the
-/// jsval (reusing `format_value`) and reads linear memory for pointer jsvals.
+/// Each argument is evaluated left-to-right and appended to the output buffer
+/// by the guest renderer, separated by a single space; the line is written
+/// with one `fd_write` after the last argument (for no arguments, just a
+/// newline).
 pub(super) fn emit_console_log(
     args: &[IrNode],
     function: &mut Function,
@@ -3055,32 +3061,22 @@ pub(super) fn emit_console_log(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    if args.is_empty() {
-        // `console.log()` prints just a newline; the jsval operand is ignored, so
-        // a dummy `undefined` satisfies the import's `(i64, i32)` signature.
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::I32Const(PRINT_FLAG_NEWLINE));
-        function.instruction(&Instruction::Call(helpers.print));
-    } else {
-        let last = args.len() - 1;
-        for (i, arg) in args.iter().enumerate() {
-            emit_node(arg, function, scratch, strings, helpers);
-            let flag = if i == last {
-                PRINT_FLAG_END
-            } else {
-                PRINT_FLAG_SEP
-            };
-            function.instruction(&Instruction::I32Const(flag));
-            function.instruction(&Instruction::Call(helpers.print));
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            function.instruction(&Instruction::I32Const(0x20));
+            function.instruction(&Instruction::Call(helpers.out_byte()));
         }
+        emit_node(arg, function, scratch, strings, helpers);
+        function.instruction(&Instruction::Call(helpers.render_top()));
     }
+    emit_end_line(function, helpers);
     // `console.log(..)` evaluates to `undefined`.
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
 }
 
-/// Emit a `console.log(...)` spread call: build the argument array, then print
-/// each element (a hole as `undefined`) like [`emit_console_log`] prints its
-/// arguments — a bare newline for none — and push `undefined`.
+/// Emit a `console.log(...)` spread call: build the argument array, then
+/// render each element (a hole as `undefined`) like [`emit_console_log`]
+/// renders its arguments — a bare newline for none — and push `undefined`.
 pub(super) fn emit_console_log_spread(
     args: &IrNode,
     function: &mut Function,
@@ -3093,13 +3089,7 @@ pub(super) fn emit_console_log_spread(
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalTee(base));
     function.instruction(&Instruction::I32Load(array_len_slot()));
-    function.instruction(&Instruction::LocalTee(len));
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I32Const(PRINT_FLAG_NEWLINE));
-    function.instruction(&Instruction::Call(helpers.print));
-    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalSet(len));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::LocalSet(idx));
     function.instruction(&Instruction::Block(BlockType::Empty));
@@ -3108,6 +3098,12 @@ pub(super) fn emit_console_log_spread(
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32GeU);
     function.instruction(&Instruction::BrIf(1));
+    // Every element but the first is preceded by a space.
+    function.instruction(&Instruction::LocalGet(idx));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I32Const(0x20));
+    function.instruction(&Instruction::Call(helpers.out_byte()));
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::LocalGet(base));
     emit_array_elems(function);
     function.instruction(&Instruction::LocalGet(idx));
@@ -3117,20 +3113,15 @@ pub(super) fn emit_console_log_spread(
     function.instruction(&Instruction::I64Load(elem_slot(0)));
     function.instruction(&Instruction::LocalSet(elem));
     emit_elem_read(function, elem);
-    // The last element ends the line; every other one is followed by a space.
-    function.instruction(&Instruction::I32Const(PRINT_FLAG_END));
-    function.instruction(&Instruction::I32Const(PRINT_FLAG_SEP));
+    function.instruction(&Instruction::Call(helpers.render_top()));
     function.instruction(&Instruction::LocalGet(idx));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalTee(idx));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Select);
-    function.instruction(&Instruction::Call(helpers.print));
+    function.instruction(&Instruction::LocalSet(idx));
     function.instruction(&Instruction::Br(0));
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
+    emit_end_line(function, helpers);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
 }
 

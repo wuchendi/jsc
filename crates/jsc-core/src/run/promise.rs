@@ -18,8 +18,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use wasmtime::{AsContextMut, Caller, Func, Global, Memory, StoreContextMut, Val};
-use wasmtime_wasi::p1::WasiP1Ctx;
 
+use super::harness::{WasiCtx, reentry_error};
 use crate::abi;
 
 use abi::{
@@ -37,14 +37,14 @@ const UNDEFINED: u64 = abi::UNDEFINED;
 /// promise engine.
 pub(super) struct Host {
     /// The preview-1 context behind the `wasi_snapshot_preview1` imports.
-    pub(super) wasi: WasiP1Ctx,
+    pub(super) wasi: WasiCtx,
     /// The promise engine's microtask queue and reaction lists.
     pub(super) engine: PromiseEngine,
 }
 
 impl Host {
     /// Wrap a WASI context with a fresh, empty promise engine.
-    pub(super) fn new(wasi: WasiP1Ctx) -> Self {
+    pub(super) fn new(wasi: WasiCtx) -> Self {
         Self {
             wasi,
             engine: PromiseEngine::default(),
@@ -164,40 +164,45 @@ impl Handles {
 /// top-level `await`, or `p.finally`. Returns the result jsval bits (a promise,
 /// or the awaited value). A missing export set makes it a no-op returning
 /// `undefined` rather than trapping the guest.
-pub(super) fn dispatch(caller: &mut Caller<'_, Host>, op: i32, a: u64, b: u64) -> u64 {
+pub(super) fn dispatch(
+    caller: &mut Caller<'_, Host>,
+    op: i32,
+    a: u64,
+    b: u64,
+) -> wasmtime::Result<u64> {
     let Some(handles) = Handles::from_caller(caller) else {
-        return UNDEFINED;
+        return Ok(UNDEFINED);
     };
     let mut ctx = caller.as_context_mut();
-    match op {
-        x if x == abi::PROMISE_OP_RESOLVE => resolve(ctx, &handles, a),
+    Ok(match op {
+        x if x == abi::PROMISE_OP_RESOLVE => resolve(ctx, &handles, a)?,
         x if x == abi::PROMISE_OP_REJECT => {
-            alloc_promise(ctx, &handles, PROMISE_REJECTED, a).unwrap_or(UNDEFINED)
+            alloc_promise(ctx, &handles, PROMISE_REJECTED, a)?.unwrap_or(UNDEFINED)
         }
-        x if x == abi::PROMISE_OP_FINALLY => finally(ctx, &handles, a, b),
-        x if x == abi::PROMISE_OP_AWAIT => await_promise(ctx, &handles, a),
+        x if x == abi::PROMISE_OP_FINALLY => finally(ctx, &handles, a, b)?,
+        x if x == abi::PROMISE_OP_AWAIT => await_promise(ctx, &handles, a)?,
         // `new Promise` support: allocate a pending promise, or settle a
         // promise from a `resolve`/`reject` settler call.
         x if x == abi::PROMISE_OP_NEW => {
-            alloc_promise(ctx, &handles, PROMISE_PENDING, UNDEFINED).unwrap_or(UNDEFINED)
+            alloc_promise(ctx, &handles, PROMISE_PENDING, UNDEFINED)?.unwrap_or(UNDEFINED)
         }
         x if x == abi::PROMISE_OP_SETTLE_FULFILL => {
             if let Some(base) = as_promise(handles.memory.data(&ctx), a) {
-                settle(ctx.as_context_mut(), &handles, base, PROMISE_FULFILLED, b);
+                settle(ctx.as_context_mut(), &handles, base, PROMISE_FULFILLED, b)?;
             }
             UNDEFINED
         }
         x if x == abi::PROMISE_OP_SETTLE_REJECT => {
             if let Some(base) = as_promise(handles.memory.data(&ctx), a) {
-                settle(ctx.as_context_mut(), &handles, base, PROMISE_REJECTED, b);
+                settle(ctx.as_context_mut(), &handles, base, PROMISE_REJECTED, b)?;
             }
             UNDEFINED
         }
         // Spawn an `async function` body: `a` is the generator handle.
-        x if x == abi::PROMISE_OP_ASYNC_SPAWN => spawn_async(ctx, &handles, a),
+        x if x == abi::PROMISE_OP_ASYNC_SPAWN => spawn_async(ctx, &handles, a)?,
         // Deleted in R4 with the host promise engine.
         x if x == abi::PROMISE_OP_DRAIN => {
-            drain(ctx.as_context_mut(), &handles);
+            drain(ctx.as_context_mut(), &handles)?;
             let engine = &ctx.data().engine;
             engine
                 .rejected
@@ -206,7 +211,7 @@ pub(super) fn dispatch(caller: &mut Caller<'_, Host>, op: i32, a: u64, b: u64) -
                 .map_or(0, |base| HEAP | u64::from(*base))
         }
         _ => UNDEFINED,
-    }
+    })
 }
 
 /// Handle a `__then(p, on_f, on_r)` host-import call: allocate the chained result
@@ -217,14 +222,14 @@ pub(super) fn then(
     p: u64,
     on_fulfilled: u64,
     on_rejected: u64,
-) -> u64 {
+) -> wasmtime::Result<u64> {
     let Some(handles) = Handles::from_caller(caller) else {
-        return UNDEFINED;
+        return Ok(UNDEFINED);
     };
     let mut ctx = caller.as_context_mut();
-    let Some(result) = alloc_promise(ctx.as_context_mut(), &handles, PROMISE_PENDING, UNDEFINED)
+    let Some(result) = alloc_promise(ctx.as_context_mut(), &handles, PROMISE_PENDING, UNDEFINED)?
     else {
-        return UNDEFINED;
+        return Ok(UNDEFINED);
     };
     let result_base = base_of(result);
     register_source(
@@ -237,26 +242,34 @@ pub(super) fn then(
         false,
         None,
     );
-    result
+    Ok(result)
 }
 
 /// `Promise.resolve(a)`: `a` itself when it is already a promise, else a fresh
 /// promise fulfilled with `a`.
-fn resolve(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, a: u64) -> u64 {
+fn resolve(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, a: u64) -> wasmtime::Result<u64> {
     let is_promise = as_promise(handles.memory.data(&ctx), a).is_some();
     if is_promise {
-        a
+        Ok(a)
     } else {
-        alloc_promise(ctx.as_context_mut(), handles, PROMISE_FULFILLED, a).unwrap_or(UNDEFINED)
+        Ok(
+            alloc_promise(ctx.as_context_mut(), handles, PROMISE_FULFILLED, a)?
+                .unwrap_or(UNDEFINED),
+        )
     }
 }
 
 /// `p.finally(fn)`: a chained promise that runs `fn` on settlement (both paths)
 /// and passes `p`'s original settlement through.
-fn finally(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, p: u64, on_finally: u64) -> u64 {
-    let Some(result) = alloc_promise(ctx.as_context_mut(), handles, PROMISE_PENDING, UNDEFINED)
+fn finally(
+    mut ctx: StoreContextMut<'_, Host>,
+    handles: &Handles,
+    p: u64,
+    on_finally: u64,
+) -> wasmtime::Result<u64> {
+    let Some(result) = alloc_promise(ctx.as_context_mut(), handles, PROMISE_PENDING, UNDEFINED)?
     else {
-        return UNDEFINED;
+        return Ok(UNDEFINED);
     };
     let result_base = base_of(result);
     // The finalizer is the callback for BOTH fulfill and reject; `finally: true`
@@ -271,7 +284,7 @@ fn finally(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, p: u64, on_fin
         true,
         None,
     );
-    result
+    Ok(result)
 }
 
 /// Top-level `await p`: turn the event loop — drain the microtask queue to empty
@@ -282,14 +295,18 @@ fn finally(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, p: u64, on_fin
 /// always drains `p` to a settlement. A rejection is surfaced through the
 /// exception globals (`__exc_pending`/`__exc_value`) so the emitted propagation
 /// unwinds it as an uncaught error; awaiting a non-promise yields it unchanged.
-fn await_promise(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, p: u64) -> u64 {
+fn await_promise(
+    mut ctx: StoreContextMut<'_, Host>,
+    handles: &Handles,
+    p: u64,
+) -> wasmtime::Result<u64> {
     let Some(base) = as_promise(handles.memory.data(&ctx), p) else {
-        return p;
+        return Ok(p);
     };
     ctx.data_mut().engine.handled.insert(base);
-    drain(ctx.as_context_mut(), handles);
+    drain(ctx.as_context_mut(), handles)?;
     let mem = handles.memory.data(&ctx);
-    match read_state(mem, base) {
+    Ok(match read_state(mem, base) {
         s if s == PROMISE_FULFILLED => read_value(mem, base),
         s if s == PROMISE_REJECTED => {
             let value = read_value(mem, base);
@@ -302,7 +319,7 @@ fn await_promise(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, p: u64) 
         // Still pending after the queue drained: a deadlocked promise. It resolves
         // to `undefined` as a defensive fallback rather than a hang.
         _ => UNDEFINED,
-    }
+    })
 }
 
 /// Spawn an `async function` body: allocate the result promise, drive
@@ -315,14 +332,18 @@ fn await_promise(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, p: u64) 
 /// `__async_step` — the same re-entrant pattern the reaction engine uses for
 /// `__invoke1`, so a nested `await`/`.then` chain is driven to completion by the
 /// enclosing top-level `await` or the after-`main` drain.
-fn spawn_async(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, gen_handle: u64) -> u64 {
-    let Some(result) = alloc_promise(ctx.as_context_mut(), handles, PROMISE_PENDING, UNDEFINED)
+fn spawn_async(
+    mut ctx: StoreContextMut<'_, Host>,
+    handles: &Handles,
+    gen_handle: u64,
+) -> wasmtime::Result<u64> {
+    let Some(result) = alloc_promise(ctx.as_context_mut(), handles, PROMISE_PENDING, UNDEFINED)?
     else {
-        return UNDEFINED;
+        return Ok(UNDEFINED);
     };
     let result_base = base_of(result);
-    drive_async(ctx, handles, gen_handle, result_base, UNDEFINED);
-    result
+    drive_async(ctx, handles, gen_handle, result_base, UNDEFINED)?;
+    Ok(result)
 }
 
 /// Advance an `async function` body's generator by one step and route the outcome.
@@ -338,15 +359,13 @@ fn drive_async(
     gen_handle: u64,
     result_base: u32,
     sent: u64,
-) {
-    let (value, threw) = async_step(ctx.as_context_mut(), handles, gen_handle, sent);
+) -> wasmtime::Result<()> {
+    let (value, threw) = async_step(ctx.as_context_mut(), handles, gen_handle, sent)?;
     if threw {
-        settle(ctx, handles, result_base, PROMISE_REJECTED, value);
-        return;
+        return settle(ctx, handles, result_base, PROMISE_REJECTED, value);
     }
     if read_gen_done(handles.memory.data(&ctx), gen_handle) {
-        settle(ctx, handles, result_base, PROMISE_FULFILLED, value);
-        return;
+        return settle(ctx, handles, result_base, PROMISE_FULFILLED, value);
     }
     // The body suspended on `await value`: resume it (or reject the result) when
     // `value` settles. `register_source` gives `Promise.resolve` semantics — a
@@ -361,6 +380,7 @@ fn drive_async(
         false,
         Some(gen_handle),
     );
+    Ok(())
 }
 
 /// Advance the async body's generator one suspend by re-entering the guest through
@@ -373,24 +393,20 @@ fn async_step(
     handles: &Handles,
     gen_handle: u64,
     sent: u64,
-) -> (u64, bool) {
+) -> wasmtime::Result<(u64, bool)> {
     let Some(func) = handles.async_step else {
-        return (UNDEFINED, false);
+        return Ok((UNDEFINED, false));
     };
     let mut results = [Val::I64(0)];
-    if func
-        .call(
-            &mut ctx,
-            &[
-                Val::I64(gen_handle.cast_signed()),
-                Val::I64(sent.cast_signed()),
-            ],
-            &mut results,
-        )
-        .is_err()
-    {
-        return (UNDEFINED, false);
-    }
+    func.call(
+        &mut ctx,
+        &[
+            Val::I64(gen_handle.cast_signed()),
+            Val::I64(sent.cast_signed()),
+        ],
+        &mut results,
+    )
+    .map_err(reentry_error)?;
     if handles.exc_pending.get(&mut ctx).i32().unwrap_or(0) != 0 {
         let value = handles
             .exc_value
@@ -400,13 +416,13 @@ fn async_step(
             .cast_unsigned();
         let _ = handles.exc_pending.set(&mut ctx, Val::I32(0));
         let _ = handles.exc_value.set(&mut ctx, Val::I64(0));
-        return (value, true);
+        return Ok((value, true));
     }
     let result = match results[0] {
         Val::I64(v) => v.cast_unsigned(),
         _ => UNDEFINED,
     };
-    (result, false)
+    Ok((result, false))
 }
 
 /// Read an async-body generator handle's `done` flag: `true` once the
@@ -424,10 +440,11 @@ fn read_gen_done(mem: &[u8], gen_handle: u64) -> bool {
 /// Drive the microtask queue to empty, running each job FIFO. Shared by top-level
 /// `await` (turning the event loop) and the after-`main` drain. A job may enqueue
 /// more jobs (a reaction that chains); they are appended and run in turn.
-fn drain(mut ctx: StoreContextMut<'_, Host>, handles: &Handles) {
+fn drain(mut ctx: StoreContextMut<'_, Host>, handles: &Handles) -> wasmtime::Result<()> {
     while let Some(job) = ctx.data_mut().engine.queue.pop_front() {
-        run_job(ctx.as_context_mut(), handles, job);
+        run_job(ctx.as_context_mut(), handles, job)?;
     }
+    Ok(())
 }
 
 /// Run one microtask: invoke its callback (re-entering the guest) and settle the
@@ -435,7 +452,11 @@ fn drain(mut ctx: StoreContextMut<'_, Host>, handles: &Handles) {
 /// forwards the source settlement; a `finally` job runs the callback for effect
 /// and forwards the original settlement (unless the callback throws, which
 /// rejects the result).
-fn run_job(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, job: Job) {
+fn run_job(
+    mut ctx: StoreContextMut<'_, Host>,
+    handles: &Handles,
+    job: Job,
+) -> wasmtime::Result<()> {
     // An `async function` continuation: the awaited value has settled.
     // On fulfillment, resume the body's generator with the settled value (which
     // may suspend again on the next `await` or complete and settle the result);
@@ -452,23 +473,21 @@ fn run_job(mut ctx: StoreContextMut<'_, Host>, handles: &Handles, job: Job) {
             let _ = handles.exc_pending.set(&mut ctx, Val::I32(1));
             UNDEFINED
         };
-        drive_async(ctx, handles, gen_handle, job.result, sent);
-        return;
+        return drive_async(ctx, handles, gen_handle, job.result, sent);
     }
     let is_fn = as_function(handles.memory.data(&ctx), job.callback);
     if !is_fn {
         // No callback for this path: pass the source settlement straight through.
-        settle(ctx, handles, job.result, job.state, job.value);
-        return;
+        return settle(ctx, handles, job.result, job.state, job.value);
     }
-    let (outcome, threw) = invoke1(ctx.as_context_mut(), handles, job.callback, job.value);
+    let (outcome, threw) = invoke1(ctx.as_context_mut(), handles, job.callback, job.value)?;
     if threw {
-        settle(ctx, handles, job.result, PROMISE_REJECTED, outcome);
+        settle(ctx, handles, job.result, PROMISE_REJECTED, outcome)
     } else if job.finally {
         // A finalizer's normal return is ignored: forward the original settlement.
-        settle(ctx, handles, job.result, job.state, job.value);
+        settle(ctx, handles, job.result, job.state, job.value)
     } else {
-        settle(ctx, handles, job.result, PROMISE_FULFILLED, outcome);
+        settle(ctx, handles, job.result, PROMISE_FULFILLED, outcome)
     }
 }
 
@@ -483,21 +502,18 @@ fn settle(
     base: u32,
     mut state: i32,
     mut value: u64,
-) {
+) -> wasmtime::Result<()> {
     if read_state(handles.memory.data(&ctx), base) != PROMISE_PENDING {
-        return; // settle-once.
+        return Ok(()); // settle-once.
     }
     if state == PROMISE_FULFILLED {
         match as_promise(handles.memory.data(&ctx), value) {
             Some(inner) if inner == base => {
                 let mut results = [Val::I64(0)];
-                if handles
+                handles
                     .self_error
                     .call(&mut ctx, &[], &mut results)
-                    .is_err()
-                {
-                    return; // an out-of-memory trap: the run stage reports it.
-                }
+                    .map_err(reentry_error)?;
                 state = PROMISE_REJECTED;
                 value = match results[0] {
                     Val::I64(v) => v.cast_unsigned(),
@@ -508,7 +524,7 @@ fn settle(
             // promise-as-value.
             Some(_) => {
                 register_source(ctx, handles, value, UNDEFINED, UNDEFINED, base, false, None);
-                return;
+                return Ok(());
             }
             None => {}
         }
@@ -538,6 +554,7 @@ fn settle(
             async_gen: r.async_gen,
         });
     }
+    Ok(())
 }
 
 /// Register a reaction whose source is `source` (a promise, or a plain value):
@@ -610,24 +627,20 @@ fn invoke1(
     handles: &Handles,
     callback: u64,
     arg: u64,
-) -> (u64, bool) {
+) -> wasmtime::Result<(u64, bool)> {
     let Some(func) = handles.invoke1 else {
-        return (UNDEFINED, false);
+        return Ok((UNDEFINED, false));
     };
     let mut results = [Val::I64(0)];
-    if func
-        .call(
-            &mut ctx,
-            &[
-                Val::I64(callback.cast_signed()),
-                Val::I64(arg.cast_signed()),
-            ],
-            &mut results,
-        )
-        .is_err()
-    {
-        return (UNDEFINED, false);
-    }
+    func.call(
+        &mut ctx,
+        &[
+            Val::I64(callback.cast_signed()),
+            Val::I64(arg.cast_signed()),
+        ],
+        &mut results,
+    )
+    .map_err(reentry_error)?;
     if handles.exc_pending.get(&mut ctx).i32().unwrap_or(0) != 0 {
         let value = handles
             .exc_value
@@ -637,34 +650,38 @@ fn invoke1(
             .cast_unsigned();
         let _ = handles.exc_pending.set(&mut ctx, Val::I32(0));
         let _ = handles.exc_value.set(&mut ctx, Val::I64(0));
-        return (value, true);
+        return Ok((value, true));
     }
     let result = match results[0] {
         Val::I64(v) => v.cast_unsigned(),
         _ => UNDEFINED,
     };
-    (result, false)
+    Ok((result, false))
 }
 
 /// Allocate a fresh promise block through the guest `__new_promise` export,
-/// settle it to `state`/`value` unless pending, and return its heap jsval, or
-/// `None` on a failed allocation (an out-of-memory trap leaves the sentinel for
-/// the run stage to report).
+/// settle it to `state`/`value` unless pending, and return its heap jsval.
+/// `None` when the export has an unexpected type; a failed call propagates.
 fn alloc_promise(
     mut ctx: StoreContextMut<'_, Host>,
     handles: &Handles,
     state: i32,
     value: u64,
-) -> Option<u64> {
-    let new_promise = handles.new_promise.typed::<(), i32>(&ctx).ok()?;
-    let base = u32::try_from(new_promise.call(&mut ctx, ()).ok()?).ok()?;
+) -> wasmtime::Result<Option<u64>> {
+    let Ok(new_promise) = handles.new_promise.typed::<(), i32>(&ctx) else {
+        return Ok(None);
+    };
+    let raw = new_promise.call(&mut ctx, ()).map_err(reentry_error)?;
+    let Ok(base) = u32::try_from(raw) else {
+        return Ok(None);
+    };
     if state != PROMISE_PENDING {
         write_settlement(ctx.as_context_mut(), handles, base, state, value);
     }
     if state == PROMISE_REJECTED {
         ctx.data_mut().engine.rejected.insert(base);
     }
-    Some(HEAP | u64::from(base))
+    Ok(Some(HEAP | u64::from(base)))
 }
 
 /// Write a promise block's settlement (`state` + `value`) into guest memory.

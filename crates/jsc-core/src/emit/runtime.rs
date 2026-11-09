@@ -22,10 +22,9 @@ macro_rules! wasm {
 /// `memory.size * 64 KiB`. On
 /// overflow the cold path grows by `max(needed, current)` pages (at least
 /// doubling), falling back to exactly the needed pages. When even that fails
-/// (the module's memory `maximum` is reached) it stores the sticky
-/// [`abi::HEAP_PTR_OOM`] sentinel in `__heap_ptr` and traps; the run stage maps
-/// the sentinel to `Uncaught RangeError: out of memory`. The sentinel also makes
-/// every later allocation fail. The `i32` param is local 0; extra locals hold the
+/// (the module's memory `maximum` is reached) it writes the static
+/// [`abi::OOM_LINE`] to fd 2 through its static iovec, allocating nothing, and
+/// calls `proc_exit(1)`. The `i32` param is local 0; extra locals hold the
 /// old pointer (i32), the end offset (i64), and the needed page count (i32).
 pub(super) fn emit_alloc() -> Function {
     let mut function = Function::new(vec![
@@ -80,10 +79,12 @@ pub(super) fn emit_alloc() -> Function {
     function.instruction(&Instruction::I32Const(-1));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
-    // Out of memory: store the sticky sentinel and trap.
-    function.instruction(&Instruction::I32Const(abi::HEAP_PTR_OOM));
-    function.instruction(&Instruction::GlobalSet(HEAP_PTR_GLOBAL));
-    function.instruction(&Instruction::Unreachable);
+    // Out of memory: the static line on fd 2, then `proc_exit(1)`.
+    wasm!(function;
+        I32Const(2), I32Const(abi::OOM_IOVEC.cast_signed()), I32Const(1),
+        I32Const(abi::WASI_NWRITTEN.cast_signed()), Call(FD_WRITE_IMPORT), Drop,
+        I32Const(1), Call(PROC_EXIT_IMPORT), Unreachable,
+    );
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);

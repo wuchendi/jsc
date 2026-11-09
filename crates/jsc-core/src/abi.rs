@@ -680,39 +680,45 @@ pub(crate) const STR_DATA_OFFSET: u32 = 8;
 /// never exported, since the run stage never reads it.
 pub(crate) const THIS_GLOBAL_INDEX: u32 = 5;
 
-/// The module name of every host env import (`print`/`__convert`/`__method`).
+/// The module name of the host env imports not yet replaced by guest code.
 pub(crate) const IMPORT_MODULE: &str = "env";
 
 /// The import module of the four WASI preview-1 functions.
-#[expect(dead_code, reason = "first used by the R1 emitter")]
 pub(crate) const WASI_MODULE: &str = "wasi_snapshot_preview1";
 
 /// The WASI `fd_write` import.
-#[expect(dead_code, reason = "first used by the R1 emitter")]
 pub(crate) const WASI_FD_WRITE_NAME: &str = "fd_write";
 
 /// The WASI `clock_time_get` import.
-#[expect(dead_code, reason = "first used by the R1 emitter")]
 pub(crate) const WASI_CLOCK_TIME_GET_NAME: &str = "clock_time_get";
 
 /// The WASI `random_get` import.
-#[expect(dead_code, reason = "first used by the R1 emitter")]
 pub(crate) const WASI_RANDOM_GET_NAME: &str = "random_get";
 
 /// The WASI `proc_exit` import.
-#[expect(dead_code, reason = "first used by the R1 emitter")]
 pub(crate) const WASI_PROC_EXIT_NAME: &str = "proc_exit";
 
 /// The command-module entry point export.
 pub(crate) const START_EXPORT_NAME: &str = "_start";
 
-/// Size in bytes of the static WASI scratch area: one iovec, `nwritten`, the
-/// 8-byte clock result and the 16-byte random seed buffer.
-#[expect(dead_code, reason = "first used by the R1 emitter")]
-pub(crate) const WASI_SCRATCH: u32 = 40;
+/// Address of the static WASI scratch area, 40 bytes: one iovec, `nwritten`,
+/// the 8-byte clock result and the 16-byte random seed buffer.
+pub(crate) const WASI_SCRATCH: u32 = 8;
 
-/// The field name of the host `print` import backing `console.log`.
-pub(crate) const PRINT_IMPORT_NAME: &str = "print";
+/// Address of the `nwritten` word of the WASI scratch area.
+pub(crate) const WASI_NWRITTEN: u32 = WASI_SCRATCH + 8;
+
+/// Address of the static iovec of [`OOM_LINE`], right after the scratch area.
+pub(crate) const OOM_IOVEC: u32 = WASI_SCRATCH + 40;
+
+/// Address of the [`OOM_LINE`] bytes, right after its iovec.
+pub(crate) const OOM_LINE_ADDR: u32 = OOM_IOVEC + 8;
+
+/// The line `__alloc` writes to fd 2 before `proc_exit(1)`.
+pub(crate) const OOM_LINE: &str = "Uncaught RangeError: out of memory\n";
+
+/// The first address after the fixed static area, where the string blocks begin.
+pub(crate) const STATIC_AREA_END: u32 = OOM_LINE_ADDR + 40;
 
 /// The field name of the host `__convert` import backing the
 /// `String`/`Number`/`parseFloat` conversions.
@@ -803,12 +809,6 @@ pub(crate) const INVOKE_EXPORT_NAME: &str = "__invoke1";
 /// exception via `__exc_pending`) for the host to read.
 pub(crate) const ASYNC_STEP_EXPORT_NAME: &str = "__async_step";
 
-/// The name under which the module exports the `__alloc(size: i32) -> base: i32`
-/// bump allocator. It rounds `size` up to [`BLOCK_ALIGN`], zeroes the block's
-/// [`HEADER_SIZE`] header bytes, and returns the 8-aligned base; on exhaustion it
-/// stores [`HEAP_PTR_OOM`] and traps.
-pub(crate) const ALLOC_EXPORT_NAME: &str = "__alloc";
-
 /// The name under which the module exports the `__new_string(len: i32,
 /// two_byte: i32) -> base: i32` constructor: a [`TYPE_STRING`] block of `len`
 /// code units — `len` Latin-1 bytes, or with `two_byte` (`0`/`1`)
@@ -817,12 +817,6 @@ pub(crate) const ALLOC_EXPORT_NAME: &str = "__alloc";
 /// hosts allocate every string through it, in canonical form (one-byte iff
 /// every unit is `<= 0xFF`).
 pub(crate) const NEW_STRING_EXPORT_NAME: &str = "__new_string";
-
-/// The name under which the module exports the `__new_array(len: i32) -> base:
-/// i32` constructor: a [`TYPE_ARRAY`] handle with `len` set and a `cap = len`
-/// [`TYPE_ELEMS`] store (none when `len` is 0) whose every element is
-/// `undefined`. The hosts allocate every array through it.
-pub(crate) const NEW_ARRAY_EXPORT_NAME: &str = "__new_array";
 
 /// The name under which the module exports the `__new_promise() -> base: i32`
 /// constructor: a pending [`TYPE_PROMISE`] block (value `undefined`). The hosts
@@ -839,21 +833,10 @@ pub(crate) const PROMISE_SELF_ERROR_EXPORT_NAME: &str = "__promise_self_error";
 /// reads it back to resolve heap pointers.
 pub(crate) const MEMORY_EXPORT_NAME: &str = "memory";
 
-/// The name under which the bump-allocator heap-pointer global is exported so
-/// the run stage can detect the [`HEAP_PTR_OOM`] sentinel (hosts only read it;
-/// they allocate through the constructor exports).
-pub(crate) const HEAP_PTR_EXPORT_NAME: &str = "__heap_ptr";
-
 /// The linear-memory cap in 64 KiB wasm pages (512 MiB), declared as the
 /// module's memory `maximum`: a guest `__alloc` or host allocation that cannot
 /// grow memory within it is out of memory.
 pub(crate) const MEMORY_MAX_PAGES: u64 = 8192;
-
-/// The sticky out-of-memory sentinel stored in the heap-pointer global when an
-/// allocation cannot grow memory (as `i32`, i.e. `0xFFFF_FFFF`). Every later
-/// allocation fails against it, and the run stage reports it as
-/// `Uncaught RangeError: out of memory`.
-pub(crate) const HEAP_PTR_OOM: i32 = -1;
 
 /// The name under which the pending-exception flag global (`$exc_pending`, i32)
 /// is exported so the run stage can detect an uncaught exception after `main`
@@ -863,18 +846,6 @@ pub(crate) const EXC_PENDING_EXPORT_NAME: &str = "__exc_pending";
 /// The name under which the in-flight exception value global (`$exc_value`, i64)
 /// is exported so the run stage can render an uncaught exception.
 pub(crate) const EXC_VALUE_EXPORT_NAME: &str = "__exc_value";
-
-/// `print` import flag: format the jsval and follow it with a single
-/// space — used for every `console.log` argument except the last.
-pub(crate) const PRINT_FLAG_SEP: i32 = 0;
-
-/// `print` import flag: format the jsval and follow it with a newline —
-/// used for the last `console.log` argument.
-pub(crate) const PRINT_FLAG_END: i32 = 1;
-
-/// `print` import flag: emit only a newline, ignoring the (dummy) jsval
-/// operand — used for a zero-argument `console.log()`.
-pub(crate) const PRINT_FLAG_NEWLINE: i32 = 2;
 
 /// `__convert` op flag: stringify the argument (`String(x)`).
 pub(crate) const CONVERT_OP_TO_STRING: i32 = 0;

@@ -3,14 +3,13 @@
 //! This is the final backend stage. It walks an [`IrNode`] tree and produces the
 //! raw bytes of a valid WebAssembly module using the [`wasm_encoder`] crate.
 //!
-//! The emitted module exports exactly one function under the name **`"main"`**
-//! with the signature `() -> i64` (no parameters, a single `i64` result). The
-//! `i64` result is a NaN-boxed jsval (see [`crate::run`] for the layout); using
-//! an `i64` carrier — not `f64` — guarantees the value's bits survive every
-//! wasm op and the wasmtime return boundary without NaN canonicalization. The
-//! run/CLI stages depend on this exact export name and signature. `main`
-//! declares one `i64` local per top-level variable; the program's value is the
-//! value of its last expression statement, which is left on the operand stack.
+//! The emitted module is a WASI command: it exports `_start: () -> ()` and
+//! `memory`, plus the helpers the host still needs until the guest promise
+//! engine lands. The internal `main: () -> i64` runs the top-level statements
+//! and returns the completion value as a NaN-boxed jsval (see [`crate::run`]);
+//! `_start` wraps it with the drain, the uncaught reports and the optional
+//! completion print. An `i64` carrier — not `f64` — keeps the value's bits
+//! intact through every wasm op.
 //!
 //! Any user-defined functions are emitted as additional wasm functions
 //! (indices `1..`, signature `(i64, ..) -> i64`), so a call expression lowers
@@ -40,23 +39,15 @@ use crate::ir::{
     PrivateError, PropKey, ProtoKind, SpreadCallee, SpreadElem,
 };
 
-/// The name of the entry function exported from the emitted module.
-const EXPORT_NAME: &str = "main";
-
 /// The name under which the module's linear memory is exported (see
 /// [`abi::MEMORY_EXPORT_NAME`]). [`crate::run`] reads it back to resolve heap
 /// pointers.
 const MEMORY_EXPORT_NAME: &str = abi::MEMORY_EXPORT_NAME;
 
-/// The module and field name of the host `print` import backing `console.log`.
-/// [`crate::run`] supplies this function through a `wasmtime::Linker`.
-const PRINT_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
-const PRINT_IMPORT_NAME: &str = abi::PRINT_IMPORT_NAME;
-
 /// The module and field name of the host `__convert` import backing the
 /// `String`/`Number`/`parseFloat` conversions. It receives the
 /// argument jsval plus a `CONVERT_OP_*` flag and returns the converted jsval,
-/// reusing the run stage's `format_value`/parse helpers (and allocating a heap
+/// reusing the run stage's `to_js_string`/parse helpers (and allocating a heap
 /// string in guest memory for `String`).
 const CONVERT_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const CONVERT_IMPORT_NAME: &str = abi::CONVERT_IMPORT_NAME;
@@ -107,21 +98,15 @@ const INVOKE_EXPORT_NAME: &str = abi::INVOKE_EXPORT_NAME;
 /// host async engine calls to advance an `async function` body's state machine.
 const ASYNC_STEP_EXPORT_NAME: &str = abi::ASYNC_STEP_EXPORT_NAME;
 
-/// The export names of the bump allocator and the guest constructors the
-/// hosts allocate through (see [`abi`]).
-const ALLOC_EXPORT_NAME: &str = abi::ALLOC_EXPORT_NAME;
+/// The export names of the guest constructors the hosts allocate through
+/// (see [`abi`]).
 const NEW_STRING_EXPORT_NAME: &str = abi::NEW_STRING_EXPORT_NAME;
-const NEW_ARRAY_EXPORT_NAME: &str = abi::NEW_ARRAY_EXPORT_NAME;
 const NEW_PROMISE_EXPORT_NAME: &str = abi::NEW_PROMISE_EXPORT_NAME;
 const PROMISE_SELF_ERROR_EXPORT_NAME: &str = abi::PROMISE_SELF_ERROR_EXPORT_NAME;
 
 /// `__method` op flags; see [`abi`].
 const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
 const METHOD_OP_INCLUDES: i32 = abi::METHOD_OP_INCLUDES;
-
-/// The name under which the bump-allocator heap pointer global is exported so the
-/// run stage can detect the out-of-memory sentinel.
-const HEAP_PTR_EXPORT_NAME: &str = abi::HEAP_PTR_EXPORT_NAME;
 
 /// The name under which the pending-exception flag global (`$exc_pending`, i32) is
 /// exported so the run stage can detect an uncaught exception after `main` returns.
@@ -133,24 +118,17 @@ const EXC_PENDING_EXPORT_NAME: &str = abi::EXC_PENDING_EXPORT_NAME;
 /// thrown jsval bits; only meaningful while `$exc_pending` is `1`.
 const EXC_VALUE_EXPORT_NAME: &str = abi::EXC_VALUE_EXPORT_NAME;
 
-/// The number of imported functions the module declares: the host `print`
-/// function occupies function index `0`, the host `__convert` function
-/// index `1`, and the host `__method` function index `2`, so
-/// every DEFINED function — `main`, the user functions, and the runtime helpers —
-/// plus the funcref-table element indices and the exported `main` index all shift
-/// up by this count.
-///
-/// Two more imports — `__promise` (index 3) and `__then` (index 4) — back the
-/// host promise engine, and `__now` (index 5) is the host wall clock backing
-/// `Date.now()` / `new Date()`, and `__parse_int` (index 6) backs
-/// `parseInt(s, radix)`, so the count is `7`.
-const IMPORT_FUNC_COUNT: u32 = 7;
+/// The number of imported functions: the four WASI imports (`fd_write`,
+/// `clock_time_get`, `random_get`, `proc_exit`) at indices `0..=3`, then the
+/// six `env` imports. Every defined function, funcref-table element and
+/// function export index is shifted up by this count.
+const IMPORT_FUNC_COUNT: u32 = 10;
 
-/// `print` import flags; see [`abi`]: a value plus a trailing space, a
-/// value plus a newline, or a newline alone for zero-argument `console.log()`.
-const PRINT_FLAG_SEP: i32 = abi::PRINT_FLAG_SEP;
-const PRINT_FLAG_END: i32 = abi::PRINT_FLAG_END;
-const PRINT_FLAG_NEWLINE: i32 = abi::PRINT_FLAG_NEWLINE;
+/// The function index of the WASI `fd_write` import.
+const FD_WRITE_IMPORT: u32 = 0;
+
+/// The function index of the WASI `proc_exit` import.
+const PROC_EXIT_IMPORT: u32 = 3;
 
 /// The wasm global index of the bump-allocator heap pointer (`__heap_ptr`).
 const HEAP_PTR_GLOBAL: u32 = 0;
@@ -235,10 +213,30 @@ const SPREAD_ARGS_GLOBAL: u32 = 13;
 /// [`abi::PROPS_WATCHED`] and bit index `i`. Bits are never cleared. Internal.
 const DIRTY_GLOBAL: u32 = 14;
 
+/// The output buffer: base, UTF-8 length and capacity (`$__out_buf`, all i32,
+/// init 0). Empty between lines; see [`render`].
+const OUT_BUF_GLOBAL: u32 = 15;
+/// See [`OUT_BUF_GLOBAL`].
+const OUT_LEN_GLOBAL: u32 = 16;
+/// See [`OUT_BUF_GLOBAL`].
+const OUT_CAP_GLOBAL: u32 = 17;
+
+/// The renderer's recursion-path block: base and capacity (i32, init 0).
+const PATH_BUF_GLOBAL: u32 = 18;
+/// See [`PATH_BUF_GLOBAL`].
+const PATH_CAP_GLOBAL: u32 = 19;
+
+/// The renderer's ref table: base, capacity and entry count (i32, init 0).
+const REFS_BUF_GLOBAL: u32 = 20;
+/// See [`REFS_BUF_GLOBAL`].
+const REFS_CAP_GLOBAL: u32 = 21;
+/// See [`REFS_BUF_GLOBAL`].
+const REFS_LEN_GLOBAL: u32 = 22;
+
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
-/// the dirty-bits global and set in `main`'s prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 15;
+/// the renderer globals and set in `main`'s prologue).
+const MODULE_CELL_GLOBAL_BASE: u32 = 23;
 
 /// An array hole (see [`abi::HOLE`]): the element-slot bit pattern of a
 /// missing element. Every element read maps it to `undefined`.
@@ -258,11 +256,11 @@ const CF_BREAK: i32 = 2;
 /// [`CF_KIND_GLOBAL`] value for a pending `continue`.
 const CF_CONTINUE: i32 = 3;
 
-/// The base heap offset: the first byte of static string-literal data (offset 0
-/// is reserved as a null guard). Literal blobs are packed contiguously from here;
+/// The base heap offset: the first byte of static string-literal data, after
+/// the null guard, the function-table word and the fixed WASI area. Literal blobs are packed contiguously from here;
 /// the bump allocator (`__alloc`) then starts at the first free offset *after*
 /// them (see [`emit`]).
-const HEAP_BASE: i32 = 8;
+const HEAP_BASE: i32 = abi::STATIC_AREA_END.cast_signed();
 
 /// The alignment of every heap block base (see [`abi::BLOCK_ALIGN`]).
 const BLOCK_ALIGN: i32 = abi::BLOCK_ALIGN.cast_signed();
@@ -883,29 +881,20 @@ struct Helpers<'a> {
     /// place (push/pop a handler, bump/restore the depth) without re-plumbing a
     /// `&mut` through every helper.
     unwind: &'a RefCell<Unwind>,
-    /// The host `print` import's function index. Imports occupy the
-    /// lowest function indices, so this is always `0`; `console.log` lowers to
-    /// `call`s of it.
-    print: u32,
-    /// The host `__convert` import's function index. Always `1` (the
-    /// second import); `String`/`Number`/`parseFloat` lower to `call`s of it.
+    /// The host `__convert` import's function index. Always `4`; `String`/`Number`/`parseFloat` lower to `call`s of it.
     convert: u32,
-    /// The host `__method` import's function index. Always `2` (the third
-    /// import); the non-callback array/string methods lower to `call`s of it.
+    /// The host `__method` import's function index. Always `5`; the non-callback array/string methods lower to `call`s of it.
     method: u32,
-    /// The host `__promise` import's function index. Always `3` (the fourth
-    /// import); `Promise.resolve`/`reject`, `await`, and `p.finally` lower to
+    /// The host `__promise` import's function index. Always `6`; `Promise.resolve`/`reject`, `await`, and `p.finally` lower to
     /// `call`s of it.
     promise: u32,
-    /// The host `__then` import's function index. Always `4` (the fifth
-    /// import); `p.then`/`p.catch` lower to `call`s of it.
+    /// The host `__then` import's function index. Always `7`; `p.then`/`p.catch` lower to `call`s of it.
     then: u32,
-    /// The host `__now` import's function index (backing `Date`). Always `5` (the
-    /// sixth import); `Date.now()` / `new Date()` lower to `call`s of it. The
+    /// The host `__now` import's function index (backing `Date`). Always `8`; `Date.now()` / `new Date()` lower to `call`s of it. The
     /// import returns an f64 (ms since the Unix epoch).
     now: u32,
     /// The host `__parse_int(s: i64, radix: i64) -> i64` import's function
-    /// index. Always `6` (the seventh import); `parseInt` lowers to `call`s of it.
+    /// index. Always `9`; `parseInt` lowers to `call`s of it.
     parse_int: u32,
     /// `__gen_to_array(gen: i64) -> i64`: drive a generator to
     /// exhaustion via `call_indirect`, collecting its yielded values into a fresh
@@ -1387,6 +1376,7 @@ mod numeric;
 mod object;
 mod props;
 mod realm;
+mod render;
 mod runtime;
 mod sections;
 mod stmt;
@@ -1430,15 +1420,9 @@ pub struct CompileOptions {
     pub print_completion: bool,
 }
 
-/// Emit a complete WebAssembly module for `program`.
-///
-/// The returned bytes are a self-contained module exporting a single function
-/// `main` with signature `() -> i64`. It declares one `i64` local per program
-/// variable, executes each statement in order, and leaves the value of the last
-/// expression statement on the stack as the result. Values of any earlier
-/// expression statements are dropped. A program with no expression statement
-/// (only declarations) has no value, so the `undefined` jsval is pushed as the
-/// result to keep the `() -> i64` signature total.
+/// Emit a complete WebAssembly command module for `program`: exports
+/// `_start` and `memory`, imports the WASI functions and the remaining `env`
+/// functions. See the module documentation.
 #[allow(clippy::too_many_lines)]
 pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     let mut module = Module::new();
@@ -1470,69 +1454,30 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // Per-function exception-unwinding state, reset at each function body.
     // Owned here so it outlives every `emit_main`/`emit_function` call below.
     let unwind = RefCell::new(Unwind::default());
-    let (
-        types,
-        functions,
-        helpers,
-        print_type,
-        convert_type,
-        method_type,
-        promise_type,
-        then_type,
-        now_type,
-        parse_int_type,
-    ) = build_type_and_function_sections(program, &unwind, layout);
+    let (types, functions, helpers, import_types) =
+        build_type_and_function_sections(program, &unwind, layout);
     module.section(&types);
 
-    // Import section: the host `print` function backing `console.log` (index 0),
-    // the host `__convert` function backing the conversions (index 1), and the
-    // host `__method` function backing the array/string methods (index 2).
-    // Imports occupy the lowest function indices, so every defined
-    // function/element/export index is shifted by IMPORT_FUNC_COUNT (accounted for
-    // in `build_type_and_function_sections` and below). This follows the type
-    // section and precedes the function section (wasm section order); the order of
-    // the imports here must match their assigned indices in `Helpers`.
+    // Import section: the WASI functions (indices 0..=3), then the `env`
+    // functions (indices 4..=9). Imports occupy the lowest function indices,
+    // so every defined function/element/export index is shifted by
+    // IMPORT_FUNC_COUNT. The order must match `Helpers`.
     let mut imports = ImportSection::new();
-    imports.import(
-        PRINT_IMPORT_MODULE,
-        PRINT_IMPORT_NAME,
-        EntityType::Function(print_type),
-    );
-    imports.import(
-        CONVERT_IMPORT_MODULE,
-        CONVERT_IMPORT_NAME,
-        EntityType::Function(convert_type),
-    );
-    imports.import(
-        METHOD_IMPORT_MODULE,
-        METHOD_IMPORT_NAME,
-        EntityType::Function(method_type),
-    );
-    // The host promise imports (indices 3/4): `__promise(op, a, b) -> i64`
-    // and `__then(p, on_f, on_r) -> i64`, backing the host promise engine.
-    imports.import(
-        PROMISE_IMPORT_MODULE,
-        PROMISE_IMPORT_NAME,
-        EntityType::Function(promise_type),
-    );
-    imports.import(
-        THEN_IMPORT_MODULE,
-        THEN_IMPORT_NAME,
-        EntityType::Function(then_type),
-    );
-    // The host wall-clock import (backing `Date`, index 5): `__now() -> f64`,
-    // milliseconds since the Unix epoch, backing `Date.now()` / `new Date()`.
-    imports.import(
-        NOW_IMPORT_MODULE,
-        NOW_IMPORT_NAME,
-        EntityType::Function(now_type),
-    );
-    // The host `parseInt` import (index 6): `__parse_int(s, radix) -> i64`.
-    imports.import(
-        PARSE_INT_IMPORT_MODULE,
-        PARSE_INT_IMPORT_NAME,
-        EntityType::Function(parse_int_type),
-    );
+    let names = [
+        (abi::WASI_MODULE, abi::WASI_FD_WRITE_NAME),
+        (abi::WASI_MODULE, abi::WASI_CLOCK_TIME_GET_NAME),
+        (abi::WASI_MODULE, abi::WASI_RANDOM_GET_NAME),
+        (abi::WASI_MODULE, abi::WASI_PROC_EXIT_NAME),
+        (CONVERT_IMPORT_MODULE, CONVERT_IMPORT_NAME),
+        (METHOD_IMPORT_MODULE, METHOD_IMPORT_NAME),
+        (PROMISE_IMPORT_MODULE, PROMISE_IMPORT_NAME),
+        (THEN_IMPORT_MODULE, THEN_IMPORT_NAME),
+        (NOW_IMPORT_MODULE, NOW_IMPORT_NAME),
+        (PARSE_INT_IMPORT_MODULE, PARSE_INT_IMPORT_NAME),
+    ];
+    for ((module_name, name), ty) in names.into_iter().zip(import_types) {
+        imports.import(module_name, name, EntityType::Function(ty));
+    }
     module.section(&imports);
 
     module.section(&functions);
@@ -1569,15 +1514,11 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // exception-unwinding globals (see [`build_globals`]).
     module.section(&build_globals(heap_ptr_init, &intern, program.module_cells));
 
-    // Export section: `main` as function index IMPORT_FUNC_COUNT (the first
-    // DEFINED function, after the imports), memory index 0 as "memory" (function
-    // imports do not shift the single memory's index).
+    // Export section: `_start` (the last defined function), memory index 0 as
+    // "memory", and the helpers the host promise engine still needs.
     let mut exports = ExportSection::new();
-    exports.export(EXPORT_NAME, ExportKind::Func, IMPORT_FUNC_COUNT);
+    exports.export(abi::START_EXPORT_NAME, ExportKind::Func, helpers.start());
     exports.export(MEMORY_EXPORT_NAME, ExportKind::Memory, 0);
-    // The bump-allocator heap pointer global is exported so the run stage can
-    // detect the out-of-memory sentinel.
-    exports.export(HEAP_PTR_EXPORT_NAME, ExportKind::Global, HEAP_PTR_GLOBAL);
     // The exception-unwinding globals are exported so the run stage can
     // detect and render an uncaught exception after `main` returns.
     exports.export(
@@ -1593,15 +1534,9 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // The `__async_step` trampoline is exported so the host async engine
     // can drive an `async function` body's state machine one suspend at a time.
     exports.export(ASYNC_STEP_EXPORT_NAME, ExportKind::Func, helpers.async_step);
-    // The allocator and the guest constructors: the hosts allocate every
-    // string/array/promise block through these, never by hand.
-    exports.export(ALLOC_EXPORT_NAME, ExportKind::Func, helpers.alloc);
+    // The guest constructors: the hosts allocate every string/promise block
+    // through these, never by hand.
     exports.export(NEW_STRING_EXPORT_NAME, ExportKind::Func, helpers.new_string);
-    exports.export(
-        NEW_ARRAY_EXPORT_NAME,
-        ExportKind::Func,
-        helpers.new_string + 1,
-    );
     exports.export(
         NEW_PROMISE_EXPORT_NAME,
         ExportKind::Func,
@@ -1640,7 +1575,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // Code section: `main` first, then each user function's body, then the
     // helpers last (mirroring the function-index order above).
     let mut code = CodeSection::new();
-    code.function(&emit_main(program, &offsets, helpers, options));
+    code.function(&emit_main(program, &offsets, helpers));
     for func in &program.functions {
         // A generator state machine emits a `switch (gen.state)` dispatch
         // over its segments rather than a straight-line body.
@@ -1776,6 +1711,10 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     code.function(&emit_private_set(helpers));
     code.function(&emit_private_brand(helpers));
     code.function(&emit_private_in(&offsets, helpers));
+    for helper in render::emit_helpers(&offsets, helpers) {
+        code.function(&helper);
+    }
+    code.function(&emit_start(&offsets, helpers, options));
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.

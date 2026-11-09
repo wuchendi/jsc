@@ -6,12 +6,24 @@ use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{I32Exit, WasiCtxBuilder};
 
-use super::host::{
-    alloc_string, heap_exhausted, method_dispatch, parse_float_str, parse_int_str, value_to_number,
-};
+use super::host::{alloc_string, method_dispatch, parse_float_str, parse_int_str, value_to_number};
 use super::promise::{self, Host};
-use super::value::{Value, decode, format_value, to_js_string};
+use super::value::{Value, decode, to_js_string};
 use crate::abi;
+
+/// The WASI preview-1 context behind the `wasi_snapshot_preview1` imports.
+pub(super) type WasiCtx = wasmtime_wasi::p1::WasiP1Ctx;
+
+/// Prepare the failure of a guest call made from inside a host import for
+/// propagation: a `proc_exit` passes through untouched, so the runner maps it
+/// to the exit code; a trap gets a note on where it happened.
+pub(super) fn reentry_error(err: wasmtime::Error) -> wasmtime::Error {
+    if err.downcast_ref::<I32Exit>().is_some() {
+        err
+    } else {
+        err.context("guest trap during a host re-entry")
+    }
+}
 
 /// In-memory stdout and stderr of a run; clones share the same buffers.
 #[derive(Debug, Clone)]
@@ -177,23 +189,6 @@ fn number_bits(n: f64) -> i64 {
     if n.is_nan() { abi::QNAN } else { n.to_bits() }.cast_signed()
 }
 
-/// The rendered error for a program that exhausted the capped linear memory.
-const OUT_OF_MEMORY: &str = "Uncaught RangeError: out of memory";
-
-/// Pass an import's result through, or trap when an allocation left the
-/// out-of-memory sentinel in `__heap_ptr`.
-fn oom_guard(caller: &mut Caller<'_, Host>, bits: i64) -> wasmtime::Result<i64> {
-    match caller
-        .get_export(abi::HEAP_PTR_EXPORT_NAME)
-        .and_then(wasmtime::Extern::into_global)
-    {
-        Some(global) if heap_exhausted(&mut *caller, global) => {
-            Err(wasmtime::Error::msg(OUT_OF_MEMORY))
-        }
-        _ => Ok(bits),
-    }
-}
-
 /// Decode a jsval, reading linear memory for heap operands.
 fn decode_arg(caller: &mut Caller<'_, Host>, bits: i64) -> Value {
     let memory = caller
@@ -212,20 +207,23 @@ fn link_conversions(linker: &mut Linker<Host>) -> anyhow::Result<()> {
         abi::CONVERT_IMPORT_NAME,
         |mut caller: Caller<'_, Host>, bits: i64, op: i32| -> wasmtime::Result<i64> {
             let value = decode_arg(&mut caller, bits);
-            let result = match op {
+            Ok(match op {
                 abi::CONVERT_OP_TO_NUMBER => number_bits(value_to_number(&value)),
                 abi::CONVERT_OP_PARSE_FLOAT => number_bits(parse_float_str(&to_js_string(&value))),
                 abi::CONVERT_OP_TO_STRING => {
                     if matches!(value, Value::Str(_)) {
                         return Ok(bits);
                     }
-                    alloc_string(&mut caller, &to_js_string(&value))
-                        .map_or(abi::UNDEFINED, |base| abi::HEAP | base)
+                    let mut failed = None;
+                    let base = alloc_string(&mut caller, &mut failed, &to_js_string(&value));
+                    if let Some(err) = failed {
+                        return Err(err);
+                    }
+                    base.map_or(abi::UNDEFINED, |base| abi::HEAP | base)
                         .cast_signed()
                 }
                 _ => abi::UNDEFINED.cast_signed(),
-            };
-            oom_guard(&mut caller, result)
+            })
         },
     )?;
     linker.func_wrap(
@@ -237,10 +235,19 @@ fn link_conversions(linker: &mut Linker<Host>) -> anyhow::Result<()> {
          arg0: i64,
          arg1: i64|
          -> wasmtime::Result<i64> {
-            let result = method_dispatch(&mut caller, recv.cast_unsigned(), op, arg0, arg1)
-                .unwrap_or(abi::UNDEFINED)
-                .cast_signed();
-            oom_guard(&mut caller, result)
+            let mut failed = None;
+            let result = method_dispatch(
+                &mut caller,
+                &mut failed,
+                recv.cast_unsigned(),
+                op,
+                arg0,
+                arg1,
+            );
+            if let Some(err) = failed {
+                return Err(err);
+            }
+            Ok(result.unwrap_or(abi::UNDEFINED).cast_signed())
         },
     )?;
     linker.func_wrap(
@@ -256,7 +263,7 @@ fn link_conversions(linker: &mut Linker<Host>) -> anyhow::Result<()> {
         abi::IMPORT_MODULE,
         abi::PARSE_INT_IMPORT_NAME,
         |mut caller: Caller<'_, Host>, bits: i64, radix: i64| -> i64 {
-            let text = format_value(&decode_arg(&mut caller, bits));
+            let text = to_js_string(&decode_arg(&mut caller, bits));
             let radix = value_to_number(&decode_arg(&mut caller, radix));
             number_bits(parse_int_str(&text, radix))
         },
@@ -270,23 +277,21 @@ fn link_promises(linker: &mut Linker<Host>) -> anyhow::Result<()> {
         abi::IMPORT_MODULE,
         abi::PROMISE_IMPORT_NAME,
         |mut caller: Caller<'_, Host>, op: i32, a: i64, b: i64| -> wasmtime::Result<i64> {
-            let result = promise::dispatch(&mut caller, op, a.cast_unsigned(), b.cast_unsigned())
-                .cast_signed();
-            oom_guard(&mut caller, result)
+            promise::dispatch(&mut caller, op, a.cast_unsigned(), b.cast_unsigned())
+                .map(u64::cast_signed)
         },
     )?;
     linker.func_wrap(
         abi::IMPORT_MODULE,
         abi::THEN_IMPORT_NAME,
         |mut caller: Caller<'_, Host>, p: i64, on_f: i64, on_r: i64| -> wasmtime::Result<i64> {
-            let result = promise::then(
+            promise::then(
                 &mut caller,
                 p.cast_unsigned(),
                 on_f.cast_unsigned(),
                 on_r.cast_unsigned(),
             )
-            .cast_signed();
-            oom_guard(&mut caller, result)
+            .map(u64::cast_signed)
         },
     )?;
     Ok(())

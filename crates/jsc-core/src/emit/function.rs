@@ -11,12 +11,7 @@ pub(super) fn emit_main(
     program: &IrProgram,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
-    options: CompileOptions,
 ) -> Function {
-    // The epilogue that renders the completion value is emitted with `_start`.
-    let CompileOptions {
-        print_completion: _,
-    } = options;
     // One i64 local per top-level variable, plus three trailing i64 scratch
     // locals (indices `program.locals`/`+1`/`+2`) used to inspect operand bits:
     // `typeof` and truthiness use the first, strict `===`/`!==` uses both, and
@@ -98,6 +93,74 @@ pub(super) fn emit_main(
     }
     function.instruction(&Instruction::End);
     function
+}
+
+/// Emit `_start` (§2.4): run `main`, drain unless it threw, report an uncaught
+/// exception or the first unhandled rejection on fd 2 with `proc_exit(1)`, and
+/// otherwise print the completion value when asked.
+pub(super) fn emit_start(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    options: CompileOptions,
+) -> Function {
+    use Instruction as I;
+    let mut f = Function::new(vec![(2, ValType::I64)]);
+    let (value, unhandled) = (0, 1);
+    let at = |text| I::I32Const(static_key(strings, text));
+    for op in [
+        I::Call(IMPORT_FUNC_COUNT),
+        I::LocalSet(value),
+        I::GlobalGet(EXC_PENDING_GLOBAL),
+        I::I32Eqz,
+        I::If(BlockType::Empty),
+        I::I32Const(abi::PROMISE_OP_DRAIN),
+        I::I64Const(UNDEFINED_BITS),
+        I::I64Const(UNDEFINED_BITS),
+        I::Call(helpers.promise),
+        I::LocalSet(unhandled),
+        I::End,
+        I::GlobalGet(EXC_PENDING_GLOBAL),
+        I::If(BlockType::Empty),
+        I::I32Const(2),
+        at("Uncaught "),
+        I::GlobalGet(EXC_VALUE_GLOBAL),
+        I::Call(helpers.report()),
+        I::I32Const(1),
+        I::Call(PROC_EXIT_IMPORT),
+        I::Unreachable,
+        I::End,
+        I::LocalGet(unhandled),
+        I::I64Eqz,
+        I::I32Eqz,
+        I::If(BlockType::Empty),
+        I::I32Const(2),
+        at("Uncaught (in promise) "),
+        I::LocalGet(unhandled),
+        I::I32WrapI64,
+        I::I64Load(MemArg {
+            offset: PROMISE_VALUE_OFFSET,
+            align: 3,
+            memory_index: 0,
+        }),
+        I::Call(helpers.report()),
+        I::I32Const(1),
+        I::Call(PROC_EXIT_IMPORT),
+        I::Unreachable,
+        I::End,
+    ] {
+        f.instruction(&op);
+    }
+    if options.print_completion {
+        f.instruction(&I::I32Const(1));
+        f.instruction(&at(""));
+        f.instruction(&I::LocalGet(value));
+        f.instruction(&I::Call(helpers.report()));
+    }
+    // A line left unfinished by a throwing `console.log` argument.
+    f.instruction(&I::I32Const(1));
+    f.instruction(&I::Call(helpers.out_flush()));
+    f.instruction(&I::End);
+    f
 }
 
 /// Emit a user-defined function body.

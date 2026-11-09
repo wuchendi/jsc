@@ -207,6 +207,21 @@ fn oom_static_line_exit1() {
     assert_eq!(done.stderr, "Uncaught RangeError: out of memory\n");
 }
 
+/// `__alloc`'s `proc_exit(1)` inside a microtask leaves through the host's
+/// re-entrant call: the program ends there and no later job runs.
+#[test]
+fn proc_exit_propagates_from_microtask() {
+    let src = "console.log('sync'); \
+               Promise.resolve() \
+                 .then(() => { let s = 'x'; for (let i = 0; i < 26; i++) { s = s + s } \
+                               let a = [...s]; console.log('after oom', a.length) }) \
+                 .then(() => console.log('next job'), () => console.log('next job'));";
+    let done = exec(src, false).expect("runs");
+    assert_eq!(done.code, 1);
+    assert_eq!(done.stdout, "sync\n");
+    assert_eq!(done.stderr, "Uncaught RangeError: out of memory\n");
+}
+
 /// One program per builtin family under `emit/builtins/`; `compile` fails the
 /// test on an invalid module. Proxy and typed arrays do not exist yet.
 #[test]

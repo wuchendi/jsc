@@ -1,5 +1,5 @@
 use super::run_inspect;
-use super::value::{Value, decode, format_number, format_value};
+use super::value::{Value, decode, format_number, to_js_string};
 use crate::abi::{TYPE_ARRAY, TYPE_FUNCTION, TYPE_OBJECT, TYPE_STRING};
 use crate::emit::CompileOptions;
 
@@ -151,18 +151,6 @@ fn decode_reads_type_byte_to_pick_the_arm() {
 }
 
 #[test]
-fn format_value_covers_every_arm() {
-    assert_eq!(format_value(&Value::Number(42.0)), "42");
-    assert_eq!(format_value(&Value::Bool(true)), "true");
-    assert_eq!(format_value(&Value::Bool(false)), "false");
-    assert_eq!(format_value(&Value::Null), "null");
-    assert_eq!(format_value(&Value::Undefined), "undefined");
-    assert_eq!(format_value(&Value::Str("number".to_owned())), "number");
-    // A string renders as its raw text, no surrounding quotes.
-    assert_eq!(format_value(&Value::Str("foo".into())), "foo");
-}
-
-#[test]
 fn format_number_still_renders_numbers() {
     assert_eq!(format_number(42.0), "42");
     assert_eq!(format_number(0.5), "0.5");
@@ -251,7 +239,7 @@ fn function_value_decode_reads_type_byte() {
     memory.extend_from_slice(&0x7FFB_0000_0000_0000_u64.to_le_bytes());
     let bits = 0x7FFD_0000_0000_0000_u64 | 0x8;
     assert_eq!(
-        format_value(&decode(bits, &memory)),
+        to_js_string(&decode(bits, &memory)),
         "[Function (anonymous)]"
     );
 }
