@@ -119,9 +119,57 @@ fn noroot_loop_counter_not_spilled() {
              }}
              f()"
         );
-        frame_slots(&bodies(&program)[2]).expect("the call is a safepoint")
+        frame_slots(&bodies(&program)[2]).unwrap_or(0)
     };
     assert_eq!(framed("g()"), framed("0") + 1);
+}
+
+/// A numeric operator's operands are stashed in raw locals: even in a loop
+/// holding a safepoint, the two stashes follow each other with no slot write.
+#[test]
+fn numeric_scratch_not_written_through() {
+    let bodies = bodies(
+        "function g() { return 0; }
+         function f(a, b) {
+           var s = 0;
+           for (var i = 0; i < 2; i = i + 1) { g(); s = a * b; }
+           return s;
+         }
+         f(2, 3)",
+    );
+    assert!(bodies[2].windows(3).any(|w| matches!(
+        w,
+        [
+            Operator::LocalSet { local_index: s1 },
+            Operator::LocalSet { local_index: s0 },
+            Operator::LocalGet { local_index: read },
+        ] if *s0 + 1 == *s1 && read == s0
+    )));
+}
+
+/// `b` can still be a heap value while `ToNumber(a)` runs, so it takes a temp
+/// slot in the cold arm; a numeric right operand needs none.
+#[test]
+fn numeric_coerce_roots_pending_operand() {
+    let framed = |rhs: &str| {
+        let program = format!("function f(a, b) {{ return a * {rhs}; }} f(2, 3)");
+        frame_slots(&bodies(&program)[1])
+    };
+    assert_eq!(framed("b"), Some(1));
+    assert_eq!(framed("2"), None);
+}
+
+/// Every `Math.min` argument stays rooted until folded: the later ones are
+/// heap values while the first one's `ToNumber` runs.
+#[test]
+fn min_max_roots_stashed_arguments() {
+    let framed = |args: &str| {
+        let program = format!(
+            "function g(x) {{ return x; }} function f() {{ return Math.min({args}); }} f()"
+        );
+        frame_slots(&bodies(&program)[2]).unwrap_or(0)
+    };
+    assert_eq!(framed("g(1), g(2)"), framed("g(1) * 1, g(2) * 1") + 2);
 }
 
 /// A kind test's base is never rooted, even in a loop holding a safepoint: the
