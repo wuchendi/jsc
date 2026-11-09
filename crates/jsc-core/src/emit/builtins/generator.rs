@@ -63,7 +63,7 @@ fn done_result(value: u32) -> IrNode {
 /// Read `this` into `this` and argument 0 into `arg`, throwing `text`
 /// unless `this` is a generator.
 fn this_generator(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     this: u32,
     arg: u32,
@@ -85,7 +85,7 @@ fn this_generator(
 }
 
 /// Push the generator's i32 field at `offset`.
-fn field(function: &mut Function, generator: u32, offset: u32) {
+fn field(function: &mut FnBuilder<'_>, generator: u32, offset: u32) {
     wasm!(function;
         LocalGet(generator), I32WrapI64,
         I32Load(MemArg { offset: u64::from(offset), align: 2, memory_index: 0 }),
@@ -94,14 +94,14 @@ fn field(function: &mut Function, generator: u32, offset: u32) {
 
 /// Push `1` when the generator has not started or has completed (no `yield`
 /// is suspended).
-fn not_suspended(function: &mut Function, generator: u32) {
+fn not_suspended(function: &mut FnBuilder<'_>, generator: u32) {
     field(function, generator, abi::GEN_DONE_OFFSET);
     field(function, generator, abi::GEN_STATE_OFFSET);
     wasm!(function; I32Eqz, I32Or);
 }
 
 /// Complete the generator: `done = 1` and a state past every block.
-fn complete(function: &mut Function, generator: u32) {
+fn complete(function: &mut FnBuilder<'_>, generator: u32) {
     for (offset, value) in [
         (abi::GEN_DONE_OFFSET, 1),
         (abi::GEN_STATE_OFFSET, COMPLETED_STATE),
@@ -114,7 +114,7 @@ fn complete(function: &mut Function, generator: u32) {
 }
 
 /// Store `mode` into the generator's [`abi::GEN_RESUME_MODE_MASK`] field.
-fn set_resume_mode(function: &mut Function, generator: u32, mode: u32) {
+fn set_resume_mode(function: &mut FnBuilder<'_>, generator: u32, mode: u32) {
     let limits = MemArg {
         offset: u64::from(abi::GEN_LIMITS_OFFSET),
         align: 2,
@@ -131,7 +131,7 @@ fn set_resume_mode(function: &mut Function, generator: u32, mode: u32) {
 
 /// Make the value in `value` pending as a `mode` resumption's value (see
 /// [`abi::GEN_RESUME_MODE_MASK`]) of the generator in `generator`.
-fn pend_resumption(function: &mut Function, generator: u32, value: u32, mode: u32) {
+fn pend_resumption(function: &mut FnBuilder<'_>, generator: u32, value: u32, mode: u32) {
     set_resume_mode(function, generator, mode);
     wasm!(function;
         LocalGet(value), GlobalSet(EXC_VALUE_GLOBAL),
@@ -141,7 +141,7 @@ fn pend_resumption(function: &mut Function, generator: u32, value: u32, mode: u3
 
 /// `next(value)`: resume at the suspended `yield` with `value`.
 pub(super) fn emit_next(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -170,7 +170,7 @@ pub(super) fn emit_next(
 /// and forwards to a `yield*` delegate, and may suspend again); otherwise
 /// complete the generator and yield `{ value, done: true }`.
 pub(super) fn emit_return(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -212,7 +212,7 @@ pub(super) fn emit_return(
 /// machine with it pending), or, when no `yield` is suspended, complete the
 /// generator and throw it.
 pub(super) fn emit_throw(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -350,7 +350,7 @@ fn type_error(text: CalleeErrorText<'static>) -> IrNode {
 }
 
 /// Set (`on`) or clear the `limits` `bits` of the generator in `generator`.
-fn set_limits(function: &mut Function, generator: u32, bits: u32, on: bool) {
+fn set_limits(function: &mut FnBuilder<'_>, generator: u32, bits: u32, on: bool) {
     wasm!(function;
         LocalGet(generator), I32WrapI64,
         LocalGet(generator), I32WrapI64, I32Load(m32(u64::from(abi::GEN_LIMITS_OFFSET))),
@@ -365,23 +365,23 @@ fn set_limits(function: &mut Function, generator: u32, bits: u32, on: bool) {
 
 /// Push the `limits` `bits` of the generator in `generator` (nonzero when
 /// any is set).
-fn limits_bits(function: &mut Function, generator: u32, bits: u32) {
+fn limits_bits(function: &mut FnBuilder<'_>, generator: u32, bits: u32) {
     field(function, generator, abi::GEN_LIMITS_OFFSET);
     wasm!(function; I32Const(bits.cast_signed()), I32And);
 }
 
 /// Push the queue's front record base (`0` when empty).
-fn queue_head(function: &mut Function, generator: u32) {
+fn queue_head(function: &mut FnBuilder<'_>, generator: u32) {
     wasm!(function; LocalGet(generator), I32WrapI64, I32Load(m32(QUEUE_HEAD)));
 }
 
 /// Settle the front request's promise (`op` = `PROMISE_OP_SETTLE_*`) with
 /// the value `value` pushes, then drop the request.
 fn settle_front(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     generator: u32,
     op: i32,
-    value: impl FnOnce(&mut Function),
+    value: impl FnOnce(&mut FnBuilder<'_>),
     helpers: Helpers<'_>,
 ) {
     wasm!(function; I32Const(op));
@@ -405,7 +405,7 @@ fn settle_front(
 /// `value`, then drop it.
 #[allow(clippy::too_many_arguments)]
 fn fulfill_front(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     generator: u32,
     value: u32,
@@ -426,7 +426,7 @@ fn fulfill_front(
 /// Register `reaction`'s fulfilled/rejected pair (`env` = the generator in
 /// `generator`) on the value in `value`, `Promise.resolve` semantics.
 fn await_value(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     generator: u32,
     value: u32,
@@ -434,10 +434,14 @@ fn await_value(
     helpers: Helpers<'_>,
 ) {
     wasm!(function; LocalGet(value));
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Jsval);
     for reaction in [fulfilled, rejected] {
         let slot = helpers.builtin_slot(Builtin::AsyncGeneratorReaction(reaction));
         emit_settler_value(slot, generator, function, frame.scratch(), helpers);
+        function.root_temp(TempClass::Jsval);
     }
+    function.release_temps(mark);
     wasm!(function; Call(helpers.then), Drop);
 }
 
@@ -445,7 +449,7 @@ fn await_value(
 /// argument 1 from `arg` (or `undefined`) and `env` = `env`, dropping its
 /// result. Only emitted when `K >= 2`.
 fn call_internal(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     builtin: Builtin,
     generator: u32,
@@ -472,7 +476,7 @@ fn call_internal(
 /// queue unless the body is busy.
 pub(super) fn emit_async_method(
     request: AsyncGenRequest,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -483,7 +487,7 @@ pub(super) fn emit_async_method(
         return;
     }
     let (this, arg, promise) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let (record, tail) = (frame.i32(0), frame.i32(1));
+    let (record, tail) = (frame.base(0), frame.base(1));
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
     frame.arg(function, 0);
     wasm!(function; LocalSet(arg));
@@ -535,7 +539,7 @@ pub(super) fn emit_async_method(
 /// until it empties or the body is busy (executing, or awaiting).
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_async_drain(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -634,7 +638,7 @@ pub(super) fn emit_async_drain(
 /// resume it (the body stays busy); a `yield`, completion or throw settles
 /// the front request.
 pub(super) fn emit_async_step(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -711,7 +715,7 @@ pub(super) fn emit_async_step(
 /// an `await`, or complete a `return(v)` request, then serve the queue.
 pub(super) fn emit_async_reaction(
     reaction: AsyncGenReaction,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
