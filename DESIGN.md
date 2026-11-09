@@ -331,7 +331,7 @@ the table, including one without user functions.
 | 15–17 | `$__out_buf`, `$__out_len`, `$__out_cap` | `i32` | — | output buffer: base, UTF-8 length, capacity (§6.9) |
 | 18–19 | `$__path_buf`, `$__path_cap` | `i32` | — | renderer recursion path |
 | 20–22 | `$__refs_buf`, `$__refs_cap`, `$__refs_len` | `i32` | — | renderer ref table |
-| 23 | `$__sp` | `i32` | — | shadow-stack pointer (§5.7), initialized to `SS_SIZE` |
+| 23 | `$__sp` | `i32` | — | shadow-stack pointer (§5.7), initialized to `SS_SIZE - 8` |
 | 24+ | module cells | `i64` | — | one cell pointer per module binding (`24 + slot`, §7.1), then one per tagged-template site (§7.4) |
 
 **Exports.** `_start`, `memory`, `__exc_pending`, `__exc_value`,
@@ -350,9 +350,15 @@ renders the completion value as one line on fd 1 (`jsc -p`, §9); the default
 emit discards it. Finally `_start` flushes a line left unfinished on fd 1 by a
 throwing `console.log` argument, and returns (exit code `0`).
 
-**Shadow stack.** `[0, abi::SHADOW_STACK_SIZE)` (1 MiB, 16 pages) is the
-shadow stack, growing down from its end (§5.7); `$__sp` starts at
-`SS_SIZE`. Overflow wraps below `0` and the first slot store traps.
+**Shadow stack.** `[0, abi::SHADOW_STACK_SIZE)` (1 MiB, 16 pages) holds the
+shadow stack, growing down from its end (§5.7). Its body is `[8, SS_SIZE)`:
+`$__sp` starts at `SS_SIZE - 8`, the frame pointer `$fp = $__sp - 8N` is biased
+by 8 (slot `k` at `$fp + 8 + 8k`, the first frame's top slot ending at
+`SS_SIZE`), and addresses `0..8` never hold stack data, so a raw ref of `0`
+always reads zero. A big frame (`N > 4`) is cleared by `memory.fill` from `$fp`
+for `8N + 8` bytes, never from `$fp + 8`, which wraps to `0` at `$fp = -8`. The
+collector (M2) scans `[$__sp + 8, SS_SIZE)`. Overflow wraps below `0` and the
+first slot store traps: at `$fp = -8` the static-offset address does not wrap.
 
 **Static region (data segments).** Everything from `SS_SIZE` to the initial
 heap pointer is laid out by the compiler, in this order:

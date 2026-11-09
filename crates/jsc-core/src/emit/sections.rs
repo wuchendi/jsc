@@ -532,7 +532,7 @@ pub(super) fn build_globals(
         globals.global(ty, &init);
     }
     // The shadow-stack pointer ($__sp, i32, index SP_GLOBAL), empty at startup.
-    let (sp_ty, sp_init) = mut_i32(abi::SHADOW_STACK_SIZE.cast_signed());
+    let (sp_ty, sp_init) = mut_i32((abi::SHADOW_STACK_SIZE - abi::SHADOW_FP_BIAS).cast_signed());
     globals.global(sp_ty, &sp_init);
     // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in
     // `main`'s prologue before any user code runs.

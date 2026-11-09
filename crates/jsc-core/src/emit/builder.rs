@@ -33,6 +33,7 @@ use wasm_encoder::{Encode, Function, Instruction, MemArg, ValType};
 
 use super::roots::{LeafSet, Solution, ValueClass, classify};
 use super::{HEAP_BITS, IrNode, SP_GLOBAL};
+use crate::abi;
 
 /// How a local participates in rooting. Deliberately has no default.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -107,6 +108,10 @@ pub(super) enum BuilderError {
     BranchOutOfFrame,
     /// A `frame_begin` / `frame_end` pair is unmatched or repeated.
     BadFrameRegion,
+    /// Rooted non-parameter local `0` is written before the frame exists, so
+    /// its write-through would store through `$fp = 0` and the prologue would
+    /// not repopulate its slot.
+    WriteBeforeFrame(u32),
 }
 
 impl fmt::Display for BuilderError {
@@ -118,6 +123,9 @@ impl fmt::Display for BuilderError {
             Self::SafepointOutsideFrame => write!(f, "safepoint outside the frame region"),
             Self::BranchOutOfFrame => write!(f, "branch out of the frame region"),
             Self::BadFrameRegion => write!(f, "unbalanced frame region"),
+            Self::WriteBeforeFrame(local) => {
+                write!(f, "rooted local {local} is written before the frame region")
+            }
         }
     }
 }
@@ -199,13 +207,11 @@ impl<'a> FnBuilder<'a> {
     }
 
     /// Open the shrink-wrapped frame region at the current position.
-    #[allow(dead_code)] // Used by the helper sweep; covered by unit tests.
     pub(super) fn frame_begin(&mut self) {
         self.ops.push(Op::FrameBegin);
     }
 
     /// Close the region opened by [`Self::frame_begin`], restoring SP.
-    #[allow(dead_code)] // Used by the helper sweep; covered by unit tests.
     pub(super) fn frame_end(&mut self) {
         self.ops.push(Op::FrameEnd);
     }
@@ -378,6 +384,16 @@ impl Layout {
                 return Err(BuilderError::SafepointOutsideFrame);
             }
             check_branches(ops, begin, end)?;
+            let written_early = ops[..begin].iter().find_map(|op| match op {
+                Op::Instr {
+                    kind: Kind::Set(l) | Kind::Tee(l),
+                    ..
+                } if *l >= builder.params && local_slots.contains_key(l) => Some(*l),
+                _ => None,
+            });
+            if let Some(local) = written_early {
+                return Err(BuilderError::WriteBeforeFrame(local));
+            }
         }
         Ok(Self {
             local_slots,
@@ -476,7 +492,11 @@ impl Layout {
     }
 
     /// `$old = $__sp; $fp = $__sp - 8N; $__sp = $fp`, clear the slots, then
-    /// store the parameters that need a slot.
+    /// store the parameters that need a slot. Slot `k` is at `$fp + 8 + 8k`.
+    ///
+    /// The fill starts at `$fp` and covers the 8 free bytes below slot 0: the
+    /// destination `$fp + 8` would wrap to `0` at `$fp = -8` and write the
+    /// protected bytes instead of trapping.
     fn prologue(&self, out: &mut Writer, frame: &FrameLocals, builder: &FnBuilder<'_>) {
         let n = self.slots;
         out.instr(&Instruction::GlobalGet(SP_GLOBAL));
@@ -494,7 +514,9 @@ impl Layout {
         } else {
             out.instr(&Instruction::LocalGet(frame.fp));
             out.instr(&Instruction::I32Const(0));
-            out.instr(&Instruction::I32Const((8 * n).cast_signed()));
+            out.instr(&Instruction::I32Const(
+                (8 * n + abi::SHADOW_FP_BIAS).cast_signed(),
+            ));
             out.instr(&Instruction::MemoryFill(0));
         }
         for param in 0..builder.params {
@@ -695,9 +717,11 @@ fn run_lengths(classes: &[LocalClass]) -> Vec<(u32, ValType)> {
     runs
 }
 
+/// The biased address of `slot`: a static offset, so `$fp = -8` traps instead
+/// of wrapping to address `0`.
 fn slot_arg(slot: u32) -> MemArg {
     MemArg {
-        offset: 8 * u64::from(slot),
+        offset: u64::from(abi::SHADOW_FP_BIAS) + 8 * u64::from(slot),
         align: 3,
         memory_index: 0,
     }
@@ -821,6 +845,41 @@ mod tests {
         b.instruction(&Instruction::End);
         b.instruction(&Instruction::End);
         assert_eq!(b.finish().err(), Some(BuilderError::BranchOutOfFrame));
+    }
+
+    #[test]
+    fn rooted_local_written_before_region_is_rejected() {
+        let leaves = LeafSet::empty();
+        let mut b = builder(&leaves);
+        let local = b.local(LocalClass::Jsval);
+        b.instruction(&Instruction::LocalGet(0));
+        b.instruction(&Instruction::LocalSet(local));
+        b.frame_begin();
+        b.instruction(&Instruction::Call(99));
+        b.instruction(&Instruction::LocalGet(local));
+        b.instruction(&Instruction::Drop);
+        b.frame_end();
+        b.instruction(&Instruction::End);
+        assert_eq!(
+            b.finish().err(),
+            Some(BuilderError::WriteBeforeFrame(local))
+        );
+    }
+
+    #[test]
+    fn rooted_local_written_inside_region_is_accepted() {
+        let leaves = LeafSet::empty();
+        let mut b = builder(&leaves);
+        let local = b.local(LocalClass::Jsval);
+        b.frame_begin();
+        b.instruction(&Instruction::LocalGet(0));
+        b.instruction(&Instruction::LocalSet(local));
+        b.instruction(&Instruction::Call(99));
+        b.instruction(&Instruction::LocalGet(local));
+        b.instruction(&Instruction::Drop);
+        b.frame_end();
+        b.instruction(&Instruction::End);
+        assert!(b.finish().is_ok());
     }
 
     #[test]

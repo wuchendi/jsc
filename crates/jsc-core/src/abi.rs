@@ -301,9 +301,14 @@ pub(crate) const FUNC_FLAG_GENERATOR: u8 = 128;
 /// `%AsyncGeneratorPrototype%` instead.
 pub(crate) const FUNC_FLAG_ASYNC: u8 = 2;
 
-/// Size in bytes of the shadow stack: linear memory `[0, SHADOW_STACK_SIZE)`,
-/// growing down from its end (`$__sp` starts here). See DESIGN.md §4.2.
+/// Size in bytes of the shadow-stack region `[0, SHADOW_STACK_SIZE)`. The stack
+/// body is `[SHADOW_FP_BIAS, SHADOW_STACK_SIZE)`, growing down from its end
+/// (`$__sp` starts at `SHADOW_STACK_SIZE - SHADOW_FP_BIAS`). See DESIGN.md §4.2.
 pub(crate) const SHADOW_STACK_SIZE: u32 = 1 << 20;
+
+/// Frame-pointer bias: slot `k` is at `$fp + SHADOW_FP_BIAS + 8k`, so addresses
+/// `0..8` never hold stack data and a raw ref of `0` always reads zero.
+pub(crate) const SHADOW_FP_BIAS: u32 = 8;
 
 /// Linear-memory address of the u32 holding the base of the static function
 /// info table (inside the null guard below the first static string): entry

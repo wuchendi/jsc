@@ -5,6 +5,7 @@
 mod common;
 use common::{assert_number, assert_uncaught, compile, fails};
 use wasmparser::{Operator, Parser, Payload};
+use wasmtime::{Config, Engine, Linker, Module, Store, Trap};
 
 /// Every function body's operators, indexed by defined-function order (`main`
 /// is 0, user function `i` is `i + 1`).
@@ -137,7 +138,10 @@ fn frame_slots_cleared_on_entry() {
         let at = 6 + 3 * k;
         assert!(matches!(small[2][at], Operator::LocalGet { .. }));
         assert!(matches!(small[2][at + 1], Operator::I64Const { value: 0 }));
-        assert!(matches!(small[2][at + 2], Operator::I64Store { .. }));
+        assert!(matches!(
+            small[2][at + 2],
+            Operator::I64Store { memarg } if memarg.offset == 8 + 8 * k as u64
+        ));
     }
     // Many slots: a `memory.fill` instead.
     let big = bodies(
@@ -150,6 +154,10 @@ fn frame_slots_cleared_on_entry() {
     );
     let n = frame_slots(&big[2]).expect("framed");
     assert!(n > 4, "expected a large frame, got {n}");
+    assert!(matches!(big[2][7], Operator::I32Const { value: 0 }));
+    assert!(
+        matches!(big[2][8], Operator::I32Const { value } if value.cast_unsigned() == 8 * n + 8)
+    );
     assert!(matches!(big[2][9], Operator::MemoryFill { .. }));
 }
 
@@ -249,4 +257,56 @@ fn from_async_state_block_is_headered_env() {
 #[test]
 fn deep_recursion_traps() {
     assert!(fails("function r(n) { return r(n + 1) + 1; } r(0)"));
+}
+
+/// A recursion whose frame is one slot (`a`, read after the call; the argument
+/// temp is released before the call), so `$fp` steps by 8 through `0` and `-8`.
+const ONE_SLOT_RECURSION: &str = "function r(a) { r(a); return a; } r(1)";
+
+/// Native stack for [`exhaust`]: room for every one-slot frame of the 1 MiB
+/// shadow stack. Wasmtime's default 512 KiB would overflow long before it.
+const NATIVE_STACK: usize = 240 << 20;
+
+/// Run `src` until it traps; the trap and the first 16 bytes of its memory.
+/// Imports are stubbed: no program here reaches one before trapping.
+fn exhaust(src: &str) -> (Trap, Vec<u8>) {
+    let wasm = compile(src, false).expect("compiles");
+    std::thread::Builder::new()
+        .stack_size(NATIVE_STACK + (16 << 20))
+        .spawn(move || {
+            let engine = Engine::new(Config::new().max_wasm_stack(NATIVE_STACK)).expect("engine");
+            let module = Module::new(&engine, &wasm).expect("module");
+            let mut store = Store::new(&engine, ());
+            let mut linker = Linker::new(&engine);
+            linker
+                .define_unknown_imports_as_traps(&module)
+                .expect("stub imports");
+            let instance = linker.instantiate(&mut store, &module).expect("instance");
+            let start = instance
+                .get_typed_func::<(), ()>(&mut store, "_start")
+                .expect("_start");
+            let err = start.call(&mut store, ()).expect_err("should trap");
+            let trap = *err.downcast_ref::<Trap>().expect("a wasm trap");
+            let memory = instance.get_memory(&mut store, "memory").expect("memory");
+            (trap, memory.data(&store)[..16].to_vec())
+        })
+        .expect("spawn")
+        .join()
+        .expect("runner thread")
+}
+
+#[test]
+fn raw_ref_zero_reads_zero_when_stack_nearly_full() {
+    let (_, memory) = exhaust(ONE_SLOT_RECURSION);
+    assert_eq!(memory[..8], [0; 8], "stack data below the floor");
+    assert_ne!(memory[8..16], [0; 8], "the stack never reached its floor");
+}
+
+#[test]
+fn first_push_past_floor_traps() {
+    assert_eq!(frame_slots(&bodies(ONE_SLOT_RECURSION)[1]), Some(1));
+    let (trap, memory) = exhaust(ONE_SLOT_RECURSION);
+    assert_eq!(trap, Trap::MemoryOutOfBounds);
+    // `$fp = 0` wrote slot 0 at address 8, so the trap was the very next push.
+    assert_eq!(memory[8..16], 1.0_f64.to_bits().to_le_bytes());
 }
