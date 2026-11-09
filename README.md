@@ -122,7 +122,7 @@ source ──swc──▶ AST ──codegen──▶ IR ──emit──▶ .was
 - **frontend** — parses source with [`swc`](https://swc.rs/).
 - **codegen** — lowers the AST to a small IR: scopes, closure capture analysis, generator/async state machines. Top-level bindings captured by top-level functions live in module cells.
 - **emit** — IR → wasm. Every value is a NaN-boxed `i64` (numbers are raw `f64` bits, with NaN canonicalized on every rebox through `__box_f64`; other kinds are tagged in the quiet-NaN space). Strings, arrays, objects, closures and environments live in linear memory behind a type-byte header, allocated by `__alloc`, a bump allocator that grows memory on demand up to 512 MiB. Objects keep their own properties in interned-key tables and link a prototype; builtins live on a static realm image, with guarded inline fast paths for common calls. Exceptions use manual unwinding (no wasm exception-handling proposal). `Map`/`Set` keys compare with SameValueZero (`__same_value_zero`).
-- **run** — instantiates the module on `wasmtime`, provides the host imports, drains the microtask queue, and formats the result.
+- **run** — instantiates the module on `wasmtime` with WASI preview 1 and the remaining host imports, then calls `_start`; the module drains its microtask queue and writes its own output.
 
 Details are in [DESIGN.md](DESIGN.md).
 
@@ -130,7 +130,7 @@ Details are in [DESIGN.md](DESIGN.md).
 
 - **Strict-mode semantics only.** Sloppy-mode constructs such as `with` or assigning an undeclared variable are compile errors.
 - **No GC.** The heap is bump-allocated and never freed; the 512 MiB cap ends a run with `RangeError: out of memory`.
-- **Not self-contained.** The module imports seven host functions from the `env` namespace (`print`, `__convert`, `__method`, `__promise`, `__then`, `__now`, `__parse_int`), provided by the `wasmtime` host in `jsc-core` and by the JS shim in `@cdlab/jsc`; it is not a WASI module.
+- **Not self-contained yet.** The module is a WASI command (`_start`) that imports four `wasi_snapshot_preview1` functions plus six host functions from the `env` namespace (`__convert`, `__method`, `__promise`, `__then`, `__now`, `__parse_int`), provided by the `wasmtime` host in `jsc-core` and by the JS polyfill and shim in `@cdlab/jsc`; because of those six it does not run under a plain WASI host.
 - **Missing built-ins.** No `RegExp` (regex literals are rejected), `Proxy`, `Reflect`, `BigInt`, `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `eval` or the `Function` constructor; no ES modules.
 
 ## Roadmap
