@@ -4,10 +4,21 @@
 //! `native-run` feature; without it the crate has no runtime to drive.
 #![cfg(feature = "native-run")]
 
-use crate::run::{compile_and_run, format_value};
+use crate::emit::CompileOptions;
+use crate::run::{Capture, Sinks, run};
 
 #[test]
 fn compile_and_run_evaluates_numeric_expression() {
-    let value = compile_and_run("1 + 2").expect("pipeline should succeed");
-    assert_eq!(format_value(&value), "3");
+    let program = crate::frontend::parse("1 + 2", crate::frontend::Dialect::Js).expect("parse");
+    let ir = crate::codegen::lower(&program).expect("lower");
+    let wasm = crate::emit::emit(
+        &ir,
+        CompileOptions {
+            print_completion: true,
+        },
+    );
+    let capture = Capture::new();
+    let outcome = run(&wasm, Sinks::Capture(capture.clone()), None).expect("module should run");
+    assert_eq!(outcome.code, 0);
+    assert_eq!(capture.stdout(), "3\n");
 }

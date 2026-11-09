@@ -1,9 +1,10 @@
 //! Integration tests: `Math.*` methods and constants.
 #![allow(clippy::expect_used)]
 
-use jsc_core::run::{Value, compile_and_run, format_value};
 mod common;
-use common::{assert_eval, assert_number, assert_output, assert_uncaught};
+use common::{
+    assert_bool, assert_eval, assert_nan, assert_number, assert_output, assert_uncaught, eval_text,
+};
 
 /// Each acceptance bullet: the primary result of every recognized `Math.*` method.
 #[test]
@@ -26,7 +27,7 @@ fn math_round_js_semantics() {
     assert_number("Math.round(2.5)", 3.0);
     assert_number("Math.round(-2.5)", -2.0);
     assert_number("Math.round(0.4)", 0.0);
-    assert_number("Math.round(-0.5)", -0.0);
+    assert_bool("Object.is(Math.round(-0.5), -0)", true);
 }
 
 /// `Math.PI` / `Math.E` are constant property READS (no call), lowering to their
@@ -35,10 +36,7 @@ fn math_round_js_semantics() {
 fn math_constants() {
     assert_number("Math.PI", std::f64::consts::PI);
     assert_number("Math.E", std::f64::consts::E);
-    assert_eq!(
-        format_value(&compile_and_run("typeof Math.PI").expect("runs")),
-        "number"
-    );
+    assert_eq!(eval_text("typeof Math.PI"), "number");
     // Usable in arithmetic like any number.
     assert_number("Math.PI * 2", std::f64::consts::PI * 2.0);
 }
@@ -51,16 +49,8 @@ fn math_min_max_edges() {
     assert_number("Math.max()", f64::NEG_INFINITY);
     assert_number("Math.min(7)", 7.0);
     // A NaN operand (`0/0`) propagates through the fold.
-    let nan = compile_and_run("Math.min(0 / 0, 1)").expect("runs");
-    assert!(
-        matches!(nan, Value::Number(n) if n.is_nan()),
-        "min(NaN,1) is NaN"
-    );
-    let nan = compile_and_run("Math.max(1, 0 / 0)").expect("runs");
-    assert!(
-        matches!(nan, Value::Number(n) if n.is_nan()),
-        "max(1,NaN) is NaN"
-    );
+    assert_nan("Math.min(0 / 0, 1)");
+    assert_nan("Math.max(1, 0 / 0)");
 }
 
 /// N5: empty-arg `min`/`max` RENDER as the identity infinities (`Infinity` /

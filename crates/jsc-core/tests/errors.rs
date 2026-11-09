@@ -1,7 +1,6 @@
 //! Integration tests: `throw` / `try` / `catch` / `finally` / `Error` exception handling.
 #![allow(clippy::expect_used)]
 
-use jsc_core::run::compile_and_run_capturing;
 mod common;
 use common::{assert_bool, assert_number, assert_output, assert_str, assert_uncaught};
 
@@ -62,9 +61,7 @@ fn throw_propagates_through_hof_callback() {
 /// still surfaces the exception.
 #[test]
 fn side_effect_before_throw() {
-    let err = compile_and_run_capturing("console.log(\"before\"); throw 7")
-        .expect_err("program should throw");
-    assert_eq!(err.to_string(), "Uncaught 7");
+    assert_uncaught("console.log(\"before\"); throw 7", "7");
 }
 
 // --- try/catch ----------------------------------------------------------------
@@ -1078,7 +1075,7 @@ fn continue_through_try_finally_no_catch() {
 #[test]
 fn continue_outside_loop_is_rejected() {
     assert!(
-        jsc_core::run::compile_and_run_capturing("continue;").is_err(),
+        common::fails("continue;"),
         "a top-level continue is illegal"
     );
 }

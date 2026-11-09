@@ -2,9 +2,8 @@
 //! the OTHER is coerced to its string form and the two are concatenated. Number +
 //! number stays numeric addition; string + string is unchanged.
 
-use jsc_core::run::compile_and_run;
 mod common;
-use common::{assert_number, assert_string};
+use common::{assert_nan, assert_number, assert_string, fails};
 
 /// A string on either side coerces a numeric operand to its string form.
 #[test]
@@ -43,7 +42,7 @@ fn coercion_composes_and_preserves_order() {
     assert_string("\"n=\" + (40 + 2)", "n=42");
     assert_string("(1 + 2) + \"!\"", "3!");
     // A program can run these to completion without error.
-    assert!(compile_and_run("\"x\" + 8").is_ok());
+    assert!(!fails("\"x\" + 8"));
 }
 
 /// With no string operand, `+` applies `ToNumber` to both sides: `null` is `0`,
@@ -56,11 +55,7 @@ fn non_string_primitives_add_numerically() {
     assert_number("true + 1", 2.0);
     assert_number("true + true", 2.0);
     assert_number("false + 1", 1.0);
-    let result = compile_and_run("undefined + 1");
-    assert!(
-        matches!(result, Ok(jsc_core::run::Value::Number(n)) if n.is_nan()),
-        "`undefined + 1` should be NaN, got {result:?}"
-    );
+    assert_nan("undefined + 1");
 }
 
 /// A string on either side still concatenates, after the other side's `ToString`.

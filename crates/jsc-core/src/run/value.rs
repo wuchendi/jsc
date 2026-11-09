@@ -1,19 +1,27 @@
 //! Decode a raw jsval into a [`Value`] and render a [`Value`] as user-facing
 //! text. Pure (no `wasmtime`): the NaN-box decoder and the Node-style formatter.
 
-use super::{
-    ARRAY_ELEMS_OFFSET, ARRAY_LEN_OFFSET, CLASS_ERROR, DATE_MS_OFFSET, ELEMS_DATA_OFFSET,
-    MAP_SIZE_OFFSET, PROMISE_FULFILLED, PROMISE_REJECTED, PROMISE_STATE_OFFSET,
-    PROMISE_VALUE_OFFSET, QNAN, STR_DATA_OFFSET, STR_LEN_OFFSET, TYPE_ARRAY, TYPE_DATE,
+use crate::abi::{
+    self, CLASS_ERROR, PROMISE_FULFILLED, PROMISE_REJECTED, QNAN, TYPE_ARRAY, TYPE_DATE,
     TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT, TYPE_PROMISE, TYPE_SET, TYPE_STRING,
 };
+
+const STR_LEN_OFFSET: usize = abi::STR_LEN_OFFSET as usize;
+const STR_DATA_OFFSET: usize = abi::STR_DATA_OFFSET as usize;
+const DATE_MS_OFFSET: usize = abi::DATE_MS_OFFSET as usize;
+const MAP_SIZE_OFFSET: usize = abi::MAP_SIZE_OFFSET as usize;
+const PROMISE_STATE_OFFSET: usize = abi::PROMISE_STATE_OFFSET as usize;
+const PROMISE_VALUE_OFFSET: usize = abi::PROMISE_VALUE_OFFSET as usize;
+const ARRAY_LEN_OFFSET: usize = abi::ARRAY_LEN_OFFSET as usize;
+const ARRAY_ELEMS_OFFSET: usize = abi::ARRAY_ELEMS_OFFSET as usize;
+const ELEMS_DATA_OFFSET: usize = abi::ELEMS_DATA_OFFSET as usize;
 
 /// A decoded jsval: the in-scope runtime value types for the pipeline.
 ///
 /// Not `Copy`: the `Str` variant owns a heap [`String`], so decoded values are
 /// cloned rather than copied.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Value {
+pub(super) enum Value {
     /// A JavaScript number (`f64`).
     Number(f64),
     /// A boolean (`true`/`false`).
@@ -154,12 +162,10 @@ impl Guard {
 
 /// Decode raw jsval `bits` into a [`Value`] per the NaN-box layout.
 ///
-/// `memory` is the linear-memory snapshot from [`run`]; it is consulted only for
-/// heap pointer jsvals (tag `0b101`). Pass `&[]` when decoding an immediate value.
-///
-/// [`run`]: super::run
+/// `memory` is the guest's linear memory; it is consulted only for heap pointer
+/// jsvals (tag `0b101`). Pass `&[]` when decoding an immediate value.
 #[must_use]
-pub fn decode(bits: u64, memory: &[u8]) -> Value {
+pub(super) fn decode(bits: u64, memory: &[u8]) -> Value {
     decode_in(
         bits,
         memory,
@@ -711,7 +717,7 @@ fn function_name(bits: u64, memory: &[u8]) -> Option<String> {
 /// becomes `"42"`, matching JS and keeping `40 + 2` => `"42"`); every other
 /// value falls back to Rust's shortest round-tripping form (`42.5` => `"42.5"`).
 #[must_use]
-pub fn format_number(value: f64) -> String {
+pub(super) fn format_number(value: f64) -> String {
     if value.is_nan() {
         "NaN".to_owned()
     } else if value.is_infinite() {
@@ -786,7 +792,7 @@ fn format_finite_positive(value: f64) -> String {
 
 /// Render a decoded [`Value`] as user-facing text, the way JavaScript prints it.
 #[must_use]
-pub fn format_value(value: &Value) -> String {
+pub(super) fn format_value(value: &Value) -> String {
     match value {
         Value::Number(n) => format_number(*n),
         Value::Bool(b) => b.to_string(),
@@ -964,7 +970,7 @@ fn join_elements(elems: &[Value], sep: &str) -> String {
 /// generator use their `Object.prototype.toString` tags. Functions (no source
 /// text is kept) and Dates keep their console rendering.
 #[must_use]
-pub fn to_js_string(value: &Value) -> String {
+pub(super) fn to_js_string(value: &Value) -> String {
     match value {
         Value::Array(elems, _) => join_elements(elems, ","),
         Value::Object(_) | Value::Instance { .. } => "[object Object]".to_owned(),

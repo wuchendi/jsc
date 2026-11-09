@@ -683,6 +683,34 @@ pub(crate) const THIS_GLOBAL_INDEX: u32 = 5;
 /// The module name of every host env import (`print`/`__convert`/`__method`).
 pub(crate) const IMPORT_MODULE: &str = "env";
 
+/// The import module of the four WASI preview-1 functions.
+#[expect(dead_code, reason = "first used by the R1 emitter")]
+pub(crate) const WASI_MODULE: &str = "wasi_snapshot_preview1";
+
+/// The WASI `fd_write` import.
+#[expect(dead_code, reason = "first used by the R1 emitter")]
+pub(crate) const WASI_FD_WRITE_NAME: &str = "fd_write";
+
+/// The WASI `clock_time_get` import.
+#[expect(dead_code, reason = "first used by the R1 emitter")]
+pub(crate) const WASI_CLOCK_TIME_GET_NAME: &str = "clock_time_get";
+
+/// The WASI `random_get` import.
+#[expect(dead_code, reason = "first used by the R1 emitter")]
+pub(crate) const WASI_RANDOM_GET_NAME: &str = "random_get";
+
+/// The WASI `proc_exit` import.
+#[expect(dead_code, reason = "first used by the R1 emitter")]
+pub(crate) const WASI_PROC_EXIT_NAME: &str = "proc_exit";
+
+/// The command-module entry point export.
+pub(crate) const START_EXPORT_NAME: &str = "_start";
+
+/// Size in bytes of the static WASI scratch area: one iovec, `nwritten`, the
+/// 8-byte clock result and the 16-byte random seed buffer.
+#[expect(dead_code, reason = "first used by the R1 emitter")]
+pub(crate) const WASI_SCRATCH: u32 = 40;
+
 /// The field name of the host `print` import backing `console.log`.
 pub(crate) const PRINT_IMPORT_NAME: &str = "print";
 
@@ -755,6 +783,10 @@ pub(crate) const PROMISE_OP_SETTLE_REJECT: i32 = 6;
 /// awaited value settles; completion fulfills (or, on a throw / awaited rejection,
 /// rejects) the result promise.
 pub(crate) const PROMISE_OP_ASYNC_SPAWN: i32 = 7;
+
+/// `__promise` op flag: drain the microtask queue and return the first
+/// unhandled rejected promise, or `0` if none. Deleted in R4.
+pub(crate) const PROMISE_OP_DRAIN: i32 = 8;
 
 /// The name under which the module exports the `__invoke1(fn: i64, arg: i64) ->
 /// i64` callback trampoline. The host promise engine calls it re-entrantly

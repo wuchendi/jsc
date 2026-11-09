@@ -1423,6 +1423,13 @@ use stmt::*;
 #[allow(clippy::wildcard_imports)]
 use value::*;
 
+/// Options of a compilation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompileOptions {
+    /// Render the completion value to fd 1 after the final drain.
+    pub print_completion: bool,
+}
+
 /// Emit a complete WebAssembly module for `program`.
 ///
 /// The returned bytes are a self-contained module exporting a single function
@@ -1433,7 +1440,7 @@ use value::*;
 /// (only declarations) has no value, so the `undefined` jsval is pushed as the
 /// result to keep the `() -> i64` signature total.
 #[allow(clippy::too_many_lines)]
-pub fn emit(program: &IrProgram) -> Vec<u8> {
+pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     let mut module = Module::new();
 
     // Collect every distinct string literal and assign each a compile-time byte
@@ -1633,7 +1640,7 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // Code section: `main` first, then each user function's body, then the
     // helpers last (mirroring the function-index order above).
     let mut code = CodeSection::new();
-    code.function(&emit_main(program, &offsets, helpers));
+    code.function(&emit_main(program, &offsets, helpers, options));
     for func in &program.functions {
         // A generator state machine emits a `switch (gen.state)` dispatch
         // over its segments rather than a straight-line body.
