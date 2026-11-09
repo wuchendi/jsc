@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members  = ["crates/jsc-core", "crates/jsc", "crates/jsc-wasm", "crates/jsc-test262"]
+members  = ["crates/jsc-core", "crates/jsc", "crates/jsc-wasm", "crates/jsc-test262", "tools/unicode-tables"]
 exclude  = ["tmp"]
 
 [workspace.package]

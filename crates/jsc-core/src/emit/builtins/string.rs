@@ -87,10 +87,6 @@ pub(in crate::emit) fn inline_host_op(op: StringOp, args: &[IrNode]) -> Option<(
                 | (Coerce::Number, Some(IrNode::Num(_)))
         )
     };
-    // Case mapping takes its Latin-1 fast path in the builtin.
-    if case_upper(op).is_some() {
-        return None;
-    }
     let [first, second] = coercions(op);
     if !(ready(first, args.first()) && ready(second, args.get(1))) {
         return None;
@@ -305,12 +301,12 @@ const NULLISH_TO_OBJECT: CalleeErrorText<'static> = [
 const REPEAT_COUNT: [&str; 2] = ["Invalid count value: ", "RangeError: Invalid count value: "];
 
 /// The `RangeError` of a `repeat` / `padStart` / `padEnd` result past
-/// [`MAX_STRING_LENGTH`].
+/// [`MAX_STRING_LENGTH`], or of a case mapping that grows past it.
 const STRING_LENGTH: [&str; 2] = ["Invalid string length", "RangeError: Invalid string length"];
 
 /// The longest string a `repeat` / `padStart` / `padEnd` builds, in code
 /// units (`2^29 - 24`, as V8).
-const MAX_STRING_LENGTH: f64 = 536_870_888.0;
+pub(in crate::emit) const MAX_STRING_LENGTH: f64 = 536_870_888.0;
 
 /// The own keys of a `match` result besides its element.
 const MATCH_KEYS: [&str; 3] = ["index", "input", "groups"];
@@ -482,6 +478,10 @@ pub(super) fn emit_method(
         push_str(function, strings, "");
         wasm!(function; LocalSet(a0), End);
     }
+    if let Some(upper) = case_upper(op) {
+        emit_case_map(upper, function, frame, strings, helpers);
+        return;
+    }
     let Some(flag) = op.flag() else {
         emit_units(op, function, frame, strings, helpers);
         if op == StringOp::Match {
@@ -490,10 +490,6 @@ pub(super) fn emit_method(
         }
         return;
     };
-    if let Some(upper) = case_upper(op) {
-        emit_case_map(upper, op, flag, function, frame, strings, helpers);
-        return;
-    }
     emit_host_op(op, flag, function, frame, strings, helpers);
 }
 
@@ -538,11 +534,10 @@ fn case_upper(op: StringOp) -> Option<bool> {
 /// `toUpperCase` / `toLowerCase` (and the `toLocale*` twins) over the string
 /// in i64 temp 0: a one-byte receiver whose mapping stays one-byte at the
 /// same length (lowercasing always; uppercasing unless it holds `µ`, `ß` or
-/// `ÿ`) maps per unit in the guest, anything else runs the host op `flag`.
+/// `ÿ`) maps per unit, anything else runs the table-driven `__case_map`,
+/// which refuses a result past [`MAX_STRING_LENGTH`].
 fn emit_case_map(
     upper: bool,
-    op: StringOp,
-    flag: i32,
     function: &mut Function,
     frame: Frame,
     strings: &StrOffsets,
@@ -605,8 +600,14 @@ fn emit_case_map(
     });
     wasm!(function; LocalGet(dst));
     box_heap(function);
-    wasm!(function; Else);
-    emit_host_op(op, flag, function, frame, strings, helpers);
+    wasm!(function;
+        Else,
+        LocalGet(s.p), I32Const(i32::from(upper)), Call(helpers.case_map()), LocalTee(dst), I32Eqz,
+        If(BlockType::Empty),
+    );
+    throw_range_error(function, frame, STRING_LENGTH, None, strings, helpers);
+    wasm!(function; End, LocalGet(dst));
+    box_heap(function);
     wasm!(function; End);
 }
 
