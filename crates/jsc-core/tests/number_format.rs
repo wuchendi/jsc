@@ -54,11 +54,22 @@ fn literal(x: f64) -> String {
 }
 
 /// `(significant digits, n)` of a finite nonzero `|x|`, from Rust's shortest
-/// `{:e}`: `|x| = 0.digits * 10^n`.
+/// `{:e}`: `|x| = 0.digits * 10^n`. On an exact tie between two shortest
+/// candidates Rust rounds up where ECMA-262 picks the even digit, so the
+/// truncated candidate wins when it is even and still round-trips.
 fn shortest_digits(x: f64) -> (String, i32) {
     let sci = format!("{:e}", x.abs());
     let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
-    let digits = mantissa.chars().filter(|c| *c != '.').collect();
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let (exact, exact_n) = exact_digits(x);
+    let k = digits.len();
+    if exact.len() == k + 1 && exact[k] == b'5' && (exact[k - 1] - b'0').is_multiple_of(2) {
+        let truncated = String::from_utf8_lossy(&exact[..k]).into_owned();
+        let parsed = format!("0.{truncated}e{exact_n}").parse::<f64>();
+        if parsed.is_ok_and(|t| t.to_bits() == x.abs().to_bits()) {
+            return (truncated, exact_n);
+        }
+    }
     (digits, exp.parse::<i32>().unwrap_or(0) + 1)
 }
 
@@ -263,6 +274,18 @@ fn number_to_string_shortest_roundtrip() -> anyhow::Result<()> {
         .map(|&x| format!("c(String({}), {:?});", literal(x), es_to_string(x)))
         .collect();
     run_checks(&checks)
+}
+
+#[test]
+fn number_to_string_exact_ties_pick_even_digit() -> anyhow::Result<()> {
+    for (text, expected) in [
+        ("1394865425023536.25", "1394865425023536.2"),
+        ("1394865425023536.75", "1394865425023536.8"),
+    ] {
+        assert_eq!(es_to_string(text.parse()?), expected);
+        assert_string(&format!("String({text})"), expected);
+    }
+    Ok(())
 }
 
 #[test]
