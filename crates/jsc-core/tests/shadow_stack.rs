@@ -324,7 +324,14 @@ fn exhaust(src: &str) -> (Trap, Vec<u8>) {
     std::thread::Builder::new()
         .stack_size(NATIVE_STACK + (16 << 20))
         .spawn(move || {
-            let engine = Engine::new(Config::new().max_wasm_stack(NATIVE_STACK)).expect("engine");
+            // `Engine::new` rejects a `max_wasm_stack` above `async_stack_size`,
+            // even when no async entry point is used.
+            let engine = Engine::new(
+                Config::new()
+                    .max_wasm_stack(NATIVE_STACK)
+                    .async_stack_size(NATIVE_STACK),
+            )
+            .expect("engine");
             let module = Module::new(&engine, &wasm).expect("module");
             let mut store = Store::new(&engine, ());
             let mut linker = Linker::new(&engine);
