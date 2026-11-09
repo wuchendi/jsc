@@ -29,48 +29,6 @@ pub(super) fn user_builder(params: u32, locals: u32, leaves: &LeafSet) -> FnBuil
     b
 }
 
-/// A jsval local or parameter, written through to its root slot when live.
-pub(super) const ROOT_JS: LocalClass = LocalClass::Jsval;
-/// An `i32` block base or property key, rooted as `HEAP | base` when live.
-pub(super) const ROOT_BASE: LocalClass = LocalClass::Base;
-/// An `i32` integer, interior address, or base kept alive by another root.
-pub(super) const RAW_I32: LocalClass = LocalClass::Raw(ValType::I32);
-/// Raw `i64` bits that are not a jsval.
-pub(super) const RAW_I64: LocalClass = LocalClass::Raw(ValType::I64);
-/// A raw `f64`.
-pub(super) const RAW_F64: LocalClass = LocalClass::Raw(ValType::F64);
-
-/// A builder for a hand-written helper with the given parameter and local
-/// classes, numbered in order from local 0.
-pub(super) fn helper_builder<'a>(
-    leaves: &'a LeafSet,
-    params: &[LocalClass],
-    locals: &[LocalClass],
-) -> FnBuilder<'a> {
-    let mut builder = FnBuilder::new(leaves);
-    for class in params {
-        builder.param(*class);
-    }
-    for class in locals {
-        builder.local(*class);
-    }
-    builder
-}
-
-/// Declare the 24 expression-scratch locals `+0..+23` of [`user_builder`],
-/// for helpers that build a value through `emit_node`.
-pub(super) fn declare_scratch(builder: &mut FnBuilder<'_>) {
-    builder.locals(3, ROOT_JS); // +0..+2
-    builder.locals(1, ROOT_BASE); // +3
-    builder.locals(3, ROOT_JS); // +4..+6
-    builder.locals(2, ROOT_BASE); // +7, +8
-    builder.locals(2, RAW_I32); // +9, +10 (integers)
-    builder.locals(2, ROOT_BASE); // +11, +12
-    builder.locals(8, ROOT_JS); // +13..+20
-    builder.locals(1, ROOT_BASE); // +21
-    builder.locals(2, ROOT_JS); // +22, +23
-}
-
 /// Finish a user-code builder; a violated invariant is a compiler bug.
 pub(super) fn finish_builder(builder: FnBuilder<'_>) -> Function {
     builder

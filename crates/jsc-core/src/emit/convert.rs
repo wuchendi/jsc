@@ -96,7 +96,7 @@ const STRINGS: [&str; 17] = [
 ];
 
 /// Return `ret` (pushed by `ret`) when the last call left an exception pending.
-fn return_if_pending(function: &mut impl Sink, ret: &Instruction<'_>) {
+fn return_if_pending(function: &mut Function, ret: &Instruction<'_>) {
     wasm!(function; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
     function.instruction(ret);
     wasm!(function; Return, End);
@@ -107,7 +107,7 @@ fn return_if_pending(function: &mut impl Sink, ret: &Instruction<'_>) {
 /// unwind through [`emit_throw_error`]). The helper's locals must start with
 /// [`type_error_helper_locals`] at `scratch`.
 pub(super) fn throw_if_symbol(
-    f: &mut impl Sink,
+    f: &mut Function,
     v: u32,
     text: CalleeErrorText<'_>,
     ret: &Instruction<'_>,
@@ -138,20 +138,12 @@ pub(super) fn throw_if_symbol(
 /// then `toString` (hint string: `toString` first), each looked up through
 /// the `proto` chain, skipped unless callable, its result skipped unless a
 /// primitive; neither -> `TypeError`.
-pub(super) fn emit_to_primitive(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
+pub(super) fn emit_to_primitive(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let (v, hint, method, result, key, second, base) = (0, 1, 2, 3, 4, 5, 6);
     let scratch = 7;
-    // `key` / `second` hold static strings; `base` an integer-or-callee scratch.
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, RAW_I32],
-        &[ROOT_JS, ROOT_JS, RAW_I32, RAW_I32, RAW_I32],
-    );
-    declare_error_scratch(&mut f);
+    let mut locals = vec![(2, ValType::I64), (3, ValType::I32)];
+    locals.extend(type_error_helper_locals());
+    let mut f = Function::new(locals);
     helpers.unwind.borrow_mut().reset();
     emit_is_object(&mut f, v);
     wasm!(f; I32Eqz, If(BlockType::Empty), LocalGet(v), Return, End);
@@ -223,21 +215,16 @@ pub(super) fn emit_to_primitive(
     }
     emit_throw_not_a_function(&mut f, NO_PRIMITIVE, scratch, strings, helpers);
     wasm!(f; End);
-    finish_builder(f)
+    f
 }
 
 /// `__to_string(v: i64) -> i32`: `ToString(v)` as a heap-string base. A
 /// string is itself; an object is first converted with hint string; a symbol
 /// throws the `TypeError`; the remaining primitives are formatted by the
 /// host. A pending throw returns the empty string.
-pub(super) fn emit_to_string(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
+pub(super) fn emit_to_string(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let (v, scratch) = (0, 1);
-    let mut f = helper_builder(leaves, &[ROOT_JS], &[]);
-    declare_error_scratch(&mut f);
+    let mut f = Function::new(type_error_helper_locals());
     helpers.unwind.borrow_mut().reset();
     let empty = Instruction::I32Const(static_key(strings, ""));
     emit_is_string(&mut f, v);
@@ -268,13 +255,13 @@ pub(super) fn emit_to_string(
         End,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// Set i32 local `kind` to the type byte of the heap value in `x`, or `-1`
 /// for a non-heap value (so `kind == 0` is a string, `kind > 0` an object or
 /// a symbol).
-fn load_kind(function: &mut impl Sink, x: u32, kind: u32) {
+fn load_kind(function: &mut Function, x: u32, kind: u32) {
     emit_is_pointer(function, x);
     wasm!(function; If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, x);
@@ -286,13 +273,9 @@ fn load_kind(function: &mut impl Sink, x: u32, kind: u32) {
 /// symbol comes back as is), then concatenate the `ToString`s when either
 /// primitive is a string, else add the `ToNumber`s (a symbol throws in
 /// either conversion).
-pub(super) fn emit_add_helper(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+pub(super) fn emit_add_helper(helpers: Helpers<'_>) -> Function {
     let (a, b, ka, kb, lhs, num) = (0, 1, 2, 3, 4, 5);
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, ROOT_JS],
-        &[RAW_I32, RAW_I32, ROOT_BASE, RAW_F64],
-    );
+    let mut f = Function::new(vec![(3, ValType::I32), (1, ValType::F64)]);
     let undefined = Instruction::I64Const(UNDEFINED_BITS);
     for (x, kind) in [(a, ka), (b, kb)] {
         load_kind(&mut f, x, kind);
@@ -308,7 +291,7 @@ pub(super) fn emit_add_helper(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
     // Both operands are primitives now: a string is its own `ToString`, the
     // rest go through `__to_string` (a symbol throws, the host formats the
     // others).
-    let primitive_to_string = |f: &mut FnBuilder<'_>, x: u32, kind: u32| {
+    let primitive_to_string = |f: &mut Function, x: u32, kind: u32| {
         wasm!(f;
             LocalGet(kind), I32Eqz,
             If(BlockType::Result(ValType::I32)),
@@ -323,12 +306,8 @@ pub(super) fn emit_add_helper(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
     wasm!(f; LocalSet(lhs));
     return_if_pending(&mut f, &undefined);
     wasm!(f; LocalGet(lhs));
-    let mark = f.temp_mark();
-    f.root_temp(TempClass::Base);
     primitive_to_string(&mut f, b, kb);
-    wasm!(f; Call(helpers.concat));
-    f.release_temps(mark);
-    wasm!(f; I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Else);
+    wasm!(f; Call(helpers.concat), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Else);
     wasm!(f; LocalGet(a), Call(helpers.to_number), F64ReinterpretI64, LocalSet(num));
     return_if_pending(&mut f, &undefined);
     wasm!(f;
@@ -337,12 +316,12 @@ pub(super) fn emit_add_helper(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
         End,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// Push the relational result for `op` (i32 local) from the four candidate
 /// comparisons `lt`, `gt`, `le`, `ge` each pushes.
-fn pick_relational(function: &mut FnBuilder<'_>, op: u32, cmps: [&dyn Fn(&mut FnBuilder<'_>); 4]) {
+fn pick_relational(function: &mut Function, op: u32, cmps: [&dyn Fn(&mut Function); 4]) {
     let [lt, gt, le, ge] = cmps;
     lt(function);
     gt(function);
@@ -357,13 +336,9 @@ fn pick_relational(function: &mut FnBuilder<'_>, op: u32, cmps: [&dyn Fn(&mut Fn
 /// once an operand is not a number: `ToPrimitive` both (hint number), then
 /// two strings compare by bytes and anything else by `ToNumber` (which
 /// throws for a symbol).
-pub(super) fn emit_compare(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+pub(super) fn emit_compare(helpers: Helpers<'_>) -> Function {
     let (a, b, op, ord, lhs, rhs) = (0, 1, 2, 3, 4, 5);
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, ROOT_JS, RAW_I32],
-        &[RAW_I32, RAW_F64, RAW_F64],
-    );
+    let mut f = Function::new(vec![(1, ValType::I32), (2, ValType::F64)]);
     for v in [a, b] {
         wasm!(f; LocalGet(v), I32Const(HINT_NUMBER), Call(helpers.to_primitive()), LocalSet(v));
         return_if_pending(&mut f, &Instruction::I32Const(0));
@@ -375,7 +350,7 @@ pub(super) fn emit_compare(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         If(BlockType::Result(ValType::I32)),
         LocalGet(a), I32WrapI64, LocalGet(b), I32WrapI64, Call(helpers.str_cmp), LocalSet(ord),
     );
-    let int = |cmp: Instruction<'static>| move |function: &mut FnBuilder<'_>| wasm!(function; LocalGet(ord), I32Const(0), cmp.clone());
+    let int = |cmp: Instruction<'static>| move |function: &mut Function| wasm!(function; LocalGet(ord), I32Const(0), cmp.clone());
     pick_relational(
         &mut f,
         op,
@@ -393,7 +368,7 @@ pub(super) fn emit_compare(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     return_if_pending(&mut f, &Instruction::I32Const(0));
     wasm!(f; LocalGet(b), Call(helpers.to_number), F64ReinterpretI64, LocalSet(rhs));
     return_if_pending(&mut f, &Instruction::I32Const(0));
-    let float = |cmp: Instruction<'static>| move |function: &mut FnBuilder<'_>| wasm!(function; LocalGet(lhs), LocalGet(rhs), cmp.clone());
+    let float = |cmp: Instruction<'static>| move |function: &mut Function| wasm!(function; LocalGet(lhs), LocalGet(rhs), cmp.clone());
     pick_relational(
         &mut f,
         op,
@@ -405,7 +380,7 @@ pub(super) fn emit_compare(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         ],
     );
     wasm!(f; End, End);
-    finish_builder(f)
+    f
 }
 
 /// `__array_join(recv: i64, sep: i64) -> i64`: `Array.prototype.join` on an
@@ -414,17 +389,9 @@ pub(super) fn emit_compare(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 /// `undefined` and absent elements are empty; a hole reads through the
 /// prototype chain) joined by it. An array already being
 /// joined (a cycle) joins as the empty string.
-pub(super) fn emit_array_join(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
+pub(super) fn emit_array_join(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let (recv, sep_v, arr, len, i, acc, sep, e) = (0, 1, 2, 3, 4, 5, 6, 7);
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, ROOT_JS],
-        &[ROOT_BASE, RAW_I32, RAW_I32, ROOT_BASE, ROOT_BASE, ROOT_JS],
-    );
+    let mut f = Function::new(vec![(5, ValType::I32), (1, ValType::I64)]);
     let empty = static_key(strings, "");
     let flags = MemArg {
         offset: u64::from(abi::HEADER_FLAGS_OFFSET),
@@ -474,7 +441,7 @@ pub(super) fn emit_array_join(
         If(BlockType::Empty),
         LocalGet(arr), LocalGet(i), Call(helpers.proto_elem()), LocalSet(e),
     );
-    let unwind = |f: &mut FnBuilder<'_>| {
+    let unwind = |f: &mut Function| {
         wasm!(f;
             GlobalGet(EXC_PENDING_GLOBAL),
             If(BlockType::Empty),
@@ -501,7 +468,7 @@ pub(super) fn emit_array_join(
         LocalGet(acc), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// Replace an object key in i64 `local` by its `ToPrimitive(hint string)` (a

@@ -87,7 +87,7 @@ pub(in crate::emit) fn descriptor_strings() -> impl Iterator<Item = &'static str
 }
 
 /// Push `1` when `local & mask` is nonzero, else `0`.
-fn emit_flag(function: &mut impl Sink, local: u32, mask: i32) {
+fn emit_flag(function: &mut Function, local: u32, mask: i32) {
     wasm!(function; LocalGet(local), I32Const(mask), I32And, I32Const(0), I32Ne);
 }
 
@@ -95,7 +95,7 @@ fn emit_flag(function: &mut impl Sink, local: u32, mask: i32) {
 /// numbers by bits (so `+0` and `-0` differ) or both `NaN`; anything else
 /// by `__same_value_zero` (strings by content, the rest by identity).
 pub(in crate::emit) fn emit_same_value(
-    function: &mut impl Sink,
+    function: &mut Function,
     a: u32,
     b: u32,
     helpers: Helpers<'_>,
@@ -117,11 +117,11 @@ pub(in crate::emit) fn emit_same_value(
 
 /// Push a fresh `TYPE_ACCESSOR` block (as a heap jsval) whose getter and
 /// setter are pushed by `getter` / `setter`; `b` is i32 scratch.
-fn emit_accessor_block<S: Sink>(
-    function: &mut S,
+fn emit_accessor_block(
+    function: &mut Function,
     b: u32,
-    getter: impl FnOnce(&mut S),
-    setter: impl FnOnce(&mut S),
+    getter: impl FnOnce(&mut Function),
+    setter: impl FnOnce(&mut Function),
     helpers: Helpers<'_>,
 ) {
     wasm!(function;
@@ -165,30 +165,20 @@ fn emit_accessor_block<S: Sink>(
 /// accessor rejects a `get` / `set` that is not `SameValue`. An update sets
 /// the table's `HAS_NON_ENUM` flag and its dirty bit.
 #[allow(clippy::too_many_lines)] // one straight-line helper body
-pub(in crate::emit) fn emit_define_own(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_BASE, ROOT_BASE, RAW_I32, ROOT_JS, ROOT_JS, ROOT_JS],
-        &[
-            RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, ROOT_JS, ROOT_JS,
-        ],
-    );
+pub(in crate::emit) fn emit_define_own(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(7, ValType::I32), (2, ValType::I64)]);
     let (o, key, desc, value, get, set) = (0, 1, 2, 3, 4, 5);
     let (e, a, m, t, i, b, p) = (6, 7, 8, 9, 10, 11, 12);
     let (x, y) = (13, 14);
-    let undefined = |f: &mut FnBuilder<'_>| wasm!(f; I64Const(UNDEFINED_BITS));
+    let undefined = |f: &mut Function| wasm!(f; I64Const(UNDEFINED_BITS));
     let accessor_desc = DESC_HAS_GET | DESC_HAS_SET;
     let data_desc = DESC_HAS_VALUE | DESC_HAS_WRITABLE;
     // Push 1 when the boolean field `bit` is present and true.
-    let present_true = |f: &mut FnBuilder<'_>, bit: i32| {
+    let present_true = |f: &mut Function, bit: i32| {
         let both = (bit << DESC_HAS_SHIFT) | bit;
         wasm!(f; LocalGet(desc), I32Const(both), I32And, I32Const(both), I32Eq);
     };
-    let flag = |f: &mut FnBuilder<'_>, bit: i32| {
+    let flag = |f: &mut Function, bit: i32| {
         wasm!(f; LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(bit), I32And);
     };
 
@@ -472,7 +462,7 @@ pub(in crate::emit) fn emit_define_own(
         LocalGet(e),
     );
     let half = |present: i32, offset: u64, replacement: u32| {
-        move |f: &mut FnBuilder<'_>| {
+        move |f: &mut Function| {
             wasm!(f;
                 LocalGet(replacement),
                 LocalGet(p), I64Load(m64(offset)),
@@ -511,7 +501,7 @@ pub(in crate::emit) fn emit_define_own(
         emit_mark_dirty(&mut f, p);
     }
     wasm!(f; I32Const(DEFINE_OK), End);
-    finish_builder(f)
+    f
 }
 
 /// `__to_desc(attrs: i64, list: i32)`: `ToPropertyDescriptor` (ECMA-262
@@ -522,19 +512,11 @@ pub(in crate::emit) fn emit_define_own(
 /// callable nor `undefined` throws, and so does mixing `get` / `set` with
 /// `value` / `writable`. A throw leaves the exception pending and appends
 /// nothing.
-pub(in crate::emit) fn emit_to_desc(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, ROOT_BASE],
-        &[RAW_I32, ROOT_JS, ROOT_JS, ROOT_JS, ROOT_JS, ROOT_JS],
-    );
+pub(in crate::emit) fn emit_to_desc(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32), (5, ValType::I64)]);
     let (attrs, list, desc) = (0, 1, 2);
     let (v, value, get, set, scratch) = (3, 4, 5, 6, 7);
-    let throw = |f: &mut FnBuilder<'_>, mode: i32| {
+    let throw = |f: &mut Function, mode: i32| {
         wasm!(f; I32Const(mode), Call(helpers.prop_throw), Return);
     };
     emit_is_object(&mut f, attrs);
@@ -604,7 +586,7 @@ pub(in crate::emit) fn emit_to_desc(
         wasm!(f; LocalGet(list), LocalGet(slot), Call(helpers.array_push), Drop);
     }
     wasm!(f; End);
-    finish_builder(f)
+    f
 }
 
 /// `__own_desc(obj: i64, key: i32) -> i64`: `FromPropertyDescriptor` of the
@@ -616,16 +598,8 @@ pub(in crate::emit) fn emit_to_desc(
 /// attributes and its table elements their own; a `String` wrapper's index is
 /// `{value: s[i], writable: false, enumerable: true, configurable: false}`;
 /// a `LAZY` function is materialized by the lookup.
-pub(in crate::emit) fn emit_own_desc(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, ROOT_BASE],
-        &[ROOT_BASE, RAW_I32, RAW_I32, ROOT_BASE, RAW_I32, ROOT_JS],
-    );
+pub(in crate::emit) fn emit_own_desc(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(5, ValType::I32), (1, ValType::I64)]);
     let (obj, key) = (0, 1);
     let (o, e, i, d, a) = (2, 3, 4, 5, 6);
     let v = 7;
@@ -681,13 +655,13 @@ pub(in crate::emit) fn emit_own_desc(
         TYPE_OBJECT,
         intrinsic_bits(Intrinsic::ObjectPrototype, helpers),
     );
-    let field = |f: &mut FnBuilder<'_>, name: &str, push: &dyn Fn(&mut FnBuilder<'_>)| {
+    let field = |f: &mut Function, name: &str, push: &dyn Fn(&mut Function)| {
         wasm!(f; LocalGet(d), I32Const(static_key(strings, name)));
         push(f);
         wasm!(f; I32Const(ATTRS_DEFAULT), Call(helpers.define));
     };
     let boolean = |bit: i32| {
-        move |f: &mut FnBuilder<'_>| {
+        move |f: &mut Function| {
             wasm!(f;
                 I64Const(TRUE_BITS), I64Const(FALSE_BITS),
                 LocalGet(a), I32Const(bit), I32And, Select,
@@ -718,18 +692,18 @@ pub(in crate::emit) fn emit_own_desc(
     wasm!(f; LocalGet(d));
     emit_box_heap(&mut f);
     wasm!(f; End);
-    finish_builder(f)
+    f
 }
 
 /// Walk the live entries of the property table in i32 local `p` (nonzero):
 /// `body` runs with the entry address in i32 local `e` (`end` is i32
 /// scratch).
-fn emit_live_entries<S: Sink>(
-    function: &mut S,
+fn emit_live_entries(
+    function: &mut Function,
     p: u32,
     e: u32,
     end: u32,
-    body: impl FnOnce(&mut S),
+    body: impl FnOnce(&mut Function),
 ) {
     wasm!(function;
         LocalGet(p), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(p), I32Add,
@@ -758,12 +732,8 @@ fn emit_live_entries<S: Sink>(
 /// dictionary mode first, so its elements are table entries the level
 /// reaches, and a frozen array's `length` becomes read-only. Private entries
 /// are left untouched.
-pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, RAW_I32],
-        &[ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32],
-    );
+pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(6, ValType::I32)]);
     let (obj, level) = (0, 1);
     let (o, p, e, end, a, t) = (2, 3, 4, 5, 6, 7);
     wasm!(f;
@@ -811,7 +781,7 @@ pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>, leaves: &LeafSet
         I32Store8(m8(FLAGS)),
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__test_integrity(obj: i64, level: i32) -> i32`: for
@@ -820,12 +790,8 @@ pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>, leaves: &LeafSet
 /// is non-configurable (and, [`INTEGRITY_FROZEN`], every own data property
 /// non-writable, an array's `length` included). A `String` wrapper's virtual
 /// indices are always frozen. Private entries are ignored.
-pub(in crate::emit) fn emit_test_integrity(leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, RAW_I32],
-        &[RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32],
-    );
+pub(in crate::emit) fn emit_test_integrity() -> Function {
+    let mut f = Function::new(vec![(5, ValType::I32)]);
     let (obj, level) = (0, 1);
     let (o, p, e, end, a) = (2, 3, 4, 5, 6);
     wasm!(f;
@@ -858,7 +824,7 @@ pub(in crate::emit) fn emit_test_integrity(leaves: &LeafSet) -> Function {
         );
     });
     wasm!(f; End, I32Const(1), End);
-    finish_builder(f)
+    f
 }
 
 /// `__own_enum(obj: i64, key: i32) -> i32`: whether the object `obj` has an
@@ -867,16 +833,8 @@ pub(in crate::emit) fn emit_test_integrity(leaves: &LeafSet) -> Function {
 /// store elements (holes are absent) are; any other key — a `SPARSE` or dictionary-mode array's
 /// elements included — is its table entry's `E` (a `LAZY` function is
 /// materialized by the lookup).
-pub(in crate::emit) fn emit_own_enum(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, ROOT_BASE],
-        &[ROOT_BASE, RAW_I32, RAW_I32],
-    );
+pub(in crate::emit) fn emit_own_enum(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(3, ValType::I32)]);
     let (obj, key, o, i, a) = (0, 1, 2, 3, 4);
     wasm!(f;
         LocalGet(key), I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
@@ -917,7 +875,7 @@ pub(in crate::emit) fn emit_own_enum(
         Else, I32Const(0), End,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__set_proto(o: i32, proto: i64) -> i32`: `OrdinarySetPrototypeOf`
@@ -928,8 +886,8 @@ pub(in crate::emit) fn emit_own_enum(
 /// prototype exotic object), [`PROP_THROW_PROTO_NOT_EXTENSIBLE`] for a
 /// non-extensible object, [`PROP_THROW_PROTO_CYCLE`] when `o` is on
 /// `proto`'s chain. A watched intrinsic sets its dirty bit.
-pub(in crate::emit) fn emit_set_proto(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_BASE, ROOT_JS], &[ROOT_JS, RAW_I32]);
+pub(in crate::emit) fn emit_set_proto(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I64), (1, ValType::I32)]);
     let (o, proto, p, t) = (0, 1, 2, 3);
     let object_prototype = intrinsic_bits(Intrinsic::ObjectPrototype, helpers);
     wasm!(f;
@@ -955,5 +913,5 @@ pub(in crate::emit) fn emit_set_proto(helpers: Helpers<'_>, leaves: &LeafSet) ->
         wasm!(f; End);
     }
     wasm!(f; I32Const(0), End);
-    finish_builder(f)
+    f
 }

@@ -56,19 +56,10 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         (helpers.str_exotic_index(), vec![helpers.index_value]),
         (helpers.same_value_zero, vec![helpers.str_eq]),
         (helpers.map_find, vec![helpers.same_value_zero]),
-        (helpers.map_get, vec![helpers.map_find]),
-        (helpers.map_has, vec![helpers.map_find]),
-        (helpers.map_delete, vec![helpers.map_find]),
         (helpers.box_f64, vec![]),
         (helpers.protos_indexless(), vec![]),
-        // Not a leaf: reaches `__prop_find` (a lazy function holds no private
-        // entry, so that call never materializes, but the graph is static).
-        (helpers.private_find(), vec![helpers.prop_find]),
+        (helpers.private_find(), vec![]),
         (helpers.json_ws, vec![]),
-        (helpers.test_integrity(), vec![]),
-        (helpers.heap_object(), vec![]),
-        (helpers.str_of(), vec![]),
-        (helpers.fn_name(), vec![helpers.heap_object()]),
         // Not a leaf: a lazy function's own properties materialize on lookup.
         (helpers.prop_find, vec![helpers.define + 1]),
     ]

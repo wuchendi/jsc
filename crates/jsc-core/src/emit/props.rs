@@ -252,7 +252,7 @@ pub(super) fn emit_key_lookup(
 
 /// Push `1` when the i32 kind byte in `local` is a string or an array (the two
 /// kinds with exotic own keys; an array's `props` table stays empty), else `0`.
-fn emit_is_string_or_array_kind(function: &mut impl Sink, local: u32) {
+fn emit_is_string_or_array_kind(function: &mut Function, local: u32) {
     wasm!(function;
         LocalGet(local), I32Const(TYPE_STRING), I32Eq,
         LocalGet(local), I32Const(TYPE_ARRAY), I32Eq,
@@ -261,14 +261,14 @@ fn emit_is_string_or_array_kind(function: &mut impl Sink, local: u32) {
 }
 
 /// Box the i32 heap block base on the stack as a heap jsval.
-fn emit_box_heap(function: &mut impl Sink) {
+fn emit_box_heap(function: &mut Function) {
     wasm!(function; I64ExtendI32U, I64Const(HEAP_BITS), I64Or);
 }
 
 /// Push the address of element `i` (i32 local) of the array whose handle base
 /// is in i32 local `arr`, less [`ELEMS_DATA_OFFSET`] (the load/store `MemArg`
 /// adds it).
-fn emit_elem_addr(function: &mut impl Sink, arr: u32, i: u32) {
+fn emit_elem_addr(function: &mut Function, arr: u32, i: u32) {
     wasm!(function;
         LocalGet(arr), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalGet(i), I32Const(3), I32Shl, I32Add,
     );
@@ -278,7 +278,7 @@ fn emit_elem_addr(function: &mut impl Sink, arr: u32, i: u32) {
 /// local `o` lives in its store — the array is not `SPARSE`, or it is and
 /// `i < cap` — else `0` (the element, if any, is a table entry). `a` is i32
 /// scratch.
-fn emit_in_store(function: &mut impl Sink, o: u32, i: u32, a: u32) {
+fn emit_in_store(function: &mut Function, o: u32, i: u32, a: u32) {
     emit_is_sparse(function, o);
     wasm!(function;
         I32Eqz,
@@ -294,14 +294,6 @@ fn emit_in_store(function: &mut impl Sink, o: u32, i: u32, a: u32) {
     );
 }
 
-/// Push slot `i` (i32 local) of the element store whose base is in i32 local
-/// `a`.
-fn emit_store_elem(function: &mut impl Sink, a: u32, i: u32) {
-    wasm!(function;
-        LocalGet(a), LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(m64(ELEMS_DATA_OFFSET)),
-    );
-}
-
 /// Put the array whose base is in i32 local `o` in dictionary mode (DESIGN.md
 /// §5.4) unless it already is: every present store element (`i < min(len,
 /// cap)`) becomes an own data property of its index key with the default
@@ -309,13 +301,18 @@ fn emit_store_elem(function: &mut impl Sink, a: u32, i: u32) {
 /// `SPARSE | DICTIONARY`. Every element then lives in the table, where it can
 /// carry any attributes. `i`, `n`, `a` are i32 scratch.
 pub(super) fn emit_dictionize(
-    function: &mut impl Sink,
+    function: &mut Function,
     o: u32,
     i: u32,
     n: u32,
     a: u32,
     helpers: Helpers<'_>,
 ) {
+    let elem = |function: &mut Function| {
+        wasm!(function;
+            LocalGet(a), LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(m64(ELEMS_DATA_OFFSET)),
+        );
+    };
     wasm!(function;
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_DICTIONARY), I32And, I32Eqz,
         If(BlockType::Empty),
@@ -329,13 +326,13 @@ pub(super) fn emit_dictionize(
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(n), I32GeU, BrIf(1),
     );
-    emit_store_elem(function, a, i);
+    elem(function);
     wasm!(function;
         I64Const(HOLE_BITS), I64Ne,
         If(BlockType::Empty),
         LocalGet(o), LocalGet(i), Call(helpers.index_string), Call(helpers.intern),
     );
-    emit_store_elem(function, a, i);
+    elem(function);
     wasm!(function;
         I32Const(ATTRS_DEFAULT), Call(helpers.define),
         End,
@@ -352,7 +349,7 @@ pub(super) fn emit_dictionize(
 }
 
 /// Push the u32 length of the string or array whose base is in i32 local `o`.
-fn emit_exotic_len(function: &mut impl Sink, o: u32) {
+fn emit_exotic_len(function: &mut Function, o: u32) {
     wasm!(function;
         LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_STRING), I32Eq,
         If(BlockType::Result(ValType::I32)),
@@ -409,7 +406,7 @@ pub(super) fn emit_accessor_call(
 /// local `recv` and the interned key in i32 local `key`, then return from the
 /// helper (the caller propagates the pending exception).
 fn emit_prop_throw_return(
-    function: &mut impl Sink,
+    function: &mut Function,
     recv: u32,
     key: u32,
     mode: i32,
@@ -422,7 +419,7 @@ fn emit_prop_throw_return(
 
 /// Set the dirty bit of the property table in the i32 local `table` when it
 /// belongs to a watched intrinsic (DESIGN.md §6.4).
-fn emit_mark_dirty(function: &mut impl Sink, table: u32) {
+fn emit_mark_dirty(function: &mut Function, table: u32) {
     wasm!(function;
         LocalGet(table), I32Load8U(m8(P_TFLAGS)), I32Const(WATCHED), I32And,
         If(BlockType::Empty),
@@ -435,8 +432,8 @@ fn emit_mark_dirty(function: &mut impl Sink, table: u32) {
 /// `__str_hash(s: i32) -> i32`: the 32-bit FNV-1a hash of the string's code
 /// units, one round per unit: a byte per round for a one-byte string, a
 /// UTF-16 unit per round for a `TWO_BYTE` one ([`fnv1a`]).
-pub(super) fn emit_str_hash(leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_BASE], &[RAW_I32, RAW_I32, RAW_I32]);
+pub(super) fn emit_str_hash() -> Function {
+    let mut f = Function::new(vec![(3, ValType::I32)]);
     let (s, h, p, end) = (0, 1, 2, 3);
     wasm!(f; I32Const(FNV_OFFSET.cast_signed()), LocalSet(h), LocalGet(s));
     emit_str_data(&mut f);
@@ -467,13 +464,13 @@ pub(super) fn emit_str_hash(leaves: &LeafSet) -> Function {
         LocalGet(h),
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__intern_slot(s: i32) -> i32`: the address of the intern-table slot that
 /// holds the string with `s`'s content, or of the empty slot where it belongs.
-pub(super) fn emit_intern_slot(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_BASE], &[RAW_I32, RAW_I32, RAW_I32, RAW_I32]);
+pub(super) fn emit_intern_slot(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(4, ValType::I32)]);
     let (s, mask, i, a, c) = (0, 1, 2, 3, 4);
     wasm!(f;
         GlobalGet(INTERN_CAP_GLOBAL), I32Const(1), I32Sub, LocalSet(mask),
@@ -490,27 +487,23 @@ pub(super) fn emit_intern_slot(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
         Unreachable,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__intern_find(s: i32) -> i32`: the interned block with `s`'s content, or
 /// `0` when no such string was ever interned (so no property has that key).
-pub(super) fn emit_intern_find(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_BASE], &[]);
+pub(super) fn emit_intern_find(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![]);
     wasm!(f; LocalGet(0), Call(helpers.intern_slot), I32Load(m32(0)), End);
-    finish_builder(f)
+    f
 }
 
 /// `__intern(s: i32) -> i32`: the interned block with `s`'s content, inserting
 /// `s` itself (flagged `INTERNED`, plus `ARRAY_INDEX` for a canonical index
 /// spelling) on a miss. The table doubles, rehashing into a fresh heap copy,
 /// once more than half its slots are used.
-pub(super) fn emit_intern(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_BASE],
-        &[RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32],
-    );
+pub(super) fn emit_intern(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(5, ValType::I32)]);
     let (s, a, c, old, cap, i) = (0, 1, 2, 3, 4, 5);
     wasm!(f;
         LocalGet(s), Call(helpers.intern_slot), LocalTee(a), I32Load(m32(0)), LocalTee(c),
@@ -527,9 +520,6 @@ pub(super) fn emit_intern(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         GlobalGet(INTERN_COUNT_GLOBAL), I32Const(1), I32Add, GlobalSet(INTERN_COUNT_GLOBAL),
         GlobalGet(INTERN_COUNT_GLOBAL), I32Const(1), I32Shl, GlobalGet(INTERN_CAP_GLOBAL), I32GtU,
         If(BlockType::Empty),
-    );
-    f.frame_begin();
-    wasm!(f;
         GlobalGet(INTERN_BASE_GLOBAL), LocalSet(old),
         GlobalGet(INTERN_CAP_GLOBAL), LocalSet(cap),
         // The new table is a `TYPE_RAW` block; `$__intern_base` is its data.
@@ -551,22 +541,19 @@ pub(super) fn emit_intern(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),
         End, End,
-    );
-    f.frame_end();
-    wasm!(f;
         End,
         LocalGet(s),
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__index_value(s: i32) -> i32`: the value of the string `s` when it is a
 /// canonical array index (`"0"`, or a nonzero digit then digits, `< 2^32 - 1`),
 /// else `-1` (`2^32 - 1`, never an index). A canonical index is ASCII, so a
 /// `TWO_BYTE` string is never one.
-pub(super) fn emit_index_value(leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_BASE], &[RAW_I32, RAW_I32, RAW_I32, RAW_I64]);
+pub(super) fn emit_index_value() -> Function {
+    let mut f = Function::new(vec![(3, ValType::I32), (1, ValType::I64)]);
     let (s, len, p, c, v) = (0, 1, 2, 3, 4);
     wasm!(f;
         LocalGet(s), I32Load8U(m8(FLAGS)), I32Const(STR_TWO_BYTE), I32And,
@@ -593,13 +580,13 @@ pub(super) fn emit_index_value(leaves: &LeafSet) -> Function {
         LocalGet(v), I64Const(i64::from(u32::MAX)), I64GeU, Select,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__index_string(n: i32) -> i32`: a fresh string holding the decimal digits
 /// of the unsigned `n`.
-pub(super) fn emit_index_string(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I32, RAW_I32]);
+pub(super) fn emit_index_string(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(3, ValType::I32)]);
     let (n, len, t, p) = (0, 1, 2, 3);
     wasm!(f;
         I32Const(1), LocalSet(len), LocalGet(n), LocalSet(t),
@@ -621,12 +608,12 @@ pub(super) fn emit_index_string(helpers: Helpers<'_>, leaves: &LeafSet) -> Funct
         LocalGet(t),
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// Push `1` when the object-family block in i32 local `o` is a `String`
 /// wrapper (`TYPE_OBJECT` of class `STRING`), else `0`.
-fn emit_is_string_wrapper(function: &mut impl Sink, o: u32) {
+fn emit_is_string_wrapper(function: &mut Function, o: u32) {
     wasm!(function;
         LocalGet(o), I32Load(m32(0)), I32Const(0xff00_00ff_u32.cast_signed()), I32And,
         I32Const(TYPE_OBJECT | (i32::from(abi::CLASS_STRING) << 24)), I32Eq,
@@ -636,13 +623,13 @@ fn emit_is_string_wrapper(function: &mut impl Sink, o: u32) {
 /// Run `body` when the block in i32 local `o` is a `String` wrapper owning
 /// the virtual index the key in i32 local `key` names (`__str_exotic_index`),
 /// with that index in i32 local `i`.
-pub(super) fn emit_if_str_exotic<S: Sink>(
-    function: &mut S,
+pub(super) fn emit_if_str_exotic(
+    function: &mut Function,
     o: u32,
     key: u32,
     i: u32,
     helpers: Helpers<'_>,
-    body: impl FnOnce(&mut S),
+    body: impl FnOnce(&mut Function),
 ) {
     emit_is_string_wrapper(function, o);
     wasm!(function;
@@ -656,12 +643,7 @@ pub(super) fn emit_if_str_exotic<S: Sink>(
 
 /// Push the boxed one-unit string at code-unit index `i` (i32 local) of the
 /// `String` wrapper in i32 local `o`.
-pub(super) fn emit_str_exotic_value(
-    function: &mut impl Sink,
-    o: u32,
-    i: u32,
-    helpers: Helpers<'_>,
-) {
+pub(super) fn emit_str_exotic_value(function: &mut Function, o: u32, i: u32, helpers: Helpers<'_>) {
     wasm!(function;
         LocalGet(o), I64Load(m64(u64::from(abi::WRAPPER_VALUE_OFFSET))), I32WrapI64,
         LocalGet(i), Call(helpers.str_index),
@@ -676,8 +658,8 @@ pub(super) fn emit_str_exotic_value(
 /// property `{value: s[i], writable: false, enumerable: true, configurable:
 /// false}` (ECMA-262 10.4.3); the property and descriptor helpers consult it
 /// before the table. `key` need not be interned.
-pub(super) fn emit_str_exotic_index(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_BASE, ROOT_BASE], &[RAW_I32]);
+pub(super) fn emit_str_exotic_index(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
     let (o, key, i) = (0, 1, 2);
     wasm!(f; LocalGet(key), I32Eqz);
     emit_is_string_wrapper(&mut f, o);
@@ -692,7 +674,7 @@ pub(super) fn emit_str_exotic_index(helpers: Helpers<'_>, leaves: &LeafSet) -> F
         Select,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__to_key(v: i64, insert: i32) -> i32`: `ToPropertyKey` of `v` as an interned
@@ -705,16 +687,8 @@ pub(super) fn emit_str_exotic_index(helpers: Helpers<'_>, leaves: &LeafSet) -> F
 /// resulting string is then interned (`insert`) or looked up (`0` on a miss).
 /// A lookup still interns a canonical array index, so an array or string
 /// element is found by an index key that no property ever used.
-pub(super) fn emit_to_key(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, RAW_I32],
-        &[ROOT_BASE, ROOT_BASE, RAW_F64],
-    );
+pub(super) fn emit_to_key(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(2, ValType::I32), (1, ValType::F64)]);
     let (v, insert, s, r, d) = (0, 1, 2, 3, 4);
     emit_is_string(&mut f, v);
     wasm!(f;
@@ -762,7 +736,7 @@ pub(super) fn emit_to_key(
         End,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__prop_find(o: i32, key: i32) -> i32`: the address of the own entry of the
@@ -770,8 +744,8 @@ pub(super) fn emit_to_key(
 /// a missed key never matches a tombstone). A `LAZY` function (which has no
 /// table yet) is materialized first, so every property operation sees its
 /// `length`/`name`/`prototype`.
-pub(super) fn emit_prop_find(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_BASE, ROOT_BASE], &[RAW_I32, RAW_I32]);
+pub(super) fn emit_prop_find(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(2, ValType::I32)]);
     let (o, key, e, end) = (0, 1, 2, 3);
     wasm!(f;
         LocalGet(key), I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
@@ -779,11 +753,7 @@ pub(super) fn emit_prop_find(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
         If(BlockType::Empty),
         LocalGet(o), I32Load(m32(0)), I32Const(LAZY_FN_MASK), I32And, I32Const(LAZY_FN_WORD), I32Ne,
         If(BlockType::Empty), I32Const(0), Return, End,
-    );
-    f.frame_begin();
-    wasm!(f; LocalGet(o), Call(helpers.define + 1));
-    f.frame_end();
-    wasm!(f;
+        LocalGet(o), Call(helpers.define + 1),
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalSet(e),
         End,
         LocalGet(e), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(e), I32Add,
@@ -799,13 +769,8 @@ pub(super) fn emit_prop_find(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
         I32Const(0),
         End,
     );
-    finish_builder(f)
+    f
 }
-
-/// The locals of `define`: e, p, q, n, src, end, cap.
-const DEFINE_LOCALS: [LocalClass; 7] = [
-    RAW_I32, ROOT_BASE, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
-];
 
 /// `__define(o: i32, key: i32, v: i64, attrs: i32)`: define the own property
 /// `key` of the object-family block `o` with the complete descriptor
@@ -820,16 +785,12 @@ const DEFINE_LOCALS: [LocalClass; 7] = [
 /// entries in order (and the table's watch flag and bit), and `o`'s `props`
 /// slot is rewritten. A watched table sets its dirty bit when the program
 /// tracks them.
-pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_BASE, ROOT_BASE, ROOT_JS, RAW_I32],
-        &DEFINE_LOCALS,
-    );
+pub(super) fn emit_define(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(7, ValType::I32)]);
     let (o, key, v, attrs) = (0, 1, 2, 3);
     let (e, p, q, n, src, end, cap) = (4, 5, 6, 7, 8, 9, 10);
     // Throw the keyed `__prop_throw` TypeError of `mode` for `o` / `key`.
-    let throw = |f: &mut FnBuilder<'_>, mode: i32| {
+    let throw = |f: &mut Function, mode: i32| {
         wasm!(f; LocalGet(o));
         emit_box_heap(f);
         wasm!(f; LocalGet(key));
@@ -844,7 +805,10 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         LocalGet(key),
     );
     emit_is_private_key(&mut f);
-    wasm!(f; I32Eqz, I32And, If(BlockType::Empty));
+    wasm!(f;
+        I32Eqz, I32And,
+        If(BlockType::Empty),
+    );
     throw(&mut f, PROP_THROW_DEFINE_NOT_EXTENSIBLE);
     wasm!(f;
         End,
@@ -926,7 +890,7 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         emit_mark_dirty(&mut f, p);
     }
     wasm!(f; End);
-    finish_builder(f)
+    f
 }
 
 /// `__fn_materialize(o: i32)`: clear the `LAZY` flag of the function block `o`
@@ -939,17 +903,12 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 /// with no `constructor`.
 /// No own `caller` / `arguments`: every function is strict, so they resolve to
 /// the `%Function.prototype%` `%ThrowTypeError%` accessors.
-pub(super) fn emit_fn_materialize(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_BASE], &[RAW_I32, ROOT_BASE]);
+pub(super) fn emit_fn_materialize(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(2, ValType::I32)]);
     let (o, i, p) = (0, 1, 2);
     // Finish a `__define(target, key, value, attrs)` whose first three
     // operands are on the stack.
-    let define =
-        |f: &mut FnBuilder<'_>, attrs: i32| wasm!(f; I32Const(attrs), Call(helpers.define));
+    let define = |f: &mut Function, attrs: i32| wasm!(f; I32Const(attrs), Call(helpers.define));
     let key = |name: &str| static_key(strings, name);
     wasm!(f;
         LocalGet(o),
@@ -1008,13 +967,13 @@ pub(super) fn emit_fn_materialize(
     emit_box_heap(&mut f);
     define(&mut f, ATTR_WRITABLE);
     wasm!(f; End, End);
-    finish_builder(f)
+    f
 }
 
 /// Materialize the `LAZY` function whose block base is in i32 local `o` (a
 /// no-op for any other block), so its own `length` / `name` / `prototype`
 /// exist before a whole-table walk or an integrity change.
-pub(super) fn emit_materialize(function: &mut impl Sink, o: u32, helpers: Helpers<'_>) {
+pub(super) fn emit_materialize(function: &mut Function, o: u32, helpers: Helpers<'_>) {
     wasm!(function;
         LocalGet(o), I32Load(m32(0)), I32Const(LAZY_FN_MASK), I32And, I32Const(LAZY_FN_WORD), I32Eq,
         If(BlockType::Empty), LocalGet(o), Call(helpers.define + 1), End,
@@ -1031,7 +990,7 @@ pub(super) fn emit_materialize(function: &mut impl Sink, o: u32, helpers: Helper
 /// scratch.
 #[allow(clippy::too_many_arguments)]
 fn emit_exotic_get(
-    function: &mut impl Sink,
+    function: &mut Function,
     o: u32,
     t: u32,
     key: u32,
@@ -1075,7 +1034,7 @@ fn emit_exotic_get(
 /// Push the index of the interned `key` (i32 local, nonzero) into i32 local
 /// `i`, leaving it on the stack: its value when it is a canonical array index
 /// (`ARRAY_INDEX` flag), else `-1` (`2^32 - 1`, never an index).
-fn emit_exotic_index(function: &mut impl Sink, key: u32, i: u32, helpers: Helpers<'_>) {
+fn emit_exotic_index(function: &mut Function, key: u32, i: u32, helpers: Helpers<'_>) {
     wasm!(function;
         LocalGet(key), Call(helpers.index_value),
         I32Const(-1),
@@ -1094,38 +1053,21 @@ fn emit_exotic_index(function: &mut impl Sink, key: u32, i: u32, helpers: Helper
 /// number or boolean continues at its realm prototype without allocating a
 /// wrapper;
 /// `null`/`undefined` and a key of `0` (never interned) read `undefined`.
-pub(super) fn emit_get(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    emit_get_from(strings, helpers, false, leaves)
+pub(super) fn emit_get(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    emit_get_from(strings, helpers, false)
 }
 
 /// `__super_get(home: i64, key: i32, recv: i64) -> i64`: `home.[[Get]](key,
 /// recv)` — [`emit_get`]'s lookup starting at `home` (a `super` reference's
 /// home object prototype), a getter called with `this = recv`.
-pub(super) fn emit_super_get(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
-    emit_get_from(strings, helpers, true, leaves)
+pub(super) fn emit_super_get(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    emit_get_from(strings, helpers, true)
 }
 
 /// The body of [`emit_get`] (`receiver` = `false`: the lookup starts at the
 /// receiver) and [`emit_super_get`] (an extra receiver param).
-fn emit_get_from(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    receiver: bool,
-    leaves: &LeafSet,
-) -> Function {
-    let mut f = FnBuilder::new(leaves);
-    f.param(ROOT_JS);
-    f.param(ROOT_BASE);
-    if receiver {
-        f.param(ROOT_JS);
-    }
-    for class in [ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, ROOT_JS] {
-        f.local(class); // o, e, t (also the callee scratch), i, p
-    }
+fn emit_get_from(strings: &StrOffsets, helpers: Helpers<'_>, receiver: bool) -> Function {
+    let mut f = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
     let shift = u32::from(receiver);
     let (recv, key) = (0, 1);
     let (o, e, t, i, p) = (2 + shift, 3 + shift, 4 + shift, 5 + shift, 6 + shift);
@@ -1203,7 +1145,7 @@ fn emit_get_from(
         Unreachable,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__symbol_get(v: i64, sym: i32) -> i64`: `Get(v, sym)` for the symbol key
@@ -1215,12 +1157,8 @@ fn emit_get_from(
 /// even when the program builds no accessor of its own (so `__get` omits the
 /// dispatch): the realm's `get [@@species]` / `%IteratorPrototype%`
 /// `get [@@toStringTag]` are read by builtins alone.
-pub(super) fn emit_symbol_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, ROOT_BASE],
-        &[ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, ROOT_JS, ROOT_JS],
-    );
+pub(super) fn emit_symbol_get(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(4, ValType::I32), (2, ValType::I64)]);
     let (v, sym, o, p, e, base, next, g) = (0, 1, 2, 3, 4, 5, 6, 7);
     let proto_base = |intrinsic| {
         let bits = intrinsic_bits(intrinsic, helpers);
@@ -1284,7 +1222,7 @@ pub(super) fn emit_symbol_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
         Unreachable,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__set(recv: i64, key: i32, v: i64)`: `OrdinarySet` (strict) of the interned
@@ -1296,8 +1234,8 @@ pub(super) fn emit_symbol_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
 /// non-extensible object throws). An own overwrite on a watched table sets its
 /// dirty bit when the program tracks them (an add does so in `__define`). A
 /// throw leaves the exception pending.
-pub(super) fn emit_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    emit_set_from(None, helpers, leaves)
+pub(super) fn emit_set(helpers: Helpers<'_>) -> Function {
+    emit_set_from(None, helpers)
 }
 
 /// `__super_set(home: i64, key: i32, v: i64, recv: i64)`: `home.[[Set]](key,
@@ -1312,31 +1250,14 @@ pub(super) fn emit_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 /// element or `length`) is updated with `__define_own` of `{value}`, and a
 /// missing key is created with `CreateDataProperty` (a non-extensible `recv`
 /// throws). A throw leaves the exception pending.
-pub(super) fn emit_super_set(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
-    emit_set_from(Some(strings), helpers, leaves)
+pub(super) fn emit_super_set(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    emit_set_from(Some(strings), helpers)
 }
 
 /// The body of [`emit_set`] (`receiver` = `None`) and [`emit_super_set`]
 /// (an extra receiver param; `Some` carries the static key offsets).
-fn emit_set_from(
-    receiver: Option<&StrOffsets>,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
-    let mut f = FnBuilder::new(leaves);
-    f.param(ROOT_JS);
-    f.param(ROOT_BASE);
-    f.param(ROOT_JS);
-    if receiver.is_some() {
-        f.param(ROOT_JS);
-    }
-    for class in [ROOT_BASE, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, ROOT_JS] {
-        f.local(class); // o, q, e, own, a, s
-    }
+fn emit_set_from(receiver: Option<&StrOffsets>, helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(5, ValType::I32), (1, ValType::I64)]);
     let shift = u32::from(receiver.is_some());
     let (recv, key, v) = (0, 1, 2);
     let (o, q, e, own, a, s) = (
@@ -1412,20 +1333,20 @@ fn emit_set_from(
             LocalGet(o), LocalGet(key), LocalGet(v), I32Const(ATTRS_DEFAULT), Call(helpers.define),
             End,
         );
-        return finish_builder(f);
+        return f;
     };
     // A writable data property or a miss: the receiver takes the value.
     wasm!(f; End);
     emit_receiver_set(&mut f, [this, key, v], [o, e, a], strings, helpers);
     wasm!(f; End);
-    finish_builder(f)
+    f
 }
 
 /// The receiver half of [`emit_super_set`] (`OrdinarySetWithOwnDescriptor`
 /// steps 2.b-e): store the jsval `v` under the interned `key` on the jsval
 /// `this`, with the i32 scratch locals `o`, `e`, `a`.
 fn emit_receiver_set(
-    f: &mut impl Sink,
+    f: &mut Function,
     [this, key, v]: [u32; 3],
     [o, e, a]: [u32; 3],
     strings: &StrOffsets,
@@ -1491,7 +1412,7 @@ fn emit_receiver_set(
 /// Set the dirty bit of the own table of the object-family block `o` (i32
 /// local; `table` is an i32 scratch local) after an in-place store, when the
 /// program tracks dirty bits.
-fn emit_store_dirty(function: &mut impl Sink, o: u32, table: u32, helpers: Helpers<'_>) {
+fn emit_store_dirty(function: &mut Function, o: u32, table: u32, helpers: Helpers<'_>) {
     if helpers.dirty_tracking {
         wasm!(function; LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalSet(table));
         emit_mark_dirty(function, table);
@@ -1506,32 +1427,19 @@ fn emit_store_dirty(function: &mut impl Sink, o: u32, table: u32, helpers: Helpe
 /// has it (an array's named keys, and a `SPARSE` array's elements past its
 /// store). A primitive `obj` throws the `in`
 /// `TypeError` (left pending, result `0`).
-pub(super) fn emit_has(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    emit_has_lookup(strings, helpers, false, leaves)
+pub(super) fn emit_has(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    emit_has_lookup(strings, helpers, false)
 }
 
 /// `__has_own(key: i32, obj: i64) -> i32`: [`emit_has`] without the `proto`
 /// walk (`HasOwnProperty`, backing `Object.prototype.hasOwnProperty`).
-pub(super) fn emit_has_own(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
-    emit_has_lookup(strings, helpers, true, leaves)
+pub(super) fn emit_has_own(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    emit_has_lookup(strings, helpers, true)
 }
 
 /// The body of [`emit_has`] (`own` = `false`) and [`emit_has_own`].
-fn emit_has_lookup(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    own: bool,
-    leaves: &LeafSet,
-) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_BASE, ROOT_JS],
-        &[ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, ROOT_JS],
-    );
+fn emit_has_lookup(strings: &StrOffsets, helpers: Helpers<'_>, own: bool) -> Function {
+    let mut f = Function::new(vec![(4, ValType::I32), (1, ValType::I64)]);
     let (key, obj, o, t, i, a, p) = (0, 1, 2, 3, 4, 5, 6);
     if !own {
         // `key in primitive` is a TypeError.
@@ -1605,7 +1513,7 @@ fn emit_has_lookup(
         Unreachable,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__delete(obj: i64, key: i32)`: delete the own property `key` of an
@@ -1616,16 +1524,8 @@ fn emit_has_lookup(
 /// entries. A `String` wrapper's index (non-configurable) throws. A primitive
 /// (a string or symbol included) is left unchanged. A delete on a watched
 /// table sets its dirty bit when the program tracks them.
-pub(super) fn emit_delete(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, ROOT_BASE],
-        &[ROOT_BASE, RAW_I32, RAW_I32, RAW_I32],
-    );
+pub(super) fn emit_delete(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(4, ValType::I32)]);
     let (obj, key, o, e, t, i) = (0, 1, 2, 3, 4, 5);
     emit_is_pointer(&mut f, obj);
     wasm!(f;
@@ -1689,7 +1589,7 @@ pub(super) fn emit_delete(
         emit_mark_dirty(&mut f, e);
     }
     wasm!(f; End);
-    finish_builder(f)
+    f
 }
 
 /// `__array_set(recv: i64, key: i64, v: i64)`: the slow path of a member store
@@ -1708,26 +1608,15 @@ pub(super) fn emit_delete(
 /// `CreateDataPropertyOrThrow` (result arrays, `defineProperty` of a default
 /// element): the prototype chain is never consulted, a `SPARSE` array stores
 /// through `__sparse_define`, and a named key is an own `__define`.
-pub(super) fn emit_array_set(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    define: bool,
-    leaves: &LeafSet,
-) -> Function {
+pub(super) fn emit_array_set(strings: &StrOffsets, helpers: Helpers<'_>, define: bool) -> Function {
     let sparse_store = if define {
         helpers.sparse_define()
     } else {
         helpers.sparse_set()
     };
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, ROOT_JS, ROOT_JS],
-        &[
-            ROOT_BASE, RAW_I32, ROOT_BASE, RAW_I32, RAW_I32, RAW_F64, RAW_I32,
-        ],
-    );
+    let mut f = Function::new(vec![(5, ValType::I32), (1, ValType::F64)]);
     let (recv, key, v) = (0, 1, 2);
-    let (o, i, k, len, a, d, j) = (3, 4, 5, 6, 7, 8, 9);
+    let (o, i, k, len, a, d) = (3, 4, 5, 6, 7, 8);
     wasm!(f;
         LocalGet(recv), I32WrapI64, LocalSet(o),
         Block(BlockType::Empty),
@@ -1798,7 +1687,7 @@ pub(super) fn emit_array_set(
         If(BlockType::Empty),
     );
     // Too far: the array turns SPARSE and stores the element there.
-    emit_sparsify(&mut f, o, j, a);
+    emit_sparsify(&mut f, o, k, a);
     wasm!(f;
         LocalGet(o), LocalGet(i), LocalGet(v), Call(sparse_store), Return,
         End,
@@ -1820,12 +1709,12 @@ pub(super) fn emit_array_set(
         LocalGet(o), LocalGet(i), I32Const(1), I32Add, I32Store(m32(ARRAY_LEN_OFFSET)),
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// Fill the store slots `from..to` (i32 locals; `from` ends at `to`) of the
 /// array whose i32 base is in local `o` with holes.
-fn emit_fill_holes(function: &mut impl Sink, o: u32, from: u32, to: u32) {
+fn emit_fill_holes(function: &mut Function, o: u32, from: u32, to: u32) {
     wasm!(function;
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(from), LocalGet(to), I32GeU, BrIf(1),
@@ -1842,7 +1731,7 @@ fn emit_fill_holes(function: &mut impl Sink, o: u32, from: u32, to: u32) {
 /// Mark the dense array whose i32 base is in local `o` `SPARSE`, filling its
 /// store slots `len..cap` with holes (every slot of a sparse store is an
 /// element or a hole). `j`/`a` are i32 scratch.
-fn emit_sparsify(function: &mut impl Sink, o: u32, j: u32, a: u32) {
+fn emit_sparsify(function: &mut Function, o: u32, j: u32, a: u32) {
     wasm!(function;
         LocalGet(o), LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_SPARSE), I32Or,
         I32Store8(m8(FLAGS)),
@@ -1859,12 +1748,8 @@ fn emit_sparsify(function: &mut impl Sink, o: u32, j: u32, a: u32) {
 /// `o`, or [`HOLE_BITS`] when absent — its store slot when `i < cap`, else the
 /// value of its own table's array-index key whose value is `i` (an accessor
 /// element calls its getter with `this = o`, `undefined` without one).
-pub(super) fn emit_sparse_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_BASE, RAW_I32],
-        &[RAW_I32, RAW_I32, RAW_I32, RAW_I32, ROOT_JS, ROOT_JS],
-    );
+pub(super) fn emit_sparse_get(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(4, ValType::I32), (2, ValType::I64)]);
     let (o, i, a, e, end, k) = (0, 1, 2, 3, 4, 5);
     let (g, this) = (6, 7);
     wasm!(f;
@@ -1917,7 +1802,7 @@ pub(super) fn emit_sparse_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
         I64Const(HOLE_BITS),
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__sparse_set(o: i32, i: i32, v: i64)`: the strict `[[Set]]` of element
@@ -1933,12 +1818,8 @@ pub(super) fn emit_sparse_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
 /// With `define` this is `__sparse_define(o, i, v)`, the `SPARSE` arm of
 /// `__array_define`: no prototype check, and a table element is an own
 /// `__define` of the default attributes.
-pub(super) fn emit_sparse_set(helpers: Helpers<'_>, define: bool, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_BASE, RAW_I32, ROOT_JS],
-        &[RAW_I32, ROOT_BASE],
-    );
+pub(super) fn emit_sparse_set(helpers: Helpers<'_>, define: bool) -> Function {
+    let mut f = Function::new(vec![(2, ValType::I32)]);
     let (o, i, v, a, k) = (0, 1, 2, 3, 4);
     wasm!(f;
         LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(a),
@@ -1995,7 +1876,7 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>, define: bool, leaves: &LeafS
         End,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__protos_indexless(o: i32) -> i32`: `1` when nothing on the `proto`
@@ -2004,8 +1885,8 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>, define: bool, leaves: &LeafS
 /// flagged `HAS_INDEX_KEYS` — so every index `o` does not own is absent; else
 /// `0`. The builtins' array
 /// fast paths that read a hole as absent run only under it.
-pub(super) fn emit_protos_indexless(leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_BASE], &[ROOT_JS, RAW_I32]);
+pub(super) fn emit_protos_indexless() -> Function {
+    let mut f = Function::new(vec![(1, ValType::I64), (1, ValType::I32)]);
     let (o, p, t) = (0, 1, 2);
     wasm!(f;
         LocalGet(o), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(p),
@@ -2031,7 +1912,7 @@ pub(super) fn emit_protos_indexless(leaves: &LeafSet) -> Function {
         Unreachable,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__proto_elem(o: i32, i: i32) -> i64`: element `i` of the object-family
@@ -2040,8 +1921,8 @@ pub(super) fn emit_protos_indexless(leaves: &LeafSet) -> Function {
 /// `HasProperty(o, i)` is false (at once under `__protos_indexless`), else
 /// `Get(o, i)` (an inherited getter runs with `this = o`; its throw is left
 /// pending). Every element read that meets a hole goes through here.
-pub(super) fn emit_proto_elem(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_BASE, RAW_I32], &[ROOT_BASE]);
+pub(super) fn emit_proto_elem(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
     let (o, i, k) = (0, 1, 2);
     wasm!(f;
         LocalGet(o), Call(helpers.protos_indexless()),
@@ -2057,7 +1938,7 @@ pub(super) fn emit_proto_elem(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
     );
     emit_box_heap(&mut f);
     wasm!(f; LocalGet(k), Call(helpers.get), End);
-    finish_builder(f)
+    f
 }
 
 /// `__proto_set(o: i32, i: i32, v: i64) -> i32`: the inherited half of the
@@ -2069,12 +1950,8 @@ pub(super) fn emit_proto_elem(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
 /// consumed (a throw left pending). A writable data property, no owner at
 /// all, or `__protos_indexless(o)` (checked first) yield `0`: the caller
 /// creates the own element.
-pub(super) fn emit_proto_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_BASE, RAW_I32, ROOT_JS],
-        &[ROOT_BASE, ROOT_BASE, RAW_I32, ROOT_JS, ROOT_JS],
-    );
+pub(super) fn emit_proto_set(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(3, ValType::I32), (2, ValType::I64)]);
     let (o, i, v) = (0, 1, 2);
     let (k, q, e, p, recv) = (3, 4, 5, 6, 7);
     wasm!(f;
@@ -2148,7 +2025,7 @@ pub(super) fn emit_proto_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
         Unreachable,
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__array_set_length(o: i32, v: i64)`: the `length` write `o.length = v` on
@@ -2165,22 +2042,15 @@ pub(super) fn emit_proto_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
 /// densely while `n - 1 < len + DENSE_GAP` and otherwise makes the
 /// array `SPARSE` without allocating the gap. Then `len = n`.
 #[allow(clippy::too_many_lines)] // one straight-line helper body
-pub(super) fn emit_array_set_length(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
+pub(super) fn emit_array_set_length(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let (o, v) = (0, 1);
     // The error object is built in the shared helper scratch layout after the
     // two params; this helper's own locals follow it.
     let scratch = 2;
-    let base = scratch + 26;
-    let mut f = helper_builder(leaves, &[ROOT_BASE, ROOT_JS], &[]);
-    declare_error_scratch(&mut f);
-    // `k` aliases the integer `j`, so neither is rooted: no key is held
-    // across a safepoint here.
-    f.locals(9, RAW_I32);
-    f.local(RAW_F64);
+    let mut locals = type_error_helper_locals();
+    let base = scratch + locals.iter().map(|(count, _)| count).sum::<u32>();
+    locals.extend([(9, ValType::I32), (1, ValType::F64)]);
+    let mut f = Function::new(locals);
     let (n, len, a, cap, j, e, end) = (
         base,
         base + 1,
@@ -2196,7 +2066,7 @@ pub(super) fn emit_array_set_length(
     let length_key = static_key(strings, INDEX_LENGTH_KEY);
     // Walk the live array-index entries of the table in `a` (nonzero): `body`
     // runs with the entry address in `e` and its key in `k`.
-    let index_entries = |f: &mut FnBuilder<'_>, body: &dyn Fn(&mut FnBuilder<'_>)| {
+    let index_entries = |f: &mut Function, body: &dyn Fn(&mut Function)| {
         wasm!(f;
             LocalGet(a), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(a), I32Add,
             I32Const(P_HEADER), I32Add, LocalSet(end),
@@ -2344,7 +2214,7 @@ pub(super) fn emit_array_set_length(
         LocalGet(o), LocalGet(n), I32Store(m32(ARRAY_LEN_OFFSET)),
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__own_keys(obj: i64, mode: i32) -> i64`: a fresh array of `obj`'s own
@@ -2368,15 +2238,12 @@ pub(super) fn emit_array_set_length(
 /// holds an accessor entry (a string, a store element and a data property
 /// run no code).
 #[allow(clippy::too_many_lines)] // one straight-line helper body
-pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, RAW_I32],
-        &[
-            ROOT_BASE, RAW_I32, RAW_I32, ROOT_BASE, RAW_I32, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32,
-            RAW_I32, RAW_I32, ROOT_JS, ROOT_JS, RAW_I32, RAW_I32,
-        ],
-    );
+pub(super) fn emit_own_keys(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![
+        (11, ValType::I32),
+        (2, ValType::I64),
+        (2, ValType::I32),
+    ]);
     let (obj, mode) = (0, 1);
     let (o, t, n, out, j, p, e, end, k, i, x) = (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
     let (kv, val) = (13, 14);
@@ -2384,7 +2251,7 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
     let (w, recheck) = (15, 16);
     let new_array = helpers.new_string + 1;
     // include(e) = key != 0 && (mode is ALL / SYMBOLS / ALL_KEYS || attrs & ENUMERABLE)
-    let include = |f: &mut FnBuilder<'_>| {
+    let include = |f: &mut Function| {
         wasm!(f;
             LocalGet(e), I32Load(m32(E_KEY)), LocalTee(k), I32Const(0), I32Ne,
             LocalGet(mode), I32Const(OWN_ALL), I32GeS,
@@ -2394,26 +2261,26 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
         );
     };
     // is_index(k) = (has_index & ARRAY_INDEX flag of k), with has_index in `x`.
-    let is_index = |f: &mut FnBuilder<'_>| {
+    let is_index = |f: &mut Function| {
         wasm!(f; LocalGet(k), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And, LocalGet(x), I32And);
     };
     // is_symbol(k): the key block's kind byte is TYPE_SYMBOL.
-    let is_symbol = |f: &mut FnBuilder<'_>| {
+    let is_symbol = |f: &mut Function| {
         wasm!(f; LocalGet(k), I32Load8U(m8(0)), I32Const(TYPE_SYMBOL), I32Eq);
     };
     // has_symbols(p): the table `p` has HAS_SYMBOL_KEYS.
-    let has_symbols = |f: &mut FnBuilder<'_>| {
+    let has_symbols = |f: &mut Function| {
         wasm!(f; LocalGet(p), I32Load8U(m8(P_TFLAGS)), I32Const(HAS_SYMBOL_KEYS), I32And);
     };
     // Walk the entries: e = p + 16 .. end.
-    let entry_loop_head = |f: &mut FnBuilder<'_>| {
+    let entry_loop_head = |f: &mut Function| {
         wasm!(f;
             LocalGet(p), I32Const(P_HEADER), I32Add, LocalSet(e),
             Block(BlockType::Empty), Loop(BlockType::Empty),
             LocalGet(e), LocalGet(end), I32GeU, BrIf(1),
         );
     };
-    let entry_loop_tail = |f: &mut FnBuilder<'_>| {
+    let entry_loop_tail = |f: &mut Function| {
         wasm!(f;
             LocalGet(e), I32Const(ENTRY), I32Add, LocalSet(e),
             Br(0),
@@ -2422,7 +2289,7 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
     };
     // Append each included symbol key of the table `p` (`end` set) to out[j..];
     // a private name is never listed (§7.6).
-    let symbol_pass = |f: &mut FnBuilder<'_>| {
+    let symbol_pass = |f: &mut Function| {
         entry_loop_head(f);
         include(f);
         is_symbol(f);
@@ -2482,7 +2349,7 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
     );
     // The index keys `0..n` (as decimal strings) into `out[j..]`, skipping
     // holes when `skip_holes`.
-    let index_keys = |f: &mut FnBuilder<'_>, skip_holes: bool| {
+    let index_keys = |f: &mut Function, skip_holes: bool| {
         wasm!(f;
             I32Const(0), LocalSet(i),
             Block(BlockType::Empty), Loop(BlockType::Empty),
@@ -2720,12 +2587,12 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
     );
     emit_box_heap(&mut f);
     wasm!(f; End);
-    finish_builder(f)
+    f
 }
 
 /// Push `1` when the i64 jsval in local `needle` is an element of the array
 /// whose base is in i32 local `arr`, else `0` (`i`/`n` are i32 scratch).
-pub(super) fn emit_array_contains(function: &mut impl Sink, arr: u32, needle: u32, i: u32, n: u32) {
+pub(super) fn emit_array_contains(function: &mut Function, arr: u32, needle: u32, i: u32, n: u32) {
     wasm!(function;
         LocalGet(arr), I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
         I32Const(0), LocalSet(i),
@@ -2744,23 +2611,16 @@ pub(super) fn emit_array_contains(function: &mut impl Sink, arr: u32, needle: u3
     );
 }
 
-/// The locals of `for_in_keys`: o, ks, n, i, j, m, out, seen, cur, k, cursor.
-const FOR_IN_LOCALS: [LocalClass; 11] = [
-    ROOT_BASE, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, RAW_I32, ROOT_JS, ROOT_JS, ROOT_JS, ROOT_JS,
-    RAW_I32,
-];
-
 /// `__for_in_keys(obj: i64) -> i64`: the `for-in` key snapshot — `obj`'s own
 /// enumerable string keys, then each prototype's enumerable keys not already
 /// seen (a key seen at a nearer level, enumerable or not, shadows it). An
 /// object whose prototypes have no enumerable property (an ordinary object
 /// over `%Object.prototype%`) is just its own keys.
-pub(super) fn emit_for_in_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_JS], &FOR_IN_LOCALS);
+pub(super) fn emit_for_in_keys(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(6, ValType::I32), (4, ValType::I64)]);
     let obj = 0;
     let (o, ks, n, i, j, m) = (1, 2, 3, 4, 5, 6);
     let (out, seen, cur, k) = (7, 8, 9, 10);
-    let cursor = 11;
     let new_array = helpers.new_string + 1;
     // A primitive (a symbol included) has no enumerable keys of its own or on
     // its prototype chain.
@@ -2794,14 +2654,14 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
         If(BlockType::Empty),
         LocalGet(n), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(n), I32Add,
         I32Const(P_HEADER), I32Add, LocalSet(i),
-        LocalGet(n), I32Const(P_HEADER), I32Add, LocalSet(cursor),
+        LocalGet(n), I32Const(P_HEADER), I32Add, LocalSet(ks),
         Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(cursor), LocalGet(i), I32GeU, BrIf(1),
-        LocalGet(cursor), I32Load(m32(E_KEY)), I32Const(0), I32Ne,
-        LocalGet(cursor), I32Load(m32(E_ATTRS)), I32Const(ATTR_ENUMERABLE), I32And, I32Const(0), I32Ne,
+        LocalGet(ks), LocalGet(i), I32GeU, BrIf(1),
+        LocalGet(ks), I32Load(m32(E_KEY)), I32Const(0), I32Ne,
+        LocalGet(ks), I32Load(m32(E_ATTRS)), I32Const(ATTR_ENUMERABLE), I32And, I32Const(0), I32Ne,
         I32And,
         If(BlockType::Empty), I32Const(1), LocalSet(j), Br(5), End,
-        LocalGet(cursor), I32Const(ENTRY), I32Add, LocalSet(cursor),
+        LocalGet(ks), I32Const(ENTRY), I32Add, LocalSet(ks),
         Br(0),
         End, End,
         End,
@@ -2855,7 +2715,7 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
         LocalGet(obj), I32Const(OWN_KEYS), Call(helpers.own_keys),
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__copy_data(dst: i64, src: i64, excl: i64) -> i64`: `CopyDataProperties`
@@ -2867,14 +2727,8 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
 /// indices. An object source re-checks each key as own and enumerable when
 /// visited (a getter may delete or hide a later key); a string's indices are
 /// always enumerable.
-pub(super) fn emit_copy_data(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, ROOT_JS, ROOT_JS],
-        &[
-            ROOT_BASE, ROOT_BASE, RAW_I32, RAW_I32, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, ROOT_JS,
-        ],
-    );
+pub(super) fn emit_copy_data(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(8, ValType::I32), (1, ValType::I64)]);
     let (out, src, excl) = (0, 1, 2);
     let (dst, ks, n, i, x, j, m, obj) = (3, 4, 5, 6, 7, 8, 9, 10);
     let k = 11;
@@ -2916,7 +2770,7 @@ pub(super) fn emit_copy_data(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
         LocalGet(out),
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// The header word mask and value of a private-name key block (DESIGN.md
@@ -2927,7 +2781,7 @@ const PRIVATE_KEY_WORD: i32 = TYPE_SYMBOL | (abi::SYMBOL_FLAG_PRIVATE as i32) <<
 
 /// Replace the i32 key block address on the stack with `1` when it is a
 /// private name, else `0`.
-pub(super) fn emit_is_private_key(function: &mut impl Sink) {
+pub(super) fn emit_is_private_key(function: &mut Function) {
     wasm!(function;
         I32Load(m32(0)), I32Const(PRIVATE_KEY_MASK), I32And, I32Const(PRIVATE_KEY_WORD), I32Eq,
     );
@@ -2937,7 +2791,7 @@ pub(super) fn emit_is_private_key(function: &mut impl Sink) {
 /// the private name in i32 local `key`, or `0`: a primitive, or an object
 /// without a table (a `LAZY` function holds no private entry, so it is not
 /// materialized), has none.
-fn emit_private_entry(function: &mut impl Sink, o: u32, key: u32, e: u32, helpers: Helpers<'_>) {
+fn emit_private_entry(function: &mut Function, o: u32, key: u32, e: u32, helpers: Helpers<'_>) {
     wasm!(function; I32Const(0), LocalSet(e));
     emit_is_object(function, o);
     wasm!(function;
@@ -2952,13 +2806,7 @@ fn emit_private_entry(function: &mut impl Sink, o: u32, key: u32, e: u32, helper
 
 /// Raise the `__prop_throw` `TypeError` of `mode` naming the static `"#x"`
 /// string in i32 local `name` (the receiver jsval in i64 local `o`).
-fn emit_private_throw(
-    function: &mut impl Sink,
-    o: u32,
-    name: u32,
-    mode: i32,
-    helpers: Helpers<'_>,
-) {
+fn emit_private_throw(function: &mut Function, o: u32, name: u32, mode: i32, helpers: Helpers<'_>) {
     wasm!(function; LocalGet(o), LocalGet(name));
     emit_box_heap(function);
     wasm!(function; I32Const(mode), Call(helpers.prop_throw));
@@ -2966,12 +2814,12 @@ fn emit_private_throw(
 
 /// `__private_find(o: i64, key: i32) -> i32`: `1` iff `o` is an object whose
 /// own table holds the private name `key` (no prototype walk).
-pub(super) fn emit_private_find(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_JS, ROOT_BASE], &[RAW_I32]);
+pub(super) fn emit_private_find(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
     let (o, key, e) = (0, 1, 2);
     emit_private_entry(&mut f, o, key, e, helpers);
     wasm!(f; LocalGet(e), I32Const(0), I32Ne, End);
-    finish_builder(f)
+    f
 }
 
 /// `__private_add(o: i64, key: i32, v: i64, attrs: i32, name: i32)`:
@@ -2979,12 +2827,8 @@ pub(super) fn emit_private_find(helpers: Helpers<'_>, leaves: &LeafSet) -> Funct
 /// entry throws `Cannot initialize #x twice on the same object`, else
 /// `__define` appends it (skipping its not-extensible check for a private
 /// key).
-pub(super) fn emit_private_add(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, ROOT_BASE, ROOT_JS, RAW_I32, RAW_I32],
-        &[],
-    );
+pub(super) fn emit_private_add(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![]);
     let (o, key, v, attrs, name) = (0, 1, 2, 3, 4);
     wasm!(f;
         LocalGet(o), LocalGet(key), Call(helpers.private_find()),
@@ -2997,14 +2841,14 @@ pub(super) fn emit_private_add(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
         LocalGet(o), I32WrapI64, LocalGet(key), LocalGet(v), LocalGet(attrs), Call(helpers.define),
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__private_get(o: i64, key: i32, name: i32) -> i64`: the value of the
 /// private field `key` of `o`; absent (a primitive included) throws `Cannot
 /// read private member #x from an object whose class did not declare it`.
-pub(super) fn emit_private_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_JS, ROOT_BASE, RAW_I32], &[RAW_I32]);
+pub(super) fn emit_private_get(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
     let (o, key, name, e) = (0, 1, 2, 3);
     emit_private_entry(&mut f, o, key, e, helpers);
     wasm!(f; LocalGet(e), I32Eqz, If(BlockType::Empty));
@@ -3015,15 +2859,15 @@ pub(super) fn emit_private_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
         LocalGet(e), I64Load(m64(E_VALUE)),
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__private_set(o: i64, key: i32, v: i64, name: i32) -> i64`: replace the
 /// value of the private field `key` of `o` (its attrs ignored) and return
 /// `v`; absent throws `Cannot write private member #x to an object whose
 /// class did not declare it`.
-pub(super) fn emit_private_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_JS, ROOT_BASE, ROOT_JS, RAW_I32], &[RAW_I32]);
+pub(super) fn emit_private_set(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![(1, ValType::I32)]);
     let (o, key, v, name, e) = (0, 1, 2, 3, 4);
     emit_private_entry(&mut f, o, key, e, helpers);
     wasm!(f; LocalGet(e), I32Eqz, If(BlockType::Empty));
@@ -3035,7 +2879,7 @@ pub(super) fn emit_private_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
         LocalGet(v),
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// Push `1` when the jsval in i64 local `o` holds the private brand in i64
@@ -3043,7 +2887,7 @@ pub(super) fn emit_private_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
 /// instance brand) is an own entry of `o`; any other brand (a static member's
 /// class, or `undefined` before the class value exists) must be `o` itself,
 /// an object.
-fn emit_private_has(function: &mut impl Sink, o: u32, brand: u32, helpers: Helpers<'_>) {
+fn emit_private_has(function: &mut Function, o: u32, brand: u32, helpers: Helpers<'_>) {
     emit_is_symbol(function, brand);
     wasm!(function;
         If(BlockType::Result(ValType::I32)),
@@ -3062,8 +2906,8 @@ fn emit_private_has(function: &mut impl Sink, o: u32, brand: u32, helpers: Helpe
 /// `brand` ([`emit_private_has`]) raises the `__prop_throw` `TypeError` of
 /// `mode` (the read or write message) naming the static `"#x"` in `name`.
 /// Returns `v`.
-pub(super) fn emit_private_brand(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_JS, ROOT_JS, ROOT_JS, RAW_I32, RAW_I32], &[]);
+pub(super) fn emit_private_brand(helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![]);
     let (o, v, brand, name, mode) = (0, 1, 2, 3, 4);
     emit_private_has(&mut f, o, brand, helpers);
     wasm!(f; I32Eqz, If(BlockType::Empty), LocalGet(o), LocalGet(name));
@@ -3074,19 +2918,15 @@ pub(super) fn emit_private_brand(helpers: Helpers<'_>, leaves: &LeafSet) -> Func
         LocalGet(v),
         End,
     );
-    finish_builder(f)
+    f
 }
 
 /// `__private_in(o: i64, brand: i64, name: i32) -> i64`: `#x in o` — a
 /// non-object `o` throws `Cannot use 'in' operator to search for '#x' in
 /// <String(o)>` (the `key` built as `"#x' in " + String(o)`); else whether `o`
 /// holds `brand` ([`emit_private_has`]), as a boolean jsval.
-pub(super) fn emit_private_in(
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_JS, ROOT_JS, RAW_I32], &[]);
+pub(super) fn emit_private_in(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+    let mut f = Function::new(vec![]);
     let (o, brand, name) = (0, 1, 2);
     emit_is_object(&mut f, o);
     wasm!(f;
@@ -3094,14 +2934,9 @@ pub(super) fn emit_private_in(
         If(BlockType::Empty),
         LocalGet(o),
         LocalGet(name), I32Const(static_key(strings, PRIVATE_IN_MID)), Call(helpers.concat),
-    );
-    let mark = f.temp_mark();
-    f.root_temp(TempClass::Base);
-    wasm!(f;
         LocalGet(o), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), I32WrapI64,
         Call(helpers.concat),
     );
-    f.release_temps(mark);
     emit_box_heap(&mut f);
     wasm!(f;
         I32Const(PROP_THROW_PRIVATE_IN), Call(helpers.prop_throw),
@@ -3111,5 +2946,5 @@ pub(super) fn emit_private_in(
     );
     emit_private_has(&mut f, o, brand, helpers);
     wasm!(f; Select, End);
-    finish_builder(f)
+    f
 }
