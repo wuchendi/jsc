@@ -237,7 +237,7 @@ const REFS_CAP_GLOBAL: u32 = 21;
 const REFS_LEN_GLOBAL: u32 = 22;
 
 /// The wasm global index of the shadow-stack pointer (`$__sp`, i32, init
-/// [`abi::SHADOW_STACK_SIZE`]); see [`builder`].
+/// `SS_SIZE - 8`); see [`builder`].
 const SP_GLOBAL: u32 = 23;
 
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell

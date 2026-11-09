@@ -614,7 +614,8 @@ rooted while the base is live. No write barriers.
 ### 5.1 Memory layout
 
 ```text
-[0, SS_SIZE)               shadow stack, grows down from SS_SIZE         (§5.3)
+[0, 8)                     always zero: never holds stack data           (§5.3)
+[8, SS_SIZE)               shadow stack body, grows down from SS_SIZE    (§5.3)
 [SS_SIZE, static_end)      null guard word, FN_INFO pointer, static region (DESIGN §4.2 order),
                            WASI_SCRATCH, NUM_SCRATCH, DEC_SCRATCH, Unicode/number tables,
                            page table, free-list heads, static root list
@@ -625,9 +626,8 @@ rooted while the base is live. No write barriers.
 `SS_SIZE = 1 MiB` (16 pages, `abi::SHADOW_STACK_SIZE`); `HEAP_BASE =
 SS_SIZE + 96` (the WASI scratch and the OOM line of R1 sit below it); `FN_INFO_ADDR = SS_SIZE + 4` (today `abi.rs:310`, inside the
 `0..8` null guard). Initial memory pages grow by 16; maximum stays 8192.
-A stray read of address `0..8` now reads stack data instead of the zero
-guard; every raw ref is tested against `0` before use (M1 reviews the
-`props == 0` / `elems == 0` guards).
+Addresses `0..8` stay zero (the frame pointer is biased, §5.3), so a raw ref
+of `0` reads zero however full the stack is.
 
 ### 5.2 Header and mark epoch
 
@@ -642,18 +642,24 @@ block, which is harmless. Fresh blocks (`gc = 0`) are never marked.
 
 ### 5.3 Shadow stack, safepoints, spills
 
-**SP and frames.** Global `$__sp` (initial `SS_SIZE`); live range
-`[$__sp, SS_SIZE)` scanned as a flat jsval array; frames have no header or
-descriptor. A function with `N > 0` root slots:
+**SP and frames.** Global `$__sp` (initial `SS_SIZE - 8`); `$fp` is biased by
+8, so slot `k` is at `$fp + 8 + 8k` and the first frame's top slot ends at
+`SS_SIZE`. The stack body is `[8, SS_SIZE)`; M2 scans `[$__sp + 8, SS_SIZE)`
+as a flat jsval array; frames have no header or descriptor. A function with
+`N > 0` root slots:
 
 ```wasm
 ;; prologue (emitted last, once N is known)
 global.get $__sp  local.tee $old  i32.const 8N  i32.sub  local.tee $fp  global.set $__sp
-;; clear: N <= 4 -> N x (local.get $fp  i64.const 0  i64.store offset=8k)
-;;        N >  4 -> local.get $fp  i32.const 0  i32.const 8N  memory.fill
+;; clear: N <= 4 -> N x (local.get $fp  i64.const 0  i64.store offset=8+8k)
+;;        N >  4 -> local.get $fp  i32.const 0  i32.const 8N+8  memory.fill
 ;; epilogue before every exit
 local.get $old  global.set $__sp
 ```
+
+The fill starts at `$fp`, not `$fp + 8`, and also covers the 8 free bytes
+below slot 0: at `$fp = -8` the `i32.add` would wrap to `0` and write the
+protected bytes, while a fill from `$fp` is out of bounds and traps.
 
 Every slot always holds a valid jsval (`0` = number `+0` after clearing, a
 written-through jsval, or `HEAP | base` for a rooted raw base). Clearing is
@@ -661,6 +667,8 @@ mandatory (a stale slot could name a block freed later).
 
 **Overflow (Q10 default):** no explicit check; `fp = $__sp - 8N` wraps below
 `0` to an address above the 512 MiB maximum and the first slot store traps
+(`fp = 0` puts slot 0 at address 8; at `fp = -8` the static-offset effective
+address is `2^32`, which does not wrap)
 (same failure class as today's native stack overflow). A catchable
 `RangeError` costs ≈ 4 ops per frame push plus a static error object.
 
@@ -723,7 +731,7 @@ on the slow path, e.g. `__array_push` growth); the builder enforces that a
 
 | root | treatment |
 |---|---|
-| shadow stack `[$__sp, SS_SIZE)` | jsvals |
+| shadow stack `[$__sp + 8, SS_SIZE)` | jsvals |
 | `$exc_value` (`emit/sections.rs:496`), `$cf_value` (`:503`; loop-target codes are denormal numbers), `$__this`, `$__new_target`, `$__spread_args` (`:507-513,529-547`) | jsvals |
 | module cells incl. tagged-template sites (`emit/sections.rs:551-557`, `emit/function.rs:60-77`, `codegen/expr.rs:1085-1095`) | jsvals (`TYPE_CELL`; template objects live forever, as `GetTemplateObject` requires) |
 | `$__json_data/_pos/_len` (`emit/sections.rs:515-520`) | not roots (interior address valid during `__json_parse`, whose `s` is rooted, `emit/json_parse.rs:785-803`) |
