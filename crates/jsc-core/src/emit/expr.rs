@@ -1380,27 +1380,14 @@ pub(super) fn emit_proto_guard(
         Some(Builtin::StringMethod(op)) => builtins::inline_host_op(op, args),
         _ => None,
     };
-    if let Some((flag, may_fail)) = inline_string {
-        // A host op that may refuse its input (DESIGN.md §13) runs inside a
-        // block: its result leaves the block unless it is the
-        // `METHOD_RANGE_ERROR` sentinel, which falls through to the builtin
-        // call below (the builtin throws).
-        if may_fail {
-            function.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
-            enter_frame(helpers);
-        }
+    if let Some(flag) = inline_string {
         // A primitive keeps its kind: the early read decides.
         if callee.is_some() {
             found(function, STRING_SLOT);
         } else {
             string_guard(function);
         }
-        let block = if may_fail {
-            BlockType::Empty
-        } else {
-            BlockType::Result(ValType::I64)
-        };
-        function.instruction(&Instruction::If(block));
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
         enter_frame(helpers);
         function.instruction(&Instruction::LocalGet(local));
         function.instruction(&Instruction::I32Const(flag));
@@ -1413,19 +1400,7 @@ pub(super) fn emit_proto_guard(
             }
         }
         function.instruction(&Instruction::Call(helpers.method));
-        if may_fail {
-            let result = scratch + 1;
-            function.instruction(&Instruction::LocalTee(result));
-            function.instruction(&Instruction::LocalGet(result));
-            builtins::emit_is_method_refusal(function);
-            function.instruction(&Instruction::I32Eqz);
-            function.instruction(&Instruction::BrIf(1));
-            function.instruction(&Instruction::Drop);
-            leave_frame(helpers);
-            function.instruction(&Instruction::End);
-        } else {
-            function.instruction(&Instruction::Else);
-        }
+        function.instruction(&Instruction::Else);
         opened += 1;
     }
     for (slot, (kind, path)) in fast.iter().enumerate() {

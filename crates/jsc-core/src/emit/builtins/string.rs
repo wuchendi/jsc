@@ -2,8 +2,8 @@
 //! takes `ToString(RequireObjectCoercible(this))` and coerces its arguments in
 //! the guest (a user `toString` / `valueOf` may run, and throw), then works on
 //! the code units at each string's width (one-byte Latin-1 or two-byte
-//! UTF-16, DESIGN.md §5.2), producing canonical strings; only the
-//! case mappings, `localeCompare` and `normalize` run a host `__method` op.
+//! UTF-16, DESIGN.md §5.2), producing canonical strings; only
+//! `localeCompare` runs a host `__method` op.
 //! `toString` / `valueOf` are `thisStringValue`.
 
 #[allow(clippy::wildcard_imports)]
@@ -75,9 +75,8 @@ fn coercion_order(op: StringOp) -> [u32; 2] {
 /// The host op flag of `op` when the call-site arguments `args` are already
 /// of the types its coercions produce (string / number literals; a missing
 /// argument is `undefined`), so that on a string receiver the builtin is
-/// exactly its host op, inline; with whether that op may refuse its input
-/// (`normalize`; then the call site falls back to the builtin, which throws).
-pub(in crate::emit) fn inline_host_op(op: StringOp, args: &[IrNode]) -> Option<(i32, bool)> {
+/// exactly its host op, inline.
+pub(in crate::emit) fn inline_host_op(op: StringOp, args: &[IrNode]) -> Option<i32> {
     let ready = |coerce: Coerce, arg: Option<&IrNode>| {
         matches!(
             (coerce, arg),
@@ -91,22 +90,7 @@ pub(in crate::emit) fn inline_host_op(op: StringOp, args: &[IrNode]) -> Option<(
     if !(ready(first, args.first()) && ready(second, args.get(1))) {
         return None;
     }
-    // Only `normalize` with a form that is not a literal valid one may refuse.
-    let may_fail = op == StringOp::Normalize
-        && match args.first() {
-            None => false,
-            Some(IrNode::Str(form)) => !["NFC", "NFD", "NFKC", "NFKD"]
-                .iter()
-                .any(|valid| form == valid),
-            Some(_) => true,
-        };
-    op.flag().map(|flag| (flag, may_fail))
-}
-
-/// Push i32 `1` when the `__method` result on the stack is the refusal
-/// sentinel `METHOD_RANGE_ERROR`.
-pub(in crate::emit) fn emit_is_method_refusal(function: &mut Function) {
-    wasm!(function; I64Const(abi::METHOD_RANGE_ERROR.cast_signed()), I64Eq);
+    op.flag()
 }
 
 /// The `TypeError` text of `String.prototype.<name>` on a `null`/`undefined`
@@ -482,6 +466,10 @@ pub(super) fn emit_method(
         emit_case_map(upper, function, frame, strings, helpers);
         return;
     }
+    if op == StringOp::Normalize {
+        emit_normalize(function, frame, strings, helpers);
+        return;
+    }
     let Some(flag) = op.flag() else {
         emit_units(op, function, frame, strings, helpers);
         if op == StringOp::Match {
@@ -490,7 +478,7 @@ pub(super) fn emit_method(
         }
         return;
     };
-    emit_host_op(op, flag, function, frame, strings, helpers);
+    emit_host_op(flag, function, frame, helpers);
 }
 
 /// The receiver of [`emit_method`] into i64 temp 0: `this`, a
@@ -611,30 +599,46 @@ fn emit_case_map(
     wasm!(function; End);
 }
 
-/// The host op `flag` of `op` over the receiver string in i64 temp 0 and the
-/// coerced arguments in i64 temps 1 and 2; `normalize`'s refusal sentinel
-/// throws.
-fn emit_host_op(
-    op: StringOp,
-    flag: i32,
+/// `normalize` over the string in i64 temp 0 with the form (a string or
+/// `undefined`) in i64 temp 1: an unknown form throws, as does a result past
+/// [`MAX_STRING_LENGTH`].
+fn emit_normalize(
     function: &mut Function,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (s, a0, a1, r) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let (s, a0) = (frame.i64(0), frame.i64(1));
+    let locals = i32_locals(frame);
+    let [form, dst] = [locals[0], locals[1]];
     wasm!(function;
-        LocalGet(s), I32Const(flag), LocalGet(a0), LocalGet(a1), Call(helpers.method), LocalSet(r),
+        LocalGet(a0), I64Const(UNDEFINED_BITS), I64Eq,
+        If(BlockType::Result(ValType::I32)),
+        I32Const(crate::emit::unicode::FORM_COMPOSE),
+        Else,
+        LocalGet(a0), I32WrapI64, Call(helpers.normalize_form()),
+        End,
+        LocalTee(form), I32Const(0), I32LtS,
+        If(BlockType::Empty),
     );
-    if op == StringOp::Normalize {
-        wasm!(function;
-            LocalGet(r), I64Const(abi::METHOD_RANGE_ERROR.cast_signed()), I64Eq,
-            If(BlockType::Empty),
-        );
-        throw_range_error(function, frame, NORMALIZE_FORM, None, strings, helpers);
-        wasm!(function; End);
-    }
-    wasm!(function; LocalGet(r));
+    throw_range_error(function, frame, NORMALIZE_FORM, None, strings, helpers);
+    wasm!(function;
+        End,
+        LocalGet(s), I32WrapI64, LocalGet(form), Call(helpers.normalize()), LocalTee(dst), I32Eqz,
+        If(BlockType::Empty),
+    );
+    throw_range_error(function, frame, STRING_LENGTH, None, strings, helpers);
+    wasm!(function; End, LocalGet(dst));
+    box_heap(function);
+}
+
+/// The host op `flag` over the receiver string in i64 temp 0 and the coerced
+/// arguments in i64 temps 1 and 2.
+fn emit_host_op(flag: i32, function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+    let (s, a0, a1) = (frame.i64(0), frame.i64(1), frame.i64(2));
+    wasm!(function;
+        LocalGet(s), I32Const(flag), LocalGet(a0), LocalGet(a1), Call(helpers.method),
+    );
 }
 
 /// The well-known symbol `op` dispatches to on an object first argument.

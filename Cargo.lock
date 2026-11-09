@@ -1736,6 +1736,9 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 [[package]]
 name = "unicode-tables"
 version = "0.1.0"
+dependencies = [
+ "icu_normalizer",
+]
 
 [[package]]
 name = "unicode-width"

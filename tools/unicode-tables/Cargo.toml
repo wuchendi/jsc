@@ -9,3 +9,7 @@ publish.workspace      = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# Exact: the generated header records this version (src/norm.rs).
+icu_normalizer = "=2.4.0"
