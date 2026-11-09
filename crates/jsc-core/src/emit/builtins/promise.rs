@@ -86,9 +86,9 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 pub(in crate::emit) fn emit_promise_self_error(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
+    leaves: &LeafSet,
 ) -> Function {
-    let leaves = roots::leaf_set(helpers);
-    let mut function = FnBuilder::new(&leaves);
+    let mut function = FnBuilder::new(leaves);
     declare_error_scratch(&mut function);
     emit_node(
         &callee_type_error(SELF_RESOLUTION),

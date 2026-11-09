@@ -379,11 +379,14 @@ pub(super) fn emit_parse(
 /// arrays and objects being serialized: meeting one again throws a
 /// `TypeError`. A throw returns with it pending.
 #[allow(clippy::too_many_lines)]
-pub(in crate::emit) fn emit_json_rep(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+pub(in crate::emit) fn emit_json_rep(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
     use LocalClass::{Base, Jsval, Raw};
     let int = Raw(ValType::I32);
-    let leaves = roots::leaf_set(helpers);
-    let mut f = FnBuilder::new(&leaves);
+    let mut f = FnBuilder::new(leaves);
     let [holder, key, value, rep, list] = [(); 5].map(|()| f.param(Jsval));
     let stack = f.param(Base);
     let ptr = f.local(Base);
@@ -569,9 +572,8 @@ fn indent_widths(f: &mut FnBuilder<'_>, [s, gap, len, glen, ws, wg, w]: [u32; 7]
 /// string contents are copied unchanged. Two passes: the length, then the
 /// code units. Each input is read at its width; the result is two-byte when
 /// either is, then narrowed when its units fit a byte.
-pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>) -> Function {
-    let leaves = roots::leaf_set(helpers);
-    let mut f = indent_builder(&leaves);
+pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = indent_builder(leaves);
     let (s, gap) = (0, 1);
     let (len, glen, i, o, depth, b, quoted, dst, g) = (2, 3, 4, 5, 6, 7, 8, 9, 10);
     let (ws, wg, w, k) = (11, 12, 13, 14);
@@ -678,11 +680,10 @@ pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>) -> Function {
 /// non-configurable property rejects both silently), then passed to the
 /// reviver as `(key, value)` with `this = holder`. A throw returns with it
 /// pending.
-pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>) -> Function {
+pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     use LocalClass::{Base, Jsval, Raw};
     let int = Raw(ValType::I32);
-    let leaves = roots::leaf_set(helpers);
-    let mut f = FnBuilder::new(&leaves);
+    let mut f = FnBuilder::new(leaves);
     let holder = f.param(Jsval);
     let key = f.param(Base);
     let reviver = f.param(Jsval);

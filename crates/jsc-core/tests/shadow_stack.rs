@@ -204,6 +204,48 @@ fn sum_precise_uses_raw_accumulator() {
     assert_number("Math.sumPrecise([1, 2, 3])", 6.0);
 }
 
+/// `TYPE_ENV`, the environment-block type byte (`abi.rs`).
+const TYPE_ENV: i32 = 4;
+
+/// The `Array.fromAsync` state block: 10 slots behind the 8-byte header.
+const FA_SIZE: i32 = 88;
+const FA_SLOTS: i32 = 10;
+
+/// `Array.fromAsync` keeps its state in a `TYPE_ENV` block and passes the
+/// block as a heap jsval, so env tracing sees both.
+#[test]
+fn from_async_state_block_is_headered_env() {
+    let heap = 0x7FFD_0000_0000_0000_u64.cast_signed();
+    let bodies = bodies("Array.fromAsync([1])");
+    let entry = bodies
+        .iter()
+        .find_map(|ops| {
+            let at = ops.windows(2).position(|w| {
+                matches!(w[0], Operator::I32Const { value } if value == FA_SIZE)
+                    && matches!(w[1], Operator::Call { .. })
+            })?;
+            let header = &ops[at..(at + 24).min(ops.len())];
+            let typed = header.windows(2).any(|w| {
+                matches!(w[0], Operator::I32Const { value } if value == TYPE_ENV)
+                    && matches!(w[1], Operator::I32Store8 { memarg } if memarg.offset == 0)
+            });
+            let counted = header.windows(2).any(|w| {
+                matches!(w[0], Operator::I32Const { value } if value == FA_SLOTS)
+                    && matches!(w[1], Operator::I32Store { memarg } if memarg.offset == 4)
+            });
+            (typed && counted).then_some(ops)
+        })
+        .expect("no TYPE_ENV fromAsync state block is written");
+    // Into a local: a base local's own write-through ends in an `i64.store`.
+    let tagged = entry.windows(4).any(|w| {
+        matches!(w[0], Operator::I64ExtendI32U)
+            && matches!(w[1], Operator::I64Const { value } if value == heap)
+            && matches!(w[2], Operator::I64Or)
+            && matches!(w[3], Operator::LocalSet { .. } | Operator::LocalTee { .. })
+    });
+    assert!(tagged, "the state block must be passed as HEAP | base");
+}
+
 #[test]
 fn deep_recursion_traps() {
     assert!(fails("function r(n) { return r(n + 1) + 1; } r(0)"));
