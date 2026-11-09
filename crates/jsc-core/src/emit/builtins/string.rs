@@ -1089,6 +1089,11 @@ fn emit_to_uint(function: &mut Function, v: u32, modulus: f64, x: u32) {
 
 /// Push i32 `1` when the code unit in i32 local `c` is in `ranges`
 /// (inclusive).
+/// Push `1` when the code unit in i32 local `c` is a `StrWhiteSpaceChar`.
+pub(in crate::emit) fn emit_is_whitespace(function: &mut Function, c: u32) {
+    emit_unit_in(function, c, WHITESPACE);
+}
+
 fn emit_unit_in(function: &mut Function, c: u32, ranges: impl IntoIterator<Item = (i32, i32)>) {
     wasm!(function; I32Const(0));
     for (lo, hi) in ranges {

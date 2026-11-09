@@ -717,12 +717,32 @@ pub(crate) const OOM_LINE_ADDR: u32 = OOM_IOVEC + 8;
 /// The line `__alloc` writes to fd 2 before `proc_exit(1)`.
 pub(crate) const OOM_LINE: &str = "Uncaught RangeError: out of memory\n";
 
+/// Address of the static decimal-conversion scratch, 784 bytes: the
+/// `num_digits`, `decimal_point` and `truncated` words, the end index of the
+/// last parsed literal, then the 768-digit buffer.
+pub(crate) const DEC_SCRATCH: u32 = OOM_LINE_ADDR + 40;
+
+/// Address of the 23 exact `f64` powers of ten (`10^0..=10^22`).
+pub(crate) const DEC_POW10: u32 = DEC_SCRATCH + 784;
+
+/// Address of the 65-entry `u16` decimal left-shift table.
+pub(crate) const DEC_SHIFT_TABLE: u32 = DEC_POW10 + 184;
+
+/// Address of the packed decimal digits of `5^1..=5^63`.
+pub(crate) const DEC_POW5: u32 = DEC_SHIFT_TABLE + 130;
+
+/// Byte length of the digits at [`DEC_POW5`].
+pub(crate) const DEC_POW5_LEN: u32 = 1440;
+
+/// Address of the 19-entry table of decimal-conversion shift steps.
+pub(crate) const DEC_POWERS: u32 = DEC_POW5 + DEC_POW5_LEN;
+
 /// The first address after the fixed static area, where the string blocks begin.
 pub(crate) const STATIC_AREA_END: u32 = RYU_TABLES_ADDR + RYU_TABLES_SIZE;
 
 /// Address of the static `Number` formatting scratch, right after the
-/// [`OOM_LINE`] bytes.
-pub(crate) const NUM_SCRATCH_ADDR: u32 = OOM_LINE_ADDR + 40;
+/// decimal-conversion tables, 16-aligned.
+pub(crate) const NUM_SCRATCH_ADDR: u32 = (DEC_POWERS + 19 + 15) & !15;
 
 /// Size of [`NUM_SCRATCH_ADDR`].
 pub(crate) const NUM_SCRATCH_SIZE: u32 = 2048;
@@ -731,7 +751,7 @@ pub(crate) const NUM_SCRATCH_SIZE: u32 = 2048;
 pub(crate) const RYU_TABLES_ADDR: u32 = NUM_SCRATCH_ADDR + NUM_SCRATCH_SIZE;
 
 /// Size of the Ryu tables (828 bytes), rounded up to keep the string blocks
-/// 8-aligned.
+/// aligned.
 pub(crate) const RYU_TABLES_SIZE: u32 = 832;
 
 /// The field name of the host `__convert` import backing the

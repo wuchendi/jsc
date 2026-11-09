@@ -2182,8 +2182,7 @@ fn emit_index_string_key(
     function.instruction(&Instruction::Else);
     // tmp = ToNumber(key); if String(tmp) === key then key = tmp.
     function.instruction(&Instruction::LocalGet(s1));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
-    function.instruction(&Instruction::Call(helpers.convert));
+    function.instruction(&Instruction::Call(helpers.to_number_prim()));
     function.instruction(&Instruction::LocalTee(tmp));
     function.instruction(&Instruction::Call(helpers.num_to_str()));
     function.instruction(&Instruction::LocalGet(s1));

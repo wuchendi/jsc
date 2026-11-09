@@ -45,16 +45,12 @@ use crate::ir::{
 const MEMORY_EXPORT_NAME: &str = abi::MEMORY_EXPORT_NAME;
 
 /// The module and field name of the host `__convert` import backing the
-/// `String`/`Number`/`parseFloat` conversions. It receives the
+/// `String` conversion. It receives the
 /// argument jsval plus a `CONVERT_OP_*` flag and returns the converted jsval,
 /// reusing the run stage's `to_js_string`/parse helpers (and allocating a heap
 /// string in guest memory for `String`).
 const CONVERT_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const CONVERT_IMPORT_NAME: &str = abi::CONVERT_IMPORT_NAME;
-
-/// `__convert` op flags; see [`abi`].
-const CONVERT_OP_TO_NUMBER: i32 = abi::CONVERT_OP_TO_NUMBER;
-const CONVERT_OP_PARSE_FLOAT: i32 = abi::CONVERT_OP_PARSE_FLOAT;
 
 /// The module and field name of the host `__method` import backing the
 /// non-callback array/string methods. It receives the receiver jsval, a
@@ -880,8 +876,6 @@ struct Helpers<'a> {
     /// place (push/pop a handler, bump/restore the depth) without re-plumbing a
     /// `&mut` through every helper.
     unwind: &'a RefCell<Unwind>,
-    /// The host `__convert` import's function index. Always `4`; `String`/`Number`/`parseFloat` lower to `call`s of it.
-    convert: u32,
     /// The first of the [`dtoa::HELPER_COUNT`] consecutive `Number` to string
     /// helpers (see [`dtoa::emit_helpers`]).
     dtoa: u32,
@@ -895,9 +889,9 @@ struct Helpers<'a> {
     /// The host `__now` import's function index (backing `Date`). Always `8`; `Date.now()` / `new Date()` lower to `call`s of it. The
     /// import returns an f64 (ms since the Unix epoch).
     now: u32,
-    /// The host `__parse_int(s: i64, radix: i64) -> i64` import's function
-    /// index. Always `9`; `parseInt` lowers to `call`s of it.
-    parse_int: u32,
+    /// `__num_unit`, the first of the [`strtod`] number parsers; the others
+    /// follow it (see the accessors).
+    strtod: u32,
     /// `__gen_to_array(gen: i64) -> i64`: drive a generator to
     /// exhaustion via `call_indirect`, collecting its yielded values into a fresh
     /// array — the drain backing `[...gen]` / `f(...gen)` spread. Emitted just
@@ -1087,6 +1081,76 @@ struct Helpers<'a> {
 }
 
 impl Helpers<'_> {
+    /// `__num_unit(data: i32, i: i32) -> i32`: a code unit behind a tagged pointer.
+    fn num_unit(self) -> u32 {
+        self.strtod
+    }
+
+    /// `__str_ws(c: i32) -> i32`: whether a unit is a `StrWhiteSpaceChar`.
+    fn str_ws(self) -> u32 {
+        self.strtod + 1
+    }
+
+    /// `__dec_parse(data: i32, start: i32, end: i32) -> f64`: the longest `StrDecimalLiteral` prefix, correctly rounded.
+    fn dec_parse(self) -> u32 {
+        self.strtod + 2
+    }
+
+    /// `__dec_slow() -> i64`: Simple Decimal Conversion of the digit buffer.
+    fn dec_slow(self) -> u32 {
+        self.strtod + 3
+    }
+
+    /// `__dec_round() -> i64`: the digit buffer's integer part, rounded.
+    fn dec_round(self) -> u32 {
+        self.strtod + 4
+    }
+
+    /// `__dec_left(shift: i32)`: multiply the digit buffer by `2^shift`.
+    fn dec_left(self) -> u32 {
+        self.strtod + 5
+    }
+
+    /// `__dec_right(shift: i32)`: divide the digit buffer by `2^shift`.
+    fn dec_right(self) -> u32 {
+        self.strtod + 6
+    }
+
+    /// `__digit_span(data, start, end, radix) -> i32`: the end of a digit run.
+    fn digit_span(self) -> u32 {
+        self.strtod + 7
+    }
+
+    /// `__radix_pow2(data, start, end, bits) -> f64`: exact power-of-two radix.
+    fn radix_pow2(self) -> u32 {
+        self.strtod + 8
+    }
+
+    /// `__radix_fold(data, start, end, radix) -> f64`: `f64` digit accumulation.
+    fn radix_fold(self) -> u32 {
+        self.strtod + 9
+    }
+
+    /// `__string_to_number(s: i32) -> f64`: `StringToNumber`.
+    fn string_to_number(self) -> u32 {
+        self.strtod + 10
+    }
+
+    /// `__to_number_prim(v: i64) -> i64`: `ToNumber` of a non-symbol primitive.
+    fn to_number_prim(self) -> u32 {
+        self.strtod + 11
+    }
+
+    /// `__parse_float(v: i64) -> i64`: `parseFloat` of a string jsval.
+    fn parse_float(self) -> u32 {
+        self.strtod + 12
+    }
+
+    /// `__parse_int(v: i64, radix: i32) -> i64`: `parseInt` of a string jsval.
+    fn parse_int(self) -> u32 {
+        self.strtod + 13
+    }
+
     /// Base address of the realm image (see [`realm`]): right after the
     /// static declaration blocks.
     fn realm(self) -> i32 {
@@ -1443,6 +1507,7 @@ mod render;
 mod runtime;
 mod sections;
 mod stmt;
+mod strtod;
 #[cfg(test)]
 mod tests;
 mod value;
@@ -1714,7 +1779,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     code.function(&emit_json_ws());
     code.function(&emit_json_throw(&offsets, helpers));
     code.function(&emit_json_string(helpers.alloc, helpers));
-    code.function(&emit_json_number(helpers.alloc, helpers.convert, helpers));
+    code.function(&emit_json_number(helpers));
     code.function(&emit_json_value(helpers));
     code.function(&emit_json_array(helpers));
     code.function(&emit_json_object(helpers.alloc, helpers));
@@ -1732,6 +1797,20 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     for helper in dtoa::emit_helpers(&offsets, helpers) {
         code.function(&helper);
     }
+    code.function(&strtod::emit_num_unit());
+    code.function(&strtod::emit_str_ws());
+    code.function(&strtod::emit_dec_parse(helpers));
+    code.function(&strtod::emit_dec_slow(helpers));
+    code.function(&strtod::emit_dec_round());
+    code.function(&strtod::emit_dec_left());
+    code.function(&strtod::emit_dec_right());
+    code.function(&strtod::emit_digit_span(helpers));
+    code.function(&strtod::emit_radix_pow2(helpers));
+    code.function(&strtod::emit_radix_fold(helpers));
+    code.function(&strtod::emit_string_to_number(helpers));
+    code.function(&strtod::emit_to_number_prim(helpers));
+    code.function(&strtod::emit_parse_float(helpers));
+    code.function(&strtod::emit_parse_int(helpers));
     code.function(&emit_invoke1(helpers));
     code.function(&generator::emit_async_step(helpers));
     code.function(&emit_settler(PROMISE_OP_SETTLE_FULFILL, helpers));

@@ -973,8 +973,8 @@ pub(super) fn emit_pow(
 /// `Boolean(x)` is emitted inline: JS truthiness (via [`emit_cond`]) selects
 /// between the boxed `true`/`false` jsvals, no host call. `Number(x)` is the
 /// shared `ToNumber`, `String(x)` the guest `__to_string`; `parseInt` /
-/// `parseFloat` convert their argument with `__to_string` and parse it on the
-/// host (`__parse_int` / the `__convert` parse-float op).
+/// `parseFloat` convert their argument with `__to_string` and parse it with
+/// the guest `__parse_int` / `__parse_float`.
 pub(super) fn emit_convert_call(
     op: ConvertOp,
     arg: &IrNode,
@@ -1003,8 +1003,8 @@ pub(super) fn emit_convert_call(
         return;
     }
     if matches!(op, ConvertOp::ParseInt) {
-        // `__parse_int(ToString(s), radix)`: an omitted radix is passed as
-        // `undefined`. Both operands are evaluated before the conversion.
+        // `__parse_int(ToString(s), ToInt32(radix))`: an omitted radix is
+        // `undefined`. Both operands are evaluated before the conversions.
         emit_node(arg, function, scratch, strings, helpers);
         match radix {
             Some(radix) => emit_node(radix, function, scratch, strings, helpers),
@@ -1015,12 +1015,15 @@ pub(super) fn emit_convert_call(
         function.instruction(&Instruction::LocalSet(scratch + 1));
         function.instruction(&Instruction::LocalSet(scratch));
         emit_to_string_jsval(function, scratch, helpers);
-        function.instruction(&Instruction::LocalGet(scratch + 1));
-        function.instruction(&Instruction::Call(helpers.parse_int));
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_coerce_number(function, scratch + 1, helpers);
+        function.instruction(&Instruction::LocalGet(scratch));
+        emit_to_int32(function, scratch + 1);
+        function.instruction(&Instruction::Call(helpers.parse_int()));
         return;
     }
     // `String(x)` is `ToString` in the guest; `parseFloat` parses the
-    // argument's `ToString` on the host.
+    // argument's `ToString` with the guest `__parse_float`.
     emit_node(arg, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(scratch));
     if matches!(op, ConvertOp::String) {
@@ -1028,8 +1031,7 @@ pub(super) fn emit_convert_call(
     }
     emit_to_string_jsval(function, scratch, helpers);
     if matches!(op, ConvertOp::ParseFloat) {
-        function.instruction(&Instruction::I32Const(CONVERT_OP_PARSE_FLOAT));
-        function.instruction(&Instruction::Call(helpers.convert));
+        function.instruction(&Instruction::Call(helpers.parse_float()));
     }
 }
 
