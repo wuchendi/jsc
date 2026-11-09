@@ -13,7 +13,7 @@ default = ["native-run"]
 # module. Off by the caller (e.g. wasm32 targets) leaves a frontend+codegen+emit
 # core that produces module bytes without a runtime.
 # The native host also normalizes strings (`String.prototype.normalize`).
-native-run = ["dep:icu_normalizer", "dep:wasmtime", "dep:wasmtime-wasi"]
+native-run = ["dep:icu_normalizer", "dep:wasmtime"]
 
 [dependencies]
 anyhow                         = "1.0.104"
@@ -26,7 +26,6 @@ swc_ecma_transforms_typescript = "56"
 swc_ecma_visit                 = "29"
 wasm-encoder                   = "0.262.0"
 wasmtime                       = { version = "50.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"], optional = true }
-wasmtime-wasi                  = { version = "50.0.1", default-features = false, features = ["p1"], optional = true }
 
 [dev-dependencies]
 wasmparser = "0.262.0"
