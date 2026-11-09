@@ -54,7 +54,7 @@ pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
 pub(super) use namespace::fragment;
 use number::NumberFormat;
 pub(super) use promise::emit_promise_self_error;
-pub(super) use string::{emit_is_method_refusal, inline_host_op};
+pub(super) use string::{MAX_STRING_LENGTH, emit_is_method_refusal, inline_host_op};
 
 /// Argument `i` (an i32 local) into i64 `out`: element `i` of the spread
 /// argument array captured (as the `__spread_args` jsval) in i64 `spread`

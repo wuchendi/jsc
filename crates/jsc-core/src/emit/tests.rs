@@ -437,7 +437,11 @@ fn no_literals_starts_heap_after_the_intern_table() {
     let info = abi::FN_INFO_ENTRY_SIZE.cast_signed() * (2 + builtin_count());
     let intern_base = strings_end + info + realm::image_size();
     let cap = intern_table(&offsets, intern_base).cap;
-    assert_eq!(data_layout(&bytes).1, Some(intern_base + 4 * cap));
+    let end = intern_base + 4 * cap + crate::emit::unicode::data_size();
+    assert_eq!(
+        data_layout(&bytes).1,
+        Some((end + crate::emit::BLOCK_ALIGN - 1) & -crate::emit::BLOCK_ALIGN)
+    );
 }
 
 #[test]
