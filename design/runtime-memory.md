@@ -652,7 +652,8 @@ as a flat jsval array; frames have no header or descriptor. A function with
 ```wasm
 ;; prologue (emitted last, once N is known)
 global.get $__sp  local.tee $old  i32.const 8N  i32.sub  local.tee $fp  global.set $__sp
-;; clear: N <= 4 -> N x (local.get $fp  i64.const 0  i64.store offset=8+8k)
+;; clear: N <= 4 -> local.get $fp  i64.const 0  i64.store offset=8+8k, for each
+;;                  slot k a parameter store does not fill
 ;;        N >  4 -> local.get $fp  i32.const 0  i32.const 8N+8  memory.fill
 ;; epilogue before every exit
 local.get $old  global.set $__sp
@@ -706,6 +707,7 @@ on lookup through `__fn_materialize`, which allocates), and so neither is
 | parameters `a0..a_{K-1}`, `env` | locals `0..K+1` (DESIGN §4.2) | stored in the prologue iff read after a safepoint; `argc` never |
 | `this` snapshot | DESIGN §4.3 | write-through |
 | emitter `i64` scratch | `scratch+0..+2, +4..+6, +13..+20, +22, +23` (`emit/function.rs:15-44`) | write-through; **`Date` scratch `+24..+29` declared raw, never rooted**; `emit/builtins/iter.rs` and `async_iter.rs` also hold jsvals in `+24..+26`, raw for the same reason: no safepoint between def and last use, except the Map `step_entry` key/value across the one entry-array allocation, which stay reachable from the Map backing |
+| numeric operator scratch | raw `i64` `+31`, `+32` (`NUM_A`, `NUM_B`), plus `+24..+28` in `pow`; raw `i32` `+30` (`KIND_TMP`) for a receiver kind test | never rooted. Operands are passed by value and numbers once coerced; the one live heap value, `s1` across `ToNumber(s0)`, takes a temp slot in the cold arm of that coerce (`emit_coerce_operands`), and `Math.min`/`max` root their stashed arguments on the operand stack until folded |
 | emitter `i32` bases / keys | `+3`, `+7`, `+8`, `+11`, `+12`, `+21` (`emit/object.rs:31`, `emit/generator.rs:43`) | write-through of `HEAP | base` (+6); `+9`, `+10` are integers (`+9` also holds the array-pop `new_len`, moved off `+7`); the remaining integer uses of `+3`, `+8` and `+21` are to be re-audited before M2 enables collection |
 | builtin `Frame` locals | `emit/builtins/mod.rs:127-151` | `i64` write-through; `i32` only via `frame.base(k)`; `f64` never |
 | hand-written helper locals | each `Function::new` | declared jsval / base / raw; **no default** (Q11: the builder rejects an undeclared local) |
@@ -900,9 +902,35 @@ Per executed event (fuel units, estimated from the sequences above):
 | a collection | ≈ 8 per live jsval slot + ≈ 6 per swept slot |
 
 No corpus row reaches `GC_MIN_BUDGET` (largest `push_1e5` peaks near
-2 MiB), so the rows carry no collection cost. M1+M2 estimates (unmeasured;
-fuel at `c34cd36`, `crates/jsc-core/tests/opcount/snapshot.tsv`), excluding
-the R-stage cost of guest formatting (§7):
+2 MiB), so the rows carry no collection cost.
+
+**Measured M1 cost** (fuel before → after, CI run 42622140613 on `69f818b`).
+These figures predate the F1-F5 reductions; L1 re-baselines from CI.
+
+| row | before → after | Δ |
+|---|---|---|
+| `fib` | 3,603,210 → 4,544,568 | +26 % |
+| `push_1e5` | 20,752,442 → 26,052,760 | +25.5 % |
+| `class_methods` | 63,252 → 83,312 | +32 % |
+| `generators` | 168,351 → 223,821 | +33 % |
+| `object_reads` | 21,103 → 26,149 | +24 % |
+| `for_of` | | +16 % |
+| `spread` | | +19 % |
+| `math` | | +17 % |
+| `array_hofs` | | +18 % |
+
+`user_ops` rose 20-45 % on most rows. The estimates below missed this for
+three reasons: the write-through of the emitter scratch was never costed,
+`N` for `fib` is above 2, and `__prop_find` is not a leaf. About 8 k of
+`class_methods` and 1.7 k of `object_reads` remain unattributed.
+
+**Phase 6 reductions** (not yet scheduled): F6 shrink-wrap user frames to the
+paths that reach a hot safepoint; F7 sink write-throughs; F8 make
+`__prop_find` a leaf on non-lazy objects, then shrink-wrap the `__get` family.
+
+The original M1+M2 estimates (unmeasured; fuel at `c34cd36`,
+`crates/jsc-core/tests/opcount/snapshot.tsv`), excluding the R-stage cost of
+guest formatting (§7):
 
 | row | fuel today | dominant new costs | est. Δ |
 |---|---|---|---|
