@@ -350,6 +350,11 @@ fn to_precision_and_exponential_exact() -> anyhow::Result<()> {
     assert_string("(123456).toExponential()", "1.23456e+5");
     assert_string("(-1.5).toExponential(0)", "-2e+0");
     assert_string("(1e21).toExponential(2)", "1.00e+21");
+    assert_string("(1).toExponential(3)", "1.000e+0");
+    assert_string("(1.5).toExponential(0)", "2e+0");
+    assert_string("(0).toExponential(2)", "0.00e+0");
+    assert_string("(1234.5678).toExponential()", "1.2345678e+3");
+    assert_string("(-1.5).toExponential(1)", "-1.5e+0");
     assert_string("(9.5).toPrecision(1)", "1e+1");
 
     let mut rng = Rng(0xFEDC_BA98_7654_3210);
