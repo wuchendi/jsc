@@ -1,9 +1,8 @@
 //! Object -> primitive conversion in the guest: `OrdinaryToPrimitive` and
 //! the conversion helpers built on it (`ToString`, the `+` and relational
 //! slow paths, `Array.prototype.join`). Every object reaching a conversion
-//! site goes through [`emit_to_primitive`], so the host `__convert` import
-//! only ever sees primitives (and, until `Function.prototype.toString`
-//! lands, a function without a user `toString`).
+//! site goes through [`emit_to_primitive`], so the guest number and string
+//! formatters only ever see primitives.
 //!
 //! Each helper leaves a throw from a user `valueOf`/`toString` pending and
 //! returns a harmless value; the emitting site propagates it.

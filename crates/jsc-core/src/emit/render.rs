@@ -472,7 +472,7 @@ fn tag_of(f: &mut Function, v: u32) {
 
 /// `__render(v, depth_path)`: `depth_path` is the number of containers on the
 /// recursion path. A number, and a boxed value of an unused tag, renders
-/// through `__convert` (decode reads those as numbers).
+/// through the guest number formatter (decode reads those as numbers).
 fn emit_render(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     let mut f = Function::new(vec![(1, I32)]);
     let (v, depth, tag) = (0, 1, 2);

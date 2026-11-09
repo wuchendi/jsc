@@ -216,7 +216,7 @@ pub enum ConvertOp {
     ToNumber,
     /// `Boolean(x)` — JS truthiness (a boolean jsval). Lowered to inline wasm.
     ToBoolean,
-    /// `parseInt(s, radix)` — the host `__parse_int` over `ToString(s)` and the
+    /// `parseInt(s, radix)` — the guest `__parse_int` over `ToString(s)` and the
     /// radix (`undefined` when omitted).
     ParseInt,
     /// `parseFloat(s)` — the leading decimal float of `ToString(s)`, parsed on
@@ -1787,10 +1787,9 @@ pub enum IrNode {
     /// names, not real bindings: they are recognized syntactically at codegen
     /// (only when nothing of the same name shadows them) and take exactly one
     /// argument (`parseInt` also an optional radix). `Boolean` lowers to inline
-    /// JS-truthiness wasm; `parseInt` calls the host `__parse_int` import; the
-    /// other three delegate to the host `__convert` import, which reuses the run
-    /// stage's `format_value`/parse helpers (so `String(42) == "42"`, matching
-    /// `format_number`).
+    /// JS-truthiness wasm; `parseInt` calls the guest `__parse_int`; the
+    /// other three run the guest conversions (`__to_string`, `__to_number`,
+    /// `__parse_float`).
     ConvertCall {
         /// Which conversion this call performs.
         op: ConvertOp,
@@ -2068,15 +2067,15 @@ pub enum IrNode {
     /// runtime helper (`__json_str`): numbers/booleans/`null` render literally
     /// (non-finite numbers as `"null"`), strings are quoted + escaped, arrays and
     /// objects recurse (own enumerable keys in own-key order; `undefined`/function values are omitted as object values
-    /// and become `"null"` as array elements). Number formatting reuses the
-    /// existing `__convert` host import (no NEW host import). See [`IrNode::JsonParse`]
+    /// and become `"null"` as array elements). Numbers go through the guest
+    /// number formatter. See [`IrNode::JsonParse`]
     /// for the inverse.
     JsonStringify {
         /// The single value argument, evaluated once and serialized.
         arg: Box<IrNode>,
     },
     /// A `JSON.parse(text)` call. `arg` is
-    /// coerced to a string (via the `__convert` `ToString` import) and handed to
+    /// coerced to a string (via the guest `__to_string`) and handed to
     /// the in-wasm recursive-descent parser `__json_parse`, which materializes a
     /// guest value tree — including OBJECTS with runtime-unknown keys, each
     /// member interned and defined through `__define`. Malformed
@@ -2169,7 +2168,7 @@ pub enum IrNode {
     /// `new Date()` / `new Date(value)`. Allocates a fresh `TYPE_DATE`
     /// block whose f64 payload is `TimeClip` of the timestamp in milliseconds
     /// since the Unix epoch, and yields the handle heap jsval. `arg` is `None`
-    /// for the no-argument form (the host clock, the `__now` import); otherwise
+    /// for the no-argument form (the WASI clock, the guest `__now`); otherwise
     /// it is the single constructor argument: a Date's time value is taken
     /// directly, anything else goes through `ToPrimitive`, then a string is
     /// parsed as by `Date.parse` and any other primitive goes through
@@ -2179,7 +2178,7 @@ pub enum IrNode {
         arg: Option<Box<IrNode>>,
     },
     /// `Date.now()`: the host wall-clock time in milliseconds since the
-    /// Unix epoch, as a plain number jsval. Lowers to the host `__now` import.
+    /// Unix epoch, as a plain number jsval. Lowers to the guest `__now`.
     DateNow,
     /// A static `obj.size` read (DESIGN.md §6.4): a
     /// `TYPE_MAP`/`TYPE_SET` receiver passing its [`ProtoKind::Collection`]

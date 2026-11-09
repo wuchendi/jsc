@@ -478,7 +478,7 @@ pub(crate) const GEN_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 32;
 /// TYPE BYTE of a `Date` block: the object-family prefix, then `[ms:f64 @16]`. The
 /// single f64 payload is the timestamp in milliseconds since the Unix epoch — the
 /// same value `Date.now()` / `d.getTime()` yield. `new Date(ms)` stores its
-/// numeric argument; `new Date()` stores the host clock (the `__now` import).
+/// numeric argument; `new Date()` stores the WASI clock (the guest `__now`).
 /// Maps to `typeof` "object".
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_DATE: u8 = 10;
@@ -708,6 +708,12 @@ pub(crate) const WASI_SCRATCH: u32 = 8;
 /// Address of the `nwritten` word of the WASI scratch area.
 pub(crate) const WASI_NWRITTEN: u32 = WASI_SCRATCH + 8;
 
+/// Address of the 8-byte `clock_time_get` result in the WASI scratch area.
+pub(crate) const WASI_CLOCK: u32 = WASI_SCRATCH + 16;
+
+/// Address of the 16-byte `random_get` seed buffer in the WASI scratch area.
+pub(crate) const WASI_SEED: u32 = WASI_SCRATCH + 24;
+
 /// Address of the static iovec of [`OOM_LINE`], right after the scratch area.
 pub(crate) const OOM_IOVEC: u32 = WASI_SCRATCH + 40;
 
@@ -754,10 +760,6 @@ pub(crate) const RYU_TABLES_ADDR: u32 = NUM_SCRATCH_ADDR + NUM_SCRATCH_SIZE;
 /// aligned.
 pub(crate) const RYU_TABLES_SIZE: u32 = 832;
 
-/// The field name of the host `__convert` import backing the
-/// `String`/`Number`/`parseFloat` conversions.
-pub(crate) const CONVERT_IMPORT_NAME: &str = "__convert";
-
 /// The field name of the host `__method` import backing the non-callback
 /// array/string methods.
 pub(crate) const METHOD_IMPORT_NAME: &str = "__method";
@@ -773,16 +775,6 @@ pub(crate) const PROMISE_IMPORT_NAME: &str = "__promise";
 /// / `p.catch(onR)`. It receives the promise plus the two reaction handlers
 /// (`undefined` for a missing handler) and returns the chained result promise.
 pub(crate) const THEN_IMPORT_NAME: &str = "__then";
-
-/// The field name of the host `__now` import backing
-/// `Date.now()` / `new Date()`. It takes no arguments and returns the current
-/// wall-clock time as an f64 count of milliseconds since the Unix epoch.
-pub(crate) const NOW_IMPORT_NAME: &str = "__now";
-
-/// The field name of the host `__parse_int` import backing `parseInt(s, radix)`.
-/// It receives the string and radix jsvals (`undefined` for an omitted radix) and
-/// returns the parsed number jsval.
-pub(crate) const PARSE_INT_IMPORT_NAME: &str = "__parse_int";
 
 /// `__promise` op flag: `Promise.resolve(a)` — a promise already fulfilled
 /// with `a` (or `a` itself when it is already a promise).
@@ -881,15 +873,6 @@ pub(crate) const EXC_PENDING_EXPORT_NAME: &str = "__exc_pending";
 /// is exported so the run stage can render an uncaught exception.
 pub(crate) const EXC_VALUE_EXPORT_NAME: &str = "__exc_value";
 
-/// `__convert` op flag: stringify the argument (`String(x)`).
-pub(crate) const CONVERT_OP_TO_STRING: i32 = 0;
-
-/// `__convert` op flag: coerce the argument to a number (`Number(x)`).
-pub(crate) const CONVERT_OP_TO_NUMBER: i32 = 1;
-
-/// `__convert` op flag: parse a leading float (`parseFloat(x)`).
-pub(crate) const CONVERT_OP_PARSE_FLOAT: i32 = 3;
-
 /// `__method` op flag: array `indexOf`.
 pub(crate) const METHOD_OP_INDEX_OF: i32 = 0;
 
@@ -902,10 +885,6 @@ pub(crate) const METHOD_OP_TO_UPPER: i32 = 4;
 /// `__method` op flag: `toLowerCase`.
 pub(crate) const METHOD_OP_TO_LOWER: i32 = 5;
 
-/// `__method` op flag: `Number.prototype.toString(radix)` (a number receiver,
-/// `arg0` an integral radix in `2..=36`).
-pub(crate) const METHOD_OP_NUMBER_TO_STRING: i32 = 17;
-
 /// `__method` op flag: `String.prototype.localeCompare` (string, code-unit
 /// order).
 pub(crate) const METHOD_OP_LOCALE_COMPARE: i32 = 22;
@@ -917,19 +896,6 @@ pub(crate) const METHOD_OP_NORMALIZE: i32 = 23;
 /// `__method` result: the argument is out of range (an unknown `normalize`
 /// form); the calling builtin throws a `RangeError`.
 pub(crate) const METHOD_RANGE_ERROR: u64 = UNDEFINED | 2;
-
-/// `__method` op flag: `Number.prototype.toFixed(f)` (a finite number
-/// receiver, `arg0` an integral `f` in `0..=100`).
-pub(crate) const METHOD_OP_NUMBER_TO_FIXED: i32 = 40;
-
-/// `__method` op flag: `Number.prototype.toExponential(f)` (a finite number
-/// receiver, `arg0` an integral `f` in `0..=100`, or `undefined` for the
-/// shortest round-tripping digits).
-pub(crate) const METHOD_OP_NUMBER_TO_EXPONENTIAL: i32 = 41;
-
-/// `__method` op flag: `Number.prototype.toPrecision(p)` (a finite number
-/// receiver, `arg0` an integral `p` in `1..=100`).
-pub(crate) const METHOD_OP_NUMBER_TO_PRECISION: i32 = 42;
 
 /// `__method` op flag: a host `Math` function. The receiver is the first
 /// number operand, `arg0` the second (`Math.atan2`'s `x`; `undefined` for
@@ -977,9 +943,6 @@ pub(crate) const MATH_FN_ASINH: i64 = 17;
 pub(crate) const MATH_FN_ACOSH: i64 = 18;
 /// `METHOD_OP_MATH` function code: `Math.atanh`.
 pub(crate) const MATH_FN_ATANH: i64 = 19;
-/// `METHOD_OP_MATH` function code: `Math.random` (operands ignored).
-pub(crate) const MATH_FN_RANDOM: i64 = 20;
-
 #[cfg(test)]
 #[path = "abi_drift_tests.rs"]
 mod drift_tests;

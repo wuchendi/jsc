@@ -23,7 +23,7 @@ pub(super) fn build_type_and_function_sections<'a>(
     Helpers<'a>,
     [u32; IMPORT_FUNC_COUNT as usize],
 ) {
-    use ValType::{F64, I32, I64};
+    use ValType::{I32, I64};
     let mut types = TypeSection::new();
     let mut functions = FunctionSection::new();
     types.ty().function([], [ValType::I64]); // type 0: main
@@ -55,12 +55,11 @@ pub(super) fn build_type_and_function_sections<'a>(
     };
     let helpers = Helpers {
         unwind,
-        // The `env` imports follow the four WASI imports (0..=3): `__convert`
-        // 4, `__method` 5, `__promise` 6, `__then` 7, `__now` 8; `__parse_int` is 9.
-        method: 5,
-        promise: 6,
-        then: 7,
-        now: 8,
+        // The `env` imports follow the four WASI imports (0..=3): `__method`
+        // 4, `__promise` 5, `__then` 6.
+        method: 4,
+        promise: 5,
+        then: 6,
         alloc: index(),
         concat: index(),
         str_eq: index(),
@@ -144,6 +143,12 @@ pub(super) fn build_type_and_function_sections<'a>(
             }
             first
         },
+        // `__now`, then `__random` (read back as `now + 1`).
+        now: {
+            let first = index();
+            index();
+            first
+        },
         // The `__invoke1` callback trampoline is appended after every helper
         // above; the `__async_step` trampoline follows it, then the two
         // `new Promise` settler functions.
@@ -185,12 +190,9 @@ pub(super) fn build_type_and_function_sections<'a>(
         (&[I32, I64, I32], &[I32]),      // clock_time_get(id, precision, time)
         (&[I32, I32], &[I32]),           // random_get(buf, buf_len)
         (&[I32], &[]),                   // proc_exit(rval)
-        (&[I64, I32], &[I64]),           // __convert(bits, op)
         (&[I64, I32, I64, I64], &[I64]), // __method(recv, op, arg0, arg1)
         (&[I32, I64, I64], &[I64]),      // __promise(op, a, b)
         (&[I64, I64, I64], &[I64]),      // __then(p, on_f, on_r)
-        (&[], &[F64]),                   // __now()
-        (&[I64, I64], &[I64]),           // __parse_int(s, radix)
     ];
     let import_base = next_type;
     for (params, results) in signatures {
@@ -465,6 +467,8 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         (&[I64], &[I64]),                // __to_number_prim(v)
         (&[I64], &[I64]),                // __parse_float(v)
         (&[I64, I32], &[I64]),           // __parse_int(v, radix)
+        (&[], &[F64]),                   // __now()
+        (&[], &[F64]),                   // __random()
         // The `__invoke1(fn, arg)` and `__async_step(gen, sent)` trampolines.
         (&[I64, I64], &[I64]),
         (&[I64, I64], &[I64]),
@@ -568,8 +572,13 @@ pub(super) fn build_globals(
     let (dirty_ty, dirty_init) = mut_i32(0);
     globals.global(dirty_ty, &dirty_init);
     // The renderer's output buffer, recursion path and ref table (all i32, 0).
-    for _ in OUT_BUF_GLOBAL..MODULE_CELL_GLOBAL_BASE {
+    for _ in OUT_BUF_GLOBAL..RNG0_GLOBAL {
         let (ty, init) = mut_i32(0);
+        globals.global(ty, &init);
+    }
+    // The `Math.random` state (i64, 0 = not seeded yet).
+    for _ in RNG0_GLOBAL..MODULE_CELL_GLOBAL_BASE {
+        let (ty, init) = mut_i64();
         globals.global(ty, &init);
     }
     // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in
