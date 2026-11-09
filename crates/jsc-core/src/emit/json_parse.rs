@@ -828,7 +828,7 @@ pub(super) fn emit_json_parse(helpers: Helpers<'_>) -> Function {
 /// conversion or syntax error.
 pub(super) fn emit_json_parse_node(
     arg: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,

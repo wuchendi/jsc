@@ -301,13 +301,17 @@ pub(crate) const FUNC_FLAG_GENERATOR: u8 = 128;
 /// `%AsyncGeneratorPrototype%` instead.
 pub(crate) const FUNC_FLAG_ASYNC: u8 = 2;
 
+/// Size in bytes of the shadow stack: linear memory `[0, SHADOW_STACK_SIZE)`,
+/// growing down from its end (`$__sp` starts here). See DESIGN.md §4.2.
+pub(crate) const SHADOW_STACK_SIZE: u32 = 1 << 20;
+
 /// Linear-memory address of the u32 holding the base of the static function
 /// info table (inside the null guard below the first static string): entry
 /// `func_idx` is [`FN_INFO_ENTRY_SIZE`] bytes at `base + FN_INFO_ENTRY_SIZE *
 /// func_idx`, holding the function's interned `name` key at
 /// [`FN_INFO_NAME_OFFSET`] and its `length` at [`FN_INFO_LENGTH_OFFSET`]
 /// (`__fn_info`). `__fn_materialize` and the host renderers read it.
-pub(crate) const FN_INFO_ADDR: u32 = 4;
+pub(crate) const FN_INFO_ADDR: u32 = SHADOW_STACK_SIZE + 4;
 
 /// The byte size of one function info entry (see [`FN_INFO_ADDR`]).
 pub(crate) const FN_INFO_ENTRY_SIZE: u32 = 8;
@@ -607,6 +611,11 @@ pub(crate) const ELEMS_DATA_OFFSET: u32 = 8;
 /// symbols are static blocks in the realm image.
 pub(crate) const TYPE_SYMBOL: u8 = 14;
 
+/// TYPE BYTE of an internal raw buffer: `[type=19][pad×3][len:u32][data]`,
+/// a collector leaf whose `len` bytes from offset `8` hold no references (the
+/// grown intern table, the `Math.sumPrecise` accumulator). Never a user value.
+pub(crate) const TYPE_RAW: u8 = 19;
+
 /// Byte offset (from a [`TYPE_SYMBOL`] block base) of the `description` jsval
 /// (an `i64`: a string jsval or `undefined`).
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -703,7 +712,7 @@ pub(crate) const START_EXPORT_NAME: &str = "_start";
 
 /// Address of the static WASI scratch area, 40 bytes: one iovec, `nwritten`,
 /// the 8-byte clock result and the 16-byte random seed buffer.
-pub(crate) const WASI_SCRATCH: u32 = 8;
+pub(crate) const WASI_SCRATCH: u32 = SHADOW_STACK_SIZE + 8;
 
 /// Address of the `nwritten` word of the WASI scratch area.
 pub(crate) const WASI_NWRITTEN: u32 = WASI_SCRATCH + 8;

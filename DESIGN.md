@@ -331,7 +331,8 @@ the table, including one without user functions.
 | 15–17 | `$__out_buf`, `$__out_len`, `$__out_cap` | `i32` | — | output buffer: base, UTF-8 length, capacity (§6.9) |
 | 18–19 | `$__path_buf`, `$__path_cap` | `i32` | — | renderer recursion path |
 | 20–22 | `$__refs_buf`, `$__refs_cap`, `$__refs_len` | `i32` | — | renderer ref table |
-| 23+ | module cells | `i64` | — | one cell pointer per module binding (`23 + slot`, §7.1), then one per tagged-template site (§7.4) |
+| 23 | `$__sp` | `i32` | — | shadow-stack pointer (§5.7), initialized to `SS_SIZE` |
+| 24+ | module cells | `i64` | — | one cell pointer per module binding (`24 + slot`, §7.1), then one per tagged-template site (§7.4) |
 
 **Exports.** `_start`, `memory`, `__exc_pending`, `__exc_value`,
 `__invoke1(fn: i64, arg: i64) -> i64`, `__async_step(gen: i64, sent: i64) -> i64`,
@@ -349,15 +350,19 @@ renders the completion value as one line on fd 1 (`jsc -p`, §9); the default
 emit discards it. Finally `_start` flushes a line left unfinished on fd 1 by a
 throwing `console.log` argument, and returns (exit code `0`).
 
-**Static region (data segments).** Everything below the initial heap pointer is
-laid out by the compiler, in this order:
+**Shadow stack.** `[0, abi::SHADOW_STACK_SIZE)` (1 MiB, 16 pages) is the
+shadow stack, growing down from its end (§5.7); `$__sp` starts at
+`SS_SIZE`. Overflow wraps below `0` and the first slot store traps.
 
-| range | contents |
+**Static region (data segments).** Everything from `SS_SIZE` to the initial
+heap pointer is laid out by the compiler, in this order:
+
+| range (from `SS_SIZE`) | contents |
 |---|---|
-| `0 … 7` | null guard; the `u32` at `abi::FN_INFO_ADDR = 4` holds the base of the function info table |
+| `0 … 7` | null guard word; the `u32` at `abi::FN_INFO_ADDR = SS_SIZE + 4` holds the base of the function info table |
 | `8 … 47` | WASI scratch area (`abi::WASI_SCRATCH`): one iovec, `nwritten`, the clock result and the random seed buffer |
 | `48 … 95` | the iovec (`abi::OOM_IOVEC`) and bytes of the static out-of-memory line (§5.6) |
-| from `HEAP_BASE = 96` | every distinct string literal and static key, one `TYPE_STRING` block each, 8-byte aligned, `flags = INTERNED` (plus `ARRAY_INDEX` for a canonical index spelling) |
+| from `HEAP_BASE = SS_SIZE + 96` | every distinct string literal and static key, one `TYPE_STRING` block each, 8-byte aligned, `flags = INTERNED` (plus `ARRAY_INDEX` for a canonical index spelling) |
 | next | the function info table: one 8-byte entry `[name: u32 interned key][length: u32]` per funcref slot (user functions, the two settlers, the builtins) |
 | next | one static 32-byte `TYPE_FUNCTION` block per user function (`LAZY`, no properties, `proto = %Function.prototype%`, `env = undefined`): the single function object of a top-level declaration |
 | next | the realm image (§6.4) |
@@ -409,7 +414,7 @@ Every heap block starts with a 4-byte header (`HEADER_SIZE = 4`):
 | byte | field | values |
 |---|---|---|
 | 0 | `kind` | the type byte (§5.2) |
-| 1 | `gc` | reserved for the phase-4 mark bit; always `0` |
+| 1 | `gc` | GC epoch mark; always `0` until the collector lands |
 | 2 | `flags` | per kind, `0` = default (below) |
 | 3 | `class` | `TYPE_OBJECT` sub-class (§5.2); `0` for every other kind |
 
@@ -460,6 +465,7 @@ the array bits is ever cleared (except `JOINING`).
 | `11` `TYPE_ACCESSOR` | accessor pair (internal) | header, pad, `getter: i64 @8`, `setter: i64 @16` | 24 | — |
 | `12` `TYPE_PROPS` | own-property table (internal) | §5.3 | `16 + 16·cap` | — |
 | `13` `TYPE_ELEMS` | array element store (internal) | header, `cap: u32 @4`, `elem: i64 × cap @8` | `8 + 8·cap` | — |
+| `19` `TYPE_RAW` | internal raw buffer | header, `len: u32 @4`, `len` bytes from `@8`, no references (the grown intern table, `Math.sumPrecise` accumulator) | 8 + `len` | — |
 | `14` `TYPE_SYMBOL` | Symbol primitive | header (flags: `4` `SYMBOL_FLAG_REGISTERED`, `8` `SYMBOL_FLAG_PRIVATE` (a private name, §7.6, phase 5a); bits `1`/`2` always clear), reserved `u32 @4` = 0, `description: i64 @8` (string or `undefined`) | 16 | `symbol` |
 
 **`TYPE_OBJECT` classes** (header byte 3): `0` `CLASS_ORDINARY`, `1`
@@ -767,8 +773,9 @@ The layouts above are chosen so a collector can be added without relayout:
   memory; the 512 MiB cap stays.
 - **Roots.** A shadow stack in linear memory: each function reserves slots for
   jsvals live across a safepoint (any call that may allocate), clears them on
-  entry, and pops them on every exit including the exception paths; raw `i32`
-  bases are re-derived from spilled jsvals after safepoints. Global roots are
+  entry, and pops them on every exit including the exception paths; the
+  collector does not move blocks, so a raw `i32` base is rooted as `HEAP |
+  base` and stays valid. Global roots are
   `$exc_value`, `$cf_value`, `$__this`, `$__new_target`, `$__spread_args`, and
   the module cells. The static region is a root region: static object-family
   blocks are traced, never swept. With the promise engine in the guest
@@ -787,7 +794,8 @@ The layouts above are chosen so a collector can be added without relayout:
   together with a forwarding step that live iterators follow.
 - **Intern table.** Weak: the sweep clears slots whose string is unmarked.
 - **Reserved now.** Header byte 1, 8-byte alignment, every internal store a
-  headered block, every reference at a kind-known offset, host allocation only
+  headered block (the grown intern table and the `Math.sumPrecise` accumulator
+  are `TYPE_RAW` blocks with their data at `+8`), every reference at a kind-known offset, host allocation only
   through exports, and truncation writing `HOLE`.
 
 ---

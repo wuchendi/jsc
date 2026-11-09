@@ -1284,3 +1284,43 @@ fn super_and_private_helpers_validate() {
         console.log(new B().run({}))",
     ));
 }
+
+/// Every call a declared leaf-graph helper makes is declared
+/// ([`roots::helper_graph`]), so the leaf set cannot silently go stale.
+#[test]
+fn leaf_declarations_match_bodies() {
+    use wasmparser::{Operator, Parser, Payload};
+    let program = expr_program(IrNode::Num(0.0));
+    let (_, strings_end) = collect_strings(&program);
+    let layout = super::FnLayout {
+        info: strings_end,
+        blocks: strings_end,
+        realm: strings_end,
+    };
+    let unwind = std::cell::RefCell::new(super::Unwind::default());
+    let (.., helpers, _) =
+        super::sections::build_type_and_function_sections(&program, &unwind, layout);
+    let bytes = emit(&program);
+    let mut calls: Vec<Vec<u32>> = Vec::new();
+    for payload in Parser::new(0).parse_all(&bytes) {
+        if let Payload::CodeSectionEntry(body) = payload.expect("valid module") {
+            let mut callees = Vec::new();
+            for op in body.get_operators_reader().expect("operators") {
+                if let Operator::Call { function_index } = op.expect("operator") {
+                    callees.push(function_index);
+                }
+            }
+            calls.push(callees);
+        }
+    }
+    for (helper, declared) in super::roots::helper_graph(helpers) {
+        let defined = (helper - super::IMPORT_FUNC_COUNT) as usize;
+        let mut actual = calls[defined].clone();
+        actual.sort_unstable();
+        actual.dedup();
+        let mut declared = declared;
+        declared.sort_unstable();
+        declared.dedup();
+        assert_eq!(actual, declared, "declared callees of function {helper}");
+    }
+}

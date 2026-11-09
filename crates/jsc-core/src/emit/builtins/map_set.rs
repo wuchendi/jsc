@@ -216,7 +216,7 @@ fn this_collection(
 
 /// Push the slot count (two per entry, tombstones included) of the backing
 /// array of the handle in `handle`.
-pub(super) fn entries_len(function: &mut Function, handle: u32) {
+pub(super) fn entries_len(function: &mut impl Sink, handle: u32) {
     wasm!(function;
         LocalGet(handle), I32WrapI64,
         I64Load(MemArg { offset: MAP_ENTRIES_OFFSET, align: 3, memory_index: 0 }), I32WrapI64,
@@ -227,7 +227,7 @@ pub(super) fn entries_len(function: &mut Function, handle: u32) {
 /// Load the key and value of the backing slot pair at i32 index `i` of the
 /// handle in `handle` into `key` / `value` (`at` an i32 temp).
 pub(super) fn load_entry(
-    function: &mut Function,
+    function: &mut impl Sink,
     handle: u32,
     i: u32,
     at: u32,
@@ -250,7 +250,7 @@ pub(super) fn load_entry(
 /// tombstones (a `HOLE` key, DESIGN.md §5.2), stopping at the
 /// next live entry or the end (`at`, `key`, `value` temps).
 pub(super) fn skip_tombstones(
-    function: &mut Function,
+    function: &mut impl Sink,
     handle: u32,
     i: u32,
     at: u32,

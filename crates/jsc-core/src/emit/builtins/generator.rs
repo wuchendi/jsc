@@ -514,7 +514,8 @@ pub(super) fn emit_async_method(
         If(BlockType::Empty),
         LocalGet(this), I32WrapI64, LocalGet(record), I32Store(m32(QUEUE_HEAD)),
         Else,
-        LocalGet(tail), LocalGet(record), I64ExtendI32U, I64Store(m64(REQ_NEXT)),
+        LocalGet(tail), LocalGet(record), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+        I64Store(m64(REQ_NEXT)),
         End,
         LocalGet(this), I32WrapI64, LocalGet(record), I32Store(m32(QUEUE_TAIL)),
     );

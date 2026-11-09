@@ -476,7 +476,7 @@ pub(super) fn emit_array_join(strings: &StrOffsets, helpers: Helpers<'_>) -> Fun
 /// yields its symbol), propagating a user `toString`/`valueOf` throw, so a key
 /// read and written by one expression (`o[k] op= v`, `o[k]++`) is converted
 /// once.
-pub(super) fn emit_key_to_primitive(function: &mut Function, local: u32, helpers: Helpers<'_>) {
+pub(super) fn emit_key_to_primitive(function: &mut impl Sink, local: u32, helpers: Helpers<'_>) {
     emit_is_object(function, local);
     wasm!(function; If(BlockType::Empty));
     enter_frame(helpers);

@@ -427,6 +427,8 @@ pub(super) fn emit_sum_precise(
 ) {
     let (items, v) = (frame.i64(0), frame.i64(1));
     let (acc, state) = (frame.i32(0), frame.i32(1));
+    // The accumulator's data (`acc`, the `TYPE_RAW` block base, plus 8).
+    let data = frame.x32(1);
     let temps = [frame.i64(2), frame.i64(3), frame.x64(0), frame.x64(1)];
     let (cursor, bound) = (frame.i32(2), frame.i32(3));
     let rec = iter::local_record(frame.z64(0), frame.z64(1), frame.z64(2), frame.z64(3));
@@ -443,8 +445,12 @@ pub(super) fn emit_sum_precise(
         helpers,
     );
     wasm!(function;
-        I32Const(SUM_SLOTS * 8), Call(helpers.alloc), LocalTee(acc),
-        I32Const(0), I32Const(SUM_SLOTS * 8), MemoryFill(0),
+        // A `TYPE_RAW` block; `acc` stays the block base with data at `+8`.
+        I32Const(SUM_SLOTS * 8 + 8), Call(helpers.alloc), LocalTee(acc),
+        I32Const(0), I32Const(SUM_SLOTS * 8 + 8), MemoryFill(0),
+        LocalGet(acc), I32Const(i32::from(abi::TYPE_RAW)), I32Store8(MemArg { offset: 0, align: 0, memory_index: 0 }),
+        LocalGet(acc), I32Const(SUM_SLOTS * 8), I32Store(MemArg { offset: 4, align: 2, memory_index: 0 }),
+        LocalGet(acc), I32Const(8), I32Add, LocalSet(data),
         I32Const(SUM_MINUS_ZERO), LocalSet(state),
     );
     iter::guarded(function, helpers, |function| {
@@ -482,7 +488,7 @@ pub(super) fn emit_sum_precise(
             LocalGet(state), I32Const(SUM_PLUS_INF), I32LtU, I32And,
             If(BlockType::Empty), I32Const(SUM_FINITE), LocalSet(state),
         );
-        add_exact(function, acc, v, [cursor, bound], temps);
+        add_exact(function, data, v, [cursor, bound], temps);
         wasm!(function; End, End, End, End, End);
         leave_frame(helpers);
         leave_frame(helpers);
@@ -501,7 +507,7 @@ pub(super) fn emit_sum_precise(
         I64Const(UNDEFINED_BITS), Return, End,
         LocalGet(state), I32Const(SUM_FINITE), I32Eq, If(BlockType::Result(ValType::F64)),
     );
-    round_exact(function, acc, [cursor, bound, frame.x32(0)], temps);
+    round_exact(function, data, [cursor, bound, frame.x32(0)], temps);
     wasm!(function;
         F64ReinterpretI64,
         Else,
