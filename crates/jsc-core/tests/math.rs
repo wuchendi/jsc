@@ -595,3 +595,17 @@ fn assert_libm_special_values() {
         assert_eq!(verdict, "true", "{call} should be exactly {want}");
     }
 }
+
+/// `Math.random()` stays in `[0, 1)` and varies between draws (two 52-bit
+/// draws collide with probability `2^-52`).
+#[test]
+fn math_random_in_unit_interval() {
+    assert_bool(
+        "let ok = true; for (let i = 0; i < 1000; i++) { const r = Math.random(); if (!(r >= 0 && r < 1)) ok = false; } ok",
+        true,
+    );
+    assert_bool(
+        "Math.random() !== Math.random() || Math.random() !== Math.random()",
+        true,
+    );
+}

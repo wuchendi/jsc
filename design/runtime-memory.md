@@ -616,7 +616,8 @@ rooted while the base is live. No write barriers.
 ### 5.1 Memory layout
 
 ```text
-[0, SS_SIZE)               shadow stack, grows down from SS_SIZE         (§5.3)
+[0, 8)                     always zero: never holds stack data           (§5.3)
+[8, SS_SIZE)               shadow stack body, grows down from SS_SIZE    (§5.3)
 [SS_SIZE, static_end)      null guard word, FN_INFO pointer, static region (DESIGN §4.2 order),
                            WASI_SCRATCH, NUM_SCRATCH, DEC_SCRATCH, Unicode/number tables,
                            page table, free-list heads, static root list
@@ -625,11 +626,11 @@ rooted while the base is live. No write barriers.
 ```
 
 `SS_SIZE = 1 MiB` (16 pages, `abi::SHADOW_STACK_SIZE`); `HEAP_BASE =
-SS_SIZE + 8`; `FN_INFO_ADDR = SS_SIZE + 4` (today `abi.rs:310`, inside the
+abi::STATIC_AREA_END` (the WASI scratch, the OOM line of R1 and the R2 number
+scratch and tables sit below it); `FN_INFO_ADDR = SS_SIZE + 4` (today `abi.rs:310`, inside the
 `0..8` null guard). Initial memory pages grow by 16; maximum stays 8192.
-A stray read of address `0..8` now reads stack data instead of the zero
-guard; every raw ref is tested against `0` before use (M1 reviews the
-`props == 0` / `elems == 0` guards).
+Addresses `0..8` stay zero (the frame pointer is biased, §5.3), so a raw ref
+of `0` reads zero however full the stack is.
 
 ### 5.2 Header and mark epoch
 
@@ -644,18 +645,24 @@ block, which is harmless. Fresh blocks (`gc = 0`) are never marked.
 
 ### 5.3 Shadow stack, safepoints, spills
 
-**SP and frames.** Global `$__sp` (initial `SS_SIZE`); live range
-`[$__sp, SS_SIZE)` scanned as a flat jsval array; frames have no header or
-descriptor. A function with `N > 0` root slots:
+**SP and frames.** Global `$__sp` (initial `SS_SIZE - 8`); `$fp` is biased by
+8, so slot `k` is at `$fp + 8 + 8k` and the first frame's top slot ends at
+`SS_SIZE`. The stack body is `[8, SS_SIZE)`; M2 scans `[$__sp + 8, SS_SIZE)`
+as a flat jsval array; frames have no header or descriptor. A function with
+`N > 0` root slots:
 
 ```wasm
 ;; prologue (emitted last, once N is known)
 global.get $__sp  local.tee $old  i32.const 8N  i32.sub  local.tee $fp  global.set $__sp
-;; clear: N <= 4 -> N x (local.get $fp  i64.const 0  i64.store offset=8k)
-;;        N >  4 -> local.get $fp  i32.const 0  i32.const 8N  memory.fill
+;; clear: N <= 4 -> N x (local.get $fp  i64.const 0  i64.store offset=8+8k)
+;;        N >  4 -> local.get $fp  i32.const 0  i32.const 8N+8  memory.fill
 ;; epilogue before every exit
 local.get $old  global.set $__sp
 ```
+
+The fill starts at `$fp`, not `$fp + 8`, and also covers the 8 free bytes
+below slot 0: at `$fp = -8` the `i32.add` would wrap to `0` and write the
+protected bytes, while a fill from `$fp` is out of bounds and traps.
 
 Every slot always holds a valid jsval (`0` = number `+0` after clearing, a
 written-through jsval, or `HEAP | base` for a rooted raw base). Clearing is
@@ -663,6 +670,8 @@ mandatory (a stale slot could name a block freed later).
 
 **Overflow (Q10 default):** no explicit check; `fp = $__sp - 8N` wraps below
 `0` to an address above the 512 MiB maximum and the first slot store traps
+(`fp = 0` puts slot 0 at address 8; at `fp = -8` the static-offset effective
+address is `2^32`, which does not wrap)
 (same failure class as today's native stack overflow). A catchable
 `RangeError` costs ≈ 4 ops per frame push plus a static error object.
 
@@ -680,12 +689,16 @@ audit mechanical. Exceptions unwind by `br` (SP unchanged) or by
 callee may reach `__alloc` — all user functions, builtins, `call_indirect`s,
 and helpers outside a **non-allocating leaf set** computed from a static
 helper call graph (each helper emitter declares its callees). Expected
-leaves: `__str_eq`, `__str_cmp`, `__str_hash`, `__intern_find`,
-`__index_value`, `__prop_find`, `__same_value_zero`, `__map_find`,
-`__box_f64`, `__protos_indexless`, `__private_find`, `__json_ws`,
-`__str_exotic_index`, plus the new `__ryu_d2d`, `__umul128`, libm helpers
+leaves: `__str_eq`, `__str_cmp`, `__str_hash`, `__intern_slot`,
+`__intern_find`, `__index_value`, `__same_value_zero`, `__map_find`,
+`__map_get`, `__map_has`, `__map_delete`, `__box_f64`,
+`__protos_indexless`, `__test_integrity`, `__json_ws`,
+`__str_exotic_index`, `__heap_object`, `__str_of`, `__fn_name`, plus the new `__ryu_d2d`, `__umul128`, libm helpers
 and Unicode lookups. WASI imports never call back, so they are not
-safepoints.
+safepoints. `__prop_find` is **not** a leaf (a `LAZY` function materializes
+on lookup through `__fn_materialize`, which allocates), and so neither is
+`__private_find`, which calls it; every property helper that loops over the
+`proto` chain therefore keeps its object and key rooted across the lookup.
 
 **Spill set** (all IR locals are `i64` jsvals, `emit/function.rs:45-56,128-139`):
 
@@ -694,8 +707,8 @@ safepoints.
 | IR locals (`let`/`const`/`var`, temps, `%penv`, iterator records) | `ir.rs:2347-2365,2470-2478` | write-through on every `local.set`/`tee` (+3 ops) |
 | parameters `a0..a_{K-1}`, `env` | locals `0..K+1` (DESIGN §4.2) | stored in the prologue iff read after a safepoint; `argc` never |
 | `this` snapshot | DESIGN §4.3 | write-through |
-| emitter `i64` scratch | `scratch+0..+2, +4..+6, +13..+20, +22, +23` (`emit/function.rs:15-44`) | write-through; **`Date` scratch `+24..+29` declared raw, never rooted** |
-| emitter `i32` bases / keys | `+3`, `+7`, `+8`, `+11`, `+12`, `+21` (`emit/object.rs:31`, `emit/generator.rs:43`) | write-through of `HEAP | base` (+6); `+9`, `+10` are integers |
+| emitter `i64` scratch | `scratch+0..+2, +4..+6, +13..+20, +22, +23` (`emit/function.rs:15-44`) | write-through; **`Date` scratch `+24..+29` declared raw, never rooted**; `emit/builtins/iter.rs` and `async_iter.rs` also hold jsvals in `+24..+26`, raw for the same reason: no safepoint between def and last use, except the Map `step_entry` key/value across the one entry-array allocation, which stay reachable from the Map backing |
+| emitter `i32` bases / keys | `+3`, `+7`, `+8`, `+11`, `+12`, `+21` (`emit/object.rs:31`, `emit/generator.rs:43`) | write-through of `HEAP | base` (+6); `+9`, `+10` are integers (`+9` also holds the array-pop `new_len`, moved off `+7`); the remaining integer uses of `+3`, `+8` and `+21` are to be re-audited before M2 enables collection |
 | builtin `Frame` locals | `emit/builtins/mod.rs:127-151` | `i64` write-through; `i32` only via `frame.base(k)`; `f64` never |
 | hand-written helper locals | each `Function::new` | declared jsval / base / raw; **no default** (Q11: the builder rejects an undeclared local) |
 | operand-stack temporaries | call args (`emit/expr.rs:808`), binary operands, `dst` under element expressions (`emit/array.rs:162-167`, `emit/object.rs:76-86`) | temp slot: `local.set $t; local.get $fp; local.get $t; i64.store off; local.get $t` (+4; +7 for `i32`) |
@@ -721,14 +734,14 @@ on the slow path, e.g. `__array_push` growth); the builder enforces that a
 
 | root | treatment |
 |---|---|
-| shadow stack `[$__sp, SS_SIZE)` | jsvals |
+| shadow stack `[$__sp + 8, SS_SIZE)` | jsvals |
 | `$exc_value` (`emit/sections.rs:496`), `$cf_value` (`:503`; loop-target codes are denormal numbers), `$__this`, `$__new_target`, `$__spread_args` (`:507-513,529-547`) | jsvals |
 | module cells incl. tagged-template sites (`emit/sections.rs:551-557`, `emit/function.rs:60-77`, `codegen/expr.rs:1085-1095`) | jsvals (`TYPE_CELL`; template objects live forever, as `GetTemplateObject` requires) |
 | `$__json_data/_pos/_len` (`emit/sections.rs:515-520`) | not roots (interior address valid during `__json_parse`, whose `s` is rooted, `emit/json_parse.rs:785-803`) |
 | intern table (`$__intern_base/_cap/_count`, `emit/props.rs:505-540`) | **weak** (§5.6); the table block itself marked via `$__intern_base - 8` |
 | static region | never swept; the compiler emits a **static root list** `[count: u32][addr: u32 × count]` of every static object-family block (realm intrinsics, static builtin-method and user top-level `TYPE_FUNCTION` blocks); each cycle traces their fields without marking them. Static strings / symbols / accessors are immutable and skipped. The `Symbol.for` registry (`emit/realm.rs:66-69`) is in the list (strong, per spec). |
 | promise engine (R4) | `$__job_head`, `$__job_tail`, `$__rejected_head` (raw refs) |
-| `$__out_buf` (R1) | raw ref |
+| `$__out_buf` (R1), `$__path_buf`, `$__refs_buf` | raw refs |
 | weak collections (M3) | `$__kept_objects` (strong array), `$__fin_jobs` (raw ref, traced as a registry list) |
 | host-held handles | **none after R4.** Today `PromiseEngine` (`run/promise.rs:36-98`) holds jsvals and bases (queue `callback`/`value`/`result`/`async_gen`, reactions, `rejected`, `handled`) and both hosts hold fresh `__new_string`/`__new_array` bases while filling them — invisible to a guest collector. **M2 must not land before R4.** |
 | `$__intrinsics_dirty`, `$exc_pending`, `$cf_kind`, `$__heap_ptr` | integers |
@@ -787,7 +800,9 @@ a **raw ref** is a `u32` base, `0` = none.
 | # | blocker | fix |
 |---|---|---|
 | F1 | headerless `__alloc` blocks: the intern growth copy (`emit/props.rs:525-526`, `cap·8` bytes, slot 0 overlapping the header) and the `Math.sumPrecise` accumulator (`emit/builtins/number.rs:446-447`, 576 bytes, held in an `i32` across user-code iterator steps) | both become `TYPE_RAW` blocks (data at `+8`); `$__intern_base` points at `block + 8`; the accumulator base is a rooted base local |
-| F2 | async-generator request record `next` stored as a zero-extended raw `u32` in a `TYPE_ENV` slot (`emit/builtins/generator.rs:505-519`, `I64ExtendI32U` at `:517`), invisible to env tracing | store `HEAP | record` (`I64Or` `HEAP_BITS`); readers already `I32WrapI64` (`:395`); the only raw-`u32`-into-`i64` store in `emit/` |
+| F2 | async-generator request record `next` stored as a zero-extended raw `u32` in a `TYPE_ENV` slot (`emit/builtins/generator.rs:505-519`, `I64ExtendI32U` at `:517`), invisible to env tracing | store `HEAP | record` (`I64Or` `HEAP_BITS`); readers already `I32WrapI64` (`:395`) |
+| F3 | `Array.fromAsync` state block (`emit/builtins/array.rs`, `from_async_entry`): headerless `__alloc` block with a jsval at `+0`, passed as the settler `env` zero-extended, so neither the block nor its jsvals were traceable | a `TYPE_ENV` block of 10 slots at `+8` (the last slot packs the i32 phase and close flag, reading as a denormal number); the `env` is `HEAP | st`, readers `I32WrapI64` |
+| F4 | the console render buffers (`emit/render.rs`, `emit_reserve`): the output, recursion-path and ref-table buffers are headerless `__alloc` blocks | all three become `TYPE_RAW` blocks (data at `+8`, `len` = capacity in bytes); `$__out_buf`, `$__path_buf` and `$__refs_buf` hold the block base, each a raw-ref root (§5.4). The path and ref entries are `u32` bases compared by identity only, so the blocks stay leaves: every entry is reachable from the value being rendered, and rendering runs no user code |
 
 ### 5.6 Allocator and collection policy
 

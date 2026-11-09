@@ -14,7 +14,8 @@ use super::unicode_data::{
     DECOMPOSITION_POOL, DECOMPOSITIONS, SPECIAL_LOWER, SPECIAL_UPPER,
 };
 use super::{
-    Helpers, abi, emit_alloc_str, emit_str_two_byte, emit_str_unit, emit_surrogate_pair_at,
+    FnBuilder, Helpers, LeafSet, LocalClass, RAW_I32, ROOT_BASE, Sink, abi, emit_alloc_str,
+    emit_str_two_byte, emit_str_unit, emit_surrogate_pair_at, finish_builder, helper_builder,
 };
 
 /// Emit each listed instruction in order.
@@ -147,19 +148,49 @@ impl Helpers<'_> {
 }
 
 /// Every helper body, in [`TYPES`] order.
-pub(super) fn emit_helpers(helpers: Helpers<'_>) -> Vec<Function> {
+pub(super) fn emit_helpers(helpers: Helpers<'_>, leaves: &LeafSet) -> Vec<Function> {
     vec![
-        emit_find(),
-        emit_in(helpers),
-        emit_simple(helpers),
-        emit_context(helpers),
-        emit_map(helpers),
-        emit_normalize_form(),
-        emit_decompose(helpers),
-        emit_compose(helpers),
-        emit_normalize(helpers),
+        emit_find(leaves),
+        emit_in(helpers, leaves),
+        emit_simple(helpers, leaves),
+        emit_context(helpers, leaves),
+        emit_map(helpers, leaves),
+        emit_normalize_form(leaves),
+        emit_decompose(helpers, leaves),
+        emit_compose(helpers, leaves),
+        emit_normalize(helpers, leaves),
     ]
 }
+
+/// The helpers that never reach `__alloc`, with their declared callees for
+/// [`leaf_set`](super::roots::leaf_set). `__case_map` and `__normalize`
+/// allocate their results and stay safepoints.
+pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
+    vec![
+        (helpers.unicode_find(), vec![]),
+        (helpers.unicode_in(), vec![helpers.unicode_find()]),
+        (helpers.case_simple(), vec![helpers.unicode_find()]),
+        (helpers.case_context(), vec![helpers.unicode_in()]),
+        (helpers.normalize_form(), vec![]),
+        (helpers.decompose(), vec![helpers.unicode_find()]),
+        (helpers.compose(), vec![helpers.unicode_find()]),
+    ]
+}
+
+/// The locals of `__case_map` after its parameters: `dst` is the result block,
+/// the only heap reference; `record` addresses a static table.
+const CASE_MAP_LOCALS: [LocalClass; 12] = [
+    RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
+    RAW_I32, RAW_I32,
+];
+
+/// The locals of `__normalize` after its parameters, in [`NormalizeLocals`]
+/// order: `buf` and `dst` are block bases held across allocation; `addr` is
+/// an interior address into `buf` or an index, never live across one.
+const NORMALIZE_LOCALS: [LocalClass; 16] = [
+    RAW_I32, RAW_I32, RAW_I32, RAW_I32, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
+    RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, ROOT_BASE,
+];
 
 /// The total size of the table data.
 pub(super) fn data_size() -> i32 {
@@ -186,7 +217,7 @@ fn table(helpers: Helpers<'_>, index: usize) -> (i32, i32) {
 
 /// Push the base and count of table `upper` or `lower`, chosen at run time by
 /// the i32 local `flag`.
-fn push_either(f: &mut Function, helpers: Helpers<'_>, upper: usize, lower: usize, flag: u32) {
+fn push_either(f: &mut FnBuilder<'_>, helpers: Helpers<'_>, upper: usize, lower: usize, flag: u32) {
     let (upper_base, upper_count) = table(helpers, upper);
     let (lower_base, lower_count) = table(helpers, lower);
     wasm!(f;
@@ -196,21 +227,21 @@ fn push_either(f: &mut Function, helpers: Helpers<'_>, upper: usize, lower: usiz
 }
 
 /// Push `1` when the code point in i32 local `cp` is in range table `index`.
-fn push_in(f: &mut Function, helpers: Helpers<'_>, index: usize, cp: u32) {
+fn push_in(f: &mut FnBuilder<'_>, helpers: Helpers<'_>, index: usize, cp: u32) {
     let (base, count) = table(helpers, index);
     wasm!(f; I32Const(base), I32Const(count), LocalGet(cp), Call(helpers.unicode_in()));
 }
 
 /// Push `1` when the code point in i32 local `cp` is `Alphanumeric`.
-pub(super) fn push_is_alphanumeric(f: &mut Function, helpers: Helpers<'_>, cp: u32) {
+pub(super) fn push_is_alphanumeric(f: &mut FnBuilder<'_>, helpers: Helpers<'_>, cp: u32) {
     push_in(f, helpers, T_ALPHANUMERIC, cp);
 }
 
 /// Push the code point of the surrogate pair at unit `at` (i32 local) of the
 /// two-byte string block in i32 local `s`.
-pub(super) fn push_pair_cp(f: &mut Function, s: u32, at: u32) {
+pub(super) fn push_pair_cp(f: &mut FnBuilder<'_>, s: u32, at: u32) {
     let address =
-        |f: &mut Function| wasm!(f; LocalGet(s), LocalGet(at), I32Const(1), I32Shl, I32Add);
+        |f: &mut FnBuilder<'_>| wasm!(f; LocalGet(s), LocalGet(at), I32Const(1), I32Shl, I32Add);
     address(f);
     wasm!(f; I32Load16U(m16(DATA)), I32Const(0xD800), I32Sub, I32Const(10), I32Shl);
     address(f);
@@ -251,15 +282,15 @@ fn m16(offset: u64) -> MemArg {
 }
 
 /// Push the `u24` at the record address in i32 local `record`.
-fn push_u24(f: &mut Function, record: u32) {
+fn push_u24(f: &mut FnBuilder<'_>, record: u32) {
     wasm!(f; LocalGet(record), I32Load(m8(0)), I32Const(0x00FF_FFFF), I32And);
 }
 
 /// `__unicode_find(base, count, record, cp) -> addr`: the address of the last
 /// of the `count` records of `record` bytes at `base`, sorted by their leading
 /// `u24`, that starts at or before `cp`; `0` when there is none.
-fn emit_find() -> Function {
-    let mut f = Function::new(vec![(2, ValType::I32)]);
+fn emit_find(leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I32; 4], &[RAW_I32; 2]);
     let (base, hi, record, cp, lo, mid) = (0, 1, 2, 3, 4, 5);
     wasm!(f;
         Block(BlockType::Empty), Loop(BlockType::Empty),
@@ -277,13 +308,13 @@ fn emit_find() -> Function {
         LocalGet(base), LocalGet(lo), I32Const(1), I32Sub, LocalGet(record), I32Mul, I32Add,
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__unicode_in(base, count, cp) -> bool`: whether `cp` is in the range table
 /// of `count` records at `base`.
-fn emit_in(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(1, ValType::I32)]);
+fn emit_in(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I32; 3], &[RAW_I32; 1]);
     let (base, count, cp, record) = (0, 1, 2, 3);
     let size = i32::try_from(RANGE_RECORD).unwrap_or(0);
     wasm!(f;
@@ -293,13 +324,13 @@ fn emit_in(helpers: Helpers<'_>) -> Function {
         LocalGet(cp), LocalGet(record), I32Load(m8(2)), I32Const(8), I32ShrU, I32LeU,
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__case_simple(cp, upper) -> cp`: the single-scalar case mapping of `cp`,
 /// `cp` itself when it has none.
-fn emit_simple(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(3, ValType::I32)]);
+fn emit_simple(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I32; 2], &[RAW_I32; 3]);
     let (cp, upper, record, offset, stride) = (0, 1, 2, 3, 4);
     let size = i32::try_from(RUN_RECORD).unwrap_or(0);
     push_either(&mut f, helpers, T_CASE_UPPER, T_CASE_LOWER, upper);
@@ -319,17 +350,21 @@ fn emit_simple(helpers: Helpers<'_>) -> Function {
         LocalGet(cp), LocalGet(record), I32Load(m8(4)), I32Add,
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__case_context(s, pos, forward, n, w) -> bool`: starting at unit boundary
 /// `pos` of the string block `s` (`n` units, width `w`) and walking forward or
 /// backward over its well-formed run, whether the first scalar that is not
 /// `Case_Ignorable` exists and is `Cased`. A lone surrogate ends the run.
-fn emit_context(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(2, ValType::I32)]);
+fn emit_context(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, RAW_I32],
+        &[RAW_I32; 2],
+    );
     let (s, pos, forward, n, w, at, cp) = (0, 1, 2, 3, 4, 5, 6);
-    let by_direction = |f: &mut Function, ahead: i32, behind: i32, base: u32| {
+    let by_direction = |f: &mut FnBuilder<'_>, ahead: i32, behind: i32, base: u32| {
         wasm!(f;
             LocalGet(base), I32Const(ahead), I32Add,
             LocalGet(base), I32Const(behind), I32Add,
@@ -368,13 +403,13 @@ fn emit_context(helpers: Helpers<'_>) -> Function {
     wasm!(f; I32Eqz, If(BlockType::Empty));
     push_in(&mut f, helpers, T_CASED, cp);
     wasm!(f; Return, End, Br(0), End, I32Const(0), End);
-    f
+    finish_builder(f)
 }
 
 /// Output the first `count` (i32 local) of the three `units`: with `dst`
 /// still `0` only note whether one needs two bytes in `wide`, else store them
 /// at index `j` of the block `dst`; `j` advances either way.
-fn put_units(f: &mut Function, units: [u32; 3], count: u32, dst: u32, wide: u32, j: u32) {
+fn put_units(f: &mut FnBuilder<'_>, units: [u32; 3], count: u32, dst: u32, wide: u32, j: u32) {
     for (slot, unit) in (0..).zip(units) {
         wasm!(f;
             LocalGet(count), I32Const(slot), I32GtU, If(BlockType::Empty),
@@ -400,8 +435,8 @@ fn put_units(f: &mut Function, units: [u32; 3], count: u32, dst: u32, wide: u32,
 /// string block `s`. A first pass measures the result (length and width), a
 /// second writes it; the string is one-byte when every unit fits. A lone
 /// surrogate passes through as its unit.
-fn emit_map(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(12, ValType::I32)]);
+fn emit_map(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_BASE, RAW_I32], &CASE_MAP_LOCALS);
     let (s, upper, len, w, i, cp, out, dst, wide, record, count) =
         (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
     let (u0, u1, u2) = (11, 12, 13);
@@ -434,7 +469,7 @@ fn emit_map(helpers: Helpers<'_>) -> Function {
         LocalGet(upper), I32Eqz, LocalGet(cp), I32Const(0x3A3), I32Eq, I32And,
         If(BlockType::Empty),
     );
-    let context = |f: &mut Function, pos: i32, forward: i32| {
+    let context = |f: &mut FnBuilder<'_>, pos: i32, forward: i32| {
         wasm!(f;
             LocalGet(s), LocalGet(i), I32Const(pos), I32Add, I32Const(forward),
             LocalGet(len), LocalGet(w), Call(helpers.case_context()),
@@ -490,16 +525,16 @@ fn emit_map(helpers: Helpers<'_>) -> Function {
         dst,
     );
     wasm!(f; Br(0), End, I32Const(0), End);
-    f
+    finish_builder(f)
 }
 
 /// `__normalize_form(s) -> form | -1`: the form named by the string block `s`
 /// (`NFC`, `NFD`, `NFKC`, `NFKD`), as [`FORM_COMPOSE`] and [`FORM_COMPAT`] bits.
-fn emit_normalize_form() -> Function {
-    let mut f = Function::new(vec![(4, ValType::I32)]);
+fn emit_normalize_form(leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_BASE], &[RAW_I32; 4]);
     let (s, len, w, i, form) = (0, 1, 2, 3, 4);
     // Refuse unless unit `at` of `s` is `unit`.
-    let expect = |f: &mut Function, at: i32, unit: u8| {
+    let expect = |f: &mut FnBuilder<'_>, at: i32, unit: u8| {
         wasm!(f; I32Const(at), LocalSet(i));
         emit_str_unit(f, s, i, w);
         wasm!(f;
@@ -533,12 +568,12 @@ fn emit_normalize_form() -> Function {
         LocalGet(form),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// Output one code point at cell `n` of the working buffer `buf` (i32
 /// locals): with `buf` still `0` only count it; `n` advances either way.
-fn put_cell(f: &mut Function, buf: u32, n: u32, value: impl Fn(&mut Function)) {
+fn put_cell(f: &mut FnBuilder<'_>, buf: u32, n: u32, value: impl Fn(&mut FnBuilder<'_>)) {
     wasm!(f;
         LocalGet(buf), If(BlockType::Empty),
         LocalGet(buf), LocalGet(n), I32Const(2), I32Shl, I32Add,
@@ -554,14 +589,18 @@ fn put_cell(f: &mut Function, buf: u32, n: u32, value: impl Fn(&mut Function)) {
 /// `__decompose(cp, compat, buf, n) -> n`: output the full canonical (or, with
 /// `compat`, compatibility) decomposition of `cp` from cell `n` of the working
 /// buffer `buf`, returning the next free cell. A `buf` of `0` only counts.
-fn emit_decompose(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(4, ValType::I32)]);
+fn emit_decompose(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[RAW_I32, RAW_I32, ROOT_BASE, RAW_I32],
+        &[RAW_I32; 4],
+    );
     let (cp, compat, buf, n, record, at, count, h) = (0, 1, 2, 3, 4, 5, 6, 7);
     let (base, records) = table(helpers, T_DECOMPOSITIONS);
     let (pool, _) = table(helpers, T_DECOMPOSITION_POOL);
     let size = i32::try_from(DECOMPOSITION_RECORD).unwrap_or(0);
     // Clear `record` unless it belongs to `cp`.
-    let keep_own = |f: &mut Function| {
+    let keep_own = |f: &mut FnBuilder<'_>| {
         push_u24(f, record);
         wasm!(f;
             LocalGet(cp), I32Ne,
@@ -629,13 +668,13 @@ fn emit_decompose(helpers: Helpers<'_>) -> Function {
         LocalGet(n),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__compose(first, second) -> cp | 0`: the primary composite of the pair,
 /// `0` when it has none.
-fn emit_compose(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(2, ValType::I32)]);
+fn emit_compose(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I32; 2], &[RAW_I32; 2]);
     let (first, second, record, second_of) = (0, 1, 2, 3);
     let (base, records) = table(helpers, T_COMPOSITIONS);
     let size = i32::try_from(COMPOSITION_RECORD).unwrap_or(0);
@@ -680,12 +719,12 @@ fn emit_compose(helpers: Helpers<'_>) -> Function {
         I32Const(0),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// Run `body` for each `i` (i32 local) from its current value up to the i32
 /// local `limit`. The body sits two labels deep: `Br(1)` breaks.
-fn count_up(f: &mut Function, i: u32, limit: u32, body: impl FnOnce(&mut Function)) {
+fn count_up(f: &mut FnBuilder<'_>, i: u32, limit: u32, body: impl FnOnce(&mut FnBuilder<'_>)) {
     wasm!(f;
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(limit), I32GeU, BrIf(1),
@@ -740,7 +779,7 @@ const NORMALIZE: NormalizeLocals = NormalizeLocals {
 
 /// Push the address (before the data offset) of the working cell whose index
 /// is in i32 local `index`.
-fn cell_at(f: &mut Function, index: u32) {
+fn cell_at(f: &mut FnBuilder<'_>, index: u32) {
     wasm!(f; LocalGet(NORMALIZE.buf), LocalGet(index), I32Const(2), I32Shl, I32Add);
 }
 
@@ -754,8 +793,8 @@ fn cell_at(f: &mut Function, index: u32) {
 /// its combining class in the top byte, so reordering and composing never
 /// repeat the table lookup. A lone surrogate is a cell of its own unit: class
 /// `0`, no mappings.
-fn emit_normalize(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(16, ValType::I32)]);
+fn emit_normalize(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_BASE, RAW_I32], &NORMALIZE_LOCALS);
     let NormalizeLocals {
         s,
         form,
@@ -785,11 +824,11 @@ fn emit_normalize(helpers: Helpers<'_>) -> Function {
     normalize_compose(&mut f, helpers);
     normalize_encode(&mut f, helpers);
     wasm!(f; LocalGet(NORMALIZE.dst), End);
-    f
+    finish_builder(f)
 }
 
 /// The working buffer: the full decomposition of every scalar.
-fn normalize_decompose(f: &mut Function, helpers: Helpers<'_>) {
+fn normalize_decompose(f: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
     let NormalizeLocals {
         s,
         form,
@@ -837,7 +876,7 @@ fn normalize_decompose(f: &mut Function, helpers: Helpers<'_>) {
 }
 
 /// Tag each working cell with its combining class.
-fn normalize_classes(f: &mut Function, helpers: Helpers<'_>) {
+fn normalize_classes(f: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
     let NormalizeLocals {
         i,
         cp,
@@ -873,7 +912,7 @@ fn normalize_classes(f: &mut Function, helpers: Helpers<'_>) {
 }
 
 /// Canonical ordering of the working cells.
-fn normalize_order(f: &mut Function) {
+fn normalize_order(f: &mut FnBuilder<'_>) {
     let NormalizeLocals {
         i,
         cp,
@@ -910,7 +949,7 @@ fn normalize_order(f: &mut Function) {
 }
 
 /// Canonical composition of the working cells, for the composing forms.
-fn normalize_compose(f: &mut Function, helpers: Helpers<'_>) {
+fn normalize_compose(f: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
     let NormalizeLocals {
         form,
         i,
@@ -968,7 +1007,7 @@ fn normalize_compose(f: &mut Function, helpers: Helpers<'_>) {
 }
 
 /// The result string block in `dst`, from the working cells.
-fn normalize_encode(f: &mut Function, helpers: Helpers<'_>) {
+fn normalize_encode(f: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
     let NormalizeLocals {
         i,
         cp,
@@ -1002,7 +1041,7 @@ fn normalize_encode(f: &mut Function, helpers: Helpers<'_>) {
         dst,
     );
     wasm!(f; I32Const(0), LocalSet(i), I32Const(0), LocalSet(j));
-    let put = |f: &mut Function, value: &dyn Fn(&mut Function)| {
+    let put = |f: &mut FnBuilder<'_>, value: &dyn Fn(&mut FnBuilder<'_>)| {
         wasm!(f; LocalGet(wide), If(BlockType::Empty), LocalGet(dst), LocalGet(j), I32Const(1), I32Shl, I32Add);
         value(f);
         wasm!(f; I32Store16(m16(DATA)), Else, LocalGet(dst), LocalGet(j), I32Add);

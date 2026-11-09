@@ -10,9 +10,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store};
 
-use super::host::{alloc_string, method_dispatch, parse_float_str, parse_int_str, value_to_number};
+use super::host::method_dispatch;
 use super::promise::{self, Host};
-use super::value::{Value, decode, to_js_string};
 use crate::abi;
 
 const ERRNO_SUCCESS: i32 = 0;
@@ -207,7 +206,7 @@ fn execute(wasm: &[u8], sinks: Sinks, fuel: Option<u64>) -> anyhow::Result<Finis
     }
     let mut linker = Linker::new(&engine);
     link_wasi(&mut linker)?;
-    link_conversions(&mut linker)?;
+    link_method(&mut linker)?;
     link_promises(&mut linker)?;
     let instance = linker.instantiate(&mut store, &module)?;
     let start = instance.get_typed_func::<(), ()>(&mut store, abi::START_EXPORT_NAME)?;
@@ -398,48 +397,8 @@ fn link_wasi(linker: &mut Linker<Host>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Box a host-computed `f64` as a number jsval's raw bits, canonicalizing NaN.
-fn number_bits(n: f64) -> i64 {
-    if n.is_nan() { abi::QNAN } else { n.to_bits() }.cast_signed()
-}
-
-/// Decode a jsval, reading linear memory for heap operands.
-fn decode_arg(caller: &mut Caller<'_, Host>, bits: i64) -> Value {
-    let memory = caller
-        .get_export("memory")
-        .and_then(wasmtime::Extern::into_memory);
-    decode(
-        bits.cast_unsigned(),
-        memory.map_or(&[][..], |mem| mem.data(&*caller)),
-    )
-}
-
-/// The `__convert`/`__method`/`__now`/`__parse_int` imports.
-fn link_conversions(linker: &mut Linker<Host>) -> anyhow::Result<()> {
-    linker.func_wrap(
-        abi::IMPORT_MODULE,
-        abi::CONVERT_IMPORT_NAME,
-        |mut caller: Caller<'_, Host>, bits: i64, op: i32| -> wasmtime::Result<i64> {
-            let value = decode_arg(&mut caller, bits);
-            Ok(match op {
-                abi::CONVERT_OP_TO_NUMBER => number_bits(value_to_number(&value)),
-                abi::CONVERT_OP_PARSE_FLOAT => number_bits(parse_float_str(&to_js_string(&value))),
-                abi::CONVERT_OP_TO_STRING => {
-                    if matches!(value, Value::Str(_)) {
-                        return Ok(bits);
-                    }
-                    let mut failed = None;
-                    let base = alloc_string(&mut caller, &mut failed, &to_js_string(&value));
-                    if let Some(err) = failed {
-                        return Err(err);
-                    }
-                    base.map_or(abi::UNDEFINED, |base| abi::HEAP | base)
-                        .cast_signed()
-                }
-                _ => abi::UNDEFINED.cast_signed(),
-            })
-        },
-    )?;
+/// The `__method` import.
+fn link_method(linker: &mut Linker<Host>) -> anyhow::Result<()> {
     linker.func_wrap(
         abi::IMPORT_MODULE,
         abi::METHOD_IMPORT_NAME,
@@ -462,24 +421,6 @@ fn link_conversions(linker: &mut Linker<Host>) -> anyhow::Result<()> {
                 return Err(err);
             }
             Ok(result.unwrap_or(abi::UNDEFINED).cast_signed())
-        },
-    )?;
-    linker.func_wrap(
-        abi::IMPORT_MODULE,
-        abi::NOW_IMPORT_NAME,
-        |_caller: Caller<'_, Host>| -> f64 {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
-        },
-    )?;
-    linker.func_wrap(
-        abi::IMPORT_MODULE,
-        abi::PARSE_INT_IMPORT_NAME,
-        |mut caller: Caller<'_, Host>, bits: i64, radix: i64| -> i64 {
-            let text = to_js_string(&decode_arg(&mut caller, bits));
-            let radix = value_to_number(&decode_arg(&mut caller, radix));
-            number_bits(parse_int_str(&text, radix))
         },
     )?;
     Ok(())

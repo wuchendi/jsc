@@ -19,7 +19,7 @@ use wasm_encoder::{
     TypeSection, ValType,
 };
 
-use super::{Helpers, MathOp, unicode};
+use super::{Helpers, LeafSet, LocalClass, MathOp, Sink, finish_builder, helper_builder, unicode};
 use crate::abi;
 
 type W = Instruction<'static>;
@@ -505,9 +505,13 @@ impl B {
     }
 
     /// The finished body, with sibling calls relocated by `base`. Every path
-    /// returns explicitly, so the end of the body is unreachable.
-    fn finish(self, base: u32) -> Function {
-        let mut function = Function::new_with_locals_types(self.locals);
+    /// returns explicitly, so the end of the body is unreachable. Parameters
+    /// and locals are `f64` / `i32` / `i64` numbers, never references.
+    fn finish(self, base: u32, params: &[ValType], leaves: &LeafSet) -> Function {
+        let raw = |types: &[ValType]| -> Vec<LocalClass> {
+            types.iter().copied().map(LocalClass::Raw).collect()
+        };
+        let mut function = helper_builder(leaves, &raw(params), &raw(&self.locals));
         for ins in self.code {
             match ins {
                 W::Call(h) => function.instruction(&W::Call(base + h)),
@@ -516,7 +520,7 @@ impl B {
         }
         function.instruction(&W::Unreachable);
         function.instruction(&W::End);
-        function
+        finish_builder(function)
     }
 }
 
@@ -704,7 +708,7 @@ pub(super) fn unary_helper(op: MathOp) -> Option<H> {
 }
 
 /// Every helper body, in [`H`] order.
-pub(super) fn emit_helpers(helpers: Helpers<'_>) -> Vec<Function> {
+pub(super) fn emit_helpers(helpers: Helpers<'_>, leaves: &LeafSet) -> Vec<Function> {
     let bodies: [fn() -> B; 30] = [
         emit_scalbn,
         emit_mul_err,
@@ -738,7 +742,55 @@ pub(super) fn emit_helpers(helpers: Helpers<'_>) -> Vec<Function> {
         emit_atanh,
     ];
     let base = helpers.libm(H::Scalbn);
-    bodies.iter().map(|body| body().finish(base)).collect()
+    bodies
+        .iter()
+        .zip(TYPES)
+        .map(|(body, (params, _))| body().finish(base, params, leaves))
+        .collect()
+}
+
+/// The sibling callees of every helper, in [`H`] order.
+const CALLEES: [&[H]; 30] = [
+    &[],                             // scalbn
+    &[],                             // mul_err
+    &[],                             // asin_r
+    &[H::Scalbn],                    // exp
+    &[],                             // expm1
+    &[],                             // log
+    &[],                             // log1p
+    &[],                             // log2
+    &[],                             // log10
+    &[H::MulErr],                    // cbrt
+    &[],                             // k_sin
+    &[],                             // k_cos
+    &[],                             // k_tan
+    &[],                             // rem_medium
+    &[H::Scalbn],                    // rem_large
+    &[H::RemLarge, H::RemMedium],    // rem_pio2
+    &[H::KCos, H::KSin, H::RemPio2], // sin
+    &[H::KCos, H::KSin, H::RemPio2], // cos
+    &[H::KTan, H::RemPio2],          // tan
+    &[H::AsinR],                     // asin
+    &[H::AsinR],                     // acos
+    &[],                             // atan
+    &[H::Atan],                      // atan2
+    &[H::Exp],                       // expo2
+    &[H::Expm1, H::Expo2],           // sinh
+    &[H::Exp, H::Expm1, H::Expo2],   // cosh
+    &[H::Expm1],                     // tanh
+    &[H::Log, H::Log1p],             // asinh
+    &[H::Log, H::Log1p],             // acosh
+    &[H::Log1p],                     // atanh
+];
+
+/// Every helper with its declared callees for
+/// [`leaf_set`](super::roots::leaf_set): pure numerics, all leaves.
+pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
+    let base = helpers.libm(H::Scalbn);
+    (base..)
+        .zip(CALLEES)
+        .map(|(helper, callees)| (helper, callees.iter().map(|h| helpers.libm(*h)).collect()))
+        .collect()
 }
 
 /// `f64` from a bit pattern, for the constants below.

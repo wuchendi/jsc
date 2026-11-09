@@ -301,13 +301,22 @@ pub(crate) const FUNC_FLAG_GENERATOR: u8 = 128;
 /// `%AsyncGeneratorPrototype%` instead.
 pub(crate) const FUNC_FLAG_ASYNC: u8 = 2;
 
+/// Size in bytes of the shadow-stack region `[0, SHADOW_STACK_SIZE)`. The stack
+/// body is `[SHADOW_FP_BIAS, SHADOW_STACK_SIZE)`, growing down from its end
+/// (`$__sp` starts at `SHADOW_STACK_SIZE - SHADOW_FP_BIAS`). See DESIGN.md §4.2.
+pub(crate) const SHADOW_STACK_SIZE: u32 = 1 << 20;
+
+/// Frame-pointer bias: slot `k` is at `$fp + SHADOW_FP_BIAS + 8k`, so addresses
+/// `0..8` never hold stack data and a raw ref of `0` always reads zero.
+pub(crate) const SHADOW_FP_BIAS: u32 = 8;
+
 /// Linear-memory address of the u32 holding the base of the static function
 /// info table (inside the null guard below the first static string): entry
 /// `func_idx` is [`FN_INFO_ENTRY_SIZE`] bytes at `base + FN_INFO_ENTRY_SIZE *
 /// func_idx`, holding the function's interned `name` key at
 /// [`FN_INFO_NAME_OFFSET`] and its `length` at [`FN_INFO_LENGTH_OFFSET`]
 /// (`__fn_info`). `__fn_materialize` and the host renderers read it.
-pub(crate) const FN_INFO_ADDR: u32 = 4;
+pub(crate) const FN_INFO_ADDR: u32 = SHADOW_STACK_SIZE + 4;
 
 /// The byte size of one function info entry (see [`FN_INFO_ADDR`]).
 pub(crate) const FN_INFO_ENTRY_SIZE: u32 = 8;
@@ -478,7 +487,7 @@ pub(crate) const GEN_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 32;
 /// TYPE BYTE of a `Date` block: the object-family prefix, then `[ms:f64 @16]`. The
 /// single f64 payload is the timestamp in milliseconds since the Unix epoch — the
 /// same value `Date.now()` / `d.getTime()` yield. `new Date(ms)` stores its
-/// numeric argument; `new Date()` stores the host clock (the `__now` import).
+/// numeric argument; `new Date()` stores the WASI clock (the guest `__now`).
 /// Maps to `typeof` "object".
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_DATE: u8 = 10;
@@ -607,6 +616,12 @@ pub(crate) const ELEMS_DATA_OFFSET: u32 = 8;
 /// symbols are static blocks in the realm image.
 pub(crate) const TYPE_SYMBOL: u8 = 14;
 
+/// TYPE BYTE of an internal raw buffer: `[type=19][pad×3][len:u32][data]`,
+/// a collector leaf whose `len` bytes from offset `8` hold no references (the
+/// grown intern table, the `Math.sumPrecise` accumulator, the console render
+/// output, path and ref buffers). Never a user value.
+pub(crate) const TYPE_RAW: u8 = 19;
+
 /// Byte offset (from a [`TYPE_SYMBOL`] block base) of the `description` jsval
 /// (an `i64`: a string jsval or `undefined`).
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -703,10 +718,16 @@ pub(crate) const START_EXPORT_NAME: &str = "_start";
 
 /// Address of the static WASI scratch area, 40 bytes: one iovec, `nwritten`,
 /// the 8-byte clock result and the 16-byte random seed buffer.
-pub(crate) const WASI_SCRATCH: u32 = 8;
+pub(crate) const WASI_SCRATCH: u32 = SHADOW_STACK_SIZE + 8;
 
 /// Address of the `nwritten` word of the WASI scratch area.
 pub(crate) const WASI_NWRITTEN: u32 = WASI_SCRATCH + 8;
+
+/// Address of the 8-byte `clock_time_get` result in the WASI scratch area.
+pub(crate) const WASI_CLOCK: u32 = WASI_SCRATCH + 16;
+
+/// Address of the 16-byte `random_get` seed buffer in the WASI scratch area.
+pub(crate) const WASI_SEED: u32 = WASI_SCRATCH + 24;
 
 /// Address of the static iovec of [`OOM_LINE`], right after the scratch area.
 pub(crate) const OOM_IOVEC: u32 = WASI_SCRATCH + 40;
@@ -717,12 +738,42 @@ pub(crate) const OOM_LINE_ADDR: u32 = OOM_IOVEC + 8;
 /// The line `__alloc` writes to fd 2 before `proc_exit(1)`.
 pub(crate) const OOM_LINE: &str = "Uncaught RangeError: out of memory\n";
 
-/// The first address after the fixed static area, where the string blocks begin.
-pub(crate) const STATIC_AREA_END: u32 = OOM_LINE_ADDR + 40;
+/// Address of the static decimal-conversion scratch, 784 bytes: the
+/// `num_digits`, `decimal_point` and `truncated` words, the end index of the
+/// last parsed literal, then the 768-digit buffer.
+pub(crate) const DEC_SCRATCH: u32 = OOM_LINE_ADDR + 40;
 
-/// The field name of the host `__convert` import backing the
-/// `String`/`Number`/`parseFloat` conversions.
-pub(crate) const CONVERT_IMPORT_NAME: &str = "__convert";
+/// Address of the 23 exact `f64` powers of ten (`10^0..=10^22`).
+pub(crate) const DEC_POW10: u32 = DEC_SCRATCH + 784;
+
+/// Address of the 65-entry `u16` decimal left-shift table.
+pub(crate) const DEC_SHIFT_TABLE: u32 = DEC_POW10 + 184;
+
+/// Address of the packed decimal digits of `5^1..=5^63`.
+pub(crate) const DEC_POW5: u32 = DEC_SHIFT_TABLE + 130;
+
+/// Byte length of the digits at [`DEC_POW5`].
+pub(crate) const DEC_POW5_LEN: u32 = 1440;
+
+/// Address of the 19-entry table of decimal-conversion shift steps.
+pub(crate) const DEC_POWERS: u32 = DEC_POW5 + DEC_POW5_LEN;
+
+/// The first address after the fixed static area, where the string blocks begin.
+pub(crate) const STATIC_AREA_END: u32 = RYU_TABLES_ADDR + RYU_TABLES_SIZE;
+
+/// Address of the static `Number` formatting scratch, right after the
+/// decimal-conversion tables, 16-aligned.
+pub(crate) const NUM_SCRATCH_ADDR: u32 = (DEC_POWERS + 19 + 15) & !15;
+
+/// Size of [`NUM_SCRATCH_ADDR`].
+pub(crate) const NUM_SCRATCH_SIZE: u32 = 2048;
+
+/// Address of the static Ryu power-of-5 tables, right after the scratch.
+pub(crate) const RYU_TABLES_ADDR: u32 = NUM_SCRATCH_ADDR + NUM_SCRATCH_SIZE;
+
+/// Size of the Ryu tables (828 bytes), rounded up to keep the string blocks
+/// aligned.
+pub(crate) const RYU_TABLES_SIZE: u32 = 832;
 
 /// The field name of the host `__method` import backing the non-callback
 /// array/string methods.
@@ -739,16 +790,6 @@ pub(crate) const PROMISE_IMPORT_NAME: &str = "__promise";
 /// / `p.catch(onR)`. It receives the promise plus the two reaction handlers
 /// (`undefined` for a missing handler) and returns the chained result promise.
 pub(crate) const THEN_IMPORT_NAME: &str = "__then";
-
-/// The field name of the host `__now` import backing
-/// `Date.now()` / `new Date()`. It takes no arguments and returns the current
-/// wall-clock time as an f64 count of milliseconds since the Unix epoch.
-pub(crate) const NOW_IMPORT_NAME: &str = "__now";
-
-/// The field name of the host `__parse_int` import backing `parseInt(s, radix)`.
-/// It receives the string and radix jsvals (`undefined` for an omitted radix) and
-/// returns the parsed number jsval.
-pub(crate) const PARSE_INT_IMPORT_NAME: &str = "__parse_int";
 
 /// `__promise` op flag: `Promise.resolve(a)` — a promise already fulfilled
 /// with `a` (or `a` itself when it is already a promise).
@@ -847,15 +888,6 @@ pub(crate) const EXC_PENDING_EXPORT_NAME: &str = "__exc_pending";
 /// is exported so the run stage can render an uncaught exception.
 pub(crate) const EXC_VALUE_EXPORT_NAME: &str = "__exc_value";
 
-/// `__convert` op flag: stringify the argument (`String(x)`).
-pub(crate) const CONVERT_OP_TO_STRING: i32 = 0;
-
-/// `__convert` op flag: coerce the argument to a number (`Number(x)`).
-pub(crate) const CONVERT_OP_TO_NUMBER: i32 = 1;
-
-/// `__convert` op flag: parse a leading float (`parseFloat(x)`).
-pub(crate) const CONVERT_OP_PARSE_FLOAT: i32 = 3;
-
 /// `__method` op flag: array `indexOf`.
 pub(crate) const METHOD_OP_INDEX_OF: i32 = 0;
 
@@ -870,10 +902,6 @@ pub(crate) const METHOD_OP_TO_UPPER: i32 = 4;
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const METHOD_OP_TO_LOWER: i32 = 5;
 
-/// `__method` op flag: `Number.prototype.toString(radix)` (a number receiver,
-/// `arg0` an integral radix in `2..=36`).
-pub(crate) const METHOD_OP_NUMBER_TO_STRING: i32 = 17;
-
 /// `__method` op flag: `String.prototype.localeCompare` (string, code-unit
 /// order).
 pub(crate) const METHOD_OP_LOCALE_COMPARE: i32 = 22;
@@ -887,19 +915,6 @@ pub(crate) const METHOD_OP_NORMALIZE: i32 = 23;
 /// form); the calling builtin throws a `RangeError`.
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const METHOD_RANGE_ERROR: u64 = UNDEFINED | 2;
-
-/// `__method` op flag: `Number.prototype.toFixed(f)` (a finite number
-/// receiver, `arg0` an integral `f` in `0..=100`).
-pub(crate) const METHOD_OP_NUMBER_TO_FIXED: i32 = 40;
-
-/// `__method` op flag: `Number.prototype.toExponential(f)` (a finite number
-/// receiver, `arg0` an integral `f` in `0..=100`, or `undefined` for the
-/// shortest round-tripping digits).
-pub(crate) const METHOD_OP_NUMBER_TO_EXPONENTIAL: i32 = 41;
-
-/// `__method` op flag: `Number.prototype.toPrecision(p)` (a finite number
-/// receiver, `arg0` an integral `p` in `1..=100`).
-pub(crate) const METHOD_OP_NUMBER_TO_PRECISION: i32 = 42;
 
 /// `__method` op flag: a host `Math` function. The receiver is the first
 /// number operand, `arg0` the second (`Math.atan2`'s `x`; `undefined` for
@@ -947,9 +962,6 @@ pub(crate) const MATH_FN_ASINH: i64 = 17;
 pub(crate) const MATH_FN_ACOSH: i64 = 18;
 /// `METHOD_OP_MATH` function code: `Math.atanh`.
 pub(crate) const MATH_FN_ATANH: i64 = 19;
-/// `METHOD_OP_MATH` function code: `Math.random` (operands ignored).
-pub(crate) const MATH_FN_RANDOM: i64 = 20;
-
 #[cfg(test)]
 #[path = "abi_drift_tests.rs"]
 mod drift_tests;

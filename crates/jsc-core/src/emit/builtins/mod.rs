@@ -54,13 +54,13 @@ pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
 pub(super) use namespace::fragment;
 use number::NumberFormat;
 pub(super) use promise::emit_promise_self_error;
-pub(super) use string::{MAX_STRING_LENGTH, inline_host_op};
+pub(super) use string::{MAX_STRING_LENGTH, emit_is_whitespace, inline_host_op};
 
 /// Argument `i` (an i32 local) into i64 `out`: element `i` of the spread
 /// argument array captured (as the `__spread_args` jsval) in i64 `spread`
 /// when the call passed more than `K` arguments, else slot `i` (`undefined`
 /// past the slots); a spread hole reads `undefined`.
-fn arg_at(function: &mut Function, frame: Frame, i: u32, spread: u32, out: u32) {
+fn arg_at(function: &mut FnBuilder<'_>, frame: Frame, i: u32, spread: u32, out: u32) {
     let k = frame.k;
     wasm!(function;
         LocalGet(frame.argc()), F64ReinterpretI64, I32TruncSatF64U,
@@ -113,47 +113,50 @@ struct Frame {
 }
 
 impl Frame {
-    /// Start a builtin body under the program's arity `K`: its wasm function
-    /// and frame, with the unwind state reset.
-    fn begin(helpers: Helpers<'_>) -> (Function, Self) {
+    /// Start a builtin body under the program's arity `K`: its function
+    /// builder and frame, with the unwind state reset.
+    fn begin<'a>(helpers: Helpers<'_>, leaves: &'a LeafSet) -> (FnBuilder<'a>, Self) {
         helpers.unwind.borrow_mut().reset();
         let frame = Self {
             k: helpers.max_args,
         };
-        (Self::function(), frame)
+        (Self::builder(frame.k, leaves), frame)
     }
 
-    /// The wasm function with a frame's locals.
-    fn function() -> Function {
-        Function::new(vec![
-            (4, ValType::I64),
-            (4, ValType::I32),
-            (3, ValType::I64),
-            (1, ValType::I32),
-            (3, ValType::I64),
-            (1, ValType::I32),
-            (5, ValType::I32),
-            (1, ValType::I64),
-            (7, ValType::I64),
-            (1, ValType::I32),
-            (2, ValType::I64),
-            (6, ValType::I64),
-            (2, ValType::I64),
-            (2, ValType::I32),
-            (1, ValType::F64),
-            (1, ValType::I64),
-            (6, ValType::I64),
-            (4, ValType::I32),
-            (2, ValType::F64),
-            (6, ValType::F64),
-            (4, ValType::I64),
-        ])
+    /// The builder with a frame's locals (DESIGN.md §5.7 spill-set table):
+    /// every `i64` is a jsval except the raw Date scratch; an `i32` is rooted
+    /// only as a [`Self::base`] (or a scratch base slot), `f64`s never.
+    fn builder(k: u32, leaves: &LeafSet) -> FnBuilder<'_> {
+        use LocalClass::{Base, Jsval, Raw};
+        let int = Raw(ValType::I32);
+        let float = Raw(ValType::F64);
+        let mut b = FnBuilder::new(leaves);
+        for _ in 0..=k {
+            b.param(Jsval); // a0..a_{K-1}, env
+        }
+        b.param(Raw(ValType::I64)); // argc
+        b.locals(4, Jsval); // i64(0..4)
+        b.locals(4, int); // i32(0..4)
+        declare_error_scratch(&mut b);
+        b.locals(4, Raw(ValType::I64)); // +26..+29 (Date arithmetic)
+        b.locals(2, Jsval); // x64(0..2)
+        b.locals(2, int); // x32(0..2)
+        b.locals(1, float); // f64(0)
+        b.locals(1, Jsval); // +35, the `arg` temp
+        b.locals(6, Jsval); // y64(0..6)
+        b.locals(4, int); // y32(0..4)
+        b.locals(2, float); // yf64(0..2)
+        b.locals(6, float); // zf64(0..6)
+        b.locals(4, Jsval); // z64(0..4)
+        b.locals(Self::BASES, Base); // base(0..BASES)
+        b.locals(8, int); // w32(0..8)
+        b
     }
 
     /// Push argument `i`: slot `i`, or past the `K` slots the element of the
     /// spread argument array a call with more than `K` arguments published
     /// (`undefined` past the argument count, or for a spread hole).
-    fn arg(self, function: &mut Function, i: u32) {
+    fn arg(self, function: &mut FnBuilder<'_>, i: u32) {
         if i < self.k {
             wasm!(function; LocalGet(i));
             return;
@@ -229,6 +232,38 @@ impl Frame {
     fn z64(self, n: u32) -> u32 {
         self.scratch() + 54 + n
     }
+
+    /// The rooted `i32` locals: a block base or property key held across a
+    /// safepoint lives here (`0` is fine, a non-reference integer is not).
+    const BASES: u32 = 12;
+
+    /// Rooted `i32` local `n` (`0..BASES`).
+    fn base(self, n: u32) -> u32 {
+        self.scratch() + 58 + n
+    }
+
+    /// Further raw `i32` temp `n` (`0..8`), past the rooted bases.
+    fn w32(self, n: u32) -> u32 {
+        self.scratch() + 58 + Self::BASES + n
+    }
+}
+
+/// Declare the scratch layout `+0..+25` of [`emit_node`], which a helper
+/// raising a `TypeError` also carries: `+3`, `+7`, `+8`, `+11`, `+12` and
+/// `+21` are block bases, `+9` and `+10` integers, `+24` and `+25` raw Date
+/// bits (DESIGN.md §5.7 spill-set table).
+fn declare_error_scratch(b: &mut FnBuilder<'_>) {
+    use LocalClass::{Base, Jsval, Raw};
+    b.locals(3, Jsval); // +0..+2
+    b.locals(1, Base); // +3
+    b.locals(3, Jsval); // +4..+6
+    b.locals(2, Base); // +7, +8
+    b.locals(2, Raw(ValType::I32)); // +9, +10
+    b.locals(2, Base); // +11, +12
+    b.locals(8, Jsval); // +13..+20
+    b.locals(1, Base); // +21
+    b.locals(2, Jsval); // +22, +23
+    b.locals(2, Raw(ValType::I64)); // +24, +25
 }
 
 /// Every static string the builtin bodies reference. Interned in every program.
@@ -260,18 +295,32 @@ pub(super) fn emit_builtin(
     builtin: Builtin,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
+    leaves: &LeafSet,
 ) -> Function {
-    let (mut f, frame) = Frame::begin(helpers);
+    let (mut f, frame) = Frame::begin(helpers, leaves);
+    emit_builtin_body(builtin, &mut f, frame, strings, helpers);
+    wasm!(f; End);
+    finish_builder(f)
+}
+
+/// Emit the instructions of `builtin` into `f`, its frame's builder.
+fn emit_builtin_body(
+    builtin: Builtin,
+    f: &mut FnBuilder<'_>,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     match builtin {
         Builtin::FunctionPrototype => wasm!(f; I64Const(UNDEFINED_BITS)),
-        Builtin::HasOwnProperty => object::emit_has_own_property(&mut f, frame, strings, helpers),
-        Builtin::ObjectToString => object::emit_to_string(&mut f, frame, strings, helpers),
-        Builtin::ValueOf => object::emit_value_of(&mut f, frame, strings, helpers),
-        Builtin::IsPrototypeOf => object::emit_is_prototype_of(&mut f, frame, strings, helpers),
-        Builtin::ToLocaleString => object::emit_to_locale_string(&mut f, frame, strings, helpers),
-        Builtin::ProtoGet => object::emit_proto_get(&mut f, frame, strings, helpers),
-        Builtin::ProtoSet => object::emit_proto_set(&mut f, frame, strings, helpers),
-        Builtin::ObjectReflect(op) => object_static::emit(op, &mut f, frame, strings, helpers),
+        Builtin::HasOwnProperty => object::emit_has_own_property(f, frame, strings, helpers),
+        Builtin::ObjectToString => object::emit_to_string(f, frame, strings, helpers),
+        Builtin::ValueOf => object::emit_value_of(f, frame, strings, helpers),
+        Builtin::IsPrototypeOf => object::emit_is_prototype_of(f, frame, strings, helpers),
+        Builtin::ToLocaleString => object::emit_to_locale_string(f, frame, strings, helpers),
+        Builtin::ProtoGet => object::emit_proto_get(f, frame, strings, helpers),
+        Builtin::ProtoSet => object::emit_proto_set(f, frame, strings, helpers),
+        Builtin::ObjectReflect(op) => object_static::emit(op, f, frame, strings, helpers),
         Builtin::Call
         | Builtin::Apply
         | Builtin::Bind
@@ -279,8 +328,8 @@ pub(super) fn emit_builtin(
         | Builtin::FunctionHasInstance
         | Builtin::BoundCall
         | Builtin::ThrowTypeError
-        | Builtin::MethodCall => emit_function_family(builtin, &mut f, frame, strings, helpers),
-        Builtin::ErrorToString => error::emit_to_string(&mut f, frame, strings, helpers),
+        | Builtin::MethodCall => emit_function_family(builtin, f, frame, strings, helpers),
+        Builtin::ErrorToString => error::emit_to_string(f, frame, strings, helpers),
         Builtin::ArrayPush
         | Builtin::ArrayPop
         | Builtin::ArrayHof(_)
@@ -305,13 +354,13 @@ pub(super) fn emit_builtin(
         | Builtin::ArrayUnshift
         | Builtin::ArrayFill
         | Builtin::ArrayCopyWithin
-        | Builtin::ArrayCopy(_) => emit_array_family(builtin, &mut f, frame, strings, helpers),
+        | Builtin::ArrayCopy(_) => emit_array_family(builtin, f, frame, strings, helpers),
         Builtin::StringMethod(_)
         | Builtin::StringToString
         | Builtin::StringValueOf
         | Builtin::StringFromCharCode
         | Builtin::StringFromCodePoint
-        | Builtin::StringRaw => emit_string_family(builtin, &mut f, frame, strings, helpers),
+        | Builtin::StringRaw => emit_string_family(builtin, f, frame, strings, helpers),
         Builtin::NumberToString
         | Builtin::NumberValueOf
         | Builtin::NumberToFixed
@@ -323,9 +372,9 @@ pub(super) fn emit_builtin(
         | Builtin::ParseInt
         | Builtin::BooleanToString
         | Builtin::BooleanValueOf
-        | Builtin::MathSumPrecise => emit_number_family(builtin, &mut f, frame, strings, helpers),
-        Builtin::Protocol(op) => iter::emit_protocol(op, &mut f, frame, strings, helpers),
-        Builtin::Iter(op) => iter::emit(op, &mut f, frame, strings, helpers),
+        | Builtin::MathSumPrecise => emit_number_family(builtin, f, frame, strings, helpers),
+        Builtin::Protocol(op) => iter::emit_protocol(op, f, frame, strings, helpers),
+        Builtin::Iter(op) => iter::emit(op, f, frame, strings, helpers),
         Builtin::PropertyIsEnumerable
         | Builtin::DefineAccessor { .. }
         | Builtin::LookupAccessor { .. }
@@ -347,24 +396,22 @@ pub(super) fn emit_builtin(
         | Builtin::AsyncGeneratorStep
         | Builtin::AsyncGeneratorReaction(_)
         | Builtin::Species(_)
-        | Builtin::DateBody(_) => emit_object_family(builtin, &mut f, frame, strings, helpers),
-        Builtin::JsonStringify => json::emit_stringify(&mut f, frame, strings, helpers),
-        Builtin::JsonParse => json::emit_parse(&mut f, frame, strings, helpers),
-        Builtin::IsNaN | Builtin::IsFinite => emit_global(builtin, &mut f, frame, helpers),
-        Builtin::Symbol(op) => symbol::emit(op, &mut f, frame, strings, helpers),
+        | Builtin::DateBody(_) => emit_object_family(builtin, f, frame, strings, helpers),
+        Builtin::JsonStringify => json::emit_stringify(f, frame, strings, helpers),
+        Builtin::JsonParse => json::emit_parse(f, frame, strings, helpers),
+        Builtin::IsNaN | Builtin::IsFinite => emit_global(builtin, f, frame, helpers),
+        Builtin::Symbol(op) => symbol::emit(op, f, frame, strings, helpers),
         Builtin::Math(_)
         | Builtin::ConsoleLog
         | Builtin::Ctor(_)
         | Builtin::ObjectStatic(_)
         | Builtin::IsArray
-        | Builtin::DateNow => emit_fragment(builtin, &mut f, frame, strings, helpers),
+        | Builtin::DateNow => emit_fragment(builtin, f, frame, strings, helpers),
     }
-    wasm!(f; End);
-    f
 }
 
 /// Emit the body of the global `isNaN` / `isFinite` into `f`.
-fn emit_global(builtin: Builtin, f: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+fn emit_global(builtin: Builtin, f: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     if builtin == Builtin::IsNaN {
         global::emit_is_nan(f, frame, helpers);
     } else {
@@ -375,7 +422,7 @@ fn emit_global(builtin: Builtin, f: &mut Function, frame: Frame, helpers: Helper
 /// Emit the IR [`fragment`] body of `builtin` into `f`.
 fn emit_fragment(
     builtin: Builtin,
-    f: &mut Function,
+    f: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -388,7 +435,7 @@ fn emit_fragment(
 /// (the variants [`emit_builtin`] routes here).
 fn emit_string_family(
     builtin: Builtin,
-    f: &mut Function,
+    f: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -414,7 +461,7 @@ fn emit_string_family(
 /// routes here).
 fn emit_object_family(
     builtin: Builtin,
-    f: &mut Function,
+    f: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -479,7 +526,7 @@ fn emit_object_family(
 /// (the variants [`emit_builtin`] routes here).
 fn emit_function_family(
     builtin: Builtin,
-    f: &mut Function,
+    f: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -501,7 +548,7 @@ fn emit_function_family(
 /// (the variants [`emit_builtin`] routes here).
 fn emit_array_family(
     builtin: Builtin,
-    f: &mut Function,
+    f: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -551,7 +598,7 @@ fn emit_array_family(
 /// variants [`emit_builtin`] routes here).
 fn emit_number_family(
     builtin: Builtin,
-    f: &mut Function,
+    f: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -586,7 +633,7 @@ fn emit_number_family(
 
 /// Throw a `TypeError` with `text` (`[message, stack]`) and return.
 fn throw_type_error(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     text: CalleeErrorText<'_>,
     strings: &StrOffsets,
@@ -597,7 +644,7 @@ fn throw_type_error(
 
 /// Push `1` when the jsval in `local` is a wrapper object of `class`
 /// (DESIGN.md §5.2).
-pub(super) fn emit_is_wrapper(function: &mut Function, local: u32, class: u8) {
+pub(super) fn emit_is_wrapper(function: &mut impl Sink, local: u32, class: u8) {
     emit_is_pointer(function, local);
     wasm!(function;
         If(BlockType::Result(ValType::I32)),
@@ -613,11 +660,11 @@ pub(super) fn emit_is_wrapper(function: &mut Function, local: u32, class: u8) {
 /// `%Number.prototype%`, itself a Number object), else throw `text`.
 #[allow(clippy::too_many_arguments)]
 fn this_primitive(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     out: u32,
     class: u8,
-    is_prim: fn(&mut Function, u32),
+    is_prim: fn(&mut FnBuilder<'_>, u32),
     text: CalleeErrorText<'static>,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -654,10 +701,17 @@ fn this_primitive(
 /// which callers reject first) is returned as is. A String wrapper's
 /// `length` is defined as its own read-only, non-configurable property; its
 /// indices are virtual (`__str_exotic_index`).
-pub(super) fn emit_to_object(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(2, ValType::I32), (1, ValType::I64)]);
-    let (v, obj, class, proto) = (0, 1, 2, 3);
-    let wrap = |f: &mut Function, c: u8, proto_bits: i64| {
+pub(super) fn emit_to_object(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
+    let mut f = FnBuilder::new(leaves);
+    let v = f.param(LocalClass::Jsval);
+    let obj = f.local(LocalClass::Base);
+    let class = f.local(LocalClass::Raw(ValType::I32));
+    let proto = f.local(LocalClass::Jsval);
+    let wrap = |f: &mut FnBuilder<'_>, c: u8, proto_bits: i64| {
         wasm!(f;
             I32Const(i32::from(c)), LocalSet(class),
             I64Const(proto_bits), LocalSet(proto),
@@ -706,15 +760,15 @@ pub(super) fn emit_to_object(strings: &StrOffsets, helpers: Helpers<'_>) -> Func
         LocalGet(obj), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// Push the target's environment, then (after `argc`, pushed by `argc`) its
 /// funcref slot, and `call_indirect` it: the tail every dispatch shares.
 fn invoke(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     target: u32,
-    argc: impl FnOnce(&mut Function),
+    argc: impl FnOnce(&mut FnBuilder<'_>),
     helpers: Helpers<'_>,
 ) {
     wasm!(function;
@@ -731,7 +785,7 @@ fn invoke(
 
 /// Emit `node` in the body's scratch layout, dropping its value.
 fn emit_drop(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     node: &IrNode,
     strings: &StrOffsets,
@@ -742,7 +796,7 @@ fn emit_drop(
 }
 
 /// Return `undefined` when the last call left an exception pending.
-fn return_if_pending(function: &mut Function) {
+fn return_if_pending(function: &mut FnBuilder<'_>) {
     wasm!(function;
         GlobalGet(EXC_PENDING_GLOBAL),
         If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
@@ -750,12 +804,12 @@ fn return_if_pending(function: &mut Function) {
 }
 
 /// Push the argument count (`argc`, a number jsval) as an i32.
-fn push_argc(function: &mut Function, frame: Frame) {
+fn push_argc(function: &mut FnBuilder<'_>, frame: Frame) {
     wasm!(function; LocalGet(frame.argc()), F64ReinterpretI64, I32TruncSatF64U);
 }
 
 /// `while i < n { body; i += 1 }` over i32 locals.
-fn count_loop(function: &mut Function, i: u32, n: u32, body: impl FnOnce(&mut Function)) {
+fn count_loop(function: &mut FnBuilder<'_>, i: u32, n: u32, body: impl FnOnce(&mut FnBuilder<'_>)) {
     wasm!(function;
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(n), I32GeU, BrIf(1),
@@ -769,6 +823,6 @@ fn count_loop(function: &mut Function, i: u32, n: u32, body: impl FnOnce(&mut Fu
 }
 
 /// Push the heap jsval of the static string `text`.
-fn push_str(function: &mut Function, strings: &StrOffsets, text: &str) {
+fn push_str(function: &mut FnBuilder<'_>, strings: &StrOffsets, text: &str) {
     wasm!(function; I64Const(HEAP_BITS | i64::from(static_key(strings, text))));
 }

@@ -3,16 +3,17 @@
 //! a value to `$__out_buf` as UTF-8 and issues one `fd_write` per line.
 //!
 //! Rendering runs no user code and never throws. The output buffer, the
-//! recursion path and the ref table are headerless `__alloc` blocks, the raw
-//! form `__intern` growth uses until `TYPE_RAW` arrives.
+//! recursion path and the ref table are `TYPE_RAW` blocks: each buffer global
+//! holds the block base (a raw ref), with the data at [`DATA`].
 
 use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
 use super::{
-    CONVERT_OP_TO_STRING, FD_WRITE_IMPORT, HEAP_BITS, Helpers, INVALID_DATE, OUT_BUF_GLOBAL,
+    FD_WRITE_IMPORT, FnBuilder, HEAP_BITS, Helpers, INVALID_DATE, LeafSet, OUT_BUF_GLOBAL,
     OUT_CAP_GLOBAL, OUT_LEN_GLOBAL, OWN_KEYS, PATH_BUF_GLOBAL, PATH_CAP_GLOBAL, PROC_EXIT_IMPORT,
-    QNAN_BITS, REFS_BUF_GLOBAL, REFS_CAP_GLOBAL, REFS_LEN_GLOBAL, StrOffsets, abi, emit_date_field,
-    emit_str_two_byte, emit_str_unit, emit_surrogate_pair_at, static_key, unicode,
+    QNAN_BITS, RAW_I32, RAW_I64, REFS_BUF_GLOBAL, REFS_CAP_GLOBAL, REFS_LEN_GLOBAL, ROOT_BASE,
+    ROOT_JS, Sink, StrOffsets, abi, declare_scratch, emit_date_field, emit_str_two_byte,
+    emit_str_unit, emit_surrogate_pair_at, finish_builder, helper_builder, static_key, unicode,
 };
 use crate::ir::DateOp;
 
@@ -80,6 +81,9 @@ const TYPE_SET: i32 = abi::TYPE_SET as i32;
 const TYPE_GENERATOR: i32 = abi::TYPE_GENERATOR as i32;
 const TYPE_DATE: i32 = abi::TYPE_DATE as i32;
 const TYPE_SYMBOL: i32 = abi::TYPE_SYMBOL as i32;
+const TYPE_RAW: i32 = abi::TYPE_RAW as i32;
+/// The data offset of a `TYPE_RAW` block.
+const DATA: u32 = abi::HEADER_SIZE + 4;
 
 const OPEN_ARRAY: &str = "[ ";
 const OPEN_OBJECT: &str = "{ ";
@@ -242,13 +246,13 @@ impl Helpers<'_> {
     fn render_lookup(self) -> u32 {
         self.render_base() + 18
     }
-    fn heap_object(self) -> u32 {
+    pub(super) fn heap_object(self) -> u32 {
         self.render_base() + 19
     }
-    fn str_of(self) -> u32 {
+    pub(super) fn str_of(self) -> u32 {
         self.render_base() + 20
     }
-    fn fn_name(self) -> u32 {
+    pub(super) fn fn_name(self) -> u32 {
         self.render_base() + 21
     }
     fn date_text(self) -> u32 {
@@ -261,82 +265,92 @@ impl Helpers<'_> {
 }
 
 /// Every render helper body, in [`TYPES`] order (without `_start`).
-pub(super) fn emit_helpers(strings: &StrOffsets, helpers: Helpers<'_>) -> Vec<Function> {
+pub(super) fn emit_helpers(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Vec<Function> {
     let alloc = helpers.alloc;
     vec![
-        emit_reserve(OUT_BUF_GLOBAL, OUT_CAP_GLOBAL, alloc),
-        emit_reserve(PATH_BUF_GLOBAL, PATH_CAP_GLOBAL, alloc),
-        emit_reserve(REFS_BUF_GLOBAL, REFS_CAP_GLOBAL, alloc),
-        emit_out_byte(helpers),
-        emit_out_cp(helpers),
-        emit_out_str(helpers),
-        emit_out_uint(helpers),
-        emit_out_flush(),
-        emit_report(helpers),
-        emit_render_top(helpers),
-        emit_render(strings, helpers),
-        emit_render_heap(strings, helpers),
-        emit_render_array(strings, helpers),
-        emit_render_object(strings, helpers),
-        emit_render_function(strings, helpers),
-        emit_render_props(helpers),
-        emit_render_entry(strings, helpers),
-        emit_render_key(strings, helpers),
-        emit_render_lookup(helpers),
-        emit_heap_object(),
-        emit_str_of(),
-        emit_fn_name(helpers),
-        emit_date_text(strings, helpers),
+        emit_reserve(OUT_BUF_GLOBAL, OUT_CAP_GLOBAL, alloc, leaves),
+        emit_reserve(PATH_BUF_GLOBAL, PATH_CAP_GLOBAL, alloc, leaves),
+        emit_reserve(REFS_BUF_GLOBAL, REFS_CAP_GLOBAL, alloc, leaves),
+        emit_out_byte(helpers, leaves),
+        emit_out_cp(helpers, leaves),
+        emit_out_str(helpers, leaves),
+        emit_out_uint(helpers, leaves),
+        emit_out_flush(leaves),
+        emit_report(helpers, leaves),
+        emit_render_top(helpers, leaves),
+        emit_render(strings, helpers, leaves),
+        emit_render_heap(strings, helpers, leaves),
+        emit_render_array(strings, helpers, leaves),
+        emit_render_object(strings, helpers, leaves),
+        emit_render_function(strings, helpers, leaves),
+        emit_render_props(helpers, leaves),
+        emit_render_entry(strings, helpers, leaves),
+        emit_render_key(strings, helpers, leaves),
+        emit_render_lookup(helpers, leaves),
+        emit_heap_object(leaves),
+        emit_str_of(leaves),
+        emit_fn_name(helpers, leaves),
+        emit_date_text(strings, helpers, leaves),
     ]
 }
 
 /// Append the static string `text`.
-fn lit(f: &mut Function, strings: &StrOffsets, helpers: Helpers<'_>, text: &str) {
+fn lit(f: &mut impl Sink, strings: &StrOffsets, helpers: Helpers<'_>, text: &str) {
     wasm!(f; I32Const(static_key(strings, text)), Call(helpers.out_str()));
 }
 
-/// `reserve(need: i32)`: grow the raw block in `base`/`cap` to at least `need`
-/// bytes, keeping its contents. `max(need, 2 * cap, 64)` bytes when it grows.
-fn emit_reserve(base: u32, cap: u32, alloc: u32) -> Function {
-    let mut f = Function::new(vec![(2, I32)]);
+/// `reserve(need: i32)`: grow the `TYPE_RAW` block in `base`/`cap` to at least
+/// `need` data bytes, keeping its contents. `max(need, 2 * cap, 64)` bytes when
+/// it grows. The old block stays rooted through its global across the alloc.
+fn emit_reserve(base: u32, cap: u32, alloc: u32, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I32], &[ROOT_BASE, RAW_I32]);
     let (need, block, size) = (0, 1, 2);
+    let data = DATA.cast_signed();
     wasm!(f;
         LocalGet(need), GlobalGet(cap), I32LeU, If(BlockType::Empty), Return, End,
         GlobalGet(cap), I32Const(1), I32Shl, LocalTee(size),
         I32Const(64), LocalGet(size), I32Const(64), I32GtU, Select, LocalTee(size),
         LocalGet(need), LocalGet(size), LocalGet(need), I32GtU, Select, LocalTee(size),
-        Call(alloc), LocalSet(block),
+        I32Const(data), I32Add, Call(alloc), LocalTee(block),
+        I32Const(TYPE_RAW), I32Store8(m8(0)),
+        LocalGet(block), LocalGet(size), I32Store(m32(abi::HEADER_SIZE)),
         GlobalGet(cap), If(BlockType::Empty),
-        LocalGet(block), GlobalGet(base), GlobalGet(cap), COPY,
+        LocalGet(block), I32Const(data), I32Add,
+        GlobalGet(base), I32Const(data), I32Add, GlobalGet(cap), COPY,
         End,
         LocalGet(block), GlobalSet(base),
         LocalGet(size), GlobalSet(cap),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__out_byte(b)`.
-fn emit_out_byte(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![]);
+fn emit_out_byte(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I32], &[]);
     wasm!(f;
         GlobalGet(OUT_LEN_GLOBAL), I32Const(1), I32Add, Call(helpers.out_reserve()),
-        GlobalGet(OUT_BUF_GLOBAL), GlobalGet(OUT_LEN_GLOBAL), I32Add, LocalGet(0), I32Store8(m8(0)),
+        GlobalGet(OUT_BUF_GLOBAL), GlobalGet(OUT_LEN_GLOBAL), I32Add, LocalGet(0), I32Store8(m8(DATA)),
         GlobalGet(OUT_LEN_GLOBAL), I32Const(1), I32Add, GlobalSet(OUT_LEN_GLOBAL),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__out_cp(cp)`: append the UTF-8 encoding of the scalar value `cp`.
-fn emit_out_cp(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(2, I32)]);
+fn emit_out_cp(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I32]);
     let (cp, p, n) = (0, 1, 2);
-    // Store `lead | (cp >> shift & mask)` at byte `at` of the sequence.
-    let unit = |f: &mut Function, at: u32, lead: i32, shift: i32, mask: i32| {
+    // Store `lead | (cp >> shift & mask)` at byte `at` of the sequence; `p` is
+    // `base + len`, the data offset is in the store.
+    let unit = |f: &mut FnBuilder<'_>, at: u32, lead: i32, shift: i32, mask: i32| {
         wasm!(f;
             LocalGet(p), LocalGet(cp), I32Const(shift), I32ShrU, I32Const(mask), I32And,
-            I32Const(lead), I32Or, I32Store8(m8(at)),
+            I32Const(lead), I32Or, I32Store8(m8(DATA + at)),
         );
     };
     wasm!(f;
@@ -362,13 +376,17 @@ fn emit_out_cp(helpers: Helpers<'_>) -> Function {
         GlobalGet(OUT_LEN_GLOBAL), LocalGet(n), I32Add, GlobalSet(OUT_LEN_GLOBAL),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__out_str(s)`: append the string block `s` as UTF-8, a lone surrogate as
 /// U+FFFD.
-fn emit_out_str(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(5, I32)]);
+fn emit_out_str(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[ROOT_BASE],
+        &[RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32],
+    );
     let (s, count, at, wide, unit, next) = (0, 1, 2, 3, 4, 5);
     wasm!(f; LocalGet(s), I32Load(m32(abi::STR_LEN_OFFSET)), LocalSet(count));
     emit_str_two_byte(&mut f, s);
@@ -396,12 +414,12 @@ fn emit_out_str(helpers: Helpers<'_>) -> Function {
         Br(0), End, End,
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__out_uint(n)`: append the decimal digits of the unsigned `n`.
-fn emit_out_uint(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![]);
+fn emit_out_uint(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I32], &[]);
     wasm!(f;
         LocalGet(0), I32Const(10), I32GeU, If(BlockType::Empty),
         LocalGet(0), I32Const(10), I32DivU, Call(helpers.out_uint()),
@@ -409,18 +427,18 @@ fn emit_out_uint(helpers: Helpers<'_>) -> Function {
         LocalGet(0), I32Const(10), I32RemU, I32Const(0x30), I32Add, Call(helpers.out_byte()),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__out_flush(fd)`: write the whole buffer, retrying a partial write, and
 /// reset it. An errno, or no progress, ends the program with `proc_exit(1)`.
-fn emit_out_flush() -> Function {
-    let mut f = Function::new(vec![(2, I32)]);
+fn emit_out_flush(leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I32]);
     let (fd, p, left) = (0, 1, 2);
     let iov = abi::WASI_SCRATCH.cast_signed();
     let nwritten = abi::WASI_NWRITTEN.cast_signed();
     wasm!(f;
-        GlobalGet(OUT_BUF_GLOBAL), LocalSet(p),
+        GlobalGet(OUT_BUF_GLOBAL), I32Const(DATA.cast_signed()), I32Add, LocalSet(p),
         GlobalGet(OUT_LEN_GLOBAL), LocalSet(left),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(left), I32Eqz, BrIf(1),
@@ -435,13 +453,13 @@ fn emit_out_flush() -> Function {
         I32Const(0), GlobalSet(OUT_LEN_GLOBAL),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__report(fd, prefix, v)`: a line left unfinished on stdout by a throwing
 /// `console.log` argument goes out first, then `prefix + render(v) + "\n"`.
-fn emit_report(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![]);
+fn emit_report(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I32, ROOT_BASE, ROOT_JS], &[]);
     let (fd, prefix, v) = (0, 1, 2);
     wasm!(f;
         I32Const(1), Call(helpers.out_flush()),
@@ -451,30 +469,30 @@ fn emit_report(helpers: Helpers<'_>) -> Function {
         LocalGet(fd), Call(helpers.out_flush()),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__render_top(v)`: render one value with a fresh ref numbering.
-fn emit_render_top(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![]);
+fn emit_render_top(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_JS], &[]);
     wasm!(f;
         I32Const(0), GlobalSet(REFS_LEN_GLOBAL),
         LocalGet(0), I32Const(0), Call(helpers.render()),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// Push the 3-bit NaN-box tag of the boxed jsval in i64 local `v`, as i32.
-fn tag_of(f: &mut Function, v: u32) {
+fn tag_of(f: &mut impl Sink, v: u32) {
     wasm!(f; LocalGet(v), I64Const(TAG_SHIFT), I64ShrU, I64Const(7), I64And, I32WrapI64);
 }
 
 /// `__render(v, depth_path)`: `depth_path` is the number of containers on the
 /// recursion path. A number, and a boxed value of an unused tag, renders
-/// through `__convert` (decode reads those as numbers).
-fn emit_render(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(1, I32)]);
+/// through the guest number formatter (decode reads those as numbers).
+fn emit_render(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_JS, RAW_I32], &[RAW_I32]);
     let (v, depth, tag) = (0, 1, 2);
     wasm!(f; LocalGet(v), I64Const(QNAN_BITS), I64And, I64Const(QNAN_BITS), I64Eq, If(BlockType::Empty));
     tag_of(&mut f, v);
@@ -493,16 +511,16 @@ fn emit_render(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
         LocalGet(v), I32WrapI64, LocalGet(depth), Call(helpers.render_heap()), Return,
         End,
         End,
-        LocalGet(v), I32Const(CONVERT_OP_TO_STRING), Call(helpers.convert), I32WrapI64,
+        LocalGet(v), Call(helpers.num_to_str()),
         Call(helpers.out_str()),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// Render the container `p` at `depth` by its type byte in `ty`.
-fn render_container(f: &mut Function, helpers: Helpers<'_>, p: u32, ty: u32, depth: u32) {
-    let dispatch = |f: &mut Function, kind: i32, helper: u32| {
+fn render_container(f: &mut FnBuilder<'_>, helpers: Helpers<'_>, p: u32, ty: u32, depth: u32) {
+    let dispatch = |f: &mut FnBuilder<'_>, kind: i32, helper: u32| {
         wasm!(f;
             LocalGet(ty), I32Const(kind), I32Eq, If(BlockType::Empty),
             LocalGet(p), LocalGet(depth), I32Const(1), I32Add, Call(helper),
@@ -516,7 +534,7 @@ fn render_container(f: &mut Function, helpers: Helpers<'_>, p: u32, ty: u32, dep
 
 /// The promise arm of `__render_heap`: `Promise { .. }` by settlement.
 fn render_promise(
-    f: &mut Function,
+    f: &mut FnBuilder<'_>,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
     p: u32,
@@ -524,13 +542,13 @@ fn render_promise(
     depth: u32,
 ) {
     wasm!(f; LocalGet(ty), I32Const(TYPE_PROMISE), I32Eq, If(BlockType::Empty));
-    let state = |f: &mut Function, value: i32| {
+    let state = |f: &mut FnBuilder<'_>, value: i32| {
         wasm!(f;
             LocalGet(p), I32Load(m32(abi::PROMISE_STATE_OFFSET)), I32Const(value), I32Eq,
             If(BlockType::Empty),
         );
     };
-    let body = |f: &mut Function, open: &str| {
+    let body = |f: &mut FnBuilder<'_>, open: &str| {
         lit(f, strings, helpers, open);
         wasm!(f;
             LocalGet(p), I64Load(m64(abi::PROMISE_VALUE_OFFSET)),
@@ -551,16 +569,22 @@ fn render_promise(
 /// `__render_heap(p, depth)`: the cycle guard over the four container kinds,
 /// and the leaf kinds. A cycle target's `<ref *N> ` prefix is inserted at the
 /// container's start offset once its children have been rendered.
-fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(7, I32)]);
-    let (p, depth, ty, i, id, mark, end, size, cond) = (0, 1, 2, 3, 4, 5, 6, 7, 8);
+fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[ROOT_BASE, RAW_I32],
+        &[
+            RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
+        ],
+    );
+    let (p, depth, ty, i, id, mark, end, size, cond, data) = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
     // id = the 1-based ref number of `p`, or 0.
-    let ref_of = |f: &mut Function| {
+    let ref_of = |f: &mut FnBuilder<'_>| {
         wasm!(f;
             I32Const(0), LocalSet(id), I32Const(0), LocalSet(i),
             Block(BlockType::Empty), Loop(BlockType::Empty),
             LocalGet(i), GlobalGet(REFS_LEN_GLOBAL), I32GeU, BrIf(1),
-            GlobalGet(REFS_BUF_GLOBAL), LocalGet(i), I32Const(2), I32Shl, I32Add, I32Load(m32(0)),
+            GlobalGet(REFS_BUF_GLOBAL), LocalGet(i), I32Const(2), I32Shl, I32Add, I32Load(m32(DATA)),
             LocalGet(p), I32Eq, If(BlockType::Empty),
             LocalGet(i), I32Const(1), I32Add, LocalSet(id), Br(2),
             End,
@@ -578,7 +602,7 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
         I32Const(0), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(depth), I32GeU, BrIf(1),
-        GlobalGet(PATH_BUF_GLOBAL), LocalGet(i), I32Const(2), I32Shl, I32Add, I32Load(m32(0)),
+        GlobalGet(PATH_BUF_GLOBAL), LocalGet(i), I32Const(2), I32Shl, I32Add, I32Load(m32(DATA)),
         LocalGet(p), I32Eq, If(BlockType::Empty),
     );
     ref_of(&mut f);
@@ -586,7 +610,7 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
         LocalGet(id), I32Eqz, If(BlockType::Empty),
         GlobalGet(REFS_LEN_GLOBAL), I32Const(1), I32Add, I32Const(2), I32Shl, Call(helpers.refs_reserve()),
         GlobalGet(REFS_BUF_GLOBAL), GlobalGet(REFS_LEN_GLOBAL), I32Const(2), I32Shl, I32Add,
-        LocalGet(p), I32Store(m32(0)),
+        LocalGet(p), I32Store(m32(DATA)),
         GlobalGet(REFS_LEN_GLOBAL), I32Const(1), I32Add, GlobalSet(REFS_LEN_GLOBAL),
         GlobalGet(REFS_LEN_GLOBAL), LocalSet(id),
         End,
@@ -601,7 +625,7 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
         Br(0), End, End,
         LocalGet(depth), I32Const(1), I32Add, I32Const(2), I32Shl, Call(helpers.path_reserve()),
         GlobalGet(PATH_BUF_GLOBAL), LocalGet(depth), I32Const(2), I32Shl, I32Add,
-        LocalGet(p), I32Store(m32(0)),
+        LocalGet(p), I32Store(m32(DATA)),
         GlobalGet(OUT_LEN_GLOBAL), LocalSet(mark),
     );
     render_container(&mut f, helpers, p, ty, depth);
@@ -616,33 +640,34 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     wasm!(f;
         GlobalGet(OUT_LEN_GLOBAL), LocalGet(end), I32Sub, LocalSet(size),
         GlobalGet(OUT_LEN_GLOBAL), LocalGet(size), I32Add, Call(helpers.out_reserve()),
-        GlobalGet(OUT_BUF_GLOBAL), GlobalGet(OUT_LEN_GLOBAL), I32Add,
-        GlobalGet(OUT_BUF_GLOBAL), LocalGet(end), I32Add, LocalGet(size), COPY,
-        GlobalGet(OUT_BUF_GLOBAL), LocalGet(mark), I32Add, LocalGet(size), I32Add,
-        GlobalGet(OUT_BUF_GLOBAL), LocalGet(mark), I32Add,
+        GlobalGet(OUT_BUF_GLOBAL), I32Const(DATA.cast_signed()), I32Add, LocalSet(data),
+        LocalGet(data), GlobalGet(OUT_LEN_GLOBAL), I32Add,
+        LocalGet(data), LocalGet(end), I32Add, LocalGet(size), COPY,
+        LocalGet(data), LocalGet(mark), I32Add, LocalGet(size), I32Add,
+        LocalGet(data), LocalGet(mark), I32Add,
         LocalGet(end), LocalGet(mark), I32Sub, COPY,
-        GlobalGet(OUT_BUF_GLOBAL), LocalGet(mark), I32Add,
-        GlobalGet(OUT_BUF_GLOBAL), GlobalGet(OUT_LEN_GLOBAL), I32Add, LocalGet(size), COPY,
+        LocalGet(data), LocalGet(mark), I32Add,
+        LocalGet(data), GlobalGet(OUT_LEN_GLOBAL), I32Add, LocalGet(size), COPY,
         End,
         Return,
         End,
     );
     render_leaf(&mut f, strings, helpers, p, ty, i);
     wasm!(f; End);
-    f
+    finish_builder(f)
 }
 
 /// The non-container kinds of `__render_heap`; any other type byte is
 /// `undefined`.
 fn render_leaf(
-    f: &mut Function,
+    f: &mut FnBuilder<'_>,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
     p: u32,
     ty: u32,
     tmp: u32,
 ) {
-    let is = |f: &mut Function, kind: i32| {
+    let is = |f: &mut FnBuilder<'_>, kind: i32| {
         wasm!(f; LocalGet(ty), I32Const(kind), I32Eq, If(BlockType::Empty));
     };
     is(f, TYPE_STRING);
@@ -670,7 +695,7 @@ fn render_leaf(
 
 /// Append `Symbol(desc)` for the symbol block in i32 local `p`; a description
 /// that is not a string is empty.
-fn render_symbol(f: &mut Function, strings: &StrOffsets, helpers: Helpers<'_>, p: u32, tmp: u32) {
+fn render_symbol(f: &mut impl Sink, strings: &StrOffsets, helpers: Helpers<'_>, p: u32, tmp: u32) {
     lit(f, strings, helpers, "Symbol(");
     wasm!(f;
         LocalGet(p), I64Load(m64(abi::SYMBOL_DESCRIPTION_OFFSET)), Call(helpers.str_of()),
@@ -680,7 +705,7 @@ fn render_symbol(f: &mut Function, strings: &StrOffsets, helpers: Helpers<'_>, p
 }
 
 /// Push `1` when the array in `p` is `SPARSE`, else `0`.
-fn is_sparse(f: &mut Function, p: u32) {
+fn is_sparse(f: &mut impl Sink, p: u32) {
     wasm!(f;
         LocalGet(p), I32Load8U(m8(abi::HEADER_FLAGS_OFFSET)),
         I32Const(i32::from(abi::ARRAY_FLAG_SPARSE)), I32And, I32Const(0), I32Ne,
@@ -688,21 +713,21 @@ fn is_sparse(f: &mut Function, p: u32) {
 }
 
 /// Push `1` when the jsval in i64 local `v` is a heap pointer, else `0`.
-fn is_heap(f: &mut Function, v: u32) {
+fn is_heap(f: &mut impl Sink, v: u32) {
     wasm!(f; LocalGet(v), I64Const(QNAN_BITS), I64And, I64Const(QNAN_BITS), I64Eq);
     tag_of(f, v);
     wasm!(f; I32Const(HEAP_TAG), I32Eq, I32And);
 }
 
 /// Box the block base in i32 local `p` as a heap jsval.
-fn box_heap(f: &mut Function, p: u32) {
+fn box_heap(f: &mut impl Sink, p: u32) {
     wasm!(f; LocalGet(p), I64ExtendI32U, I64Const(HEAP_BITS), I64Or);
 }
 
 /// Emit an append of `, `, or of the static string in i32 local `open` before
 /// the first part, reading and clearing the i32 local `first`.
 fn separator(
-    f: &mut Function,
+    f: &mut impl Sink,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
     first: u32,
@@ -726,7 +751,7 @@ enum Open {
 
 /// Append `close` when the i32 local `first` is clear, else `empty`.
 fn close_list(
-    f: &mut Function,
+    f: &mut impl Sink,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
     first: u32,
@@ -743,7 +768,7 @@ fn close_list(
 /// Call `__render_props(p, array, quote, 1, open, depth)` and store the
 /// resulting `first` flag.
 fn props_call(
-    f: &mut Function,
+    f: &mut impl Sink,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
     (p, depth, first): (u32, u32, u32),
@@ -759,7 +784,7 @@ fn props_call(
 
 /// Push element `k` (i32 local) of the array handle in i32 local `list`, as
 /// the i32 base of the heap jsval it holds.
-fn list_key(f: &mut Function, list: u32, k: u32) {
+fn list_key(f: &mut impl Sink, list: u32, k: u32) {
     wasm!(f;
         LocalGet(list), I32Load(m32(abi::ARRAY_ELEMS_OFFSET)),
         LocalGet(k), I32Const(3), I32Shl, I32Add, I64Load(m64(abi::ELEMS_DATA_OFFSET)), I32WrapI64,
@@ -767,7 +792,7 @@ fn list_key(f: &mut Function, list: u32, k: u32) {
 }
 
 /// `list = __own_keys(p, enumerable strings)`, `n = list.length`, `k = 0`.
-fn own_keys_list(f: &mut Function, helpers: Helpers<'_>, p: u32, list: u32, n: u32, k: u32) {
+fn own_keys_list(f: &mut impl Sink, helpers: Helpers<'_>, p: u32, list: u32, n: u32, k: u32) {
     box_heap(f, p);
     wasm!(f;
         I32Const(OWN_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(list),
@@ -776,7 +801,7 @@ fn own_keys_list(f: &mut Function, helpers: Helpers<'_>, p: u32, list: u32, n: u
 }
 
 /// Append the hole run of `count` slots pushed by `count` as one list part.
-fn hole_run(f: &mut Function, strings: &StrOffsets, helpers: Helpers<'_>, first: u32, run: u32) {
+fn hole_run(f: &mut impl Sink, strings: &StrOffsets, helpers: Helpers<'_>, first: u32, run: u32) {
     separator(f, strings, helpers, first, &Open::Text(OPEN_ARRAY));
     lit(f, strings, helpers, "<");
     wasm!(f; LocalGet(run), Call(helpers.out_uint()));
@@ -800,7 +825,7 @@ struct ArrayLocals {
 
 /// Append the present element `index` with value `bits`, after the hole run
 /// that precedes it.
-fn array_element(f: &mut Function, strings: &StrOffsets, helpers: Helpers<'_>, l: ArrayLocals) {
+fn array_element(f: &mut impl Sink, strings: &StrOffsets, helpers: Helpers<'_>, l: ArrayLocals) {
     wasm!(f; LocalGet(l.index), LocalGet(l.next), I32GtU, If(BlockType::Empty),
         LocalGet(l.index), LocalGet(l.next), I32Sub, LocalSet(l.run),
     );
@@ -816,8 +841,15 @@ fn array_element(f: &mut Function, strings: &StrOffsets, helpers: Helpers<'_>, l
 /// `__render_array(p, depth)`: store elements, then a `SPARSE` array's
 /// integer-keyed elements ascending, hole runs between them, then named
 /// properties.
-fn emit_render_array(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(12, I32), (1, I64)]);
+fn emit_render_array(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[ROOT_BASE, RAW_I32],
+        &[
+            RAW_I32, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, RAW_I32, ROOT_BASE, RAW_I32, RAW_I32,
+            RAW_I32, RAW_I32, RAW_I32, ROOT_JS,
+        ],
+    );
     let (p, depth) = (0, 1);
     let (len, store, stored, slot, next, first, list, count, key, entry_at, index, run) =
         (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13);
@@ -882,13 +914,13 @@ fn emit_render_array(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     );
     close_list(&mut f, strings, helpers, first, "[]", " ]");
     wasm!(f; End);
-    f
+    finish_builder(f)
 }
 
 /// `dst = name` when `o` holds (along its chain) a data property `key` whose
 /// value is a string, else `0`.
 fn string_field(
-    f: &mut Function,
+    f: &mut impl Sink,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
     (p, e, dst): (u32, u32, u32),
@@ -906,15 +938,15 @@ fn string_field(
 /// The wrapper arm of `__render_object`: `[String: 'ab']`, `[Number: 1]`,
 /// `[Symbol: Symbol(a)]`, `[Boolean: true]`, then own properties.
 fn render_wrapper(
-    f: &mut Function,
+    f: &mut FnBuilder<'_>,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
     (p, depth, class, first, prim): (u32, u32, u32, u32, u32),
 ) {
-    let class_is = |f: &mut Function, byte: u8| {
+    let class_is = |f: &mut FnBuilder<'_>, byte: u8| {
         wasm!(f; LocalGet(class), I32Const(i32::from(byte)), I32Eq);
     };
-    let bracketed = |f: &mut Function, open: &str| {
+    let bracketed = |f: &mut FnBuilder<'_>, open: &str| {
         lit(f, strings, helpers, open);
         wasm!(f; LocalGet(prim), LocalGet(depth), Call(helpers.render()));
         lit(f, strings, helpers, "]");
@@ -946,8 +978,12 @@ fn render_wrapper(
 
 /// `__render_object(p, depth)`: an error, `arguments`, a wrapper, or a plain
 /// object with its constructor's name when that is not `Object`.
-fn emit_render_object(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(5, I32), (1, I64)]);
+fn emit_render_object(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[ROOT_BASE, RAW_I32],
+        &[RAW_I32, RAW_I32, ROOT_BASE, ROOT_BASE, RAW_I32, ROOT_JS],
+    );
     let (p, depth, class, e, name, msg, first, prim) = (0, 1, 2, 3, 4, 5, 6, 7);
     wasm!(f;
         LocalGet(p), I32Load8U(m8(abi::HEADER_CLASS_OFFSET)), LocalTee(class),
@@ -995,15 +1031,19 @@ fn emit_render_object(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     props_call(&mut f, strings, helpers, (p, depth, first), 0, OPEN_OBJECT);
     close_list(&mut f, strings, helpers, first, "{}", CLOSE_OBJECT);
     wasm!(f; End);
-    f
+    finish_builder(f)
 }
 
 /// `__render_function(p, depth)`: the `[Function: f]` / `[class A extends B]`
 /// head, then own enumerable properties.
-fn emit_render_function(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(5, I32)]);
+fn emit_render_function(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[ROOT_BASE, RAW_I32],
+        &[RAW_I32, ROOT_BASE, ROOT_BASE, RAW_I32, RAW_I32],
+    );
     let (p, depth, flags, name, parent, first, e) = (0, 1, 2, 3, 4, 5, 6);
-    let flag = |f: &mut Function, bit: u8| {
+    let flag = |f: &mut FnBuilder<'_>, bit: u8| {
         wasm!(f; LocalGet(flags), I32Const(i32::from(bit)), I32And);
     };
     wasm!(f; LocalGet(p), I32Load8U(m8(abi::HEADER_FLAGS_OFFSET)), LocalSet(flags));
@@ -1056,11 +1096,11 @@ fn emit_render_function(strings: &StrOffsets, helpers: Helpers<'_>) -> Function 
     wasm!(f; LocalGet(first), I32Eqz, If(BlockType::Empty));
     lit(&mut f, strings, helpers, CLOSE_OBJECT);
     wasm!(f; End, End);
-    f
+    finish_builder(f)
 }
 
 /// Push `1` when the string in i32 local `name` exists and is not empty.
-fn name_nonempty(f: &mut Function, name: u32) {
+fn name_nonempty(f: &mut impl Sink, name: u32) {
     wasm!(f;
         LocalGet(name), If(BlockType::Result(I32)),
         LocalGet(name), I32Load(m32(abi::STR_LEN_OFFSET)), I32Const(0), I32Ne,
@@ -1070,7 +1110,7 @@ fn name_nonempty(f: &mut Function, name: u32) {
 
 /// Append the string in i32 local `name`, or `fallback` when it is empty.
 fn named_or(
-    f: &mut Function,
+    f: &mut impl Sink,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
     name: u32,
@@ -1086,11 +1126,17 @@ fn named_or(
 /// enumerable properties of `o` as list parts: integer keys ascending (an
 /// array's are its elements, so `array` skips them), string keys in slot
 /// order, then symbol keys in slot order.
-fn emit_render_props(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(8, I32)]);
+fn emit_render_props(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32],
+        &[
+            ROOT_BASE, RAW_I32, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
+        ],
+    );
     let (o, array, quote, first, open, depth) = (0, 1, 2, 3, 4, 5);
     let (table, tflags, list, slot, count, key, entry_at, end) = (6, 7, 8, 9, 10, 11, 12, 13);
-    let entry = |f: &mut Function| {
+    let entry = |f: &mut FnBuilder<'_>| {
         wasm!(f;
             LocalGet(entry_at), LocalGet(quote), LocalGet(first), LocalGet(open), LocalGet(depth),
             Call(helpers.render_entry()),
@@ -1098,7 +1144,7 @@ fn emit_render_props(helpers: Helpers<'_>) -> Function {
         );
     };
     // One slot-order walk over the entries that pass `keep`.
-    let walk = |f: &mut Function, symbols: bool| {
+    let walk = |f: &mut FnBuilder<'_>, symbols: bool| {
         wasm!(f;
             LocalGet(table), I32Const(HEADER), I32Add, LocalSet(entry_at),
             Block(BlockType::Empty), Loop(BlockType::Empty),
@@ -1148,13 +1194,17 @@ fn emit_render_props(helpers: Helpers<'_>) -> Function {
     wasm!(f; LocalGet(tflags), I32Const(HAS_SYMBOL), I32And, If(BlockType::Empty));
     walk(&mut f, true);
     wasm!(f; End, LocalGet(first), End);
-    f
+    finish_builder(f)
 }
 
 /// `__render_entry(e, quote, first, open, depth)`: one `key: value` list part
 /// of the table entry `e`; an accessor shows which halves it has.
-fn emit_render_entry(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(3, I32)]);
+fn emit_render_entry(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32],
+        &[RAW_I32, RAW_I32, RAW_I32],
+    );
     let (e, quote, first, open, depth) = (0, 1, 2, 3, 4);
     let (pair, getter, setter) = (5, 6, 7);
     separator(&mut f, strings, helpers, first, &Open::Local(open));
@@ -1181,7 +1231,7 @@ fn emit_render_entry(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
         End,
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// Push `1` when the character at unit `at` of the string `key`, whose first
@@ -1189,7 +1239,7 @@ fn emit_render_entry(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
 /// unit, or a non-ASCII `Alphanumeric` code point (a lone surrogate is not).
 /// A surrogate pair advances `at` to its trail unit.
 fn key_unit_ok(
-    f: &mut Function,
+    f: &mut FnBuilder<'_>,
     helpers: Helpers<'_>,
     key: u32,
     count: u32,
@@ -1215,10 +1265,14 @@ fn key_unit_ok(
 
 /// `__render_key(key, quote)`: a symbol key as `[Symbol(desc)]`, a string key
 /// raw; with `quote`, anything but a bare identifier is single-quoted.
-fn emit_render_key(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(6, I32)]);
+fn emit_render_key(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[ROOT_BASE, RAW_I32],
+        &[RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32],
+    );
     let (key, quote, count, at, wide, code, bare, tmp) = (0, 1, 2, 3, 4, 5, 6, 7);
-    let quote_mark = |f: &mut Function, on: u32| {
+    let quote_mark = |f: &mut FnBuilder<'_>, on: u32| {
         wasm!(f; LocalGet(on), If(BlockType::Empty));
         lit(f, strings, helpers, "'");
         wasm!(f; End);
@@ -1248,14 +1302,14 @@ fn emit_render_key(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     wasm!(f; LocalGet(key), Call(helpers.out_str()));
     quote_mark(&mut f, bare);
     wasm!(f; End);
-    f
+    finish_builder(f)
 }
 
 /// `__render_lookup(o, key) -> entry`: the entry of the data property `key`
 /// on `o` or the nearest object of its `proto` chain, or `0`. Accessors are
 /// skipped and no getter runs; the walk is bounded.
-fn emit_render_lookup(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(2, I32)]);
+fn emit_render_lookup(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_BASE, ROOT_BASE], &[RAW_I32, RAW_I32]);
     let (cur, key, e, steps) = (0, 1, 2, 3);
     wasm!(f;
         Block(BlockType::Empty), Loop(BlockType::Empty),
@@ -1272,13 +1326,13 @@ fn emit_render_lookup(helpers: Helpers<'_>) -> Function {
         I32Const(0),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__heap_object(v) -> p`: the base of an object-family heap value that
 /// carries a `props` slot (not a string, array or symbol), or `0`.
-fn emit_heap_object() -> Function {
-    let mut f = Function::new(vec![(1, I32)]);
+fn emit_heap_object(leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_JS], &[RAW_I32]);
     let (v, ty) = (0, 1);
     is_heap(&mut f, v);
     wasm!(f;
@@ -1291,12 +1345,12 @@ fn emit_heap_object() -> Function {
         I32Const(0),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__str_of(v) -> s`: the string block of a heap string, or `0`.
-fn emit_str_of() -> Function {
-    let mut f = Function::new(vec![]);
+fn emit_str_of(leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_JS], &[]);
     is_heap(&mut f, 0);
     wasm!(f;
         If(BlockType::Empty),
@@ -1306,12 +1360,12 @@ fn emit_str_of() -> Function {
         I32Const(0),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__fn_name(v) -> s`: the `__fn_info` name of the function `v`, or `0`.
-fn emit_fn_name(helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![(1, I32)]);
+fn emit_fn_name(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_JS], &[RAW_I32]);
     let (v, p) = (0, 1);
     wasm!(f;
         LocalGet(v), Call(helpers.heap_object()), LocalTee(p),
@@ -1325,26 +1379,17 @@ fn emit_fn_name(helpers: Helpers<'_>) -> Function {
         I32Load(m32(abi::FN_INFO_NAME_OFFSET)),
         End,
     );
-    f
+    finish_builder(f)
 }
 
 /// `__date_text(v) -> s`: the ISO text of the Date jsval `v`, or
 /// `Invalid Date`. The local layout from local 1 is the function scratch
 /// layout [`emit_date_field`] expects; its throwing arm is unreachable behind
 /// the finiteness gate.
-fn emit_date_text(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
-    let mut f = Function::new(vec![
-        (3, I64),
-        (1, I32),
-        (3, I64),
-        (1, I32),
-        (5, I32),
-        (1, I64),
-        (7, I64),
-        (1, I32),
-        (2, I64),
-        (6, I64),
-    ]);
+fn emit_date_text(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_JS], &[]);
+    declare_scratch(&mut f);
+    f.locals(6, RAW_I64);
     let (v, scratch) = (0, 1);
     helpers.unwind.borrow_mut().reset();
     wasm!(f;
@@ -1356,5 +1401,5 @@ fn emit_date_text(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
     );
     emit_date_field(DateOp::ToIsoString, v, &mut f, scratch, strings, helpers);
     wasm!(f; End, End);
-    f
+    finish_builder(f)
 }
