@@ -984,3 +984,57 @@ fn long_then_chain_no_stack_growth() {
         "adopted 7\n",
     );
 }
+
+/// Thenables are assimilated per the spec: `await`, `Promise.resolve` and an
+/// executor's `resolve` read `then` (a throwing getter rejects) and call a
+/// callable one in a later job with `this` = the thenable and a fresh
+/// once-only resolving-function pair; a native promise resolution goes the
+/// same way, taking two extra ticks against a sibling chain.
+#[test]
+fn thenable_assimilated_per_spec() {
+    assert_output(
+        "const v = await { then(r) { r(5); } }; console.log(\"await\", v); \
+         try { await { then(_, r) { r(\"no\"); } }; } catch (e) { console.log(\"caught\", e); }",
+        "await 5\ncaught no\n",
+    );
+    assert_output(
+        "Promise.resolve({ v: \"pr\", then(r) { r(this.v); } }) \
+           .then(v => console.log(\"resolve\", v)); \
+         Promise.resolve({ then(r) { r({ then(g) { g(\"deep\"); } }); } }) \
+           .then(v => console.log(\"nested\", v)); \
+         const p = Promise.resolve(1); console.log(Promise.resolve(p) === p); \
+         const q = Promise.resolve(2); q.constructor = Object; \
+         console.log(Promise.resolve(q) === q);",
+        "true\nfalse\nresolve pr\nnested deep\n",
+    );
+    assert_output(
+        "new Promise(r => r({ then(f) { f(\"ex\"); } })).then(v => console.log(\"executor\", v)); \
+         new Promise(r => { r({ then(f) { f(\"kept\"); } }); throw \"lost\"; }) \
+           .then(v => console.log(v), e => console.log(\"bad\", e));",
+        "executor ex\nkept\n",
+    );
+    assert_output(
+        "Promise.resolve({ get then() { throw \"getter\"; } }) \
+           .catch(e => console.log(\"caught\", e)); \
+         new Promise(r => r({ get then() { throw \"exec getter\"; } })) \
+           .catch(e => console.log(\"caught\", e));",
+        "caught getter\ncaught exec getter\n",
+    );
+    assert_output(
+        "Promise.resolve({ then(f, r) { f(1); f(2); r(3); throw 4; } }) \
+           .then(v => console.log(\"once\", v), e => console.log(\"bad\", e)); \
+         Promise.resolve({ then(f, r) { r(\"r1\"); f(\"f1\"); } }) \
+           .then(v => console.log(\"bad\", v), e => console.log(\"rejected\", e));",
+        "once 1\nrejected r1\n",
+    );
+    assert_output(
+        "let sync = true; \
+         Promise.resolve({ then(f) { console.log(\"then sync\", sync); f(0); } }); \
+         sync = false; \
+         const p = Promise.resolve(1); \
+         new Promise(r => r(p)).then(() => console.log(\"adopted\")); \
+         Promise.resolve().then(() => console.log(\"t1\")).then(() => console.log(\"t2\")) \
+           .then(() => console.log(\"t3\"));",
+        "then sync false\nt1\nt2\nadopted\nt3\n",
+    );
+}

@@ -494,7 +494,8 @@ fn require_constructor(
 /// `PromiseResolve(C, v)` for the constructor in i64 `c` and the value in
 /// i64 `v`, into i64 `promise`: a promise whose `constructor` is `C` itself,
 /// else a fresh capability of `C` (a constructor, else a `TypeError`)
-/// resolved with `v`.
+/// resolved with `v`. `C === %Promise%` is the engine's `__promise_resolve`
+/// (`NewPromiseCapability(%Promise%)` reads no property of `%Promise%`).
 fn promise_resolve(
     function: &mut FnBuilder<'_>,
     frame: Frame,
@@ -505,7 +506,14 @@ fn promise_resolve(
     helpers: Helpers<'_>,
 ) {
     let (resolve, reject, same, undef) = (frame.y64(5), frame.x64(1), frame.i32(1), frame.i64(3));
-    wasm!(function; I32Const(0), LocalSet(same));
+    let ctor = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Promise), helpers);
+    wasm!(function;
+        LocalGet(c), I64Const(ctor), I64Eq,
+        If(BlockType::Empty),
+        LocalGet(v), Call(helpers.promise_resolve()), LocalSet(promise),
+    );
+    return_if_pending(function);
+    wasm!(function; Else, I32Const(0), LocalSet(same));
     is_promise(function, v);
     wasm!(function;
         If(BlockType::Empty),
@@ -532,7 +540,7 @@ fn promise_resolve(
     call(function, frame, resolve, Some(v), undef, helpers);
     wasm!(function; Drop);
     return_if_pending(function);
-    wasm!(function; End);
+    wasm!(function; End, End);
 }
 
 /// Push i32 `1` when `c` (i64) is `%Promise%` and, under dirty tracking,
@@ -576,10 +584,9 @@ pub(super) fn emit_static(
 
 /// `Promise.resolve(x)` (`reject = false`) / `Promise.reject(r)` with
 /// `C = this` (an object, else a `TypeError`): `PromiseResolve(C, x)` /
-/// `NewPromiseCapability(C)` rejected with `r`. `C === %Promise%` takes
-/// `__promise_resolve` / `__promise_reject` (for `resolve` only a non-promise `x`, whose result does not
-/// depend on its `constructor`): `NewPromiseCapability(%Promise%)` reads no
-/// property of `%Promise%`, so no dirty bit is involved.
+/// `NewPromiseCapability(C)` rejected with `r` (`C === %Promise%`:
+/// `__promise_reject`, as `NewPromiseCapability(%Promise%)` reads no property
+/// of `%Promise%`).
 fn emit_resolve(
     reject: bool,
     function: &mut FnBuilder<'_>,
@@ -595,21 +602,14 @@ fn emit_resolve(
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, NOT_CONSTRUCTOR, strings, helpers);
     wasm!(function; End);
-    let promise = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Promise), helpers);
-    wasm!(function; LocalGet(c), I64Const(promise), I64Eq);
-    let helper = if reject {
-        helpers.promise_reject()
-    } else {
-        is_promise(function, x);
-        wasm!(function; I32Eqz, I32And);
-        helpers.promise_resolve()
-    };
-    wasm!(function;
-        If(BlockType::Empty),
-        LocalGet(x), Call(helper), Return,
-        End,
-    );
     if reject {
+        let promise = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Promise), helpers);
+        wasm!(function;
+            LocalGet(c), I64Const(promise), I64Eq,
+            If(BlockType::Empty),
+            LocalGet(x), Call(helpers.promise_reject()), Return,
+            End,
+        );
         let (resolve, settle) = (frame.y64(5), frame.x64(1));
         require_constructor(function, frame, c, strings, helpers);
         new_capability(function, frame, c, [out, resolve, settle], strings, helpers);

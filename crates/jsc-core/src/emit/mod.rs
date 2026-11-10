@@ -1893,7 +1893,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     for helper in libm::emit_helpers(helpers, &leaves) {
         code.function(&helper);
     }
-    for helper in promise_engine::emit_helpers(helpers, &leaves) {
+    for helper in promise_engine::emit_helpers(&offsets, helpers, &leaves) {
         code.function(&helper);
     }
     module.section(&code);
