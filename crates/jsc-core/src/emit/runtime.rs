@@ -451,17 +451,17 @@ pub(super) fn emit_invoke1(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     finish_builder(function)
 }
 
-/// Emit a `new Promise` settler function: the `resolve` (`state` =
-/// `PROMISE_FULFILLED`) or `reject` (`PROMISE_REJECTED`) half of an
-/// executor's callback pair.
+/// Emit a resolving function: the `resolve` (`state` = `PROMISE_FULFILLED`)
+/// or `reject` (`PROMISE_REJECTED`) half of a `CreateResolvingFunctions`
+/// pair (a `new Promise` executor's, a thenable job's).
 ///
 /// It shares the uniform function ABI `(a0..a_{K-1}, env, argc) -> i64` and is
-/// called through the funcref table like any function value, with the TARGET
-/// PROMISE carried in its `env` slot (local `K`) — `new Promise` builds the
-/// function value that way instead of a closure environment. The settler reads
-/// the bound promise from `env` and its first argument (`a0`, or `undefined` when
-/// the ABI has no positional slot) as the settlement value, calls
-/// `__promise_settle(promise, state, value)`, and returns `undefined`.
+/// called through the funcref table like any function value; its `env` slot
+/// (local `K`) holds the pair's shared `TYPE_ENV` block from
+/// `__promise_resolving`: `[promise, alreadyResolved]`. Once `alreadyResolved`
+/// is set it does nothing; else it sets it and calls
+/// `__promise_settle(promise, state, a0)` (`a0` is `undefined` when the ABI has
+/// no positional slot), which resolves per the spec. It returns `undefined`.
 /// `K = helpers.max_args`; no extra locals are declared.
 pub(super) fn emit_settler(state: i32, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let k = helpers.max_args;
@@ -470,15 +470,40 @@ pub(super) fn emit_settler(state: i32, helpers: Helpers<'_>, leaves: &LeafSet) -
         function.param(ROOT_JS); // a0..a_{K-1}, env
     }
     function.param(RAW_I64); // argc
-    function.instruction(&Instruction::LocalGet(k)); // env slot = the bound promise
+    let done = MemArg {
+        offset: u64::from(abi::RESOLVING_DONE_OFFSET),
+        align: 3,
+        memory_index: 0,
+    };
+    // `alreadyResolved`: a second call of either function is a no-op.
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(done));
+    function.instruction(&Instruction::I64Const(TRUE_BITS));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Const(TRUE_BITS));
+    function.instruction(&Instruction::I64Store(done));
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(MemArg {
+        offset: u64::from(abi::RESOLVING_PROMISE_OFFSET),
+        align: 3,
+        memory_index: 0,
+    }));
     function.instruction(&Instruction::I32Const(state));
     if k >= 1 {
-        function.instruction(&Instruction::LocalGet(0)); // a0 = the settlement value
+        function.instruction(&Instruction::LocalGet(0)); // a0 = the resolution
     } else {
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     }
     function.instruction(&Instruction::Call(helpers.promise_settle()));
-    // A settler returns `undefined` (its call result is ignored anyway).
+    // A resolving function returns `undefined`.
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
     finish_builder(function)

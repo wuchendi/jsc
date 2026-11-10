@@ -2128,31 +2128,33 @@ pub enum IrNode {
         /// The rejection handler (`undefined` when absent).
         on_rejected: Box<IrNode>,
     },
-    /// `p.finally(fn)`: run `fn` on settlement and pass `p`'s original
-    /// settlement through to the chained result promise. Lowers to the guest
-    /// promise engine's `__promise_finally`.
+    /// `p.finally(fn)` on a `%Promise%` instance: `p.then(thenFinally,
+    /// catchFinally)` with the spec's closures over `fn` (a non-callable `fn`
+    /// is passed as both). Lowers to the guest promise engine's
+    /// `__promise_finally`.
     PromiseFinally {
         /// The receiver promise expression.
         promise: Box<IrNode>,
         /// The finalizer callback, run for its side effect on settlement.
         on_finally: Box<IrNode>,
     },
-    /// Top-level `await p`: mark `p` handled, drain the guest microtask queue,
-    /// then yield its fulfillment value (or unwind its rejection through the
-    /// exception globals). Lowers to the guest promise engine's
+    /// Top-level `await v`: `PromiseResolve(%Promise%, v)`, mark that promise
+    /// handled, drain the guest microtask queue, then yield its fulfillment
+    /// value (or unwind its rejection through the exception globals). Lowers to the guest promise engine's
     /// `__promise_await`. Only reachable at the top level (an `await` in an
     /// async body is a `yield` of its state machine).
     Await(Box<IrNode>),
-    /// `new Promise(executor)`: allocate a fresh pending promise `P`
-    /// (stashed in `p_local`), build `resolve`/`reject` FUNCTION values bound to
-    /// `P` (via the settler funcref slots), call `executor(resolve, reject)`
-    /// synchronously — a throwing executor rejects `P` — and yield `P`. The
-    /// `resolve`/`reject` values carry `P` in their env slot, so calling one
-    /// runs `__promise_settle` on `P` (no lexical capture needed).
+    /// `new Promise(executor)`: allocate a fresh pending promise `P` and its
+    /// resolving `env` `[P, alreadyResolved]` (stashed in `p_local`), build
+    /// `resolve`/`reject` FUNCTION values over that `env` (via the settler
+    /// funcref slots), call `executor(resolve, reject)` synchronously — a
+    /// throwing executor calls `reject` — and yield `P`. Only the first call
+    /// of either function runs `__promise_settle` on `P`.
     PromiseCtor {
         /// The executor expression (a function value taking `(resolve, reject)`).
         executor: Box<IrNode>,
-        /// A dedicated local (not scratch) holding `P` across the executor call.
+        /// A dedicated local (not scratch) holding the resolving `env` across
+        /// the executor call.
         p_local: u32,
     },
     /// Spawn an `async function` body: the operand is a

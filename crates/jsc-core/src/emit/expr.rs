@@ -698,8 +698,7 @@ fn emit_node_inner(
             emit_node(value, function, scratch, strings, helpers);
             function.instruction(&Instruction::Call(helpers.promise_reject()));
         }
-        // `p.finally(fn)`: a derived promise whose reaction runs `fn` on
-        // settlement and passes the original settlement through.
+        // `p.finally(fn)`: `p.then(thenFinally, catchFinally)` over `fn`.
         IrNode::PromiseFinally {
             promise,
             on_finally,
@@ -708,9 +707,10 @@ fn emit_node_inner(
             emit_node(on_finally, function, scratch, strings, helpers);
             function.instruction(&Instruction::Call(helpers.promise_finally()));
         }
-        // Top-level `await p`: mark `p` handled, drain the microtask queue, and
-        // yield the fulfillment value; a rejection is left in flight, so unwind
-        // if one is pending.
+        // Top-level `await v`: `PromiseResolve(%Promise%, v)`, mark it handled,
+        // drain the microtask queue, and yield the fulfillment value; a
+        // rejection (or a throw of `PromiseResolve`) is left in flight, so
+        // unwind if one is pending.
         IrNode::Await(promise) => {
             emit_node(promise, function, scratch, strings, helpers);
             function.instruction(&Instruction::Call(helpers.promise_await()));
@@ -729,7 +729,7 @@ fn emit_node_inner(
             function.instruction(&Instruction::Call(helpers.promise_then()));
         }
         // `new Promise(executor)`: build the promise + resolve/reject settlers, run
-        // the executor synchronously (a throw rejects the promise), and yield it.
+        // the executor synchronously (a throw calls `reject`), and yield the promise.
         IrNode::PromiseCtor { executor, p_local } => {
             emit_promise_ctor(executor, *p_local, function, scratch, strings, helpers);
         }
@@ -2320,9 +2320,8 @@ pub(super) fn emit_cell_set(
 }
 
 /// Emit `Promise.resolve(value)` of the inline `%Promise%` namespace:
-/// `__promise_resolve`, except for a promise, whose `constructor` decides the result
-/// (`PromiseResolve(%Promise%, v)`): the `Promise.resolve` builtin with
-/// `this = %Promise%`.
+/// `PromiseResolve(%Promise%, v)` through `__promise_resolve` (a throw of the
+/// `constructor` read propagates).
 fn emit_promise_resolve(
     value: &IrNode,
     function: &mut impl Sink,
@@ -2330,70 +2329,28 @@ fn emit_promise_resolve(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (v, args) = (scratch, scratch + 3);
     emit_node(value, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(v));
-    emit_is_pointer(function, v);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, v);
-    function.instruction(&Instruction::I32Const(i32::from(abi::TYPE_PROMISE)));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    enter_frame(helpers);
-    for slot in 0..helpers.max_args {
-        if slot == 0 {
-            function.instruction(&Instruction::LocalGet(v));
-        } else {
-            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        }
-    }
-    if helpers.max_args == 0 {
-        // No positional slot: the argument rides in the spread array.
-        function.instruction(&Instruction::I32Const(1));
-        function.instruction(&Instruction::Call(helpers.new_array()));
-        function.instruction(&Instruction::LocalTee(args));
-        emit_array_elems(function);
-        function.instruction(&Instruction::LocalGet(v));
-        function.instruction(&Instruction::I64Store(elem_slot(0)));
-        function.instruction(&Instruction::LocalGet(args));
-        function.instruction(&Instruction::I64ExtendI32U);
-        function.instruction(&Instruction::I64Const(HEAP_BITS));
-        function.instruction(&Instruction::I64Or);
-        function.instruction(&Instruction::GlobalSet(SPREAD_ARGS_GLOBAL));
-    }
-    let promise = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Promise), helpers);
-    function.instruction(&Instruction::I64Const(promise));
-    function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
-    function.instruction(&Instruction::I64Const(0));
-    emit_argc(1, function);
-    let resolve = Builtin::PromiseStatic(realm::PromiseStaticOp::Resolve);
-    function.instruction(&Instruction::Call(helpers.builtin(resolve)));
-    emit_propagate_if_pending(function, helpers);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::LocalGet(v));
     function.instruction(&Instruction::Call(helpers.promise_resolve()));
-    leave_frame(helpers);
-    function.instruction(&Instruction::End);
+    emit_propagate_if_pending(function, helpers);
 }
 
 /// Emit `new Promise(executor)`, leaving the fresh promise's jsval on the
 /// stack.
 ///
-/// Steps: (1) `P = __promise_new(%Promise.prototype%)`, stashed in the
-/// dedicated `p_local`; (2) build
-/// `resolve`/`reject` FUNCTION values pointing at the settler funcref slots with
-/// `P` in their env slot; (3) call `executor(resolve, reject)` synchronously
-/// through `call_indirect` (env-last ABI), padding the two settlers to the fixed
-/// `K` positional slots (under `K < 2` publishing them as the spread argument
-/// array, which carries the overflow); (4) if the executor left `$exc_pending` set (it
-/// threw), reject `P` with the thrown value and clear the flag — a throwing
-/// executor rejects the promise rather than propagating; (5) push `P`.
+/// Steps: (1) `P = __promise_new(%Promise.prototype%)` and its resolving
+/// functions' shared env `[P, alreadyResolved]` (`__promise_resolving`),
+/// stashed in the dedicated `p_local`; (2) build `resolve`/`reject` FUNCTION
+/// values pointing at the settler funcref slots with that env; (3) call
+/// `executor(resolve, reject)` synchronously through `call_indirect` (env-last
+/// ABI), padding the two settlers to the fixed `K` positional slots (under
+/// `K < 2` publishing them as the spread argument array, which carries the
+/// overflow); (4) if the executor left `$exc_pending` set (it threw), clear the
+/// flag and call `reject` with the thrown value — a no-op once `resolve` /
+/// `reject` ran, else `P` rejects rather than the throw propagating; (5) push
+/// `P` (env slot 0).
 ///
 /// `p_local` is a real frame local (not scratch), so building the settlers and
-/// evaluating the executor cannot clobber the stashed promise.
+/// evaluating the executor cannot clobber the stashed env.
 pub(super) fn emit_promise_ctor(
     executor: &IrNode,
     p_local: u32,
@@ -2404,13 +2361,14 @@ pub(super) fn emit_promise_ctor(
 ) {
     let exec_base = scratch + 7;
 
-    // P = __promise_new(%Promise.prototype%); stash it in p_local.
+    // P = __promise_new(%Promise.prototype%); stash its resolving env in p_local.
     let proto = intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Promise), helpers);
     function.instruction(&Instruction::I64Const(proto));
     function.instruction(&Instruction::Call(helpers.promise_new()));
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::Call(helpers.promise_resolving()));
     function.instruction(&Instruction::LocalSet(p_local));
 
     // Push the K padded positional args: resolve (a0), reject (a1), then undefined
@@ -2490,30 +2448,65 @@ pub(super) fn emit_promise_ctor(
     // The executor's return value is ignored.
     function.instruction(&Instruction::Drop);
 
-    // If the executor threw, its exception is caught HERE and turned into a
-    // rejection of P (not propagated): reject P with `$exc_value`, then clear the
-    // pending flag so execution continues normally with P (now rejected).
+    emit_executor_throw(p_local, function, scratch, helpers);
+
+    // The `new Promise` expression yields P.
+    function.instruction(&Instruction::LocalGet(p_local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(MemArg {
+        offset: u64::from(abi::RESOLVING_PROMISE_OFFSET),
+        align: 3,
+        memory_index: 0,
+    }));
+}
+
+/// A `new Promise` executor that threw has its exception caught HERE (not
+/// propagated): clear the pending flag, then `reject(thrown)` through the
+/// resolving env in `p_local` — a no-op once `alreadyResolved`.
+fn emit_executor_throw(p_local: u32, function: &mut impl Sink, scratch: u32, helpers: Helpers<'_>) {
+    let done = MemArg {
+        offset: u64::from(abi::RESOLVING_DONE_OFFSET),
+        align: 3,
+        memory_index: 0,
+    };
+    let promise_slot = MemArg {
+        offset: u64::from(abi::RESOLVING_PROMISE_OFFSET),
+        align: 3,
+        memory_index: 0,
+    };
     function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(p_local));
-    function.instruction(&Instruction::I32Const(abi::PROMISE_REJECTED));
     function.instruction(&Instruction::GlobalGet(EXC_VALUE_GLOBAL));
-    function.instruction(&Instruction::Call(helpers.promise_settle()));
+    function.instruction(&Instruction::LocalSet(scratch));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::I64Const(0));
     function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
-    function.instruction(&Instruction::End);
-
-    // The `new Promise` expression yields P.
     function.instruction(&Instruction::LocalGet(p_local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(done));
+    function.instruction(&Instruction::I64Const(TRUE_BITS));
+    function.instruction(&Instruction::I64Ne);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(p_local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Const(TRUE_BITS));
+    function.instruction(&Instruction::I64Store(done));
+    function.instruction(&Instruction::LocalGet(p_local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(promise_slot));
+    function.instruction(&Instruction::I32Const(abi::PROMISE_REJECTED));
+    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::Call(helpers.promise_settle()));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
 }
 
-/// Emit a `new Promise` settler FUNCTION value, leaving its heap jsval on
-/// the stack: a `TYPE_FUNCTION` block whose funcref-table index is the settler
-/// slot `table_index` and whose ENV slot holds the bound promise (read from
-/// `p_local`) rather than a closure environment. Mirrors [`emit_func_value`] but
-/// stores `p_local` in the env slot directly.
+/// Emit an internal FUNCTION value, leaving its heap jsval on the stack: a
+/// `TYPE_FUNCTION` block whose funcref-table index is `table_index` (a
+/// resolving function, a builtin closure) and whose ENV slot holds the jsval
+/// read from `p_local` (the resolving env, the closure's captured value).
+/// Mirrors [`emit_func_value`] but stores `p_local` in the env slot directly.
 pub(super) fn emit_settler_value(
     table_index: u32,
     p_local: u32,
@@ -2543,7 +2536,7 @@ pub(super) fn emit_settler_value(
         align: 2,
         memory_index: 0,
     }));
-    // Write the bound promise into the env slot at dst + FUNC_ENV_OFFSET.
+    // Write the env jsval into the env slot at dst + FUNC_ENV_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(p_local));

@@ -8,6 +8,13 @@
 //! queued job (the FIFO `$__job_head` .. `$__job_tail`), so settling never
 //! allocates. Every `next` link is a `HEAP | record` jsval (or `0`).
 //!
+//! Resolution follows the spec's Promise Resolve Functions: a promise
+//! resolved with an object reads its `then` (a throw rejects), and a
+//! callable `then` queues a `PromiseResolveThenableJob` record (kind
+//! [`abi::REACTION_KIND_THENABLE`]) that calls it with a fresh once-only
+//! resolving-function pair, native promises included. `await` and
+//! `Promise.resolve` go through `PromiseResolve` (`__promise_resolve`).
+//!
 //! Rejected promises nobody handled are linked through `rejected_next` from
 //! `$__rejected_head`; the checkpoint after each drain prunes the ones a late
 //! reaction marked `HANDLED`, and `_start` reports the oldest survivor by
@@ -17,11 +24,14 @@ use wasm_encoder::{
     BlockType, Function, FunctionSection, Instruction, MemArg, TypeSection, ValType,
 };
 
+use super::realm::SpeciesOp;
 use super::{
-    BuiltinCtor, EXC_PENDING_GLOBAL, EXC_VALUE_GLOBAL, FnBuilder, HEAP_BITS, Helpers, Intrinsic,
-    JOB_HEAD_GLOBAL, JOB_TAIL_GLOBAL, LeafSet, PROMISE_SEQ_GLOBAL, RAW_I32, REJECTED_HEAD_GLOBAL,
-    ROOT_BASE, ROOT_JS, Sink, UNDEFINED_BITS, abi, emit_is_function, emit_is_pointer,
-    emit_load_type_byte, finish_builder, helper_builder, intrinsic_bits, libm, unicode,
+    Builtin, BuiltinCtor, EXC_PENDING_GLOBAL, EXC_VALUE_GLOBAL, FALSE_BITS, FnBuilder, HEAP_BITS,
+    Helpers, Intrinsic, JOB_HEAD_GLOBAL, JOB_TAIL_GLOBAL, LeafSet, PROMISE_SEQ_GLOBAL, RAW_I32,
+    REJECTED_HEAD_GLOBAL, ROOT_BASE, ROOT_JS, SPREAD_ARGS_GLOBAL, Sink, StrOffsets, THIS_GLOBAL,
+    TRUE_BITS, UNDEFINED_BITS, abi, elem_slot, emit_argc, emit_array_elems, emit_is_function,
+    emit_is_object, emit_is_pointer, emit_load_type_byte, emit_settler_value, finish_builder,
+    helper_builder, intrinsic_bits, libm, static_key, unicode,
 };
 
 /// Emit each listed instruction in order.
@@ -78,13 +88,15 @@ const RESULT: u32 = abi::REACTION_RESULT_OFFSET;
 const KIND: u32 = abi::REACTION_KIND_OFFSET;
 const JOB_VALUE: u32 = abi::REACTION_VALUE_OFFSET;
 const NEXT: u32 = abi::REACTION_NEXT_OFFSET;
-const FINALLY: i32 = abi::REACTION_KIND_FINALLY;
+const THENABLE: i32 = abi::REACTION_KIND_THENABLE;
+const RESOLVING_PROMISE: u32 = abi::RESOLVING_PROMISE_OFFSET;
+const RESOLVING_DONE: u32 = abi::RESOLVING_DONE_OFFSET;
 const STATE_SHIFT: i32 = abi::REACTION_KIND_STATE_SHIFT;
 
 use ValType::{I32, I64};
 
 /// The `(params, results)` of the engine helpers, in function-index order.
-pub(super) const TYPES: [(&[ValType], &[ValType]); 12] = [
+pub(super) const TYPES: [(&[ValType], &[ValType]); 13] = [
     (&[I64], &[I32]),                  // __promise_new(proto) -> base
     (&[I32], &[]),                     // __promise_enqueue(rec)
     (&[I64, I64, I64, I64, I32], &[]), // __promise_react(p, on_f, on_r, result, kind)
@@ -97,6 +109,7 @@ pub(super) const TYPES: [(&[ValType], &[ValType]); 12] = [
     (&[], &[]),                        // __drain()
     (&[], &[I64]),                     // __first_unhandled() -> promise or 0
     (&[I64], &[I64]),                  // __promise_await(v) -> value
+    (&[I64], &[I64]),                  // __promise_resolving(p) -> env
 ];
 
 /// Append the engine helpers' types and function entries (after libm's).
@@ -136,7 +149,9 @@ impl Helpers<'_> {
     pub(super) fn promise_then(self) -> u32 {
         self.engine_base() + 4
     }
-    /// `__promise_resolve(v) -> i64`: `v` when a promise, else fulfilled.
+    /// `__promise_resolve(v) -> i64`: `PromiseResolve(%Promise%, v)`; a throw
+    /// of the `constructor` read is left pending. The single entry every
+    /// `await` takes.
     pub(super) fn promise_resolve(self) -> u32 {
         self.engine_base() + 5
     }
@@ -164,6 +179,11 @@ impl Helpers<'_> {
     pub(super) fn promise_await(self) -> u32 {
         self.engine_base() + 11
     }
+    /// `__promise_resolving(p) -> i64`: the shared `env` of a fresh once-only
+    /// resolving-function pair for the promise `p`.
+    pub(super) fn promise_resolving(self) -> u32 {
+        self.engine_base() + 12
+    }
 }
 
 /// The helper call graph of the engine, for the leaf analysis.
@@ -172,20 +192,25 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
 }
 
 /// Every engine helper body, in [`TYPES`] order.
-pub(super) fn emit_helpers(helpers: Helpers<'_>, leaves: &LeafSet) -> Vec<Function> {
+pub(super) fn emit_helpers(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Vec<Function> {
     vec![
         emit_promise_new(helpers, leaves),
         emit_enqueue(leaves),
         emit_react(helpers, leaves),
-        emit_settle(helpers, leaves),
-        emit_then(helpers, leaves, false),
-        emit_resolve(helpers, leaves, false),
-        emit_resolve(helpers, leaves, true),
-        emit_then(helpers, leaves, true),
+        emit_settle(strings, helpers, leaves),
+        emit_then(helpers, leaves),
+        emit_resolve(strings, helpers, leaves, false),
+        emit_resolve(strings, helpers, leaves, true),
+        emit_finally(helpers, leaves),
         emit_run_job(helpers, leaves),
         emit_drain(helpers, leaves),
         emit_first_unhandled(leaves),
         emit_await(helpers, leaves),
+        emit_resolving(helpers, leaves),
     ]
 }
 
@@ -318,24 +343,29 @@ fn emit_react(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     finish_builder(f)
 }
 
-/// `__promise_settle(p, state, v)`: settle the promise `p` once (anything
-/// else, or an already settled promise, is a no-op). Fulfilling with `p`
-/// itself rejects with a fresh `TypeError`; fulfilling with another promise
-/// adopts it (`p` becomes the derived promise of a passthrough reaction on
-/// `v`). Otherwise the settlement is written, the reaction list is reversed
-/// in place into registration order, each record gets its source state and
-/// value, and the whole chain is spliced onto the job queue. A rejection of a
-/// promise nobody handles links it into the rejected list.
-fn emit_settle(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+/// `__promise_settle(p, state, v)`: resolve (`state` = fulfilled) or reject
+/// the promise `p` (anything else, or an already settled promise, is a
+/// no-op); the resolving functions' `alreadyResolved` lives in their `env`.
+/// Resolving follows Promise Resolve Functions: `p` itself rejects with a
+/// fresh `TypeError`; an object's `then` is read (a throw rejects with the
+/// thrown value), and a callable `then` queues a thenable job record instead
+/// of settling; anything else fulfills. Settling writes the settlement,
+/// reverses the reaction list in place into registration order, gives each
+/// record its source state and value, and splices the whole chain onto the
+/// job queue. A rejection of a promise nobody handles links it into the
+/// rejected list.
+fn emit_settle(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     // The detached reaction records are reachable only from the raw locals
     // between the detach and the splice, which contain no safepoint.
     let mut f = helper_builder(
         leaves,
         &[ROOT_JS, RAW_I32, ROOT_JS],
-        &[RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32],
+        &[
+            RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, ROOT_JS, ROOT_BASE,
+        ],
     );
     let (p, state, v) = (0, 1, 2);
-    let (pb, cur, prev, next, last) = (3, 4, 5, 6, 7);
+    let (pb, cur, prev, next, last, then, rec) = (3, 4, 5, 6, 7, 8, 9);
     is_promise(&mut f, p);
     wasm!(f;
         I32Eqz, If(BlockType::Empty), Return, End,
@@ -348,15 +378,32 @@ fn emit_settle(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         I32Const(REJECTED), LocalSet(state),
         Else,
     );
-    is_promise(&mut f, v);
+    emit_is_object(&mut f, v);
     wasm!(f;
         If(BlockType::Empty),
-        LocalGet(v), I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS), LocalGet(p), I32Const(0),
-        Call(helpers.promise_react()),
+        LocalGet(v), I32Const(static_key(strings, "then")), Call(helpers.get), LocalSet(then),
+        GlobalGet(EXC_PENDING_GLOBAL),
+        If(BlockType::Empty),
+        GlobalGet(EXC_VALUE_GLOBAL), LocalSet(v),
+        I32Const(0), GlobalSet(EXC_PENDING_GLOBAL),
+        I64Const(0), GlobalSet(EXC_VALUE_GLOBAL),
+        I32Const(REJECTED), LocalSet(state),
+        Else,
+    );
+    emit_is_function(&mut f, then);
+    wasm!(f;
+        If(BlockType::Empty),
+    );
+    queue_thenable_job(&mut f, [then, v, p], rec, helpers);
+    wasm!(f;
         Return,
         End,
         End,
         End,
+        End,
+        End,
+        // A `then` getter ran user code: settle only a still-pending `p`.
+        LocalGet(p), I32WrapI64, I32Load(m32(STATE)), If(BlockType::Empty), Return, End,
         // Write the settlement and detach the reactions.
         LocalGet(p), I32WrapI64, LocalTee(pb), LocalGet(state), I32Store(m32(STATE)),
         LocalGet(pb), LocalGet(v), I64Store(m64(VALUE)),
@@ -409,25 +456,41 @@ fn emit_settle(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     finish_builder(f)
 }
 
-/// `__promise_then(p, on_f, on_r)` (`finally = false`) or
-/// `__promise_finally(p, on_finally)`: a fresh derived promise registered as
+/// `NewPromiseResolveThenableJob(p, thenable, then)` for the locals
+/// `[then, thenable, p]`: a job record (kind [`THENABLE`]) through the free
+/// base local `rec`, queued at once.
+fn queue_thenable_job(
+    f: &mut FnBuilder<'_>,
+    [then, thenable, p]: [u32; 3],
+    rec: u32,
+    helpers: Helpers<'_>,
+) {
+    let size = abi::REACTION_BLOCK_SIZE.cast_signed();
+    let slots = abi::REACTION_SLOTS.cast_signed();
+    wasm!(f;
+        I32Const(size), Call(helpers.alloc), LocalSet(rec),
+        LocalGet(rec), I32Const(TYPE_ENV), I32Store8(m8(0)),
+        LocalGet(rec), I32Const(slots), I32Store(m32(abi::HEADER_SIZE)),
+        LocalGet(rec), LocalGet(then), I64Store(m64(ON_FULFILLED)),
+        LocalGet(rec), LocalGet(thenable), I64Store(m64(ON_REJECTED)),
+        LocalGet(rec), LocalGet(p), I64Store(m64(RESULT)),
+        LocalGet(rec), I64Const(i64::from(THENABLE)), I64Store(m64(KIND)),
+        LocalGet(rec), I64Const(UNDEFINED_BITS), I64Store(m64(JOB_VALUE)),
+        LocalGet(rec), I64Const(0), I64Store(m64(NEXT)),
+        LocalGet(rec), Call(helpers.promise_enqueue()),
+    );
+}
+
+/// `__promise_then(p, on_f, on_r)`: a fresh derived promise registered as
 /// the result of a reaction on `p`.
-fn emit_then(helpers: Helpers<'_>, leaves: &LeafSet, finally: bool) -> Function {
-    let params: &[_] = if finally {
-        &[ROOT_JS, ROOT_JS]
-    } else {
-        &[ROOT_JS, ROOT_JS, ROOT_JS]
-    };
-    let mut f = helper_builder(leaves, params, &[ROOT_JS]);
-    let (p, on_f) = (0, 1);
-    let on_r = if finally { 1 } else { 2 };
-    let derived = if finally { 2 } else { 3 };
+fn emit_then(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_JS, ROOT_JS, ROOT_JS], &[ROOT_JS]);
+    let (p, on_f, on_r, derived) = (0, 1, 2, 3);
     wasm!(f; I64Const(promise_proto(helpers)), Call(helpers.promise_new()));
     box_heap(&mut f);
     wasm!(f;
         LocalSet(derived),
-        LocalGet(p), LocalGet(on_f), LocalGet(on_r), LocalGet(derived),
-        I32Const(if finally { FINALLY } else { 0 }),
+        LocalGet(p), LocalGet(on_f), LocalGet(on_r), LocalGet(derived), I32Const(0),
         Call(helpers.promise_react()),
         LocalGet(derived),
         End,
@@ -435,15 +498,77 @@ fn emit_then(helpers: Helpers<'_>, leaves: &LeafSet, finally: bool) -> Function 
     finish_builder(f)
 }
 
-/// `__promise_resolve(v)` (`reject = false`): `v` itself when it is a
-/// promise, else a fresh promise fulfilled with `v`; `__promise_reject(v)`:
-/// a fresh promise rejected with `v`.
-fn emit_resolve(helpers: Helpers<'_>, leaves: &LeafSet, reject: bool) -> Function {
+/// `__promise_finally(p, on_finally)`: `Promise.prototype.finally` with
+/// `C = %Promise%` (the callers' guard). A callable `on_finally` is wrapped
+/// in the `thenFinally` / `catchFinally` closures over `[onFinally,
+/// %Promise%]` (each calls it, `PromiseResolve`s the result and chains the
+/// value thunk / thrower); then `__promise_then(p, thenFinally,
+/// catchFinally)`.
+fn emit_finally(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[ROOT_JS, ROOT_JS],
+        &[ROOT_JS, ROOT_JS, ROOT_JS, ROOT_BASE],
+    );
+    let (p, on_finally) = (0, 1);
+    let (env, then_finally, catch_finally, dst) = (2, 3, 4, 5);
+    // `emit_settler_value` uses `scratch + 3` (= `dst`) as its block base.
+    let scratch = dst - 3;
+    let ctor = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Promise), helpers);
+    wasm!(f;
+        LocalGet(on_finally), LocalSet(then_finally),
+        LocalGet(on_finally), LocalSet(catch_finally),
+    );
+    emit_is_function(&mut f, on_finally);
+    wasm!(f;
+        If(BlockType::Empty),
+        I32Const(2), Call(helpers.new_array()), LocalSet(dst),
+        LocalGet(dst),
+    );
+    emit_array_elems(&mut f);
+    wasm!(f; LocalGet(on_finally), I64Store(elem_slot(0)), LocalGet(dst));
+    emit_array_elems(&mut f);
+    wasm!(f; I64Const(ctor), I64Store(elem_slot(1)), LocalGet(dst));
+    box_heap(&mut f);
+    wasm!(f; LocalSet(env));
+    for (reject, out) in [(false, then_finally), (true, catch_finally)] {
+        let slot = helpers.builtin_slot(Builtin::Species(SpeciesOp::Finally { reject }));
+        emit_settler_value(slot, env, &mut f, scratch, helpers);
+        wasm!(f; LocalSet(out));
+    }
+    wasm!(f;
+        End,
+        LocalGet(p), LocalGet(then_finally), LocalGet(catch_finally),
+        Call(helpers.promise_then()),
+        End,
+    );
+    finish_builder(f)
+}
+
+/// `__promise_resolve(v)` (`reject = false`): `PromiseResolve(%Promise%, v)`
+/// — a promise whose `constructor` is `%Promise%` is `v` itself (a throw of
+/// that read is left pending, returning `undefined`), anything else a fresh
+/// promise resolved with `v` (thenables included); `__promise_reject(v)`: a
+/// fresh promise rejected with `v`.
+fn emit_resolve(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+    reject: bool,
+) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_JS], &[ROOT_JS]);
     let (v, out) = (0, 1);
     if !reject {
+        let ctor = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Promise), helpers);
         is_promise(&mut f, v);
-        wasm!(f; If(BlockType::Empty), LocalGet(v), Return, End);
+        wasm!(f;
+            If(BlockType::Empty),
+            LocalGet(v), I32Const(static_key(strings, "constructor")), Call(helpers.get),
+            LocalSet(out),
+            GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+            LocalGet(out), I64Const(ctor), I64Eq, If(BlockType::Empty), LocalGet(v), Return, End,
+            End,
+        );
     }
     wasm!(f; I64Const(promise_proto(helpers)), Call(helpers.promise_new()));
     box_heap(&mut f);
@@ -458,22 +583,63 @@ fn emit_resolve(helpers: Helpers<'_>, leaves: &LeafSet, reject: bool) -> Functio
     finish_builder(f)
 }
 
-/// `__run_job(rec)`: run one job. The callback is selected by the source
-/// state; a non-callable one passes the settlement through. Otherwise it is
-/// called through `__invoke1` (a `finally` callback with `undefined`), and the
-/// derived promise is settled from the outcome: a throw (the pending
-/// exception, cleared here) rejects it, a `finally` callback's normal return
-/// passes the source settlement through, anything else fulfills it.
+/// `__run_job(rec)`: run one job.
+///
+/// A thenable job (`PromiseResolveThenableJob`) calls `then` with `this` =
+/// the thenable and a fresh once-only resolving-function pair for its
+/// promise; a throw rejects that promise through the pair (a no-op once it
+/// resolved).
+///
+/// A reaction job selects the callback by the source state; a non-callable
+/// one passes the settlement through. Otherwise it is called through
+/// `__invoke1`, and the derived promise is settled from the outcome: a throw
+/// (the pending exception, cleared here) rejects it, a return resolves it.
 fn emit_run_job(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(
         leaves,
         &[ROOT_BASE],
-        &[RAW_I32, RAW_I32, ROOT_JS, ROOT_JS, ROOT_JS, ROOT_JS],
+        &[
+            RAW_I32, RAW_I32, ROOT_JS, ROOT_JS, ROOT_JS, ROOT_JS, ROOT_JS, ROOT_JS, ROOT_JS,
+            ROOT_BASE,
+        ],
     );
     let (rec, kind, state, callback, value, result, out) = (0, 1, 2, 3, 4, 5, 6);
+    let (env, resolve, reject, dst) = (7, 8, 9, 10);
+    // `emit_settler_value` uses `scratch + 3` (= `dst`) as its block base.
+    let scratch = dst - 3;
     wasm!(f;
         LocalGet(rec), I64Load(m64(KIND)), I32WrapI64, LocalTee(kind),
-        I32Const(STATE_SHIFT), I32ShrU, I32Const(3), I32And, LocalSet(state),
+        I32Const(THENABLE), I32And,
+        If(BlockType::Empty),
+        LocalGet(rec), I64Load(m64(ON_FULFILLED)), LocalSet(callback),
+        LocalGet(rec), I64Load(m64(ON_REJECTED)), LocalSet(value),
+        LocalGet(rec), I64Load(m64(RESULT)), LocalTee(result),
+        Call(helpers.promise_resolving()), LocalSet(env),
+    );
+    for (slot, out) in [
+        (helpers.settle_resolve_slot, resolve),
+        (helpers.settle_reject_slot, reject),
+    ] {
+        emit_settler_value(slot, env, &mut f, scratch, helpers);
+        wasm!(f; LocalSet(out));
+    }
+    call_then(&mut f, [callback, value, resolve, reject], dst, helpers);
+    wasm!(f;
+        Drop,
+        GlobalGet(EXC_PENDING_GLOBAL),
+        If(BlockType::Empty),
+        GlobalGet(EXC_VALUE_GLOBAL), LocalSet(out),
+        I32Const(0), GlobalSet(EXC_PENDING_GLOBAL),
+        I64Const(0), GlobalSet(EXC_VALUE_GLOBAL),
+        LocalGet(env), I32WrapI64, I64Load(m64(RESOLVING_DONE)), I64Const(TRUE_BITS), I64Ne,
+        If(BlockType::Empty),
+        LocalGet(env), I32WrapI64, I64Const(TRUE_BITS), I64Store(m64(RESOLVING_DONE)),
+        LocalGet(result), I32Const(REJECTED), LocalGet(out), Call(helpers.promise_settle()),
+        End,
+        End,
+        Return,
+        End,
+        LocalGet(kind), I32Const(STATE_SHIFT), I32ShrU, I32Const(3), I32And, LocalSet(state),
         LocalGet(rec), I64Load(m64(JOB_VALUE)), LocalSet(value),
         LocalGet(rec), I64Load(m64(RESULT)), LocalSet(result),
         LocalGet(state), I32Const(FULFILLED), I32Eq,
@@ -491,10 +657,7 @@ fn emit_run_job(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         LocalGet(result), LocalGet(state), LocalGet(value), Call(helpers.promise_settle()),
         Return,
         End,
-        LocalGet(callback),
-        LocalGet(kind), I32Const(FINALLY), I32And,
-        If(BlockType::Result(I64)), I64Const(UNDEFINED_BITS), Else, LocalGet(value), End,
-        Call(helpers.invoke1), LocalSet(out),
+        LocalGet(callback), LocalGet(value), Call(helpers.invoke1), LocalSet(out),
         GlobalGet(EXC_PENDING_GLOBAL),
         If(BlockType::Empty),
         GlobalGet(EXC_VALUE_GLOBAL), LocalSet(out),
@@ -503,15 +666,51 @@ fn emit_run_job(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         LocalGet(result), I32Const(REJECTED), LocalGet(out), Call(helpers.promise_settle()),
         Return,
         End,
-        LocalGet(kind), I32Const(FINALLY), I32And,
-        If(BlockType::Empty),
-        LocalGet(result), LocalGet(state), LocalGet(value), Call(helpers.promise_settle()),
-        Return,
-        End,
         LocalGet(result), I32Const(FULFILLED), LocalGet(out), Call(helpers.promise_settle()),
         End,
     );
     finish_builder(f)
+}
+
+/// Push `Call(then, thenable, «resolve, reject»)` for the jsvals in the
+/// locals `[then, thenable, resolve, reject]` (a throw left pending), over
+/// the uniform env-last ABI: the two arguments fill the `K` positional slots;
+/// under `K < 2` they also ride in the spread argument array (built through
+/// the free i32 local `base`), which carries the overflow.
+fn call_then(
+    f: &mut FnBuilder<'_>,
+    [then, thenable, resolve, reject]: [u32; 4],
+    base: u32,
+    helpers: Helpers<'_>,
+) {
+    let k = helpers.max_args;
+    if k < 2 {
+        wasm!(f; I32Const(2), Call(helpers.new_array()), LocalSet(base));
+        for (i, arg) in [(0, resolve), (1, reject)] {
+            wasm!(f; LocalGet(base));
+            emit_array_elems(f);
+            wasm!(f; LocalGet(arg), I64Store(elem_slot(i)));
+        }
+        wasm!(f; LocalGet(base));
+        box_heap(f);
+        wasm!(f; GlobalSet(SPREAD_ARGS_GLOBAL));
+    }
+    for i in 0..k {
+        match i {
+            0 => wasm!(f; LocalGet(resolve)),
+            1 => wasm!(f; LocalGet(reject)),
+            _ => wasm!(f; I64Const(UNDEFINED_BITS)),
+        }
+    }
+    wasm!(f;
+        LocalGet(thenable), GlobalSet(THIS_GLOBAL),
+        LocalGet(then), I32WrapI64, I64Load(m64(abi::FUNC_ENV_OFFSET)),
+    );
+    emit_argc(2, f);
+    wasm!(f;
+        LocalGet(then), I32WrapI64, I32Load(m32(abi::FUNC_INDEX_OFFSET)),
+        CallIndirect { type_index: helpers.fn_type, table_index: 0 },
+    );
 }
 
 /// `__drain()`: pop and run jobs until the queue is empty (a loop, never
@@ -595,35 +794,53 @@ fn emit_first_unhandled(leaves: &LeafSet) -> Function {
     finish_builder(f)
 }
 
-/// `__promise_await(v) -> i64`: top-level `await v`. Mark a promise `v`
-/// handled, drain the queue (so `await` yields even on a settled or
-/// non-promise operand), then return the fulfillment value, or leave the
-/// rejection reason in flight (`$exc_pending`) for the caller to propagate.
-/// A non-promise yields itself; a promise still pending after the drain
-/// (nothing can settle it any more) yields `undefined`.
+/// `__promise_await(v) -> i64`: top-level `await v`. `PromiseResolve(%Promise%,
+/// v)` (a throw is left pending), mark the promise handled, drain the queue
+/// (so `await` yields even on a settled operand), then return the
+/// fulfillment value, or leave the rejection reason in flight
+/// (`$exc_pending`) for the caller to propagate. A promise still pending
+/// after the drain (nothing can settle it any more) yields `undefined`.
 fn emit_await(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[ROOT_JS], &[RAW_I32]);
-    let (v, promise) = (0, 1);
-    is_promise(&mut f, v);
+    let mut f = helper_builder(leaves, &[ROOT_JS], &[ROOT_JS]);
+    let (v, p) = (0, 1);
     wasm!(f;
-        LocalTee(promise),
-        If(BlockType::Empty),
-        LocalGet(v), I32WrapI64, LocalGet(v), I32WrapI64, I32Load8U(m8(FLAGS)),
+        LocalGet(v), Call(helpers.promise_resolve()), LocalSet(p),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+        LocalGet(p), I32WrapI64, LocalGet(p), I32WrapI64, I32Load8U(m8(FLAGS)),
         I32Const(HANDLED), I32Or, I32Store8(m8(FLAGS)),
-        End,
         Call(helpers.drain()),
-        LocalGet(promise), I32Eqz, If(BlockType::Empty), LocalGet(v), Return, End,
-        LocalGet(v), I32WrapI64, I32Load(m32(STATE)), I32Const(FULFILLED), I32Eq,
+        LocalGet(p), I32WrapI64, I32Load(m32(STATE)), I32Const(FULFILLED), I32Eq,
         If(BlockType::Empty),
-        LocalGet(v), I32WrapI64, I64Load(m64(VALUE)), Return,
+        LocalGet(p), I32WrapI64, I64Load(m64(VALUE)), Return,
         End,
-        LocalGet(v), I32WrapI64, I32Load(m32(STATE)), I32Const(REJECTED), I32Eq,
+        LocalGet(p), I32WrapI64, I32Load(m32(STATE)), I32Const(REJECTED), I32Eq,
         If(BlockType::Empty),
-        LocalGet(v), I32WrapI64, I64Load(m64(VALUE)), GlobalSet(EXC_VALUE_GLOBAL),
+        LocalGet(p), I32WrapI64, I64Load(m64(VALUE)), GlobalSet(EXC_VALUE_GLOBAL),
         I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
         End,
         I64Const(UNDEFINED_BITS),
         End,
     );
+    finish_builder(f)
+}
+
+/// `__promise_resolving(p) -> i64`: the `env` of a fresh resolving-function
+/// pair for the promise `p` (`CreateResolvingFunctions`): a `TYPE_ENV` block
+/// `[p, alreadyResolved = false]` both settlers share.
+fn emit_resolving(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_JS], &[ROOT_BASE]);
+    let (p, env) = (0, 1);
+    let size = abi::RESOLVING_BLOCK_SIZE.cast_signed();
+    let slots = abi::RESOLVING_SLOTS.cast_signed();
+    wasm!(f;
+        I32Const(size), Call(helpers.alloc), LocalSet(env),
+        LocalGet(env), I32Const(TYPE_ENV), I32Store8(m8(0)),
+        LocalGet(env), I32Const(slots), I32Store(m32(abi::HEADER_SIZE)),
+        LocalGet(env), LocalGet(p), I64Store(m64(RESOLVING_PROMISE)),
+        LocalGet(env), I64Const(FALSE_BITS), I64Store(m64(RESOLVING_DONE)),
+        LocalGet(env),
+    );
+    box_heap(&mut f);
+    wasm!(f; End);
     finish_builder(f)
 }

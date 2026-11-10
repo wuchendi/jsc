@@ -1885,8 +1885,16 @@ fn from_async_reject(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helper
         I32Const(0), GlobalSet(EXC_PENDING_GLOBAL), I64Const(0), GlobalSet(EXC_VALUE_GLOBAL),
         I64Const(HOLE_BITS), LocalSet(r),
         End,
+        // `Await(innerResult)`: a throw of `PromiseResolve` keeps the reason.
         LocalGet(r), I64Const(HOLE_BITS), I64Ne, If(BlockType::Empty),
-        LocalGet(r), Call(helpers.promise_resolve()),
+        LocalGet(r), Call(helpers.promise_resolve()), LocalSet(r),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty),
+        I32Const(0), GlobalSet(EXC_PENDING_GLOBAL), I64Const(0), GlobalSet(EXC_VALUE_GLOBAL),
+        I64Const(HOLE_BITS), LocalSet(r),
+        End,
+        End,
+        LocalGet(r), I64Const(HOLE_BITS), I64Ne, If(BlockType::Empty),
+        LocalGet(r),
     );
     let mark = function.temp_mark();
     function.root_temp(TempClass::Jsval);
@@ -1918,7 +1926,10 @@ fn from_async_await(
     let scratch = frame.scratch();
     wasm!(function;
         LocalGet(st), I32Const(phase), I32Store(fa_flag(FA_PHASE)),
-        LocalGet(value), Call(helpers.promise_resolve()),
+        // A throw of `PromiseResolve` is the step's abrupt completion.
+        LocalGet(value), Call(helpers.promise_resolve()), LocalSet(value),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+        LocalGet(value),
     );
     let mark = function.temp_mark();
     function.root_temp(TempClass::Jsval);

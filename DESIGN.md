@@ -881,7 +881,7 @@ function-index order:
 | output (§6.9) | `__out_reserve(need)`, `__path_reserve(need)`, `__refs_reserve(need)`, `__out_byte(b)`, `__out_cp(cp)`, `__out_str(s)`, `__out_uint(n)`, `__out_flush(fd)`, `__report(fd, prefix, v)` |
 | renderer (§6.9) | `__render_top(v)`, `__render(v, depth)`, `__render_heap(p, depth)`, `__render_array(p, depth)`, `__render_object(p, depth)`, `__render_function(p, depth)`, `__render_props(..)`, `__render_entry(e, quote, first, open, depth)`, `__render_key(key, quote)`, `__render_lookup(o, key)`, `__heap_object(v)`, `__str_of(v)`, `__fn_name(v)`, `__date_text(v)` |
 | entry | `_start` (§4.2) |
-| promise engine (§6.7), after the Unicode and libm helpers | `__promise_new(proto)`, `__promise_enqueue(rec)`, `__promise_react(p, on_f, on_r, result, kind)`, `__promise_settle(p, state, v)`, `__promise_then(p, on_f, on_r)`, `__promise_resolve(v)`, `__promise_reject(v)`, `__promise_finally(p, on_finally)`, `__run_job(rec)`, `__drain()`, `__first_unhandled()`, `__promise_await(v)` |
+| promise engine (§6.7), after the Unicode and libm helpers | `__promise_new(proto)`, `__promise_enqueue(rec)`, `__promise_react(p, on_f, on_r, result, kind)`, `__promise_settle(p, state, v)`, `__promise_then(p, on_f, on_r)`, `__promise_resolve(v)`, `__promise_reject(v)`, `__promise_finally(p, on_finally)`, `__run_job(rec)`, `__drain()`, `__first_unhandled()`, `__promise_await(v)`, `__promise_resolving(p)` |
 
 The string helpers work on code units at either width: `__concat` makes a
 two-byte result iff either operand is two-byte (widening the one-byte side)
@@ -1280,34 +1280,46 @@ through the host (`__promise` op `7`, below).
 
 - **Records.** A reaction is one `TYPE_ENV` block of 6 jsval slots:
   `on_fulfilled`, `on_rejected` (`undefined` = passthrough), `result` (the
-  derived promise or `undefined`), `kind` (bit 0 `FINALLY`, bits 2-3 the
+  derived promise or `undefined`), `kind` (bit 0 `THENABLE`, bits 2-3 the
   source state once queued), the settlement value (written when queued) and
   `next` (`HEAP | record` or `0`). The same block is first a reaction on a
   pending promise (a newest-first list from the promise's `reactions` ref),
-  then a queued job, so settling never allocates.
+  then a queued job, so settling never allocates. A `THENABLE` record is a
+  `PromiseResolveThenableJob` (`then`, the thenable, the promise to resolve),
+  queued directly.
 - **Queue.** `$__job_head` / `$__job_tail` are raw refs to an intrusive FIFO
-  of records. `__promise_settle(p, state, v)` settles once, reverses the
-  reaction list in place into registration order, fills each record's
-  state and value, and splices the chain onto the queue.
-  `__promise_react(p, on_f, on_r, result, kind)` sets `HANDLED` and prepends
-  a record to a pending promise, or queues it at once for a settled promise
-  (a non-promise `p` acts as already fulfilled). `__promise_then`,
+  of records. `__promise_settle(p, state, v)` resolves or rejects `p`
+  (below); settling reverses the reaction list in place into registration
+  order, fills each record's state and value, and splices the chain onto the
+  queue. `__promise_react(p, on_f, on_r, result, kind)` sets `HANDLED` and
+  prepends a record to a pending promise, or queues it at once for a settled
+  promise (a non-promise `p` acts as already fulfilled). `__promise_then`,
   `__promise_finally`, `__promise_resolve` and `__promise_reject` build on
   these; promises come from `__promise_new(proto)`, which stamps `seq` from
   `$__promise_seq`.
-- **Jobs.** `__run_job(rec)` selects the callback by the source state; a
-  non-callable one passes the settlement through. Otherwise it calls the
-  internal `__invoke1(fn, arg)` trampoline (the uniform-ABI `call_indirect`;
-  a `finally` callback gets `undefined`). A throw leaves `$exc_pending` set;
-  the job clears it and rejects the derived promise. A `finally` callback's
-  normal return passes the source settlement through; anything else fulfills
-  the derived promise with the callback's result.
-- **Resolution.** Fulfilling a promise with itself — through an executor
-  `resolve`, a reaction returning its derived promise, or an `async` body
-  returning its own result — rejects it with a fresh `TypeError` ("Chaining
-  cycle detected for promise #<Promise>") built in the guest. Fulfilling with
-  another native promise adopts it (a passthrough reaction on it); other
-  thenables are not assimilated (§13).
+- **Jobs.** `__run_job(rec)` runs a `THENABLE` job as
+  `then.call(thenable, resolve, reject)` with a fresh resolving-function pair
+  for its promise (a throw calls that `reject`). A reaction job selects the
+  callback by the source state; a non-callable one passes the settlement
+  through. Otherwise it calls the internal `__invoke1(fn, arg)` trampoline
+  (the uniform-ABI `call_indirect`). A throw leaves `$exc_pending` set; the
+  job clears it and rejects the derived promise; a return resolves the
+  derived promise with the callback's result.
+- **Resolution** follows the spec's Promise Resolve Functions, for every
+  resolution (an executor's `resolve`, a reaction's result, an `async` body's
+  return, `Promise.resolve`): resolving a promise with itself rejects it with
+  a fresh `TypeError` ("Chaining cycle detected for promise #<Promise>")
+  built in the guest; a non-object fulfills; otherwise `Get(v, "then")` runs
+  (a throw rejects with the thrown value), a callable `then` queues a
+  `THENABLE` job — native promises included, so adopting a promise takes two
+  extra ticks — and anything else fulfills. A resolving-function pair
+  (`CreateResolvingFunctions`) is the two settler functions (slots `n`,
+  `n + 1`) over one shared `env` from `__promise_resolving(p)`: a
+  `TYPE_ENV` block `[p, alreadyResolved]`, so only the first call of either
+  function does anything. `PromiseResolve(%Promise%, v)` is
+  `__promise_resolve(v)`: a promise whose `constructor` is `%Promise%` is
+  `v` itself (a throw of that read propagates), anything else a fresh promise
+  resolved with `v`; every `await` goes through it.
 - **Builtins.** `then` on a receiver that is not a promise throws a
   `TypeError`. `then` and `finally` take their result promise's constructor
   from `SpeciesConstructor(this, %Promise%)`: for `%Promise%` the engine
@@ -1315,14 +1327,15 @@ through the host (`__promise` op `7`, below).
   builds `NewPromiseCapability(C)` (constructing `C` with an internal
   executor closure) and registers two internal reaction closures through
   `__promise_then` that settle the capability, and `finally` (also on any
-  non-promise object) calls `this.then(thenFinally, catchFinally)` with the
-  spec's closures (`PromiseResolve(C, onFinally())` then a value / thrower
-  thunk). `Promise.resolve` / `Promise.reject` construct from `this`:
-  `PromiseResolve(C, x)` (a promise whose `constructor` is `C` is returned as
-  is) / `NewPromiseCapability(C)`; `C === %Promise%` takes
-  `__promise_resolve` / `__promise_reject` (for `resolve` only a non-promise
-  `x`), and so does the inline `Promise.resolve(x)` of a never-written
-  `Promise` global. The combinators `Promise.all` / `allSettled` / `any` /
+  non-promise object) calls `this.then(thenFinally, catchFinally)`. Both
+  paths use the spec's closures (`PromiseResolve(C, onFinally())` then a
+  value / thrower thunk); for `%Promise%`, `__promise_finally` registers them
+  through `__promise_then`. `Promise.resolve` / `Promise.reject` construct
+  from `this`: `PromiseResolve(C, x)` (a promise whose `constructor` is `C`
+  is returned as is) / `NewPromiseCapability(C)`; `C === %Promise%` takes
+  `__promise_resolve` / `__promise_reject`, and so does the inline
+  `Promise.resolve(x)` of a never-written `Promise` global. The combinators
+  `Promise.all` / `allSettled` / `any` /
   `race` (`emit/builtins/promise.rs`) build `NewPromiseCapability(this)`,
   read `this.resolve` once, open the iterable's iterator record (§7.8) and
   per value call `resolve` with `this`, then `Invoke(next, "then", «onF,
@@ -1334,19 +1347,19 @@ through the host (`__promise` op `7`, below).
   dirty bits clear and a `%Promise%` instance without own properties skips
   the `resolve` call and registers the reactions through `__promise_then`.
 - **`new Promise(executor)`** allocates a pending promise `P`
-  (`__promise_new`), then passes the executor two function values whose
-  table slots are the settler functions (slots `n`, `n + 1`) and whose `env`
-  holds `P` directly. Calling them runs `__promise_settle` on `P`
-  (settle-once). A throwing executor rejects `P`.
+  (`__promise_new`) and its resolving `env` (`__promise_resolving`), then
+  passes the executor the two settler function values over that `env`. A
+  throwing executor calls `reject` with the thrown value (a no-op once
+  `alreadyResolved`).
 - **Draining.** There are no timers or I/O, so the microtask queue is the
   only asynchronous source. `__drain()` is a loop (no recursion, so a long
   reaction chain uses no wasm stack): pop and run jobs until the queue is
   empty, then the checkpoint — prune the promises a late reaction marked
   `HANDLED` from the rejected list (M3 adds `ClearKeptObjects` and the
   finalization cleanup jobs here) — and loop again if the checkpoint queued
-  jobs. Top-level `await v` marks a promise `v` handled, drains, and yields
-  the fulfillment value (a rejection surfaces as an uncaught throw; a
-  non-promise yields itself after the drain). After `main` returns normally
+  jobs. Top-level `await v` takes `PromiseResolve(%Promise%, v)`, marks that
+  promise handled, drains, and yields the fulfillment value (a rejection
+  surfaces as an uncaught throw). After `main` returns normally
   `_start` drains whatever remains, so unawaited `then` chains run. If `main`
   ends with a pending exception, the queue is not drained.
 - **Unhandled rejections.** A rejection of a promise with no reaction and no
@@ -2560,19 +2573,19 @@ Each item below is current behaviour of this tree.
   `String` / `Number` exotic object: `String.prototype.valueOf()` throws
   `TypeError`, and `Object.prototype.toString.call(Number.prototype)` is
   `"[object Object]"`.
-- The remaining test262 failures of the phase-3 built-in families (361 of
-  built-ins/{Array 64, String 158, Function 133, Math 1, Number 4,
+- The remaining test262 failures of the phase-3 built-in families (347 of
+  built-ins/{Array 50, String 158, Function 133, Math 1, Number 4,
   AggregateError 1}; NativeErrors has none; counted at `61f46be` from the CI
   per-test results, after phase 5a removed the `void`, tagged-template and
   `for-in` head causes; a few tests those causes hid now stop at `RegExp` or
-  the `Function` constructor), by cause and owner:
+  the `Function` constructor; minus the 14 `Array.fromAsync` tests the spec
+  thenable assimilation fixes), by cause and owner:
 
   | cause | owner | Array | String | Function | Math | Number | AggregateError |
   |---|---|---|---|---|---|---|---|
   | `RegExp` | phase 5b | 28 | 131 | 3 | | | |
   | `Function` constructor | unsupported (§14 open decisions) | | 4 | 124 | | | 1 |
   | `eval` / `Proxy` / `BigInt` / `ArrayBuffer` | `eval` unsupported; the rest phase 5b | 21 | 19 | 4 | 1 | | |
-  | thenables are not assimilated (`Array.fromAsync`, below) | async | 14 | | | | | |
   | `String.prototype` / `Number.prototype` are not exotic (above) | object model | | 3 | | | 4 | |
   | `Array.fromAsync` over an array-like of length `2^53 - 1` (timeout) | — | 1 | | | | | |
   | strict `caller` access (`caller/prop-desc`) | — | | | 1 | | | |
@@ -2605,8 +2618,10 @@ Each item below is current behaviour of this tree.
   step is a call to the cached `next` (or the `throw` / `return` method).
 - An async generator object renders as `Object [Generator]`; functions
   render as `[Function: f]` whatever their kind.
-- Thenables are not assimilated: `await t` and `Promise.resolve(t)` on a
-  non-promise thenable yield `t` itself.
+- An async generator's `await` / `yield` / `return` operand and an
+  `%AsyncFromSyncIteratorPrototype%` result value skip `PromiseResolve`: a
+  non-promise thenable is used as the value itself, and a native promise is
+  awaited whatever its `constructor`.
 
 **Date**
 

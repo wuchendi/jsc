@@ -421,7 +421,7 @@ pub(crate) const REACTION_ON_REJECTED_OFFSET: u32 = HEADER_SIZE + 12;
 /// `undefined`.
 pub(crate) const REACTION_RESULT_OFFSET: u32 = HEADER_SIZE + 20;
 
-/// Reaction slot 3: the `kind` small integer (bit 0 [`REACTION_KIND_FINALLY`],
+/// Reaction slot 3: the `kind` small integer (bit 0 [`REACTION_KIND_THENABLE`],
 /// bit 1 reserved for the async-function resumption, the source state once
 /// queued at [`REACTION_KIND_STATE_SHIFT`]).
 pub(crate) const REACTION_KIND_OFFSET: u32 = HEADER_SIZE + 28;
@@ -432,12 +432,26 @@ pub(crate) const REACTION_VALUE_OFFSET: u32 = HEADER_SIZE + 36;
 /// Reaction slot 5: `next`, a `HEAP | record` jsval or `0`.
 pub(crate) const REACTION_NEXT_OFFSET: u32 = HEADER_SIZE + 44;
 
-/// Reaction `kind` bit: `finally` semantics (run the callback for effect,
-/// pass the source settlement through).
-pub(crate) const REACTION_KIND_FINALLY: i32 = 1;
+/// Reaction `kind` bit: the record is a `PromiseResolveThenableJob` (slot 0
+/// the callable `then`, slot 1 the thenable, slot 2 the promise to resolve),
+/// queued directly, never a reaction on a promise.
+pub(crate) const REACTION_KIND_THENABLE: i32 = 1;
 
 /// The shift of the source state (bits 2-3) in a queued job's `kind`.
 pub(crate) const REACTION_KIND_STATE_SHIFT: i32 = 2;
+
+/// The jsval slot count of a resolving-function pair's shared `env`: a
+/// [`TYPE_ENV`] block of the promise and its `alreadyResolved` flag.
+pub(crate) const RESOLVING_SLOTS: u32 = 2;
+
+/// The byte size of a resolving-function `env` block.
+pub(crate) const RESOLVING_BLOCK_SIZE: u32 = HEADER_SIZE + 4 + 8 * RESOLVING_SLOTS;
+
+/// Resolving-function `env` slot 0: the promise the pair settles.
+pub(crate) const RESOLVING_PROMISE_OFFSET: u32 = HEADER_SIZE + 4;
+
+/// Resolving-function `env` slot 1: `alreadyResolved` (a boolean jsval).
+pub(crate) const RESOLVING_DONE_OFFSET: u32 = HEADER_SIZE + 12;
 
 /// [`TYPE_PROMISE`] `state`: the promise is unsettled.
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
