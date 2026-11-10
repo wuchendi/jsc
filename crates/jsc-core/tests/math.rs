@@ -323,7 +323,8 @@ impl Rng {
     fn sample(&mut self, spread: Spread) -> f64 {
         match spread {
             Uniform(lo, hi) => lo + (hi - lo) * self.next(),
-            Log(lo, hi) => lo * (hi / lo).powf(self.next()),
+            // Interpolate the exponent: `hi / lo` overflows for wide ranges.
+            Log(lo, hi) => (lo.ln() + (hi.ln() - lo.ln()) * self.next()).exp(),
             SignedLog(lo, hi) => {
                 let magnitude = self.sample(Log(lo, hi));
                 if self.next() < 0.5 {
@@ -336,14 +337,26 @@ impl Rng {
     }
 }
 
-/// At least 1,000 inputs drawn across `spreads`, plus the domain edges.
+/// At least 1,000 inputs drawn across `spreads`, plus the domain edges and
+/// the special values (both signs of zero and infinity, and NaN).
 fn sample_inputs(seed: u64, spreads: &[Spread]) -> Vec<f64> {
     const PER_FUNCTION: usize = 1_200;
     let mut rng = Rng(seed);
     let mut inputs: Vec<f64> = (0..PER_FUNCTION)
         .map(|i| rng.sample(spreads[i % spreads.len()]))
         .collect();
-    let edges = [5e-324, f64::MIN_POSITIVE, 1e-300, 0.5, 1.0, 2.0, 709.5];
+    let edges = [
+        0.0,
+        5e-324,
+        f64::MIN_POSITIVE,
+        1e-300,
+        0.5,
+        1.0,
+        2.0,
+        709.5,
+        f64::INFINITY,
+        f64::NAN,
+    ];
     inputs.extend(edges);
     inputs.extend(edges.map(|x| -x));
     inputs
@@ -355,15 +368,31 @@ fn ordinal(x: f64) -> i128 {
     i128::from(if bits < 0 { i64::MIN - bits } else { bits })
 }
 
+/// `x` as a JS numeric expression that round-trips bit-exactly (Rust float
+/// formatting spells the special values `inf` / `NaN` / `-0e0`).
+fn js_number(x: f64) -> String {
+    if x.is_nan() {
+        "NaN".to_owned()
+    } else if x.is_infinite() {
+        if x < 0.0 { "-Infinity" } else { "Infinity" }.to_owned()
+    } else if x == 0.0 && x.is_sign_negative() {
+        "-0".to_owned()
+    } else {
+        // `{:e}` is the shortest round-trip form.
+        format!("{x:e}")
+    }
+}
+
 /// Run one guest expression per input and return its results, in order
-/// (`-0` is printed with its sign so results round-trip bit-exactly).
-/// `call` renders the JS expression for input index expression `i`.
+/// (`-0` is printed with its sign so results round-trip bit-exactly; Rust's
+/// `f64` parser accepts the JS spellings `NaN`, `Infinity`, `-Infinity` and
+/// `1e+21`). `call` renders the JS expression for input index expression `i`.
 fn guest_results(literals: &[Vec<f64>], call: &str) -> Vec<f64> {
     let decls: Vec<String> = ["xs", "ys"]
         .iter()
         .zip(literals)
         .map(|(name, values)| {
-            let list: Vec<String> = values.iter().map(|x| format!("{x:e}")).collect();
+            let list: Vec<String> = values.iter().map(|&x| js_number(x)).collect();
             format!("const {name} = [{}];\n", list.join(","))
         })
         .collect();
@@ -404,8 +433,8 @@ const STD_SANITY_ULPS: i128 = 4096;
 
 /// Assert one guest result is roughly the `std` result.
 fn assert_near_std(label: &str, input: (f64, f64), guest: f64, native: f64) {
-    let near = if native.is_nan() {
-        guest.is_nan()
+    let near = if native.is_nan() || guest.is_nan() {
+        native.is_nan() && guest.is_nan()
     } else {
         (ordinal(guest) - ordinal(native)).abs() <= STD_SANITY_ULPS
     };
@@ -532,6 +561,9 @@ const LIBM_SPECIAL_CASES: &[(&str, &str)] = &[
     ("sin(NaN)", "NaN"),
     ("cos(-0)", "1"),
     ("cos(Infinity)", "NaN"),
+    // The large (Payne-Hanek) reduction path; correctly rounded, and the
+    // `libm` crate's result.
+    ("cos(1e22)", "0.523214785395139"),
     ("tan(-0)", "-0"),
     ("tan(Infinity)", "NaN"),
     ("asin(-0)", "-0"),
