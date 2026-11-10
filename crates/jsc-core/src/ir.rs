@@ -2111,16 +2111,15 @@ pub enum IrNode {
         args: Vec<IrNode>,
     },
     /// `Promise.resolve(v)`: build a promise already fulfilled with `v`
-    /// (or return `v` unchanged when it is itself a promise). Lowers to the host
-    /// `__promise` import with [`crate::abi::PROMISE_OP_RESOLVE`].
+    /// (or return `v` unchanged when it is itself a promise). Lowers to the
+    /// guest promise engine's `__promise_resolve`.
     PromiseResolve(Box<IrNode>),
     /// `Promise.reject(v)`: build a promise already rejected with reason
-    /// `v`. Lowers to the host `__promise` import with
-    /// [`crate::abi::PROMISE_OP_REJECT`].
+    /// `v`. Lowers to the guest promise engine's `__promise_reject`.
     PromiseReject(Box<IrNode>),
     /// `p.then(onF, onR)` / `p.catch(onR)`: register the reactions on `p`
     /// and yield the chained result promise. A missing handler is `undefined`
-    /// (passthrough). Lowers to the host `__then` import.
+    /// (passthrough). Lowers to the guest promise engine's `__promise_then`.
     PromiseThen {
         /// The receiver promise expression.
         promise: Box<IrNode>,
@@ -2130,27 +2129,26 @@ pub enum IrNode {
         on_rejected: Box<IrNode>,
     },
     /// `p.finally(fn)`: run `fn` on settlement and pass `p`'s original
-    /// settlement through to the chained result promise. Lowers to the host
-    /// `__promise` import with [`crate::abi::PROMISE_OP_FINALLY`].
+    /// settlement through to the chained result promise. Lowers to the guest
+    /// promise engine's `__promise_finally`.
     PromiseFinally {
         /// The receiver promise expression.
         promise: Box<IrNode>,
         /// The finalizer callback, run for its side effect on settlement.
         on_finally: Box<IrNode>,
     },
-    /// Top-level `await p`: drive the host microtask queue until `p`
-    /// settles, then yield its fulfillment value (or unwind its rejection through
-    /// the exception globals). Lowers to the host `__promise` import with
-    /// [`crate::abi::PROMISE_OP_AWAIT`]. Only reachable at the top level — an
-    /// `await` inside a function body is a parse error (async functions stay
-    /// unsupported).
+    /// Top-level `await p`: mark `p` handled, drain the guest microtask queue,
+    /// then yield its fulfillment value (or unwind its rejection through the
+    /// exception globals). Lowers to the guest promise engine's
+    /// `__promise_await`. Only reachable at the top level (an `await` in an
+    /// async body is a `yield` of its state machine).
     Await(Box<IrNode>),
     /// `new Promise(executor)`: allocate a fresh pending promise `P`
     /// (stashed in `p_local`), build `resolve`/`reject` FUNCTION values bound to
     /// `P` (via the settler funcref slots), call `executor(resolve, reject)`
     /// synchronously — a throwing executor rejects `P` — and yield `P`. The
     /// `resolve`/`reject` values carry `P` in their env slot, so calling one
-    /// drives the host settle logic on `P` (no lexical capture needed).
+    /// runs `__promise_settle` on `P` (no lexical capture needed).
     PromiseCtor {
         /// The executor expression (a function value taking `(resolve, reject)`).
         executor: Box<IrNode>,

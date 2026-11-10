@@ -741,7 +741,7 @@ impl Wrap {
             wasm!(function; I64Const(UNDEFINED_BITS));
         }
         function.release_temps(mark);
-        wasm!(function; Call(helpers.then), LocalSet(self.out));
+        wasm!(function; Call(helpers.promise_then()), LocalSet(self.out));
     }
 }
 

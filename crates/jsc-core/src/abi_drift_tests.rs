@@ -267,8 +267,25 @@ fn object_family_layout_matches_design() {
     use super::{
         ARRAY_BLOCK_SIZE, DATE_BLOCK_SIZE, ELEMS_CAP_OFFSET, FUNC_BLOCK_SIZE, FUNC_ENV_OFFSET,
         GEN_BLOCK_SIZE, GEN_ENV_OFFSET, GEN_SM_IDX_OFFSET, GEN_STATE_OFFSET, MAP_BLOCK_SIZE,
-        MAP_ENTRIES_OFFSET, OBJ_PROPS_OFFSET, TYPE_ELEMS,
+        MAP_ENTRIES_OFFSET, OBJ_PROPS_OFFSET, PROMISE_FLAG_HANDLED, PROMISE_FLAG_IN_REJECTED_LIST,
+        PROMISE_REACTIONS_OFFSET, PROMISE_REJECTED_NEXT_OFFSET, PROMISE_SEQ_OFFSET,
+        REACTION_BLOCK_SIZE, REACTION_KIND_OFFSET, REACTION_NEXT_OFFSET, REACTION_SLOTS,
+        TYPE_ELEMS,
     };
+    // TYPE_PROMISE (runtime-memory.md §3.4): reactions @20, seq @32,
+    // rejected_next @36; flags HANDLED = 2, IN_REJECTED_LIST = 4; the reaction
+    // record is a TYPE_ENV of 6 slots, kind in slot 3, next in slot 5.
+    assert_eq!(PROMISE_REACTIONS_OFFSET, 20);
+    assert_eq!(PROMISE_SEQ_OFFSET, 32);
+    assert_eq!(PROMISE_REJECTED_NEXT_OFFSET, 36);
+    assert_eq!(
+        (PROMISE_FLAG_HANDLED, PROMISE_FLAG_IN_REJECTED_LIST),
+        (2, 4)
+    );
+    assert_eq!(REACTION_SLOTS, 6);
+    assert_eq!(REACTION_BLOCK_SIZE, 56);
+    assert_eq!(REACTION_KIND_OFFSET, 8 + 8 * 3);
+    assert_eq!(REACTION_NEXT_OFFSET, 8 + 8 * 5);
     let actual = [
         ("OBJ_PROPS_OFFSET", OBJ_PROPS_OFFSET),
         ("OBJ_PROTO_OFFSET", OBJ_PROTO_OFFSET),
@@ -299,7 +316,7 @@ fn object_family_layout_matches_design() {
         4, 8, 16, // prefix
         16, 24, 32, // function
         16, 24, 32, // map / set
-        16, 24, 32, // promise
+        16, 24, 40, // promise
         16, 20, 24, 32, 48, // generator
         16, 24, // date
         16, 20, 24, // array handle

@@ -56,9 +56,8 @@ pub(super) fn build_type_and_function_sections<'a>(
     let helpers = Helpers {
         unwind,
         // The `env` imports follow the four WASI imports (0..=3): `__promise`
-        // 4, `__then` 5.
+        // 4 (`__then` 5 is no longer called).
         promise: 4,
-        then: 5,
         alloc: index(),
         concat: index(),
         str_eq: index(),
@@ -589,8 +588,14 @@ pub(super) fn build_globals(
     let (sp_ty, sp_init) = mut_i32((abi::SHADOW_STACK_SIZE - abi::SHADOW_FP_BIAS).cast_signed());
     globals.global(sp_ty, &sp_init);
     // The `Math.random` state (i64, 0 = not seeded yet).
-    for _ in RNG0_GLOBAL..MODULE_CELL_GLOBAL_BASE {
+    for _ in RNG0_GLOBAL..JOB_HEAD_GLOBAL {
         let (ty, init) = mut_i64();
+        globals.global(ty, &init);
+    }
+    // The promise engine: `$__job_head`, `$__job_tail`, `$__promise_seq`,
+    // `$__rejected_head` (all i32, 0).
+    for _ in JOB_HEAD_GLOBAL..MODULE_CELL_GLOBAL_BASE {
+        let (ty, init) = mut_i32(0);
         globals.global(ty, &init);
     }
     // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in

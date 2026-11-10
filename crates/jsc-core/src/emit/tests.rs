@@ -899,7 +899,24 @@ fn exported_constructors_build_aligned_zeroed_blocks() {
         &mem[p + 16..p + 20],
         &crate::abi::PROMISE_PENDING.to_le_bytes()
     );
+    assert_eq!(&mem[p + 20..p + 24], &0u32.to_le_bytes(), "no reactions");
     assert_eq!(&mem[p + 24..p + 32], &crate::abi::UNDEFINED.to_le_bytes());
+    let seq = u32::from_le_bytes(mem[p + 32..p + 36].try_into().expect("seq"));
+    assert_eq!(&mem[p + 36..p + 40], &0u32.to_le_bytes(), "rejected_next");
+    // The 40-byte block is followed directly by the next one, whose `seq`
+    // counts on.
+    let q = new_promise.call(&mut store, ()).expect("new promise");
+    let q = usize::try_from(q).expect("base");
+    assert_eq!(
+        q - p,
+        crate::abi::PROMISE_BLOCK_SIZE as usize,
+        "40 bytes, no rounding"
+    );
+    let mem = memory.data(&store);
+    assert_eq!(
+        u32::from_le_bytes(mem[q + 32..q + 36].try_into().expect("seq")),
+        seq + 1
+    );
 }
 
 #[test]

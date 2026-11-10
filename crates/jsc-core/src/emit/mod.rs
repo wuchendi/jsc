@@ -47,24 +47,16 @@ use crate::ir::{
 /// pointers.
 const MEMORY_EXPORT_NAME: &str = abi::MEMORY_EXPORT_NAME;
 
-/// The module and field names of the host promise imports: `__promise`
-/// backs the single-value primitives (`Promise.resolve`/`reject`, top-level
-/// `await`, `p.finally`) and `__then` backs `p.then`/`p.catch`. [`crate::run`]
-/// supplies both through a `wasmtime::Linker`, driving the host-side promise
-/// engine (reactions + microtask queue).
+/// The module and field names of the host promise imports. Every promise
+/// operation runs in the guest engine ([`promise_engine`]) except the
+/// `async` function spawn, which still calls `__promise` (op
+/// [`PROMISE_OP_ASYNC_SPAWN`]); `__then` is imported but never called.
 const PROMISE_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const PROMISE_IMPORT_NAME: &str = abi::PROMISE_IMPORT_NAME;
 const THEN_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const THEN_IMPORT_NAME: &str = abi::THEN_IMPORT_NAME;
 
-/// `__promise` op flags; see [`abi`].
-const PROMISE_OP_RESOLVE: i32 = abi::PROMISE_OP_RESOLVE;
-const PROMISE_OP_REJECT: i32 = abi::PROMISE_OP_REJECT;
-const PROMISE_OP_AWAIT: i32 = abi::PROMISE_OP_AWAIT;
-const PROMISE_OP_FINALLY: i32 = abi::PROMISE_OP_FINALLY;
-const PROMISE_OP_NEW: i32 = abi::PROMISE_OP_NEW;
-const PROMISE_OP_SETTLE_FULFILL: i32 = abi::PROMISE_OP_SETTLE_FULFILL;
-const PROMISE_OP_SETTLE_REJECT: i32 = abi::PROMISE_OP_SETTLE_REJECT;
+/// The `__promise` op flag the async-function spawn still uses; see [`abi`].
 const PROMISE_OP_ASYNC_SPAWN: i32 = abi::PROMISE_OP_ASYNC_SPAWN;
 
 /// The export name of the `__invoke1` callback trampoline the host
@@ -222,10 +214,21 @@ const RNG0_GLOBAL: u32 = 24;
 /// See [`RNG0_GLOBAL`].
 const RNG1_GLOBAL: u32 = 25;
 
+/// The promise engine's job queue: raw `i32` refs to the oldest and newest
+/// queued reaction/job record (`$__job_head`, `$__job_tail`, init 0 = empty);
+/// see [`promise_engine`].
+const JOB_HEAD_GLOBAL: u32 = 26;
+/// See [`JOB_HEAD_GLOBAL`].
+const JOB_TAIL_GLOBAL: u32 = 27;
+/// The promise creation counter (`$__promise_seq`, i32, init 0).
+const PROMISE_SEQ_GLOBAL: u32 = 28;
+/// The rejected-promise list head (`$__rejected_head`, raw `i32` ref, init 0).
+const REJECTED_HEAD_GLOBAL: u32 = 29;
+
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
-/// the renderer and RNG globals and set in `main`'s prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 26;
+/// the renderer, RNG and promise-engine globals and set in `main`'s prologue).
+const MODULE_CELL_GLOBAL_BASE: u32 = 30;
 
 /// An array hole (see [`abi::HOLE`]): the element-slot bit pattern of a
 /// missing element. Every element read maps it to `undefined`.
@@ -358,10 +361,8 @@ const MAP_SIZE_OFFSET: u64 = abi::MAP_SIZE_OFFSET as u64;
 const MAP_ENTRIES_OFFSET: u64 = abi::MAP_ENTRIES_OFFSET as u64;
 const MAP_BLOCK_SIZE: i32 = abi::MAP_BLOCK_SIZE.cast_signed();
 
-/// Field offsets and size of a `Promise` block (see [`abi::TYPE_PROMISE`]).
-const PROMISE_STATE_OFFSET: u64 = abi::PROMISE_STATE_OFFSET as u64;
+/// The settled-value offset of a `Promise` block (see [`abi::TYPE_PROMISE`]).
 const PROMISE_VALUE_OFFSET: u64 = abi::PROMISE_VALUE_OFFSET as u64;
-const PROMISE_BLOCK_SIZE: i32 = abi::PROMISE_BLOCK_SIZE.cast_signed();
 
 /// Type byte, payload offset, and size of a `Date` block. Maps to `typeof`
 /// "object". See [`abi::TYPE_DATE`].
@@ -874,11 +875,9 @@ struct Helpers<'a> {
     /// The first of the [`dtoa::HELPER_COUNT`] consecutive `Number` to string
     /// helpers (see [`dtoa::emit_helpers`]).
     dtoa: u32,
-    /// The host `__promise` import's function index. Always `4`; `Promise.resolve`/`reject`, `await`, and `p.finally` lower to
-    /// `call`s of it.
+    /// The host `__promise` import's function index. Always `4`; only the
+    /// async-function spawn (`PROMISE_OP_ASYNC_SPAWN`) still calls it.
     promise: u32,
-    /// The host `__then` import's function index. Always `5`; `p.then`/`p.catch` lower to `call`s of it.
-    then: u32,
     /// `__now() -> f64`, the WASI clock in ms since the Unix epoch (backing
     /// `Date`); `__random` follows it (see [`Self::random`]).
     now: u32,
@@ -1508,6 +1507,7 @@ mod json_parse;
 mod libm;
 mod numeric;
 mod object;
+mod promise_engine;
 mod props;
 mod realm;
 mod render;
@@ -1598,6 +1598,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     let (mut types, mut functions, helpers, import_types) =
         build_type_and_function_sections(program, &unwind, layout);
     libm::register(&mut types, &mut functions);
+    promise_engine::register(&mut types, &mut functions);
     module.section(&types);
 
     // Import section: the WASI functions (indices 0..=3), then the `env`
@@ -1833,8 +1834,8 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     code.function(&numeric::emit_random(&leaves));
     code.function(&emit_invoke1(helpers, &leaves));
     code.function(&generator::emit_async_step(helpers, &leaves));
-    code.function(&emit_settler(PROMISE_OP_SETTLE_FULFILL, helpers, &leaves));
-    code.function(&emit_settler(PROMISE_OP_SETTLE_REJECT, helpers, &leaves));
+    code.function(&emit_settler(abi::PROMISE_FULFILLED, helpers, &leaves));
+    code.function(&emit_settler(abi::PROMISE_REJECTED, helpers, &leaves));
     code.function(&emit_new_string(helpers.alloc, &leaves));
     code.function(&emit_new_array(
         helpers.alloc,
@@ -1842,7 +1843,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
         &leaves,
     ));
     code.function(&emit_new_promise(
-        helpers.alloc,
+        helpers,
         intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Promise), helpers),
         &leaves,
     ));
@@ -1884,11 +1885,15 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
         code.function(&helper);
     }
     code.function(&emit_start(&offsets, helpers, options, &leaves));
-    // The families after `_start`, in index order: Unicode, then libm.
+    // The families after `_start`, in index order: Unicode, libm, then the
+    // promise engine.
     for helper in unicode::emit_helpers(helpers, &leaves) {
         code.function(&helper);
     }
     for helper in libm::emit_helpers(helpers, &leaves) {
+        code.function(&helper);
+    }
+    for helper in promise_engine::emit_helpers(helpers, &leaves) {
         code.function(&helper);
     }
     module.section(&code);
