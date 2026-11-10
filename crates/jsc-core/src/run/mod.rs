@@ -1,14 +1,13 @@
 //! Run: execute an emitted WebAssembly command module with `wasmtime`.
 //!
-//! [`harness`] is the WASI runner; [`promise`] backs the `env` imports not yet
-//! replaced by guest code.
+//! [`harness`] is the WASI runner: the four hand-written
+//! `wasi_snapshot_preview1` imports, `_start`, and the `proc_exit` code.
 
 mod harness;
-mod promise;
 
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-pub(crate) use harness::run_inspect;
 pub use harness::{Capture, RunOutcome, Sinks, run};
+#[cfg(test)]
+pub(crate) use harness::{THROWN_PROBE_EXPORT, run_inspect};

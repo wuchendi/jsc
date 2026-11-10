@@ -113,10 +113,10 @@ fn emit_new_block(function: &mut impl Sink, alloc: u32, base: u32, type_byte: i3
     }));
 }
 
-/// Emit the exported `__new_string(len: i32, two_byte: i32) -> i32`
-/// constructor: a [`TYPE_STRING`] block of `len` code units — Latin-1 bytes,
-/// or UTF-16LE units with `STR_FLAG_TWO_BYTE` when `two_byte` (`0`/`1`) —
-/// whose data the host fills. Locals 0/1 are the params; local 2 the base.
+/// Emit the `new_string(len: i32, two_byte: i32) -> i32` constructor: a
+/// [`TYPE_STRING`] block of `len` code units — Latin-1 bytes, or UTF-16LE units
+/// with `STR_FLAG_TWO_BYTE` when `two_byte` (`0`/`1`) — whose data the caller
+/// fills. Locals 0/1 are the params; local 2 the base.
 pub(super) fn emit_new_string(alloc: u32, leaves: &LeafSet) -> Function {
     let mut function = helper_builder(leaves, &[RAW_I32, RAW_I32], &[ROOT_BASE]);
     let (len, two_byte, base) = (0, 1, 2);
@@ -333,7 +333,7 @@ fn emit_new_elems(function: &mut impl Sink, alloc: u32, cap: u32, store: u32) {
     function.instruction(&Instruction::I32Store(mem32(ELEMS_CAP_OFFSET)));
 }
 
-/// Emit the exported `__new_array(len: i32) -> i32` constructor: a
+/// Emit the `__new_array(len: i32) -> i32` constructor: a
 /// [`TYPE_ARRAY`] handle (`proto` = `%Array.prototype%`, the jsval `proto`)
 /// with `len` set and, when `len > 0`, a `cap = len`
 /// [`TYPE_ELEMS`] store whose every element is `undefined`. Local 0 is `len`;
@@ -386,46 +386,17 @@ pub(super) fn emit_new_array(alloc: u32, proto: i64, leaves: &LeafSet) -> Functi
     finish_builder(function)
 }
 
-/// Emit the exported `__new_promise() -> i32` constructor: a pending
-/// [`abi::TYPE_PROMISE`] block with prototype `proto` (`%Promise.prototype%`),
-/// `state = PENDING`, and
-/// `value = undefined`. Local 0 is the base.
-pub(super) fn emit_new_promise(alloc: u32, proto: i64, leaves: &LeafSet) -> Function {
-    let mut function = helper_builder(leaves, &[], &[ROOT_BASE]);
-    let base = 0;
-    function.instruction(&Instruction::I32Const(PROMISE_BLOCK_SIZE));
-    function.instruction(&Instruction::Call(alloc));
-    function.instruction(&Instruction::LocalSet(base));
-    emit_object_prefix(&mut function, base, i32::from(abi::TYPE_PROMISE), proto);
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Const(abi::PROMISE_PENDING));
-    function.instruction(&Instruction::I32Store(MemArg {
-        offset: PROMISE_STATE_OFFSET,
-        align: 2,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: PROMISE_VALUE_OFFSET,
-        align: 3,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::End);
-    finish_builder(function)
-}
-
 /// Emit the `__invoke1(fn: i64, arg: i64) -> i64` callback trampoline.
 ///
-/// The host promise engine calls this exported function re-entrantly to run a
-/// `.then`/`.catch`/`.finally` reaction's guest callback `fn` with the settled
-/// value `arg`. It mirrors [`super::emit_call_indirect`]'s env-last ABI: push the
+/// The guest promise engine's `__run_job` calls this internal trampoline to
+/// run a `.then`/`.catch`/`.finally` reaction's guest callback `fn` with the
+/// settled value `arg`; nothing outside the guest calls it. It mirrors
+/// [`super::emit_call_indirect`]'s env-last ABI: push the
 /// single real argument into slot `a0` (padding the remaining `K-1` positional
 /// slots with `undefined`), reset `this`, push the callee's own environment, the
 /// argument count (`1`), and the funcref-table index, then `call_indirect`. The
-/// callback's result is left on the stack; a throw inside it sets `__exc_pending`
-/// (which the host checks after the call), so no propagation is emitted here.
+/// callback's result is left on the stack; a throw inside it sets `$exc_pending`
+/// (which the caller checks after the call), so no propagation is emitted here.
 /// The two `i64` params occupy locals 0/1; one extra `i32` local holds the
 /// callee block base.
 pub(super) fn emit_invoke1(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
@@ -470,36 +441,59 @@ pub(super) fn emit_invoke1(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     finish_builder(function)
 }
 
-/// Emit a `new Promise` settler function: the `resolve` (`op` =
-/// `PROMISE_OP_SETTLE_FULFILL`) or `reject` (`PROMISE_OP_SETTLE_REJECT`) half of
-/// an executor's callback pair.
+/// Emit a resolving function: the `resolve` (`state` = `PROMISE_FULFILLED`)
+/// or `reject` (`PROMISE_REJECTED`) half of a `CreateResolvingFunctions`
+/// pair (a `new Promise` executor's, a thenable job's).
 ///
 /// It shares the uniform function ABI `(a0..a_{K-1}, env, argc) -> i64` and is
-/// called through the funcref table like any function value, with the TARGET
-/// PROMISE carried in its `env` slot (local `K`) — `new Promise` builds the
-/// function value that way instead of a closure environment. The settler reads
-/// the bound promise from `env` and its first argument (`a0`, or `undefined` when
-/// the ABI has no positional slot) as the settlement value, calls
-/// `__promise(op, promise, value)` to drive the host settle logic, and returns
-/// `undefined`. `K = helpers.max_args`; no extra locals are declared.
-pub(super) fn emit_settler(op: i32, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+/// called through the funcref table like any function value; its `env` slot
+/// (local `K`) holds the pair's shared `TYPE_ENV` block from
+/// `__promise_resolving`: `[promise, alreadyResolved]`. Once `alreadyResolved`
+/// is set it does nothing; else it sets it and calls
+/// `__promise_settle(promise, state, a0)` (`a0` is `undefined` when the ABI has
+/// no positional slot), which resolves per the spec. It returns `undefined`.
+/// `K = helpers.max_args`; no extra locals are declared.
+pub(super) fn emit_settler(state: i32, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let k = helpers.max_args;
     let mut function = FnBuilder::new(leaves);
     for _ in 0..=k {
         function.param(ROOT_JS); // a0..a_{K-1}, env
     }
     function.param(RAW_I64); // argc
-    // __promise(op, env /* the bound promise */, value): push op, then P, then v.
-    function.instruction(&Instruction::I32Const(op));
-    function.instruction(&Instruction::LocalGet(k)); // env slot = the bound promise
+    let done = MemArg {
+        offset: u64::from(abi::RESOLVING_DONE_OFFSET),
+        align: 3,
+        memory_index: 0,
+    };
+    // `alreadyResolved`: a second call of either function is a no-op.
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(done));
+    function.instruction(&Instruction::I64Const(TRUE_BITS));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Const(TRUE_BITS));
+    function.instruction(&Instruction::I64Store(done));
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(MemArg {
+        offset: u64::from(abi::RESOLVING_PROMISE_OFFSET),
+        align: 3,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(state));
     if k >= 1 {
-        function.instruction(&Instruction::LocalGet(0)); // a0 = the settlement value
+        function.instruction(&Instruction::LocalGet(0)); // a0 = the resolution
     } else {
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     }
-    function.instruction(&Instruction::Call(helpers.promise));
-    function.instruction(&Instruction::Drop);
-    // A settler returns `undefined` (its call result is ignored anyway).
+    function.instruction(&Instruction::Call(helpers.promise_settle()));
+    // A resolving function returns `undefined`.
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
     finish_builder(function)

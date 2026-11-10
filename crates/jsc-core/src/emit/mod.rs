@@ -3,13 +3,13 @@
 //! This is the final backend stage. It walks an [`IrNode`] tree and produces the
 //! raw bytes of a valid WebAssembly module using the [`wasm_encoder`] crate.
 //!
-//! The emitted module is a WASI command: it exports `_start: () -> ()` and
-//! `memory`, plus the helpers the host still needs until the guest promise
-//! engine lands. The internal `main: () -> i64` runs the top-level statements
-//! and returns the completion value as a NaN-boxed jsval (see [`crate::run`]);
-//! `_start` wraps it with the drain, the uncaught reports and the optional
-//! completion print. An `i64` carrier — not `f64` — keeps the value's bits
-//! intact through every wasm op.
+//! The emitted module is a self-contained WASI preview-1 command: it imports
+//! exactly `fd_write`, `clock_time_get`, `random_get` and `proc_exit` from
+//! `wasi_snapshot_preview1` and exports exactly `_start: () -> ()` and
+//! `memory`. The internal `main: () -> i64` runs the top-level statements and
+//! returns the completion value as a NaN-boxed jsval; `_start` wraps it with
+//! the drain, the uncaught reports and the optional completion print. An `i64`
+//! carrier — not `f64` — keeps the value's bits intact through every wasm op.
 //!
 //! Any user-defined functions are emitted as additional wasm functions
 //! (indices `1..`, signature `(i64, ..) -> i64`), so a call expression lowers
@@ -43,59 +43,14 @@ use crate::ir::{
 };
 
 /// The name under which the module's linear memory is exported (see
-/// [`abi::MEMORY_EXPORT_NAME`]). [`crate::run`] reads it back to resolve heap
-/// pointers.
+/// [`abi::MEMORY_EXPORT_NAME`]).
 const MEMORY_EXPORT_NAME: &str = abi::MEMORY_EXPORT_NAME;
 
-/// The module and field names of the host promise imports: `__promise`
-/// backs the single-value primitives (`Promise.resolve`/`reject`, top-level
-/// `await`, `p.finally`) and `__then` backs `p.then`/`p.catch`. [`crate::run`]
-/// supplies both through a `wasmtime::Linker`, driving the host-side promise
-/// engine (reactions + microtask queue).
-const PROMISE_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
-const PROMISE_IMPORT_NAME: &str = abi::PROMISE_IMPORT_NAME;
-const THEN_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
-const THEN_IMPORT_NAME: &str = abi::THEN_IMPORT_NAME;
-
-/// `__promise` op flags; see [`abi`].
-const PROMISE_OP_RESOLVE: i32 = abi::PROMISE_OP_RESOLVE;
-const PROMISE_OP_REJECT: i32 = abi::PROMISE_OP_REJECT;
-const PROMISE_OP_AWAIT: i32 = abi::PROMISE_OP_AWAIT;
-const PROMISE_OP_FINALLY: i32 = abi::PROMISE_OP_FINALLY;
-const PROMISE_OP_NEW: i32 = abi::PROMISE_OP_NEW;
-const PROMISE_OP_SETTLE_FULFILL: i32 = abi::PROMISE_OP_SETTLE_FULFILL;
-const PROMISE_OP_SETTLE_REJECT: i32 = abi::PROMISE_OP_SETTLE_REJECT;
-const PROMISE_OP_ASYNC_SPAWN: i32 = abi::PROMISE_OP_ASYNC_SPAWN;
-
-/// The export name of the `__invoke1` callback trampoline the host
-/// promise engine calls re-entrantly to run a reaction's guest callback.
-const INVOKE_EXPORT_NAME: &str = abi::INVOKE_EXPORT_NAME;
-
-/// The export name of the `__async_step` generator-step trampoline the
-/// host async engine calls to advance an `async function` body's state machine.
-const ASYNC_STEP_EXPORT_NAME: &str = abi::ASYNC_STEP_EXPORT_NAME;
-
-/// The export names of the guest constructors the hosts allocate through
-/// (see [`abi`]).
-const NEW_STRING_EXPORT_NAME: &str = abi::NEW_STRING_EXPORT_NAME;
-const NEW_PROMISE_EXPORT_NAME: &str = abi::NEW_PROMISE_EXPORT_NAME;
-const PROMISE_SELF_ERROR_EXPORT_NAME: &str = abi::PROMISE_SELF_ERROR_EXPORT_NAME;
-
-/// The name under which the pending-exception flag global (`$exc_pending`, i32) is
-/// exported so the run stage can detect an uncaught exception after `main` returns.
-/// `0` = no exception in flight, `1` = an exception is propagating.
-const EXC_PENDING_EXPORT_NAME: &str = abi::EXC_PENDING_EXPORT_NAME;
-
-/// The name under which the in-flight exception value global (`$exc_value`, i64) is
-/// exported so the run stage can render an uncaught exception. Holds the
-/// thrown jsval bits; only meaningful while `$exc_pending` is `1`.
-const EXC_VALUE_EXPORT_NAME: &str = abi::EXC_VALUE_EXPORT_NAME;
-
 /// The number of imported functions: the four WASI imports (`fd_write`,
-/// `clock_time_get`, `random_get`, `proc_exit`) at indices `0..=3`, then the
-/// two `env` imports (`__promise`, `__then`). Every defined function, funcref-table element and
-/// function export index is shifted up by this count.
-const IMPORT_FUNC_COUNT: u32 = 6;
+/// `clock_time_get`, `random_get`, `proc_exit`) at indices `0..=3`. Every
+/// defined function, funcref-table element and function export index is
+/// shifted up by this count.
+const IMPORT_FUNC_COUNT: u32 = 4;
 
 /// The function index of the WASI `fd_write` import.
 const FD_WRITE_IMPORT: u32 = 0;
@@ -222,10 +177,21 @@ const RNG0_GLOBAL: u32 = 24;
 /// See [`RNG0_GLOBAL`].
 const RNG1_GLOBAL: u32 = 25;
 
+/// The promise engine's job queue: raw `i32` refs to the oldest and newest
+/// queued reaction/job record (`$__job_head`, `$__job_tail`, init 0 = empty);
+/// see [`promise_engine`].
+const JOB_HEAD_GLOBAL: u32 = 26;
+/// See [`JOB_HEAD_GLOBAL`].
+const JOB_TAIL_GLOBAL: u32 = 27;
+/// The promise creation counter (`$__promise_seq`, i32, init 0).
+const PROMISE_SEQ_GLOBAL: u32 = 28;
+/// The rejected-promise list head (`$__rejected_head`, raw `i32` ref, init 0).
+const REJECTED_HEAD_GLOBAL: u32 = 29;
+
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
-/// the renderer and RNG globals and set in `main`'s prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 26;
+/// the renderer, RNG and promise-engine globals and set in `main`'s prologue).
+const MODULE_CELL_GLOBAL_BASE: u32 = 30;
 
 /// An array hole (see [`abi::HOLE`]): the element-slot bit pattern of a
 /// missing element. Every element read maps it to `undefined`.
@@ -358,10 +324,8 @@ const MAP_SIZE_OFFSET: u64 = abi::MAP_SIZE_OFFSET as u64;
 const MAP_ENTRIES_OFFSET: u64 = abi::MAP_ENTRIES_OFFSET as u64;
 const MAP_BLOCK_SIZE: i32 = abi::MAP_BLOCK_SIZE.cast_signed();
 
-/// Field offsets and size of a `Promise` block (see [`abi::TYPE_PROMISE`]).
-const PROMISE_STATE_OFFSET: u64 = abi::PROMISE_STATE_OFFSET as u64;
+/// The settled-value offset of a `Promise` block (see [`abi::TYPE_PROMISE`]).
 const PROMISE_VALUE_OFFSET: u64 = abi::PROMISE_VALUE_OFFSET as u64;
-const PROMISE_BLOCK_SIZE: i32 = abi::PROMISE_BLOCK_SIZE.cast_signed();
 
 /// Type byte, payload offset, and size of a `Date` block. Maps to `typeof`
 /// "object". See [`abi::TYPE_DATE`].
@@ -874,11 +838,6 @@ struct Helpers<'a> {
     /// The first of the [`dtoa::HELPER_COUNT`] consecutive `Number` to string
     /// helpers (see [`dtoa::emit_helpers`]).
     dtoa: u32,
-    /// The host `__promise` import's function index. Always `4`; `Promise.resolve`/`reject`, `await`, and `p.finally` lower to
-    /// `call`s of it.
-    promise: u32,
-    /// The host `__then` import's function index. Always `5`; `p.then`/`p.catch` lower to `call`s of it.
-    then: u32,
     /// `__now() -> f64`, the WASI clock in ms since the Unix epoch (backing
     /// `Date`); `__random` follows it (see [`Self::random`]).
     now: u32,
@@ -908,14 +867,13 @@ struct Helpers<'a> {
     /// through `__to_primitive`; see [`value::emit_to_number_helper`]).
     /// Call sites skip it for number operands (see [`value::emit_coerce_number`]).
     to_number: u32,
-    /// `__invoke1(fn: i64, arg: i64) -> i64`: the callback trampoline the
-    /// host promise engine calls re-entrantly. Exported under
-    /// [`INVOKE_EXPORT_NAME`].
+    /// `__invoke1(fn: i64, arg: i64) -> i64`: the callback trampoline
+    /// `__run_job` calls to run a reaction's callback.
     invoke1: u32,
     /// `__async_step(gen: i64, sent: i64) -> i64`: the generator
-    /// single-step trampoline the host async engine calls to advance an
+    /// single-step trampoline `__async_drive` calls to advance an
     /// `async function` body's state machine by one suspend. Appended right after
-    /// `invoke1` (index `invoke1 + 1`), exported under [`ASYNC_STEP_EXPORT_NAME`].
+    /// `invoke1` (index `invoke1 + 1`).
     async_step: u32,
     /// The funcref-TABLE slots of the two `new Promise` settler functions:
     /// `resolve` (fulfills the bound promise) and `reject`. A `new Promise`
@@ -924,11 +882,10 @@ struct Helpers<'a> {
     /// `settle_resolve_slot` is also the user function count.
     settle_resolve_slot: u32,
     settle_reject_slot: u32,
-    /// `__new_string(len: i32, two_byte: i32) -> i32`: the exported string
-    /// constructor, followed by `__new_array` (`new_string + 1`),
-    /// `__new_promise` (`new_string + 2`), `__has_own` (`new_string + 3`), and the builtin
-    /// bodies ([`Self::builtin`]), appended after the settlers so every other
-    /// index stays stable.
+    /// `new_string(len: i32, two_byte: i32) -> i32`: the string block
+    /// constructor, followed by `__new_array` (`new_string + 1`), `__has_own`
+    /// (`new_string + 2`), and the builtin bodies ([`Self::builtin`]), appended
+    /// after the settlers so every other index stays stable.
     new_string: u32,
     /// `__alloc(size) -> i32`: bump-allocate `size` bytes, returning the offset.
     /// Called inline by array literals.
@@ -1161,15 +1118,15 @@ impl Helpers<'_> {
     }
 
     /// `__has_own(key, obj) -> i32`: whether `obj` has the own property `key`
-    /// (see [`props::emit_has_own`]), right after `__new_promise`.
+    /// (see [`props::emit_has_own`]), right after `__new_array`.
     fn has_own(self) -> u32 {
-        self.new_string + 3
+        self.new_string + 2
     }
 
     /// The wasm function index of `builtin`'s body; the bodies follow
     /// `__has_own` in [`Builtin::ALL`] order.
     fn builtin(self, builtin: Builtin) -> u32 {
-        self.new_string + 4 + builtin.index()
+        self.new_string + 3 + builtin.index()
     }
 
     /// `__umul128(a, b) -> (low, high)`.
@@ -1318,8 +1275,8 @@ impl Helpers<'_> {
         self.to_primitive() + 15
     }
 
-    /// `__promise_self_error() -> i64` (see [`builtins::emit_promise_self_error`]),
-    /// exported under [`PROMISE_SELF_ERROR_EXPORT_NAME`].
+    /// The self-resolution `TypeError` constructor `() -> i64` (see
+    /// [`builtins::emit_promise_self_error`]).
     fn promise_self_error(self) -> u32 {
         self.to_primitive() + 16
     }
@@ -1378,8 +1335,8 @@ impl Helpers<'_> {
         self.settle_resolve_slot + 2 + builtin.index()
     }
 
-    /// `__new_array(len) -> i32`: the exported array constructor, right after
-    /// `__new_string`.
+    /// `__new_array(len) -> i32`: the array constructor, right after
+    /// `new_string`.
     fn new_array(self) -> u32 {
         self.new_string + 1
     }
@@ -1508,6 +1465,7 @@ mod json_parse;
 mod libm;
 mod numeric;
 mod object;
+mod promise_engine;
 mod props;
 mod realm;
 mod render;
@@ -1559,8 +1517,8 @@ pub struct CompileOptions {
 }
 
 /// Emit a complete WebAssembly command module for `program`: exports
-/// `_start` and `memory`, imports the WASI functions and the remaining `env`
-/// functions. See the module documentation.
+/// `_start` and `memory`, imports the four WASI functions. See the module
+/// documentation.
 #[allow(clippy::too_many_lines)]
 pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     let mut module = Module::new();
@@ -1598,20 +1556,18 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     let (mut types, mut functions, helpers, import_types) =
         build_type_and_function_sections(program, &unwind, layout);
     libm::register(&mut types, &mut functions);
+    promise_engine::register(&mut types, &mut functions);
     module.section(&types);
 
-    // Import section: the WASI functions (indices 0..=3), then the `env`
-    // functions (indices 4..=5). Imports occupy the lowest function indices,
-    // so every defined function/element/export index is shifted by
-    // IMPORT_FUNC_COUNT. The order must match `Helpers`.
+    // Import section: exactly the four WASI functions (indices 0..=3).
+    // Imports occupy the lowest function indices, so every defined
+    // function/element/export index is shifted by IMPORT_FUNC_COUNT.
     let mut imports = ImportSection::new();
     let names = [
         (abi::WASI_MODULE, abi::WASI_FD_WRITE_NAME),
         (abi::WASI_MODULE, abi::WASI_CLOCK_TIME_GET_NAME),
         (abi::WASI_MODULE, abi::WASI_RANDOM_GET_NAME),
         (abi::WASI_MODULE, abi::WASI_PROC_EXIT_NAME),
-        (PROMISE_IMPORT_MODULE, PROMISE_IMPORT_NAME),
-        (THEN_IMPORT_MODULE, THEN_IMPORT_NAME),
     ];
     for ((module_name, name), ty) in names.into_iter().zip(import_types) {
         imports.import(module_name, name, EntityType::Function(ty));
@@ -1652,40 +1608,10 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // exception-unwinding globals (see [`build_globals`]).
     module.section(&build_globals(heap_ptr_init, &intern, program.module_cells));
 
-    // Export section: `_start`, memory index 0 as
-    // "memory", and the helpers the host promise engine still needs.
+    // Export section: exactly `_start` and memory index 0 as "memory".
     let mut exports = ExportSection::new();
     exports.export(abi::START_EXPORT_NAME, ExportKind::Func, helpers.start());
     exports.export(MEMORY_EXPORT_NAME, ExportKind::Memory, 0);
-    // The exception-unwinding globals are exported so the run stage can
-    // detect and render an uncaught exception after `main` returns.
-    exports.export(
-        EXC_PENDING_EXPORT_NAME,
-        ExportKind::Global,
-        EXC_PENDING_GLOBAL,
-    );
-    exports.export(EXC_VALUE_EXPORT_NAME, ExportKind::Global, EXC_VALUE_GLOBAL);
-    // The `__invoke1` callback trampoline is exported so the host promise
-    // engine can run a `.then`/`.catch`/`.finally` reaction's guest callback
-    // re-entrantly. It is the LAST defined function (appended after every helper).
-    exports.export(INVOKE_EXPORT_NAME, ExportKind::Func, helpers.invoke1);
-    // The `__async_step` trampoline is exported so the host async engine
-    // can drive an `async function` body's state machine one suspend at a time.
-    exports.export(ASYNC_STEP_EXPORT_NAME, ExportKind::Func, helpers.async_step);
-    // The guest constructors: the hosts allocate every string/promise block
-    // through these, never by hand.
-    exports.export(NEW_STRING_EXPORT_NAME, ExportKind::Func, helpers.new_string);
-    exports.export(
-        NEW_PROMISE_EXPORT_NAME,
-        ExportKind::Func,
-        helpers.new_string + 2,
-    );
-    // The self-resolution `TypeError` the hosts reject `resolve(p)`-with-`p` with.
-    exports.export(
-        PROMISE_SELF_ERROR_EXPORT_NAME,
-        ExportKind::Func,
-        helpers.promise_self_error(),
-    );
     module.section(&exports);
 
     // Element section: an active segment filling the funcref table at offset
@@ -1833,17 +1759,12 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     code.function(&numeric::emit_random(&leaves));
     code.function(&emit_invoke1(helpers, &leaves));
     code.function(&generator::emit_async_step(helpers, &leaves));
-    code.function(&emit_settler(PROMISE_OP_SETTLE_FULFILL, helpers, &leaves));
-    code.function(&emit_settler(PROMISE_OP_SETTLE_REJECT, helpers, &leaves));
+    code.function(&emit_settler(abi::PROMISE_FULFILLED, helpers, &leaves));
+    code.function(&emit_settler(abi::PROMISE_REJECTED, helpers, &leaves));
     code.function(&emit_new_string(helpers.alloc, &leaves));
     code.function(&emit_new_array(
         helpers.alloc,
         intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Array), helpers),
-        &leaves,
-    ));
-    code.function(&emit_new_promise(
-        helpers.alloc,
-        intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Promise), helpers),
         &leaves,
     ));
     // The realm: `__has_own`, then the builtin bodies.
@@ -1884,11 +1805,15 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
         code.function(&helper);
     }
     code.function(&emit_start(&offsets, helpers, options, &leaves));
-    // The families after `_start`, in index order: Unicode, then libm.
+    // The families after `_start`, in index order: Unicode, libm, then the
+    // promise engine.
     for helper in unicode::emit_helpers(helpers, &leaves) {
         code.function(&helper);
     }
     for helper in libm::emit_helpers(helpers, &leaves) {
+        code.function(&helper);
+    }
+    for helper in promise_engine::emit_helpers(&offsets, helpers, &leaves) {
         code.function(&helper);
     }
     module.section(&code);

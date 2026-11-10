@@ -676,10 +676,11 @@ impl Wrap {
 
     /// `AsyncFromSyncIteratorContinuation(result, closeOnRejection)` into
     /// `out`: a `TypeError` unless `result` is an object; `done`, `value`;
-    /// then `PromiseResolve(value).then(v => ({ value: v, done }),
+    /// then `PromiseResolve(%Promise%, value).then(v => ({ value: v, done }),
     /// onRejected)` where `onRejected` closes the sync iterator and rethrows
     /// when `close_on_rejection` and not `done`, and passes the rejection
-    /// through otherwise.
+    /// through otherwise. An abrupt `PromiseResolve` closes the sync iterator
+    /// the same way (a throw of the close is discarded) and rejects.
     fn continuation(
         self,
         close_on_rejection: bool,
@@ -711,6 +712,32 @@ impl Wrap {
             LocalSet(self.method),
         );
         emit_propagate_if_pending(function, helpers);
+        wasm!(function;
+            LocalGet(self.method), Call(helpers.promise_resolve()), LocalSet(self.method),
+        );
+        if close_on_rejection {
+            wasm!(function;
+                GlobalGet(EXC_PENDING_GLOBAL),
+                LocalGet(self.done), I64Const(TRUE_BITS), I64Ne,
+                I32And, If(BlockType::Empty),
+                GlobalGet(EXC_VALUE_GLOBAL), LocalSet(self.tmp),
+                I32Const(0), GlobalSet(EXC_PENDING_GLOBAL), I64Const(0), GlobalSet(EXC_VALUE_GLOBAL),
+            );
+            call_internal(
+                function,
+                Builtin::Protocol(ProtocolOp::Close),
+                self.sync,
+                None,
+                helpers,
+            );
+            wasm!(function;
+                Drop,
+                LocalGet(self.tmp), GlobalSet(EXC_VALUE_GLOBAL),
+                I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
+                End,
+            );
+        }
+        emit_propagate_if_pending(function, helpers);
         let scratch = self.frame.scratch();
         let slot = |op| helpers.builtin_slot(Builtin::Iter(IterOp::Async(op)));
         wasm!(function; LocalGet(self.method));
@@ -741,7 +768,7 @@ impl Wrap {
             wasm!(function; I64Const(UNDEFINED_BITS));
         }
         function.release_temps(mark);
-        wasm!(function; Call(helpers.then), LocalSet(self.out));
+        wasm!(function; Call(helpers.promise_then()), LocalSet(self.out));
     }
 }
 

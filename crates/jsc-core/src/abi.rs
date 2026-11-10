@@ -1,13 +1,13 @@
 //! The single source of truth for the compiler's runtime ABI: the value
-//! encoding, heap-block layout, and host-import contract shared between the
-//! [`crate::emit`] side (which bakes these numbers into the wasm module it
-//! generates) and the [`crate::run`] side (which decodes the resulting values,
-//! backs the host imports, and reads the exported globals).
+//! encoding, heap-block layout, static memory map and module shape (the four
+//! `wasi_snapshot_preview1` imports, the `_start` and `memory` exports) that
+//! [`crate::emit`] bakes into the wasm module it generates. The
+//! [`crate::run`] WASI runner links the imports and calls `_start`; it reads no
+//! layout.
 //!
-//! Every constant has exactly one definition here; each module keeps a locally-typed alias
-//! (`i64`/`i32` on the emit side, `u64`/`u8`/`usize` on the run side) that
-//! *derives* its value from the canonical constant below, so a change here
-//! propagates to both sides and the two can no longer disagree.
+//! Every constant has exactly one definition here; the emitter keeps
+//! locally-typed aliases (`i64`/`i32`) that *derive* their value from the
+//! canonical constant below.
 //!
 //! ## Value encoding — NaN-boxing
 //!
@@ -55,8 +55,7 @@ pub(crate) const TRUE: u64 = 0x7FF9_0000_0000_0001;
 pub(crate) const NULL: u64 = 0x7FFA_0000_0000_0000;
 
 /// The NaN-boxed `undefined` jsval: [`QNAN`] plus tag `0b011`. Stands in for a
-/// bare `return;`, a program with no expression statement, and host-side
-/// fallbacks.
+/// bare `return;` and a program with no expression statement.
 pub(crate) const UNDEFINED: u64 = 0x7FFB_0000_0000_0000;
 
 /// An array hole: an element slot with no element (a literal elision, a
@@ -315,7 +314,7 @@ pub(crate) const SHADOW_FP_BIAS: u32 = 8;
 /// `func_idx` is [`FN_INFO_ENTRY_SIZE`] bytes at `base + FN_INFO_ENTRY_SIZE *
 /// func_idx`, holding the function's interned `name` key at
 /// [`FN_INFO_NAME_OFFSET`] and its `length` at [`FN_INFO_LENGTH_OFFSET`]
-/// (`__fn_info`). `__fn_materialize` and the host renderers read it.
+/// (`__fn_info`). `__fn_materialize` and the guest renderer read it.
 pub(crate) const FN_INFO_ADDR: u32 = SHADOW_STACK_SIZE + 4;
 
 /// The byte size of one function info entry (see [`FN_INFO_ADDR`]).
@@ -362,24 +361,101 @@ pub(crate) const MAP_ENTRIES_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
 pub(crate) const MAP_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
 
 /// TYPE BYTE of a `Promise` block: the object-family prefix, then
-/// `[state:i32 @16][pad:u32][value:i64 @24]`.
+/// `[state:i32 @16][reactions:u32 @20][value:i64 @24][seq:u32 @32][rejected_next:u32 @36]`.
 /// `state` is one of [`PROMISE_PENDING`] / [`PROMISE_FULFILLED`] /
 /// [`PROMISE_REJECTED`]; `value` is the settled fulfillment/rejection jsval
-/// (`undefined` while pending). The block is the RENDERABLE mirror of a promise's
-/// settlement — the host promise engine (reactions + microtask queue) owns the
-/// dynamic scheduling state, but writes `state`/`value` back here so [`crate::run`]
-/// can decode a promise from a bare memory snapshot. Maps to `typeof` "object".
+/// (`undefined` while pending); `reactions` is a raw ref to the newest
+/// reaction record (a prepend list, `0` = none); `seq` is the creation
+/// sequence number; `rejected_next` links the rejected-promise list. The guest
+/// promise engine (`emit/promise_engine.rs`) owns all of it. Header flags:
+/// [`PROMISE_FLAG_HANDLED`], [`PROMISE_FLAG_IN_REJECTED_LIST`]. Maps to
+/// `typeof` "object".
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_PROMISE: u8 = 8;
 
 /// Byte offset (from a [`TYPE_PROMISE`] block base) of the i32 `state`.
 pub(crate) const PROMISE_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE;
 
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the u32 raw ref to the
+/// newest reaction record (`0` = none).
+pub(crate) const PROMISE_REACTIONS_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
 /// Byte offset (from a [`TYPE_PROMISE`] block base) of the i64 settled `value`.
 pub(crate) const PROMISE_VALUE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
 
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the u32 creation
+/// sequence number (from the global `$__promise_seq`).
+pub(crate) const PROMISE_SEQ_OFFSET: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the u32 raw link in the
+/// rejected-promise list (`0` = end).
+pub(crate) const PROMISE_REJECTED_NEXT_OFFSET: u32 = OBJ_PREFIX_SIZE + 20;
+
 /// The byte size of a [`TYPE_PROMISE`] block.
-pub(crate) const PROMISE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+pub(crate) const PROMISE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 24;
+
+/// [`TYPE_PROMISE`] header flag (byte [`HEADER_FLAGS_OFFSET`]):
+/// `[[PromiseIsHandled]]` — a reaction was ever registered on the promise.
+pub(crate) const PROMISE_FLAG_HANDLED: u8 = 2;
+
+/// [`TYPE_PROMISE`] header flag: the promise is linked into the
+/// rejected-promise list.
+pub(crate) const PROMISE_FLAG_IN_REJECTED_LIST: u8 = 4;
+
+/// The jsval slot count of a promise reaction / job record: a [`TYPE_ENV`]
+/// block that is first a reaction on a pending promise, then a queued job.
+pub(crate) const REACTION_SLOTS: u32 = 6;
+
+/// The byte size of a reaction record (`TYPE_ENV` header, count, 6 slots).
+pub(crate) const REACTION_BLOCK_SIZE: u32 = HEADER_SIZE + 4 + 8 * REACTION_SLOTS;
+
+/// Reaction slot 0: the `on_fulfilled` callback (or the async-function
+/// generator handle).
+pub(crate) const REACTION_ON_FULFILLED_OFFSET: u32 = HEADER_SIZE + 4;
+
+/// Reaction slot 1: the `on_rejected` callback (`undefined` = passthrough).
+pub(crate) const REACTION_ON_REJECTED_OFFSET: u32 = HEADER_SIZE + 12;
+
+/// Reaction slot 2: the derived promise to settle (`HEAP` jsval) or
+/// `undefined`.
+pub(crate) const REACTION_RESULT_OFFSET: u32 = HEADER_SIZE + 20;
+
+/// Reaction slot 3: the `kind` small integer (bit 0 [`REACTION_KIND_THENABLE`],
+/// bit 1 [`REACTION_KIND_ASYNC_RESUME`], the source state once queued at
+/// [`REACTION_KIND_STATE_SHIFT`]).
+pub(crate) const REACTION_KIND_OFFSET: u32 = HEADER_SIZE + 28;
+
+/// Reaction slot 4: the settlement value, written when queued.
+pub(crate) const REACTION_VALUE_OFFSET: u32 = HEADER_SIZE + 36;
+
+/// Reaction slot 5: `next`, a `HEAP | record` jsval or `0`.
+pub(crate) const REACTION_NEXT_OFFSET: u32 = HEADER_SIZE + 44;
+
+/// Reaction `kind` bit: the record is a `PromiseResolveThenableJob` (slot 0
+/// the callable `then`, slot 1 the thenable, slot 2 the promise to resolve),
+/// queued directly, never a reaction on a promise.
+pub(crate) const REACTION_KIND_THENABLE: i32 = 1;
+
+/// Reaction `kind` bit: the record resumes an `async` function body (slot 0
+/// its generator handle, slot 2 its result promise) once the awaited promise
+/// it hangs off settles.
+pub(crate) const REACTION_KIND_ASYNC_RESUME: i32 = 2;
+
+/// The shift of the source state (bits 2-3) in a queued job's `kind`.
+pub(crate) const REACTION_KIND_STATE_SHIFT: i32 = 2;
+
+/// The jsval slot count of a resolving-function pair's shared `env`: a
+/// [`TYPE_ENV`] block of the promise and its `alreadyResolved` flag.
+pub(crate) const RESOLVING_SLOTS: u32 = 2;
+
+/// The byte size of a resolving-function `env` block.
+pub(crate) const RESOLVING_BLOCK_SIZE: u32 = HEADER_SIZE + 4 + 8 * RESOLVING_SLOTS;
+
+/// Resolving-function `env` slot 0: the promise the pair settles.
+pub(crate) const RESOLVING_PROMISE_OFFSET: u32 = HEADER_SIZE + 4;
+
+/// Resolving-function `env` slot 1: `alreadyResolved` (a boolean jsval).
+pub(crate) const RESOLVING_DONE_OFFSET: u32 = HEADER_SIZE + 12;
 
 /// [`TYPE_PROMISE`] `state`: the promise is unsettled.
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -503,7 +579,7 @@ pub(crate) const DATE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
 /// property's getter and setter FUNCTION VALUES (the `undefined` bits
 /// when a half is absent). It is the value of an [`ATTR_ACCESSOR`] property
 /// table entry, so `__get` invokes the getter with `this = receiver` and
-/// `__set` the setter. Never a program-visible value; the host decoders render
+/// `__set` the setter. Never a program-visible value; the guest renderer renders
 /// the property as `[Getter]` / `[Setter]` / `[Getter/Setter]`.
 /// The two i64 payloads land 8-byte aligned at [`ACCESSOR_GET_OFFSET`] /
 /// [`ACCESSOR_SET_OFFSET`]. Maps to no `typeof` (never observed directly).
@@ -695,9 +771,6 @@ pub(crate) const STR_DATA_OFFSET: u32 = 8;
 /// never exported, since the run stage never reads it.
 pub(crate) const THIS_GLOBAL_INDEX: u32 = 5;
 
-/// The module name of the host env imports not yet replaced by guest code.
-pub(crate) const IMPORT_MODULE: &str = "env";
-
 /// The import module of the four WASI preview-1 functions.
 pub(crate) const WASI_MODULE: &str = "wasi_snapshot_preview1";
 
@@ -775,114 +848,14 @@ pub(crate) const RYU_TABLES_ADDR: u32 = NUM_SCRATCH_ADDR + NUM_SCRATCH_SIZE;
 /// aligned.
 pub(crate) const RYU_TABLES_SIZE: u32 = 832;
 
-/// The field name of the host `__promise` import backing the promise
-/// primitives that take at most a single value operand: `Promise.resolve(v)`,
-/// `Promise.reject(v)`, top-level `await p`, and `p.finally(fn)`. It receives a
-/// `PROMISE_OP_*` flag plus two jsval slots (`a`, `b`) and returns a jsval (a
-/// promise for resolve/reject/finally, or the awaited value for await).
-pub(crate) const PROMISE_IMPORT_NAME: &str = "__promise";
-
-/// The field name of the host `__then` import backing `p.then(onF, onR)`
-/// / `p.catch(onR)`. It receives the promise plus the two reaction handlers
-/// (`undefined` for a missing handler) and returns the chained result promise.
-pub(crate) const THEN_IMPORT_NAME: &str = "__then";
-
-/// `__promise` op flag: `Promise.resolve(a)` — a promise already fulfilled
-/// with `a` (or `a` itself when it is already a promise).
-pub(crate) const PROMISE_OP_RESOLVE: i32 = 0;
-
-/// `__promise` op flag: `Promise.reject(a)` — a promise already rejected
-/// with reason `a`.
-pub(crate) const PROMISE_OP_REJECT: i32 = 1;
-
-/// `__promise` op flag: top-level `await a` — drive the microtask queue
-/// until `a` settles, then return its value (or unwind its rejection through the
-/// exception globals).
-pub(crate) const PROMISE_OP_AWAIT: i32 = 2;
-
-/// `__promise` op flag: `a.finally(b)` — run `b` on settlement, then pass
-/// `a`'s original settlement through to the returned chained promise.
-pub(crate) const PROMISE_OP_FINALLY: i32 = 3;
-
-/// `__promise` op flag: allocate a fresh PENDING promise (the backing for
-/// `new Promise(executor)`). Both value operands are ignored.
-pub(crate) const PROMISE_OP_NEW: i32 = 4;
-
-/// `__promise` op flag: fulfill promise `a` with value `b` — the `resolve`
-/// half of a `new Promise` executor's settler pair. A no-op if `a` is already
-/// settled (settle-once).
-pub(crate) const PROMISE_OP_SETTLE_FULFILL: i32 = 5;
-
-/// `__promise` op flag: reject promise `a` with reason `b` — the `reject`
-/// half of a `new Promise` executor's settler pair (and the path a throwing
-/// executor takes). A no-op if `a` is already settled.
-pub(crate) const PROMISE_OP_SETTLE_REJECT: i32 = 6;
-
-/// `__promise` op flag: spawn an `async function` body. Operand `a` is a
-/// freshly built generator handle (the async body compiled as a state machine,
-/// `await` == `yield`); the host allocates the result promise, drives the
-/// generator's first step synchronously, and returns the result promise. Each
-/// suspend (`await`) registers a continuation that resumes the generator when the
-/// awaited value settles; completion fulfills (or, on a throw / awaited rejection,
-/// rejects) the result promise.
-pub(crate) const PROMISE_OP_ASYNC_SPAWN: i32 = 7;
-
-/// `__promise` op flag: drain the microtask queue and return the first
-/// unhandled rejected promise, or `0` if none. Deleted in R4.
-pub(crate) const PROMISE_OP_DRAIN: i32 = 8;
-
-/// The name under which the module exports the `__invoke1(fn: i64, arg: i64) ->
-/// i64` callback trampoline. The host promise engine calls it re-entrantly
-/// to run a `.then`/`.catch`/`.finally` reaction's guest callback with the settled
-/// value, receiving the callback's result (or, on a throw, an ignored result plus
-/// a set `__exc_pending` global).
-pub(crate) const INVOKE_EXPORT_NAME: &str = "__invoke1";
-
-/// The name under which the module exports the `__async_step(gen: i64, sent: i64)
-/// -> i64` generator single-step trampoline. The host async driver calls
-/// it re-entrantly to advance an `async function` body's state machine by one
-/// suspend: it `call_indirect`s the state machine with `(sent, gen)`, returns the
-/// yielded/returned value, and leaves the handle's `done` flag (and any thrown
-/// exception via `__exc_pending`) for the host to read.
-pub(crate) const ASYNC_STEP_EXPORT_NAME: &str = "__async_step";
-
-/// The name under which the module exports the `__new_string(len: i32,
-/// two_byte: i32) -> base: i32` constructor: a [`TYPE_STRING`] block of `len`
-/// code units — `len` Latin-1 bytes, or with `two_byte` (`0`/`1`)
-/// [`STR_FLAG_TWO_BYTE`] set and `2 * len` bytes of UTF-16LE units — with
-/// `len` set and the data at [`STR_DATA_OFFSET`] for the caller to fill. The
-/// hosts allocate every string through it, in canonical form (one-byte iff
-/// every unit is `<= 0xFF`).
-pub(crate) const NEW_STRING_EXPORT_NAME: &str = "__new_string";
-
-/// The name under which the module exports the `__new_promise() -> base: i32`
-/// constructor: a pending [`TYPE_PROMISE`] block (value `undefined`). The hosts
-/// allocate every promise through it.
-pub(crate) const NEW_PROMISE_EXPORT_NAME: &str = "__new_promise";
-
-/// The name under which the module exports the `__promise_self_error() -> i64`
-/// constructor: a fresh `TypeError` ("Chaining cycle detected for promise
-/// #<Promise>"). The host promise engines reject a promise resolved with
-/// itself (Promise Resolve Functions step 7) with it.
-pub(crate) const PROMISE_SELF_ERROR_EXPORT_NAME: &str = "__promise_self_error";
-
-/// The name under which the module exports its linear memory; [`crate::run`]
-/// reads it back to resolve heap pointers.
+/// The name under which the module exports its linear memory (the WASI
+/// imports read and write guest buffers through it).
 pub(crate) const MEMORY_EXPORT_NAME: &str = "memory";
 
 /// The linear-memory cap in 64 KiB wasm pages (512 MiB), declared as the
-/// module's memory `maximum`: a guest `__alloc` or host allocation that cannot
-/// grow memory within it is out of memory.
+/// module's memory `maximum`: an `__alloc` that cannot grow memory within it is
+/// out of memory.
 pub(crate) const MEMORY_MAX_PAGES: u64 = 8192;
-
-/// The name under which the pending-exception flag global (`$exc_pending`, i32)
-/// is exported so the run stage can detect an uncaught exception after `main`
-/// returns. `0` = none, `1` = an exception is propagating.
-pub(crate) const EXC_PENDING_EXPORT_NAME: &str = "__exc_pending";
-
-/// The name under which the in-flight exception value global (`$exc_value`, i64)
-/// is exported so the run stage can render an uncaught exception.
-pub(crate) const EXC_VALUE_EXPORT_NAME: &str = "__exc_value";
 
 #[cfg(test)]
 #[path = "abi_drift_tests.rs"]

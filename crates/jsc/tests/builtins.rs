@@ -234,7 +234,7 @@ fn date_shadowing_and_arity() {
 
 /// Object-family values render through their payload offsets (Map/Set `size`,
 /// Date `ms`, Promise `state`/`value`, generator and function blocks). The
-/// browser shim asserts the same text in `packages/jsc/tests/run.test.ts`.
+/// browser package asserts the same text in `packages/jsc/tests/run.test.ts`.
 #[test]
 fn object_family_values_render_through_payload_offsets() {
     let src = "const m = new Map(); m.set(1, 'a'); m.set(2, 'b'); m.delete(2); \
