@@ -55,9 +55,6 @@ pub(super) fn build_type_and_function_sections<'a>(
     };
     let helpers = Helpers {
         unwind,
-        // The `env` imports follow the four WASI imports (0..=3): `__promise`
-        // 4 (`__then` 5 is no longer called).
-        promise: 4,
         alloc: index(),
         concat: index(),
         str_eq: index(),

@@ -1905,7 +1905,10 @@ fn from_async_reject(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helper
     function.root_temp(TempClass::Jsval);
     emit_settler_value(rethrow, st64, function, scratch, helpers);
     function.release_temps(mark);
-    wasm!(function; Call(helpers.promise_then()), Drop, Else);
+    wasm!(function;
+        I64Const(UNDEFINED_BITS), I32Const(0), Call(helpers.promise_react()),
+        Else,
+    );
     reject(function);
     wasm!(function; End, Else);
     reject(function);
@@ -1913,7 +1916,8 @@ fn from_async_reject(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helper
 }
 
 /// `Await(value)` of a [`FromAsyncOp::Run`] step, resuming at `phase`:
-/// `PromiseResolve(value).then(Resume, Reject)`, then return.
+/// `PromiseResolve(value)`, then `PerformPromiseThen(_, Resume, Reject)`
+/// with no derived promise, then return.
 fn from_async_await(
     function: &mut FnBuilder<'_>,
     frame: Frame,
@@ -1949,7 +1953,10 @@ fn from_async_await(
         helpers,
     );
     function.release_temps(mark);
-    wasm!(function; Call(helpers.promise_then()), Drop, I64Const(UNDEFINED_BITS), Return);
+    wasm!(function;
+        I64Const(UNDEFINED_BITS), I32Const(0), Call(helpers.promise_react()),
+        I64Const(UNDEFINED_BITS), Return,
+    );
 }
 
 /// The locals of a [`FromAsyncOp::Run`] body.

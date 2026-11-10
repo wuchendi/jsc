@@ -15,6 +15,12 @@
 //! resolving-function pair, native promises included. `await` and
 //! `Promise.resolve` go through `PromiseResolve` (`__promise_resolve`).
 //!
+//! An `async` function body runs as a generator state machine driven by
+//! `__async_spawn` / `__async_drive`: each `await` hangs an
+//! [`abi::REACTION_KIND_ASYNC_RESUME`] record (the generator handle and the
+//! result promise) off the awaited promise, and `__run_job` resumes the body
+//! from the drain loop, so no wasm frame is held across an `await`.
+//!
 //! Rejected promises nobody handled are linked through `rejected_next` from
 //! `$__rejected_head`; the checkpoint after each drain prunes the ones a late
 //! reaction marked `HANDLED`, and `_start` reports the oldest survivor by
@@ -89,6 +95,8 @@ const KIND: u32 = abi::REACTION_KIND_OFFSET;
 const JOB_VALUE: u32 = abi::REACTION_VALUE_OFFSET;
 const NEXT: u32 = abi::REACTION_NEXT_OFFSET;
 const THENABLE: i32 = abi::REACTION_KIND_THENABLE;
+const ASYNC_RESUME: i32 = abi::REACTION_KIND_ASYNC_RESUME;
+const GEN_DONE: u32 = abi::GEN_DONE_OFFSET;
 const RESOLVING_PROMISE: u32 = abi::RESOLVING_PROMISE_OFFSET;
 const RESOLVING_DONE: u32 = abi::RESOLVING_DONE_OFFSET;
 const STATE_SHIFT: i32 = abi::REACTION_KIND_STATE_SHIFT;
@@ -96,7 +104,7 @@ const STATE_SHIFT: i32 = abi::REACTION_KIND_STATE_SHIFT;
 use ValType::{I32, I64};
 
 /// The `(params, results)` of the engine helpers, in function-index order.
-pub(super) const TYPES: [(&[ValType], &[ValType]); 13] = [
+pub(super) const TYPES: [(&[ValType], &[ValType]); 15] = [
     (&[I64], &[I32]),                  // __promise_new(proto) -> base
     (&[I32], &[]),                     // __promise_enqueue(rec)
     (&[I64, I64, I64, I64, I32], &[]), // __promise_react(p, on_f, on_r, result, kind)
@@ -110,6 +118,8 @@ pub(super) const TYPES: [(&[ValType], &[ValType]); 13] = [
     (&[], &[I64]),                     // __first_unhandled() -> promise or 0
     (&[I64], &[I64]),                  // __promise_await(v) -> value
     (&[I64], &[I64]),                  // __promise_resolving(p) -> env
+    (&[I64], &[I64]),                  // __async_spawn(gen) -> promise
+    (&[I64, I64, I64], &[]),           // __async_drive(gen, result, sent)
 ];
 
 /// Append the engine helpers' types and function entries (after libm's).
@@ -137,8 +147,9 @@ impl Helpers<'_> {
     fn promise_enqueue(self) -> u32 {
         self.engine_base() + 1
     }
-    /// `__promise_react(p, on_f, on_r, result, kind)`: register a reaction.
-    fn promise_react(self) -> u32 {
+    /// `__promise_react(p, on_f, on_r, result, kind)`: register a reaction
+    /// (`result = undefined`: `PerformPromiseThen` without a capability).
+    pub(super) fn promise_react(self) -> u32 {
         self.engine_base() + 2
     }
     /// `__promise_settle(p: i64, state: i32, v: i64)`: settle once.
@@ -184,6 +195,16 @@ impl Helpers<'_> {
     pub(super) fn promise_resolving(self) -> u32 {
         self.engine_base() + 12
     }
+    /// `__async_spawn(gen) -> i64`: run an `async` function body (its
+    /// generator handle) to its first `await` and return its result promise.
+    pub(super) fn async_spawn(self) -> u32 {
+        self.engine_base() + 13
+    }
+    /// `__async_drive(gen, result, sent)`: resume an `async` body until it
+    /// awaits, returns or throws.
+    fn async_drive(self) -> u32 {
+        self.engine_base() + 14
+    }
 }
 
 /// The helper call graph of the engine, for the leaf analysis.
@@ -211,6 +232,8 @@ pub(super) fn emit_helpers(
         emit_first_unhandled(leaves),
         emit_await(helpers, leaves),
         emit_resolving(helpers, leaves),
+        emit_async_spawn(helpers, leaves),
+        emit_async_drive(helpers, leaves),
     ]
 }
 
@@ -590,6 +613,11 @@ fn emit_resolve(
 /// promise; a throw rejects that promise through the pair (a no-op once it
 /// resolved).
 ///
+/// An async-resume job continues the `async` body in slot 0 (result promise
+/// in slot 2) through `__async_drive`: a fulfilled await resumes it with the
+/// value (`next(v)`), a rejected one with the reason pending as an exception
+/// (`throw(e)`, thrown at the `await`).
+///
 /// A reaction job selects the callback by the source state; a non-callable
 /// one passes the settlement through. Otherwise it is called through
 /// `__invoke1`, and the derived promise is settled from the outcome: a throw
@@ -642,6 +670,18 @@ fn emit_run_job(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         LocalGet(kind), I32Const(STATE_SHIFT), I32ShrU, I32Const(3), I32And, LocalSet(state),
         LocalGet(rec), I64Load(m64(JOB_VALUE)), LocalSet(value),
         LocalGet(rec), I64Load(m64(RESULT)), LocalSet(result),
+        LocalGet(kind), I32Const(ASYNC_RESUME), I32And,
+        If(BlockType::Empty),
+        LocalGet(state), I32Const(REJECTED), I32Eq,
+        If(BlockType::Empty),
+        LocalGet(value), GlobalSet(EXC_VALUE_GLOBAL),
+        I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
+        I64Const(UNDEFINED_BITS), LocalSet(value),
+        End,
+        LocalGet(rec), I64Load(m64(ON_FULFILLED)), LocalGet(result), LocalGet(value),
+        Call(helpers.async_drive()),
+        Return,
+        End,
         LocalGet(state), I32Const(FULFILLED), I32Eq,
         If(BlockType::Result(I64)),
         LocalGet(rec), I64Load(m64(ON_FULFILLED)),
@@ -842,5 +882,66 @@ fn emit_resolving(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     );
     box_heap(&mut f);
     wasm!(f; End);
+    finish_builder(f)
+}
+
+/// `__async_spawn(gen) -> i64`: `AsyncFunctionStart` — allocate the result
+/// promise, drive the body (the generator handle `gen`) to its first
+/// suspend, and return the promise (pending at an `await`, settled when the
+/// body returned or threw synchronously).
+fn emit_async_spawn(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_JS], &[ROOT_JS]);
+    let (generator, result) = (0, 1);
+    wasm!(f; I64Const(promise_proto(helpers)), Call(helpers.promise_new()));
+    box_heap(&mut f);
+    wasm!(f;
+        LocalSet(result),
+        LocalGet(generator), LocalGet(result), I64Const(UNDEFINED_BITS),
+        Call(helpers.async_drive()),
+        LocalGet(result),
+        End,
+    );
+    finish_builder(f)
+}
+
+/// `__async_drive(gen, result, sent)`: resume the `async` body `gen` with
+/// `sent` through `__async_step` (a pending exception on entry is thrown at
+/// the suspended `await`). A throw out of the body (cleared here) rejects
+/// `result`; a completion (`done`) resolves it with the returned value;
+/// otherwise the body suspended on `await v`: `PromiseResolve(%Promise%, v)`
+/// gets an [`ASYNC_RESUME`] reaction (no derived promise) that resumes the
+/// body from `__run_job`. An abrupt `PromiseResolve` is thrown into the body
+/// at once (the loop resumes it with the exception pending), so the helper
+/// never recurses.
+fn emit_async_drive(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_JS, ROOT_JS, ROOT_JS], &[ROOT_JS]);
+    let (generator, result, sent, value) = (0, 1, 2, 3);
+    wasm!(f;
+        Loop(BlockType::Empty),
+        LocalGet(generator), LocalGet(sent), Call(helpers.async_step), LocalSet(value),
+        GlobalGet(EXC_PENDING_GLOBAL),
+        If(BlockType::Empty),
+        GlobalGet(EXC_VALUE_GLOBAL), LocalSet(value),
+        I32Const(0), GlobalSet(EXC_PENDING_GLOBAL),
+        I64Const(0), GlobalSet(EXC_VALUE_GLOBAL),
+        LocalGet(result), I32Const(REJECTED), LocalGet(value), Call(helpers.promise_settle()),
+        Return,
+        End,
+        LocalGet(generator), I32WrapI64, I32Load(m32(GEN_DONE)),
+        If(BlockType::Empty),
+        LocalGet(result), I32Const(FULFILLED), LocalGet(value), Call(helpers.promise_settle()),
+        Return,
+        End,
+        LocalGet(value), Call(helpers.promise_resolve()), LocalSet(value),
+        GlobalGet(EXC_PENDING_GLOBAL),
+        If(BlockType::Empty),
+        I64Const(UNDEFINED_BITS), LocalSet(sent),
+        Br(1),
+        End,
+        LocalGet(value), LocalGet(generator), I64Const(UNDEFINED_BITS), LocalGet(result),
+        I32Const(ASYNC_RESUME), Call(helpers.promise_react()),
+        End,
+        End,
+    );
     finish_builder(f)
 }

@@ -755,10 +755,12 @@ pub(super) fn emit_gen_to_array(helpers: Helpers<'_>, leaves: &LeafSet) -> Funct
 /// `async function` body's generator state machine by one suspend. It
 /// `call_indirect`s the SM with `(sent, gen, …, env = gen.env, argc = 2)` under
 /// the uniform ABI — exactly like [`emit_gen_resume`]'s drive step — and returns
-/// the SM's raw value (the yielded/awaited value, or the final return value). It
+/// the SM's raw value (the awaited value, or the final return value). It
 /// deliberately does NOT build a `{ value, done }` object or propagate a pending
-/// exception: the host async engine reads the handle's `done` flag and the
-/// `__exc_pending`/`__exc_value` globals directly after the call.
+/// exception: its only caller, the guest async driver `__async_drive`
+/// (`emit/promise_engine.rs`), reads the handle's `done` flag and the
+/// `$exc_pending` / `$exc_value` globals directly after the call. A pending
+/// exception on entry is thrown into the body at the suspended `await`.
 pub(super) fn emit_async_step(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     // Params: gen (local 0, i64), sent (local 1, i64) -> i64. No extra locals.
     let mut function = helper_builder(leaves, &[ROOT_JS, ROOT_JS], &[]);
@@ -801,7 +803,7 @@ pub(super) fn emit_async_step(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
         type_index: helpers.fn_type,
         table_index: 0,
     });
-    // The SM's value is on the stack; the host reads `done`/`__exc_pending`.
+    // The SM's value is on the stack; the driver reads `done`/`$exc_pending`.
     function.instruction(&Instruction::End);
     finish_builder(function)
 }
