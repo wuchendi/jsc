@@ -2000,10 +2000,11 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>, define: bool, leaves: &LeafS
 
 /// `__protos_indexless(o: i32) -> i32`: `1` when nothing on the `proto`
 /// chain of the object-family block `o` can hold an integer-index property —
-/// no prototype is an array or a `String` wrapper and none has a table
-/// flagged `HAS_INDEX_KEYS` — so every index `o` does not own is absent; else
-/// `0`. The builtins' array
-/// fast paths that read a hole as absent run only under it.
+/// no prototype is an array outside dictionary mode or a `String` wrapper and
+/// none has a table flagged `HAS_INDEX_KEYS` — so every index `o` does not own
+/// is absent; else `0`. A dictionary-mode array (`%Array.prototype%`) keeps
+/// every element in its table, so its table flag covers it. The builtins'
+/// array fast paths that read a hole as absent run only under it.
 pub(super) fn emit_protos_indexless(leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_BASE], &[ROOT_JS, RAW_I32]);
     let (o, p, t) = (0, 1, 2);
@@ -2015,6 +2016,7 @@ pub(super) fn emit_protos_indexless(leaves: &LeafSet) -> Function {
     wasm!(f;
         I32Eqz, If(BlockType::Empty), I32Const(1), Return, End,
         LocalGet(p), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_DICTIONARY), I32And, I32Eqz, I32And,
     );
     emit_is_string_wrapper(&mut f, o);
     wasm!(f;
