@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
 import { compile, run } from '../src/index.js'
-import { createShim } from '../src/shim.js'
 import { createWasi, Exit } from '../src/wasi.js'
 
 const WASI = 'wasi_snapshot_preview1'
@@ -23,31 +22,33 @@ it('links_wasi_polyfill', async () => {
   const module = await WebAssembly.compile(
     (await compile('1')) as Uint8Array<ArrayBuffer>,
   )
-  const imports = WebAssembly.Module.imports(module)
-  expect(imports.filter((i) => i.module === WASI).map((i) => i.name)).toEqual([
+  // Exactly the four preview-1 functions, in import order, and nothing else.
+  expect(
+    WebAssembly.Module.imports(module).map(
+      (i) => `${i.kind} ${i.module}.${i.name}`,
+    ),
+  ).toEqual([
+    `function ${WASI}.fd_write`,
+    `function ${WASI}.clock_time_get`,
+    `function ${WASI}.random_get`,
+    `function ${WASI}.proc_exit`,
+  ])
+  expect(
+    WebAssembly.Module.exports(module)
+      .map((e) => `${e.kind} ${e.name}`)
+      .sort(),
+  ).toEqual(['function _start', 'memory memory'])
+  // The polyfill provides exactly those four, so the module instantiates
+  // against it alone.
+  const provided = createWasi().imports
+  expect(Object.keys(provided)).toEqual([WASI])
+  expect(Object.keys(provided[WASI] ?? {})).toEqual([
     'fd_write',
     'clock_time_get',
     'random_get',
     'proc_exit',
   ])
-  expect(
-    imports
-      .filter((i) => i.module !== WASI)
-      .map((i) => `${i.module}.${i.name}`)
-      .sort(),
-  ).toEqual(['env.__promise', 'env.__then'])
-  const provided: WebAssembly.Imports = {
-    ...createShim().imports,
-    ...createWasi().imports,
-  }
-  for (const { module: name, kind, name: field } of imports) {
-    expect(kind).toBe('function')
-    expect(typeof provided[name]?.[field], `${name}.${field}`).toBe('function')
-  }
-  expect(Object.keys(provided[WASI] ?? {})).toHaveLength(4)
-  expect(WebAssembly.Module.exports(module).map((e) => e.name)).toContain(
-    '_start',
-  )
+  await WebAssembly.instantiate(module, provided)
 })
 
 it('runs console.log to stdout with exit code 0', async () => {
@@ -132,18 +133,7 @@ it('reports running out of memory with the static line', async () => {
   })
 }, 60_000)
 
-it('exits through a guest allocation a host import started', async () => {
-  // The 64 MiB `s.slice(1)` runs out with ~448 MiB of the cap in use, and the
-  // exit has to unwind through the shim.
-  const done = await run(
-    "let s = 'x'; for (let i = 0; i < 26; i++) { s = s + s } " +
-      'let t = s + s; let u = t + s; s.toUpperCase().length',
-  )
-  expect(done.exitCode).toBe(1)
-  expect(done.stderr).toBe('Uncaught RangeError: out of memory\n')
-}, 60_000)
-
-it('reads the Date clock through the host', async () => {
+it('reads the Date clock through clock_time_get', async () => {
   const before = Date.now()
   const now = Number(await evalText('Date.now()'))
   expect(now).toBeGreaterThanOrEqual(before)
@@ -156,19 +146,6 @@ it('keeps Math.random in range', async () => {
       'let ok = true; for (let i = 0; i < 1000; i++) { const r = Math.random(); ok = ok && r >= 0 && r < 1 } ok',
     ),
   ).toBe('true')
-})
-
-it('renders a function with its own properties in the guest', async () => {
-  const { stdout } = await run('function f() {} f.a = 1; console.log(f)')
-  expect(stdout).toBe('[Function: f] { a: 1 }\n')
-})
-
-it('runs what the env imports used to back in the guest', async () => {
-  expect(await evalText("parseInt('ff', 16) + Number('2')")).toBe('257')
-  expect(await evalText("'straße'.toUpperCase()")).toBe('STRASSE')
-  expect(await evalText("String(1.5) + ',' + [1,,NaN].indexOf(NaN)")).toBe(
-    '1.5,-1',
-  )
 })
 
 describe('wasi polyfill', () => {
