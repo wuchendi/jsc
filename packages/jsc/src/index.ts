@@ -5,9 +5,8 @@
  *   (`crates/jsc-wasm`, loaded as a wasm-bindgen module) and returns the emitted
  *   WebAssembly module bytes.
  * - {@link run} compiles the source, instantiates the emitted command module
- *   against the WASI polyfill ({@link createWasi}) and the remaining `env`
- *   imports ({@link createShim}), calls `_start`, and returns its output and
- *   exit code.
+ *   against the WASI polyfill ({@link createWasi}) alone, calls `_start`, and
+ *   returns its output and exit code.
  *
  * The wasm-bindgen glue uses an async `init()` (wasm-pack `--target web`), so
  * both entry points are async even though the underlying Rust `compile` is
@@ -15,8 +14,6 @@
  */
 
 import initGlue, { compile as wasmCompile } from '../wasm/jsc_wasm.js'
-import { MEMORY_EXPORT_NAME } from './abi.js'
-import { createShim } from './shim.js'
 import { createWasi, Exit } from './wasi.js'
 
 /** Options of {@link compile} and {@link run}. */
@@ -88,19 +85,16 @@ export async function run(
 ): Promise<RunResult> {
   const bytes = await compile(src, options)
   const wasi = createWasi()
-  const shim = createShim()
   // Compile to a Module first, then instantiate: the `(Module, imports)`
   // overload returns the `Instance` directly (no `{ instance }` wrapper). The
   // glue types `compile` as a generic `Uint8Array`; the bytes are genuinely
   // `ArrayBuffer`-backed (wasm-bindgen returns a fresh `.slice()`), so the
   // narrowing to `BufferSource` is sound.
   const module = await WebAssembly.compile(bytes as Uint8Array<ArrayBuffer>)
-  const instance = await WebAssembly.instantiate(module, {
-    ...shim.imports,
-    ...wasi.imports,
-  })
-  wasi.bind(instance.exports[MEMORY_EXPORT_NAME] as WebAssembly.Memory)
-  shim.bindInstance(instance)
+  // The module imports only the four WASI functions and exports only
+  // `memory` and `_start`.
+  const instance = await WebAssembly.instantiate(module, wasi.imports)
+  wasi.bind(instance.exports.memory as WebAssembly.Memory)
 
   let exitCode = 0
   try {
