@@ -111,6 +111,18 @@ fn render_key_non_ascii_alphanumeric() {
     assert_output("console.log({ \"a😀\": 1 })", "{ 'a😀': 1 }\n");
 }
 
+/// `arguments` is the object kind whose keys the renderer quotes; its bare
+/// check consults the `Alphanumeric` table by code point.
+#[test]
+fn render_arguments_key_non_ascii_alphanumeric() {
+    assert_output(
+        "function f() { arguments[\"é\"] = 1; arguments[\"€\"] = 2; \
+         arguments[\"\\u{1D400}\"] = 3; arguments[\"a😀\"] = 4; arguments[\"中\"] = 5; \
+         console.log(arguments) } f()",
+        "[Arguments] { é: 1, '€': 2, 𝐀: 3, 'a😀': 4, 中: 5 }\n",
+    );
+}
+
 /// Wrap `body` so the script yields `"<error name>|<message>"` for the error
 /// it throws (or `"none"` when it completes normally).
 fn caught(body: &str) -> String {
