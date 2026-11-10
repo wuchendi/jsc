@@ -101,14 +101,16 @@ fn case_map_lone_surrogate_passthrough() {
     assert_bool("\"ΑΣ\\uD800Α\".toLowerCase() === \"ας\\uD800α\"", true);
 }
 
-/// A key is bare only when every character is an identifier character; past
-/// ASCII that is the `Alphanumeric` table, by code point.
+/// Plain-object keys are never quoted (design/runtime-memory.md §2.3), so
+/// these print bare whatever their characters;
+/// `render_arguments_key_non_ascii_alphanumeric` is the real check of the
+/// `Alphanumeric` table.
 #[test]
 fn render_key_non_ascii_alphanumeric() {
     assert_output("console.log({ é: 1, 中: 2 })", "{ é: 1, 中: 2 }\n");
     assert_output("console.log({ \"\\u{1D400}\": 1 })", "{ 𝐀: 1 }\n");
-    assert_output("console.log({ \"€\": 1 })", "{ '€': 1 }\n");
-    assert_output("console.log({ \"a😀\": 1 })", "{ 'a😀': 1 }\n");
+    assert_output("console.log({ \"€\": 1 })", "{ €: 1 }\n");
+    assert_output("console.log({ \"a😀\": 1 })", "{ a😀: 1 }\n");
 }
 
 /// `arguments` is the object kind whose keys the renderer quotes; its bare
