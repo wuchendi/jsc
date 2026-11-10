@@ -113,10 +113,10 @@ fn emit_new_block(function: &mut impl Sink, alloc: u32, base: u32, type_byte: i3
     }));
 }
 
-/// Emit the exported `__new_string(len: i32, two_byte: i32) -> i32`
-/// constructor: a [`TYPE_STRING`] block of `len` code units — Latin-1 bytes,
-/// or UTF-16LE units with `STR_FLAG_TWO_BYTE` when `two_byte` (`0`/`1`) —
-/// whose data the host fills. Locals 0/1 are the params; local 2 the base.
+/// Emit the `new_string(len: i32, two_byte: i32) -> i32` constructor: a
+/// [`TYPE_STRING`] block of `len` code units — Latin-1 bytes, or UTF-16LE units
+/// with `STR_FLAG_TWO_BYTE` when `two_byte` (`0`/`1`) — whose data the caller
+/// fills. Locals 0/1 are the params; local 2 the base.
 pub(super) fn emit_new_string(alloc: u32, leaves: &LeafSet) -> Function {
     let mut function = helper_builder(leaves, &[RAW_I32, RAW_I32], &[ROOT_BASE]);
     let (len, two_byte, base) = (0, 1, 2);
@@ -333,7 +333,7 @@ fn emit_new_elems(function: &mut impl Sink, alloc: u32, cap: u32, store: u32) {
     function.instruction(&Instruction::I32Store(mem32(ELEMS_CAP_OFFSET)));
 }
 
-/// Emit the exported `__new_array(len: i32) -> i32` constructor: a
+/// Emit the `__new_array(len: i32) -> i32` constructor: a
 /// [`TYPE_ARRAY`] handle (`proto` = `%Array.prototype%`, the jsval `proto`)
 /// with `len` set and, when `len > 0`, a `cap = len`
 /// [`TYPE_ELEMS`] store whose every element is `undefined`. Local 0 is `len`;
@@ -386,17 +386,6 @@ pub(super) fn emit_new_array(alloc: u32, proto: i64, leaves: &LeafSet) -> Functi
     finish_builder(function)
 }
 
-/// Emit the exported `__new_promise() -> i32` constructor: a pending
-/// [`abi::TYPE_PROMISE`] block with prototype `proto` (`%Promise.prototype%`),
-/// allocated through the engine's `__promise_new` (so it gets its `seq`).
-pub(super) fn emit_new_promise(helpers: Helpers<'_>, proto: i64, leaves: &LeafSet) -> Function {
-    let mut function = helper_builder(leaves, &[], &[]);
-    function.instruction(&Instruction::I64Const(proto));
-    function.instruction(&Instruction::Call(helpers.promise_new()));
-    function.instruction(&Instruction::End);
-    finish_builder(function)
-}
-
 /// Emit the `__invoke1(fn: i64, arg: i64) -> i64` callback trampoline.
 ///
 /// The guest promise engine's `__run_job` calls this internal trampoline to
@@ -406,7 +395,7 @@ pub(super) fn emit_new_promise(helpers: Helpers<'_>, proto: i64, leaves: &LeafSe
 /// single real argument into slot `a0` (padding the remaining `K-1` positional
 /// slots with `undefined`), reset `this`, push the callee's own environment, the
 /// argument count (`1`), and the funcref-table index, then `call_indirect`. The
-/// callback's result is left on the stack; a throw inside it sets `__exc_pending`
+/// callback's result is left on the stack; a throw inside it sets `$exc_pending`
 /// (which the caller checks after the call), so no propagation is emitted here.
 /// The two `i64` params occupy locals 0/1; one extra `i32` local holds the
 /// callee block base.

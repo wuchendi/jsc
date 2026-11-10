@@ -81,9 +81,9 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(["then", CONSTRUCTOR, "resolve"])
 }
 
-/// `__promise_self_error() -> i64`: a fresh [`SELF_RESOLUTION`] `TypeError`.
-/// `__promise_settle` rejects a promise fulfilled with itself with it (the
-/// host async driver still reaches it through its export).
+/// The `() -> i64` self-resolution constructor: a fresh [`SELF_RESOLUTION`]
+/// `TypeError`. `__promise_settle` rejects a promise fulfilled with itself
+/// with it.
 pub(in crate::emit) fn emit_promise_self_error(
     strings: &StrOffsets,
     helpers: Helpers<'_>,

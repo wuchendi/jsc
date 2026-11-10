@@ -6,16 +6,18 @@ mod common;
 use common::{assert_output, compile, exec};
 use wasmparser::{ExternalKind, Parser, Payload, TypeRef};
 
-/// `(module, name)` of every function import, in order.
-fn function_imports(wasm: &[u8]) -> Vec<(String, String)> {
+/// `(module, name, is_function)` of every import, in order.
+fn imports(wasm: &[u8]) -> Vec<(String, String, bool)> {
     let mut found = Vec::new();
     for payload in Parser::new(0).parse_all(wasm) {
         if let Payload::ImportSection(reader) = payload.expect("valid payload") {
             for import in reader.into_imports() {
                 let import = import.expect("valid import");
-                if matches!(import.ty, TypeRef::Func(_)) {
-                    found.push((import.module.to_owned(), import.name.to_owned()));
-                }
+                found.push((
+                    import.module.to_owned(),
+                    import.name.to_owned(),
+                    matches!(import.ty, TypeRef::Func(_)),
+                ));
             }
         }
     }
@@ -36,48 +38,39 @@ fn exports(wasm: &[u8]) -> Vec<(String, ExternalKind)> {
     found
 }
 
+/// A program touching every runtime area: output, promises, `async`
+/// functions, generators, the Date clock and `Math.random`.
+const EVERY_AREA: &str = "async function f() { await 1; return Date.now() > 0 } \
+    function* g() { yield Math.random() < 1 } \
+    f().then((v) => console.log(v, [...g()], 'x'.toUpperCase()))";
+
 #[test]
-fn module_imports_only_wasi_and_env_remainder() {
-    let wasm = compile("console.log(1)", false).expect("compiles");
+fn module_imports_exactly_four_wasi() {
     let preview1 = "wasi_snapshot_preview1";
-    let expected: Vec<(String, String)> = [
-        (preview1, "fd_write"),
-        (preview1, "clock_time_get"),
-        (preview1, "random_get"),
-        (preview1, "proc_exit"),
-        ("env", "__promise"),
-        ("env", "__then"),
-    ]
-    .iter()
-    .map(|(module, name)| ((*module).to_owned(), (*name).to_owned()))
-    .collect();
-    assert_eq!(function_imports(&wasm), expected);
+    let expected: Vec<(String, String, bool)> =
+        ["fd_write", "clock_time_get", "random_get", "proc_exit"]
+            .iter()
+            .map(|name| (preview1.to_owned(), (*name).to_owned(), true))
+            .collect();
+    for src in ["console.log(1)", "1", EVERY_AREA] {
+        for print_completion in [false, true] {
+            let wasm = compile(src, print_completion).expect("compiles");
+            assert_eq!(imports(&wasm), expected, "{src}");
+        }
+    }
 }
 
 #[test]
-fn start_is_only_entry_export() {
-    // The host-needed exports of the R1 interim state (§7.1) remain until R4.
-    const HOST_NEEDED: [&str; 6] = [
-        "__new_string",
-        "__new_promise",
-        "__promise_self_error",
-        "__invoke1",
-        "__async_step",
-        "__exc_pending",
+fn exports_exactly_start_and_memory() {
+    let expected = vec![
+        ("_start".to_owned(), ExternalKind::Func),
+        ("memory".to_owned(), ExternalKind::Memory),
     ];
-    let wasm = compile("function f() { return 1 } f()", false).expect("compiles");
-    let all = exports(&wasm);
-    let has = |name: &str, kind: ExternalKind| all.iter().any(|e| e.0 == name && e.1 == kind);
-    assert!(has("_start", ExternalKind::Func), "exports: {all:?}");
-    assert!(has("memory", ExternalKind::Memory), "exports: {all:?}");
-    for (name, _) in &all {
-        assert!(
-            name == "_start"
-                || name == "memory"
-                || name == "__exc_value"
-                || HOST_NEEDED.contains(&name.as_str()),
-            "unexpected export {name}"
-        );
+    for src in ["function f() { return 1 } f()", EVERY_AREA] {
+        for print_completion in [false, true] {
+            let wasm = compile(src, print_completion).expect("compiles");
+            assert_eq!(exports(&wasm), expected, "{src}");
+        }
     }
 }
 
@@ -203,8 +196,8 @@ fn oom_static_line_exit1() {
     assert_eq!(done.stderr, "Uncaught RangeError: out of memory\n");
 }
 
-/// `__alloc`'s `proc_exit(1)` inside a microtask leaves through the host's
-/// re-entrant call: the program ends there and no later job runs.
+/// `__alloc`'s `proc_exit(1)` inside a microtask (run by the guest drain)
+/// ends the program there: no later job runs.
 #[test]
 fn proc_exit_propagates_from_microtask() {
     let src = "console.log('sync'); \

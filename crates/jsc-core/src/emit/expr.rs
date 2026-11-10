@@ -97,8 +97,8 @@ fn emit_node_inner(
             emit_reset_this(function);
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
             emit_argc(call_argc(args.len(), helpers), function);
-            // `func` is codegen's index (main = 0, user functions 1..=n); the host
-            // import shifts every defined function up by IMPORT_FUNC_COUNT.
+            // `func` is codegen's index (main = 0, user functions 1..=n); the WASI
+            // imports shift every defined function up by IMPORT_FUNC_COUNT.
             function.release_temps(mark);
             function.instruction(&Instruction::Call(*func + IMPORT_FUNC_COUNT));
             // A user function can throw; unwind if it left an exception in flight.
@@ -742,7 +742,7 @@ fn emit_node_inner(
             function.instruction(&Instruction::Call(helpers.async_spawn()));
         }
         // The `Date` builtins: allocate/read a `TYPE_DATE` block's f64
-        // millisecond payload. `DateNew`/`DateNow` seed from `arg` or the host clock;
+        // millisecond payload. `DateNew`/`DateNow` seed from `arg` or the WASI clock;
         // `DateField` computes a field from a Date receiver's payload.
         IrNode::DateNew { arg } => {
             emit_date_new_node(arg.as_deref(), function, scratch, strings, helpers);

@@ -76,7 +76,7 @@ fn pushed_objects_read_back() {
 /// Guest-allocated strings and arrays (`String(n)`, array searches) still work
 /// after the guest heap has grown past the initial page.
 #[test]
-fn host_allocations_after_growth() {
+fn runtime_allocations_after_growth() {
     let grow = "let c = 0; for (let i = 0; i < 20000; i++) { let s = 'k' + i; c = c + 1 }";
     assert_str(&format!("{grow} String(c)"), "20000");
     assert_str(
@@ -85,7 +85,7 @@ fn host_allocations_after_growth() {
     );
 }
 
-/// Promises (host-allocated blocks) still settle after the heap has grown.
+/// Promises (engine-allocated blocks) still settle after the heap has grown.
 #[test]
 fn promises_after_growth() {
     assert_number(
@@ -120,15 +120,14 @@ fn out_of_memory_inside_try_terminates() {
 }
 
 /// A program whose guest strings fill ~448 MiB of the 512 MiB cap, so the next
-/// 64 MiB HOST allocation (`s.slice(1)`, built through the guest
-/// `__new_string` export) runs out of memory. Shared verbatim with the shim
-/// parity test in `packages/jsc/tests/run.test.ts`.
-const HOST_OOM: &str = "let s = 'x'; for (let i = 0; i < 26; i++) { s = s + s } \
+/// 64 MiB allocation by a builtin (`s.slice(1)`) runs out of memory. Shared
+/// verbatim with `packages/jsc/tests/run.test.ts`.
+const BUILTIN_OOM: &str = "let s = 'x'; for (let i = 0; i < 26; i++) { s = s + s } \
      let t = s + s; let u = t + s; s.slice(1).length";
 
-/// A host-initiated allocation past the cap is the same uncaught
-/// `RangeError: out of memory` as a guest one.
+/// A builtin's allocation past the cap is the same uncaught
+/// `RangeError: out of memory` as a program's.
 #[test]
-fn host_initiated_out_of_memory() {
-    assert_uncaught(HOST_OOM, "RangeError: out of memory");
+fn builtin_allocation_out_of_memory() {
+    assert_uncaught(BUILTIN_OOM, "RangeError: out of memory");
 }

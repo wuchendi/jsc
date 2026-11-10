@@ -1,6 +1,7 @@
-//! The WASI runner: load an emitted command module into `wasmtime`, link
-//! `wasi_snapshot_preview1` plus the `env` imports still backed by the host,
-//! call `_start`, and map `proc_exit` to an exit code.
+//! The WASI runner: load an emitted command module into `wasmtime`, link the
+//! four hand-written `wasi_snapshot_preview1` imports, call `_start`, and map
+//! `proc_exit` to an exit code. The runner reads no guest layout: uncaught
+//! exceptions and unhandled rejections are reported by the guest itself.
 
 use std::hash::{BuildHasher, Hasher};
 use std::io::Write;
@@ -10,7 +11,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store};
 
-use super::promise::{self, Host};
 use crate::abi;
 
 const ERRNO_SUCCESS: i32 = 0;
@@ -42,7 +42,7 @@ impl std::error::Error for Exit {}
 
 /// The per-run state behind the `wasi_snapshot_preview1` imports.
 #[derive(Debug)]
-pub(super) struct WasiCtx {
+struct WasiCtx {
     sinks: Sinks,
     /// The origin of the monotonic clock.
     started: Instant,
@@ -106,17 +106,6 @@ fn lock(buffer: &Mutex<Vec<u8>>) -> MutexGuard<'_, Vec<u8>> {
     buffer.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Prepare the failure of a guest call made from inside a host import for
-/// propagation: a `proc_exit` passes through untouched, so the runner maps it
-/// to the exit code; a trap gets a note on where it happened.
-pub(super) fn reentry_error(err: wasmtime::Error) -> wasmtime::Error {
-    if err.downcast_ref::<Exit>().is_some() {
-        err
-    } else {
-        err.context("guest trap during a host re-entry")
-    }
-}
-
 /// In-memory stdout and stderr of a run; clones share the same buffers.
 #[derive(Debug, Clone)]
 pub struct Capture {
@@ -175,7 +164,7 @@ pub struct RunOutcome {
 struct Finished {
     outcome: RunOutcome,
     #[cfg(test)]
-    store: Store<Host>,
+    store: Store<WasiCtx>,
     #[cfg(test)]
     instance: wasmtime::Instance,
 }
@@ -199,13 +188,12 @@ fn execute(wasm: &[u8], sinks: Sinks, fuel: Option<u64>) -> anyhow::Result<Finis
         None => Engine::default(),
     };
     let module = Module::new(&engine, wasm)?;
-    let mut store = Store::new(&engine, Host::new(WasiCtx::new(sinks)));
+    let mut store = Store::new(&engine, WasiCtx::new(sinks));
     if let Some(budget) = fuel {
         store.set_fuel(budget)?;
     }
     let mut linker = Linker::new(&engine);
     link_wasi(&mut linker)?;
-    link_promises(&mut linker)?;
     let instance = linker.instantiate(&mut store, &module)?;
     let start = instance.get_typed_func::<(), ()>(&mut store, abi::START_EXPORT_NAME)?;
     let code = match start.call(&mut store, ()) {
@@ -239,10 +227,17 @@ pub(crate) struct Inspected {
     pub(crate) stderr: String,
     /// The final linear memory.
     pub(crate) memory: Vec<u8>,
-    /// The `__exc_value` global: how layout tests reach a heap block, now that
-    /// `_start` returns nothing.
+    /// The i64 global exported as [`THROWN_PROBE_EXPORT`] (`0` when absent):
+    /// emit layout tests re-export the in-flight exception global under it
+    /// to reach a thrown heap block.
     pub(crate) thrown: u64,
 }
+
+/// Test-only: the export name under which emit layout tests re-export the
+/// in-flight exception global of a module (emitted modules export only
+/// `_start` and `memory`).
+#[cfg(test)]
+pub(crate) const THROWN_PROBE_EXPORT: &str = "thrown_probe";
 
 /// Test-only: run `wasm` capturing its output, then read its final state.
 #[cfg(test)]
@@ -254,10 +249,10 @@ pub(crate) fn run_inspect(wasm: &[u8]) -> anyhow::Result<Inspected> {
         instance,
     } = execute(wasm, Sinks::Capture(capture.clone()), None)?;
     let memory = instance
-        .get_memory(&mut store, "memory")
+        .get_memory(&mut store, abi::MEMORY_EXPORT_NAME)
         .map_or_else(Vec::new, |mem| mem.data(&store).to_vec());
     let thrown = instance
-        .get_global(&mut store, abi::EXC_VALUE_EXPORT_NAME)
+        .get_global(&mut store, THROWN_PROBE_EXPORT)
         .and_then(|global| global.get(&mut store).i64())
         .unwrap_or(0)
         .cast_unsigned();
@@ -271,9 +266,9 @@ pub(crate) fn run_inspect(wasm: &[u8]) -> anyhow::Result<Inspected> {
 }
 
 /// The guest's exported linear memory.
-fn guest_memory(caller: &mut Caller<'_, Host>) -> Option<Memory> {
+fn guest_memory(caller: &mut Caller<'_, WasiCtx>) -> Option<Memory> {
     caller
-        .get_export("memory")
+        .get_export(abi::MEMORY_EXPORT_NAME)
         .and_then(wasmtime::Extern::into_memory)
 }
 
@@ -349,40 +344,45 @@ fn errno(result: Result<(), i32>) -> i32 {
 
 /// The `wasi_snapshot_preview1` imports: exactly the four an emitted module
 /// declares, so a module needing any other fails to instantiate.
-fn link_wasi(linker: &mut Linker<Host>) -> anyhow::Result<()> {
+fn link_wasi(linker: &mut Linker<WasiCtx>) -> anyhow::Result<()> {
     linker.func_wrap(
         abi::WASI_MODULE,
         abi::WASI_FD_WRITE_NAME,
-        |mut caller: Caller<'_, Host>, fd: i32, iovs: i32, iovs_len: i32, nwritten: i32| -> i32 {
+        |mut caller: Caller<'_, WasiCtx>,
+         fd: i32,
+         iovs: i32,
+         iovs_len: i32,
+         nwritten: i32|
+         -> i32 {
             let Some(memory) = guest_memory(&mut caller) else {
                 return ERRNO_FAULT;
             };
-            let (data, host) = memory.data_and_store_mut(&mut caller);
-            errno(fd_write(data, &host.wasi, (fd, iovs, iovs_len, nwritten)))
+            let (data, wasi) = memory.data_and_store_mut(&mut caller);
+            errno(fd_write(data, wasi, (fd, iovs, iovs_len, nwritten)))
         },
     )?;
     linker.func_wrap(
         abi::WASI_MODULE,
         abi::WASI_CLOCK_TIME_GET_NAME,
-        |mut caller: Caller<'_, Host>, id: i32, _precision: i64, time: i32| -> i32 {
+        |mut caller: Caller<'_, WasiCtx>, id: i32, _precision: i64, time: i32| -> i32 {
             let Some(memory) = guest_memory(&mut caller) else {
                 return ERRNO_FAULT;
             };
-            let (data, host) = memory.data_and_store_mut(&mut caller);
-            errno(clock_time_get(data, &host.wasi, id, time))
+            let (data, wasi) = memory.data_and_store_mut(&mut caller);
+            errno(clock_time_get(data, wasi, id, time))
         },
     )?;
     linker.func_wrap(
         abi::WASI_MODULE,
         abi::WASI_RANDOM_GET_NAME,
-        |mut caller: Caller<'_, Host>, buf: i32, buf_len: i32| -> i32 {
+        |mut caller: Caller<'_, WasiCtx>, buf: i32, buf_len: i32| -> i32 {
             let Some(memory) = guest_memory(&mut caller) else {
                 return ERRNO_FAULT;
             };
-            let (data, host) = memory.data_and_store_mut(&mut caller);
+            let (data, wasi) = memory.data_and_store_mut(&mut caller);
             errno(
                 span(data, buf, u64::from(buf_len.cast_unsigned())).map(|range| {
-                    host.wasi.fill_random(&mut data[range]);
+                    wasi.fill_random(&mut data[range]);
                 }),
             )
         },
@@ -391,32 +391,6 @@ fn link_wasi(linker: &mut Linker<Host>) -> anyhow::Result<()> {
         abi::WASI_MODULE,
         abi::WASI_PROC_EXIT_NAME,
         |code: i32| -> wasmtime::Result<()> { Err(wasmtime::Error::new(Exit(code))) },
-    )?;
-    Ok(())
-}
-
-/// The `__promise`/`__then` imports driving the host promise engine.
-fn link_promises(linker: &mut Linker<Host>) -> anyhow::Result<()> {
-    linker.func_wrap(
-        abi::IMPORT_MODULE,
-        abi::PROMISE_IMPORT_NAME,
-        |mut caller: Caller<'_, Host>, op: i32, a: i64, b: i64| -> wasmtime::Result<i64> {
-            promise::dispatch(&mut caller, op, a.cast_unsigned(), b.cast_unsigned())
-                .map(u64::cast_signed)
-        },
-    )?;
-    linker.func_wrap(
-        abi::IMPORT_MODULE,
-        abi::THEN_IMPORT_NAME,
-        |mut caller: Caller<'_, Host>, p: i64, on_f: i64, on_r: i64| -> wasmtime::Result<i64> {
-            promise::then(
-                &mut caller,
-                p.cast_unsigned(),
-                on_f.cast_unsigned(),
-                on_r.cast_unsigned(),
-            )
-            .map(u64::cast_signed)
-        },
     )?;
     Ok(())
 }

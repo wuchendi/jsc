@@ -5,7 +5,7 @@
 //! `ToString` built on them.
 //!
 //! Everything is composed in the static [`abi::NUM_SCRATCH_ADDR`] buffer and
-//! copied into one Latin-1 `__new_string` at the end. No user code runs while
+//! copied into one Latin-1 string block at the end. No user code runs while
 //! it is in use, so the buffer is never re-entered.
 
 #[allow(clippy::wildcard_imports)]
