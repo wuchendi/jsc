@@ -72,10 +72,10 @@ fn coercion_order(op: StringOp) -> [u32; 2] {
     }
 }
 
-/// The host op flag of `op` when the call-site arguments `args` are already
-/// of the types its coercions produce (string / number literals; a missing
-/// argument is `undefined`), so that on a string receiver the builtin is
-/// exactly its host op, inline.
+/// Whether `op` with the call-site arguments `args` already of the types its
+/// coercions produce (string / number literals; a missing argument is
+/// `undefined`) runs inline: on a string receiver the builtin is exactly its
+/// code-unit body.
 pub(in crate::emit) fn inline_str_cmp(op: StringOp, args: &[IrNode]) -> bool {
     op == StringOp::LocaleCompare && matches!(args, [IrNode::Str(_)])
 }
@@ -356,9 +356,8 @@ pub(super) fn emit_this_value(
 /// The generic `String.prototype.<op>(a0, a1)`: `ToString(this)` (a
 /// `null`/`undefined` receiver throws), the argument coercions of
 /// [`coercions`] in [`coercion_order`], `repeat`'s count check, then the
-/// code-unit body ([`emit_units`]) or the host op, whose refusal sentinels
-/// throw; `match` builds its result array. `concat`, `matchAll`, `replace`
-/// and `replaceAll` continue in their own bodies after the receiver. Before
+/// code-unit body ([`emit_units`]); `match` builds its result array.
+/// `concat`, `matchAll`, `replace` and `replaceAll` continue in their own bodies after the receiver. Before
 /// `ToString(this)`, an object first argument of `match` / `matchAll` /
 /// `replace` / `replaceAll` / `search` / `split` with the method's
 /// well-known symbol is called instead ([`emit_dispatch`]); after it,

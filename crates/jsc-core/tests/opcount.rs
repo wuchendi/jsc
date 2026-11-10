@@ -56,11 +56,11 @@ fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/opcount")
 }
 
-/// Measure one program. Function index layout (`emit/mod.rs`): the host
+/// Measure one program. Function index layout (`emit/mod.rs`): the four WASI
 /// imports come first (`0..imports`), then `main`, then the `n` user functions
 /// (`n` = `IrProgram::functions.len()`), then the runtime helpers. "User code"
 /// is code-section bodies `0..=n` (`main` + user functions); a `call` target
-/// below `imports` is a host call; `prop_calls` counts calls to the
+/// below `imports` is a WASI call (`host_calls`); `prop_calls` counts calls to the
 /// property-access helpers `__get`/`__set`/`__has`/`__delete`.
 fn measure(src: &str) -> Row {
     let program = jsc_core::frontend::parse(src, jsc_core::frontend::Dialect::Js).expect("parse");

@@ -1186,7 +1186,7 @@ fn promise_executor_and_new_non_function_throw() {
     );
 }
 
-/// A non-callable `.then` reaction is a passthrough (the host engine skips it),
+/// A non-callable `.then` reaction is a passthrough (the promise engine skips it),
 /// not a `TypeError`.
 #[test]
 fn promise_non_function_reaction_passes_through() {

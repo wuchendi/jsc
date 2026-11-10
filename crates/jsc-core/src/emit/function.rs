@@ -342,7 +342,7 @@ pub(super) fn leave_frame(helpers: Helpers<'_>) {
 
 /// Emit a post-call check that unwinds if a callee left an exception in flight.
 /// Inserted after every user-function / callback invocation (but not
-/// after pure host builtins, which cannot throw): the callee's `i64` result is
+/// after pure builtins, which cannot throw): the callee's `i64` result is
 /// already on top of the stack, so this reads `$exc_pending` and, when set,
 /// runs [`emit_throw_return`] to unwind one more frame. On the no-exception path
 /// the `if` falls through leaving the callee's result untouched, so the check is

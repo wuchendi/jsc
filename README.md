@@ -12,7 +12,7 @@ sum 6
 
 ## What it is
 
-- **A compiler, not an interpreter.** Every program becomes a validated WebAssembly module (emitted with [`wasm-encoder`](https://crates.io/crates/wasm-encoder)). The CLI runs it on [`wasmtime`](https://wasmtime.dev/) or writes the bytes out with `jsc build`.
+- **A compiler, not an interpreter.** Every program becomes a validated, self-contained WebAssembly module (emitted with [`wasm-encoder`](https://crates.io/crates/wasm-encoder)): a WASI preview-1 command that imports only `fd_write`, `clock_time_get`, `random_get` and `proc_exit` and exports only `_start` and `memory`. The CLI runs it on [`wasmtime`](https://wasmtime.dev/) or writes the bytes out with `jsc build`; the artifact also runs under `wasmtime run`, `node:wasi` and the `@cdlab/jsc` polyfill.
 - **An embeddable library.** The whole pipeline lives in the `jsc-core` crate; `jsc` is a thin CLI over it.
 - **An in-browser compiler.** `crates/jsc-wasm` compiles `jsc-core` itself to wasm (wasm-bindgen); the `@cdlab/jsc` package (`packages/jsc`) wraps it with `compile(src)` / `run(src)` for the browser and Node, and `apps/jsc-web` is a playground built on that package.
 - **TypeScript by type stripping only** — no type checking. `.ts` / `.mts` / `.cts` files have their types removed by swc's TypeScript strip pass before codegen; see [TypeScript](#typescript).
@@ -122,7 +122,7 @@ source ──swc──▶ AST ──codegen──▶ IR ──emit──▶ .was
 - **frontend** — parses source with [`swc`](https://swc.rs/).
 - **codegen** — lowers the AST to a small IR: scopes, closure capture analysis, generator/async state machines. Top-level bindings captured by top-level functions live in module cells.
 - **emit** — IR → wasm. Every value is a NaN-boxed `i64` (numbers are raw `f64` bits, with NaN canonicalized on every rebox through `__box_f64`; other kinds are tagged in the quiet-NaN space). Strings, arrays, objects, closures and environments live in linear memory behind a type-byte header, allocated by `__alloc`, a bump allocator that grows memory on demand up to 512 MiB. Objects keep their own properties in interned-key tables and link a prototype; builtins live on a static realm image, with guarded inline fast paths for common calls. Exceptions use manual unwinding (no wasm exception-handling proposal). `Map`/`Set` keys compare with SameValueZero (`__same_value_zero`).
-- **run** — instantiates the module on `wasmtime` with WASI preview 1 and the remaining host imports, then calls `_start`; the module drains its microtask queue and writes its own output.
+- **run** — instantiates the module on `wasmtime` with four hand-written WASI preview-1 imports, then calls `_start`; the module drains its microtask queue, writes its own output and reports uncaught errors itself.
 
 Details are in [DESIGN.md](DESIGN.md).
 
@@ -130,12 +130,11 @@ Details are in [DESIGN.md](DESIGN.md).
 
 - **Strict-mode semantics only.** Sloppy-mode constructs such as `with` or assigning an undeclared variable are compile errors.
 - **No GC.** The heap is bump-allocated and never freed; the 512 MiB cap ends a run with `RangeError: out of memory`.
-- **Not self-contained yet.** The module is a WASI command (`_start`) that imports four `wasi_snapshot_preview1` functions plus six host functions from the `env` namespace (`__convert`, `__method`, `__promise`, `__then`, `__now`, `__parse_int`), provided by the `wasmtime` host in `jsc-core` and by the JS polyfill and shim in `@cdlab/jsc`; because of those six it does not run under a plain WASI host.
 - **Missing built-ins.** No `RegExp` (regex literals are rejected), `Proxy`, `Reflect`, `BigInt`, `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `eval` or the `Function` constructor; no ES modules.
 
 ## Roadmap
 
-The built-in library and UTF-16 strings, self-contained WASI modules with GC, the remaining language features (ES modules, `RegExp`, …), performance work, and productization; see [DESIGN.md](DESIGN.md#14-roadmap).
+Garbage collection and weak collections, the remaining language features (ES modules, `RegExp`, …), performance work, and productization; see [DESIGN.md](DESIGN.md#14-roadmap).
 
 ## License
 

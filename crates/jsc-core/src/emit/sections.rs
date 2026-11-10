@@ -44,7 +44,7 @@ pub(super) fn build_type_and_function_sections<'a>(
     }
 
     // Every DEFINED function index is shifted up by IMPORT_FUNC_COUNT because the
-    // host imports occupy the lowest function indices: `main` is function
+    // WASI imports occupy the lowest function indices: `main` is function
     // `IMPORT_FUNC_COUNT`, user function `i` is `i + 1 + IMPORT_FUNC_COUNT`, and
     // the helpers follow in the order `helper_types` lists them (and `emit`
     // appends their bodies).
@@ -187,8 +187,6 @@ pub(super) fn build_type_and_function_sections<'a>(
         (&[I32, I64, I32], &[I32]),      // clock_time_get(id, precision, time)
         (&[I32, I32], &[I32]),           // random_get(buf, buf_len)
         (&[I32], &[]),                   // proc_exit(rval)
-        (&[I32, I64, I64], &[I64]),      // __promise(op, a, b)
-        (&[I64, I64, I64], &[I64]),      // __then(p, on_f, on_r)
     ];
     let import_base = next_type;
     for (params, results) in signatures {
@@ -199,24 +197,20 @@ pub(super) fn build_type_and_function_sections<'a>(
     let import_types = std::array::from_fn(|i| import_base + u32::try_from(i).unwrap_or(0));
     let next_type = next_type + IMPORT_FUNC_COUNT;
 
-    // The exported guest constructors, the LAST defined functions:
-    // `__new_string(len: i32, two_byte: i32) -> i32`, `__new_array(len: i32)
-    // -> i32`, and `__new_promise() -> i32`. Their types follow the import
-    // types.
+    // The block constructors: `new_string(len: i32, two_byte: i32) -> i32`
+    // and `__new_array(len: i32) -> i32`. Their types follow the import types.
     types
         .ty()
         .function([ValType::I32, ValType::I32], [ValType::I32]);
     functions.function(next_type);
     types.ty().function([ValType::I32], [ValType::I32]);
     functions.function(next_type + 1);
-    types.ty().function([], [ValType::I32]);
-    functions.function(next_type + 2);
     // The realm functions follow: `__has_own(key: i32, obj: i64) -> i32`,
     // then the builtin bodies with the uniform type.
     types
         .ty()
         .function([ValType::I32, ValType::I64], [ValType::I32]);
-    functions.function(next_type + 3);
+    functions.function(next_type + 2);
     for _ in Builtin::ALL {
         functions.function(fn_type);
     }
@@ -232,8 +226,8 @@ pub(super) fn build_type_and_function_sections<'a>(
     // i32)`, `__own_desc(obj: i64, key: i32) -> i64`, `__set_integrity(obj:
     // i64, level: i32)`, `__test_integrity(obj: i64, level: i32) -> i32`,
     // `__own_enum(obj: i64, key: i32) -> i32` and `__set_proto(o: i32, proto:
-    // i64) -> i32`; then the exported `__promise_self_error() -> i64`; then
-    // `__symbol_get(v: i64, sym: i32) -> i64`; then the `super` property
+    // i64) -> i32`; then the self-resolution `TypeError` constructor `() ->
+    // i64`; then `__symbol_get(v: i64, sym: i32) -> i64`; then the `super` property
     // helpers `__super_get(home: i64, key: i32, recv: i64) -> i64` and
     // `__super_set(home: i64, key: i32, v: i64, recv: i64)`; then the
     // private-name helpers `__private_find(o: i64, key: i32) -> i32`,
@@ -314,8 +308,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         ),
         (&[ValType::I64, ValType::I64, ValType::I32], &[ValType::I64]),
     ];
-    let render_type = next_type + 4 + u32::try_from(conversions.len()).unwrap_or(0);
-    for (ty, (params, results)) in (next_type + 4..).zip(conversions) {
+    let render_type = next_type + 3 + u32::try_from(conversions.len()).unwrap_or(0);
+    for (ty, (params, results)) in (next_type + 3..).zip(conversions) {
         types
             .ty()
             .function(params.iter().copied(), results.iter().copied());

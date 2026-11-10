@@ -32,7 +32,8 @@ fn run_js(src: &str) -> String {
     completion(&emit_js(src))
 }
 
-/// Emit `program` with its final expression thrown instead of completed.
+/// Emit `program` with its final expression thrown instead of completed, and
+/// the in-flight exception global re-exported through [`probe_thrown`].
 fn emit_throwing(mut program: IrProgram) -> Vec<u8> {
     let last = program.stmts.last_mut();
     assert!(
@@ -42,7 +43,50 @@ fn emit_throwing(mut program: IrProgram) -> Vec<u8> {
     if let Some(IrStmt::Expr(node)) = last {
         *node = IrNode::Throw(Box::new(std::mem::replace(node, IrNode::Num(0.0))));
     }
-    emit(&program)
+    probe_thrown(&emit(&program))
+}
+
+/// Test-only surgery on an emitted module: re-export its in-flight exception
+/// global (`$exc_value`) as [`crate::run::THROWN_PROBE_EXPORT`] so a layout
+/// test can reach the thrown heap block after `_start`. The emitter exports
+/// only `_start` and `memory`; every other section is copied verbatim.
+fn probe_thrown(bytes: &[u8]) -> Vec<u8> {
+    use wasm_encoder::{ExportKind, ExportSection, RawSection};
+    let mut module = wasm_encoder::Module::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload.expect("valid payload") {
+            wasmparser::Payload::ExportSection(reader) => {
+                let mut exports = ExportSection::new();
+                for export in reader {
+                    let export = export.expect("valid export");
+                    let kind = if export.kind == wasmparser::ExternalKind::Memory {
+                        ExportKind::Memory
+                    } else {
+                        assert_eq!(export.kind, wasmparser::ExternalKind::Func);
+                        ExportKind::Func
+                    };
+                    exports.export(export.name, kind, export.index);
+                }
+                exports.export(
+                    crate::run::THROWN_PROBE_EXPORT,
+                    ExportKind::Global,
+                    super::EXC_VALUE_GLOBAL,
+                );
+                module.section(&exports);
+            }
+            payload => {
+                if let Some((id, range)) = payload.as_section() {
+                    let start = usize::try_from(range.start).expect("section start");
+                    let end = usize::try_from(range.end).expect("section end");
+                    module.section(&RawSection {
+                        id,
+                        data: &bytes[start..end],
+                    });
+                }
+            }
+        }
+    }
+    module.finish()
 }
 
 /// Lower `src`.
@@ -88,7 +132,7 @@ fn starts_with_wasm_magic() {
 #[test]
 fn exports_a_memory_named_memory() {
     // Every emitted module carries a linear memory exported as
-    // "memory" (index 0), which the run stage reads back to resolve pointers.
+    // "memory" (index 0), through which the WASI imports read guest buffers.
     let bytes = emit(&expr_program(IrNode::Num(42.0)));
     validate(&bytes);
     let mut found = false;
@@ -792,7 +836,7 @@ fn static_string_blobs_are_8_aligned() {
 #[test]
 fn every_block_is_8_aligned_with_zero_header_bytes() {
     // Guest-allocated (concat, array, object, function, Map, Date, generator)
-    // and host-allocated (String(n), string/array methods, promises) blocks
+    // and builtin-allocated (String(n), string/array methods, promises) blocks
     // all start 8-aligned with header bytes 1..3 (`gc`, `flags`, `class`) zero,
     // except a fresh arrow's `flags`, which is `LAZY`.
     for src in [
@@ -839,84 +883,65 @@ fn every_block_is_8_aligned_with_zero_header_bytes() {
 }
 
 #[test]
-fn exported_constructors_build_aligned_zeroed_blocks() {
-    use wasmtime::{Engine, Linker, Module, Store};
+fn runtime_strings_and_promises_are_aligned_and_zeroed() {
+    use crate::abi::{
+        ARRAY_ELEMS_OFFSET, ELEMS_DATA_OFFSET, PROMISE_PENDING, STR_FLAG_TWO_BYTE, TYPE_PROMISE,
+        TYPE_STRING, UNDEFINED,
+    };
     let bytes = emit_js("let s = 'odd'; s");
     let start = usize::try_from(data_layout(&bytes).1.expect("heap start")).expect("start");
     assert_eq!(start % 8, 0, "heap start is 8-aligned");
-    let engine = Engine::default();
-    let module = Module::new(&engine, &bytes).expect("compile");
-    let mut linker = Linker::new(&engine);
-    linker
-        .define_unknown_imports_as_traps(&module)
-        .expect("stub imports");
-    let mut store = Store::new(&engine, ());
-    let instance = linker
-        .instantiate(&mut store, &module)
-        .expect("instantiate");
-    let memory = instance.get_memory(&mut store, "memory").expect("memory");
-    // Dirty the free region so the constructors must WRITE the zero bytes.
-    memory.data_mut(&mut store)[start..start + 256].fill(0xFF);
+    let base_of = |bits: u64| {
+        assert_eq!((bits >> 48) & 0b111, 0b101, "a heap jsval");
+        usize::try_from(bits & 0xFFFF_FFFF).expect("base")
+    };
+    let u32_at =
+        |mem: &[u8], at: usize| u32::from_le_bytes(mem[at..at + 4].try_into().expect("u32"));
+    let u64_at =
+        |mem: &[u8], at: usize| u64::from_le_bytes(mem[at..at + 8].try_into().expect("u64"));
 
-    let new_string = instance
-        .get_typed_func::<(i32, i32), i32>(&mut store, crate::abi::NEW_STRING_EXPORT_NAME)
-        .expect("__new_string export");
-    let s = new_string.call(&mut store, (3, 0)).expect("new string");
+    // A runtime Latin-1 string: 3 one-byte units, flags clear.
+    let (bits, mem) = thrown(&emit_throwing(lower_js(
+        "let pad = 'ab' + 'c'; String(123)",
+    )));
+    let s = base_of(bits);
     assert_eq!(s % 8, 0);
-    let mem = memory.data(&store);
-    let s = usize::try_from(s).expect("base");
-    assert_eq!(&mem[s..s + 4], &[crate::abi::TYPE_STRING, 0, 0, 0]);
-    assert_eq!(&mem[s + 4..s + 8], &3u32.to_le_bytes());
-    // A two-byte string sets the flag; its 3 units take 6 data bytes.
-    let t = new_string
-        .call(&mut store, (3, 1))
-        .expect("new two-byte string");
-    assert_eq!(
-        t - i32::try_from(s).expect("base"),
-        16,
-        "8 + 3 rounds up to 16"
-    );
-    let mem = memory.data(&store);
-    let t = usize::try_from(t).expect("base");
-    assert_eq!(
-        &mem[t..t + 4],
-        &[crate::abi::TYPE_STRING, 0, crate::abi::STR_FLAG_TWO_BYTE, 0]
-    );
-    assert_eq!(&mem[t + 4..t + 8], &3u32.to_le_bytes());
+    assert_eq!(&mem[s..s + 4], &[TYPE_STRING, 0, 0, 0]);
+    assert_eq!(u32_at(&mem, s + 4), 3);
+    // A two-byte concatenation sets the flag; its 3 units take 6 data bytes.
+    let (bits, mem) = thrown(&emit_throwing(lower_js(
+        "let pad = 'ab' + 'c'; let w = '\\u0100\\u0101'; w + 'b'",
+    )));
+    let t = base_of(bits);
+    assert_eq!(t % 8, 0);
+    assert_eq!(&mem[t..t + 4], &[TYPE_STRING, 0, STR_FLAG_TWO_BYTE, 0]);
+    assert_eq!(u32_at(&mem, t + 4), 3);
 
-    let new_promise = instance
-        .get_typed_func::<(), i32>(&mut store, crate::abi::NEW_PROMISE_EXPORT_NAME)
-        .expect("__new_promise export");
-    let p = new_promise.call(&mut store, ()).expect("new promise");
-    assert_eq!(p % 8, 0);
-    let mem = memory.data(&store);
-    let p = usize::try_from(p).expect("base");
-    assert_eq!(&mem[p..p + 4], &[crate::abi::TYPE_PROMISE, 0, 0, 0]);
-    assert_eq!(&mem[p + 4..p + 8], &0u32.to_le_bytes(), "props");
-    // `proto` = `%Promise.prototype%`.
-    assert_eq!(mem[p + 14..p + 16], [0xFD, 0x7F], "proto is a heap pointer");
-    assert_eq!(
-        &mem[p + 16..p + 20],
-        &crate::abi::PROMISE_PENDING.to_le_bytes()
-    );
-    assert_eq!(&mem[p + 20..p + 24], &0u32.to_le_bytes(), "no reactions");
-    assert_eq!(&mem[p + 24..p + 32], &crate::abi::UNDEFINED.to_le_bytes());
-    let seq = u32::from_le_bytes(mem[p + 32..p + 36].try_into().expect("seq"));
-    assert_eq!(&mem[p + 36..p + 40], &0u32.to_le_bytes(), "rejected_next");
-    // The 40-byte block is followed directly by the next one, whose `seq`
-    // counts on.
-    let q = new_promise.call(&mut store, ()).expect("new promise");
-    let q = usize::try_from(q).expect("base");
-    assert_eq!(
-        q - p,
-        crate::abi::PROMISE_BLOCK_SIZE as usize,
-        "40 bytes, no rounding"
-    );
-    let mem = memory.data(&store);
-    assert_eq!(
-        u32::from_le_bytes(mem[q + 32..q + 36].try_into().expect("seq")),
-        seq + 1
-    );
+    // Two pending promises: the 40-byte runtime-memory.md §3.4 layout, `seq`
+    // counting on in creation order.
+    let (bits, mem) = thrown(&emit_throwing(lower_js(
+        "let f = () => {}; [new Promise(f), new Promise(f)]",
+    )));
+    let store =
+        usize::try_from(u32_at(&mem, base_of(bits) + ARRAY_ELEMS_OFFSET as usize)).expect("store");
+    let data = store + ELEMS_DATA_OFFSET as usize;
+    let (p, q) = (base_of(u64_at(&mem, data)), base_of(u64_at(&mem, data + 8)));
+    for at in [p, q] {
+        assert_eq!(at % 8, 0);
+        assert_eq!(&mem[at..at + 4], &[TYPE_PROMISE, 0, 0, 0]);
+        assert_eq!(u32_at(&mem, at + 4), 0, "props");
+        // `proto` = `%Promise.prototype%`.
+        assert_eq!(
+            mem[at + 14..at + 16],
+            [0xFD, 0x7F],
+            "proto is a heap pointer"
+        );
+        assert_eq!(u32_at(&mem, at + 16).cast_signed(), PROMISE_PENDING);
+        assert_eq!(u32_at(&mem, at + 20), 0, "no reactions");
+        assert_eq!(u64_at(&mem, at + 24), UNDEFINED);
+        assert_eq!(u32_at(&mem, at + 36), 0, "rejected_next");
+    }
+    assert_eq!(u32_at(&mem, q + 32), u32_at(&mem, p + 32) + 1, "seq");
 }
 
 #[test]
@@ -988,7 +1013,7 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     );
     assert_eq!(u32_at(&mem, func + FUNC_INDEX_OFFSET), 0, "func_idx");
     assert_eq!(u32_at(&mem, func + FUNC_INDEX_OFFSET + 4), 0, "reserved");
-    assert_eq!(u64_at(&mem, func + FUNC_ENV_OFFSET), UNDEFINED, "env");
+    assert_eq!(u64_at(&mem, func + FUNC_ENV_OFFSET), UNDEFINED, "env slot");
 
     let (closure, mem) = heap(
         "let n = 1; let g = () => n; g",

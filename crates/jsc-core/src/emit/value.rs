@@ -26,7 +26,7 @@ pub(super) fn emit_object_prefix(function: &mut impl Sink, base: u32, type_byte:
 
 /// Rebox the `f64` on top of the stack as a number jsval (via `__box_f64`).
 /// Every site that turns an `f64` (arithmetic, `Math.*`, a stored `Date` payload,
-/// a host-imported clock) back into a jsval goes through here, so the number NaN
+/// the WASI clock) back into a jsval goes through here, so the number NaN
 /// is ALWAYS exactly the canonical [`abi::QNAN`] bits: wasm arithmetic may yield
 /// any NaN (`0/0` sets the sign bit on x86; a NaN operand such as `undefined`
 /// propagates its tag payload), and a raw reinterpret would leak those bits as a
