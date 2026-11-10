@@ -621,8 +621,10 @@ aliases, captured bindings, and member receivers all observe `push`.
   and every `Array.prototype` method) continue along the prototype chain
   exactly as for an index at or past `length`. Every element read that meets
   a hole calls `__proto_elem(o, i)`: `HOLE` at once when
-  `__protos_indexless(o)` (no prototype is an array or has a table flagged
-  `HAS_INDEX_KEYS`), else `HasProperty` then `Get` of the index key with
+  `__protos_indexless(o)` (no prototype is an array outside dictionary mode
+  or has a table flagged `HAS_INDEX_KEYS`; a dictionary-mode array such as
+  `%Array.prototype%` keeps every element in its table, so the flag covers
+  it), else `HasProperty` then `Get` of the index key with
   `this = o`. A dense read pays nothing; a hole read pays one call.
 - **Element writes.** A store to an index the array does not own (a hole, or
   at or past `length`) is `OrdinarySet` through the prototype chain:
@@ -671,9 +673,12 @@ aliases, captured bindings, and member receivers all observe `push`.
   setter, and non-extensible rules) and throws `Cannot add property i, object
   is not extensible` when it would grow a read-only `length`; `__delete`
   honours `configurable`. The builtin fast paths (the `ProtoGuard` receiver
-  test, the `Array.prototype` bodies' array branches, the host search/slice)
-  skip a dictionary array, which takes the generic per-index path. The mode is
-  never left.
+  test, the `Array.prototype` bodies' array branches, the slice copy) skip a
+  dictionary array, which takes the generic per-index path; `indexOf` /
+  `includes` instead scan a `SPARSE` or dictionary array's own index keys
+  when its table holds no accessor element and its prototypes are indexless
+  (an accessor array keeps the per-index path, so getters run in index
+  order). The mode is never left.
 - **`length`** is an own, non-enumerable, non-configurable exotic property,
   writable unless `LENGTH_READONLY`. Writes go through `__array_set_length`
   (`ArraySetLength`): a read-only `length` throws `Cannot assign to read only
