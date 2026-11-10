@@ -394,3 +394,44 @@ fn yield_star_rejects_a_non_object_inner_result() {
         "true Iterator result 5 is not an object\n",
     );
 }
+
+/// The request queue per spec (`AsyncGeneratorEnqueue` / `DrainQueue` /
+/// `AwaitReturn`), on the guest engine: `next()` calls made before the first
+/// resumption, a `return()` queued behind them (awaited at the `yield`), a
+/// `yield` that awaits its operand, and each settlement's position among a
+/// plain `then` chain; then `return()` before the body started.
+#[test]
+fn async_generator_queue_order() {
+    assert_output(
+        "async function* g(){
+           console.log('start');
+           const x = yield await Promise.resolve('a');
+           console.log('x', x);
+           yield 'b';
+           console.log('unreachable');
+         }
+         const it = g();
+         const p1 = it.next('ignored');
+         const p2 = it.next('X');
+         const p3 = it.return('R');
+         const p4 = it.next();
+         p1.then(r => console.log('p1', r.value, r.done));
+         p2.then(r => console.log('p2', r.value, r.done));
+         p3.then(r => console.log('p3', r.value, r.done));
+         p4.then(r => console.log('p4', r.value, r.done));
+         Promise.resolve().then(() => console.log('t1')).then(() => console.log('t2'))
+           .then(() => console.log('t3')).then(() => console.log('t4'))
+           .then(() => console.log('t5')).then(() => console.log('t6'));
+         console.log('sync');",
+        "start\nsync\nt1\nx X\nt2\np1 a false\nt3\np2 b false\nt4\np3 R true\np4 undefined true\nt5\nt6\n",
+    );
+    assert_output(
+        "async function* h(){ console.log('never'); }
+         const it = h();
+         it.return(Promise.resolve('early')).then(r => console.log('r', r.value, r.done));
+         it.next().then(r => console.log('n', r.value, r.done));
+         Promise.resolve().then(() => console.log('u1')).then(() => console.log('u2'))
+           .then(() => console.log('u3'));",
+        "u1\nr early true\nn undefined true\nu2\nu3\n",
+    );
+}

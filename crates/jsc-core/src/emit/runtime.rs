@@ -401,7 +401,8 @@ pub(super) fn emit_new_promise(helpers: Helpers<'_>, proto: i64, leaves: &LeafSe
 ///
 /// The guest promise engine's `__run_job` calls this internal trampoline to
 /// run a `.then`/`.catch`/`.finally` reaction's guest callback `fn` with the
-/// settled value `arg` (the host async driver still calls its export). It mirrors [`super::emit_call_indirect`]'s env-last ABI: push the
+/// settled value `arg`; nothing outside the guest calls it. It mirrors
+/// [`super::emit_call_indirect`]'s env-last ABI: push the
 /// single real argument into slot `a0` (padding the remaining `K-1` positional
 /// slots with `undefined`), reset `this`, push the callee's own environment, the
 /// argument count (`1`), and the funcref-table index, then `call_indirect`. The

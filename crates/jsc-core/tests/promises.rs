@@ -885,6 +885,57 @@ fn microtask_order_matches_spec() {
     );
 }
 
+/// `async` functions on the guest driver: each `await` of a native promise
+/// resumes one tick later among plain `then` jobs, returning a promise adopts
+/// it through a thenable job (two extra ticks), a rejected `await` throws
+/// into the body, an abrupt `PromiseResolve` (a throwing `constructor`
+/// getter) throws synchronously at the `await`, and a thenable is assimilated
+/// through its `then`.
+#[test]
+fn async_await_order_matches_spec() {
+    assert_output(
+        "async function a() { console.log(\"a1\"); await null; console.log(\"a2\"); \
+           await Promise.resolve(); console.log(\"a3\"); return \"ra\"; } \
+         async function b() { console.log(\"b1\"); await new Promise(r => r()); console.log(\"b2\"); } \
+         const pa = a(); \
+         b(); \
+         Promise.resolve().then(() => console.log(\"t1\")).then(() => console.log(\"t2\")) \
+           .then(() => console.log(\"t3\")); \
+         pa.then(v => console.log(v)); \
+         console.log(\"sync\");",
+        "a1\nb1\nsync\na2\nb2\nt1\na3\nt2\nra\nt3\n",
+    );
+    assert_output(
+        "async function f() { return Promise.resolve(\"x\"); } \
+         f().then(v => console.log(\"f\", v)); \
+         Promise.resolve().then(() => console.log(\"1\")).then(() => console.log(\"2\")) \
+           .then(() => console.log(\"3\")).then(() => console.log(\"4\"));",
+        "1\n2\nf x\n3\n4\n",
+    );
+    assert_output(
+        "async function g() { \
+           try { await Promise.reject(\"boom\"); } catch (e) { console.log(\"caught\", e); } \
+           throw \"out\"; } \
+         g().catch(e => console.log(\"rejected\", e));",
+        "caught boom\nrejected out\n",
+    );
+    assert_output(
+        "const p = Promise.resolve(5); \
+         Object.defineProperty(p, \"constructor\", { get() { throw \"ctor\"; } }); \
+         async function h() { try { await p; } catch (e) { console.log(\"h caught\", e); } } \
+         h(); \
+         console.log(\"after h\");",
+        "h caught ctor\nafter h\n",
+    );
+    assert_output(
+        "const t = { then(r) { console.log(\"then called\"); r(7); } }; \
+         async function k() { const v = await t; console.log(\"k\", v); } \
+         k(); \
+         console.log(\"sync k\");",
+        "sync k\nthen called\nk 7\n",
+    );
+}
+
 /// The reported unhandled rejection is the oldest by CREATION, not by
 /// rejection time, and a handled older one is skipped.
 #[test]

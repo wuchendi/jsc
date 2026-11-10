@@ -251,8 +251,9 @@ pub(super) fn emit_throw(
 // promise, and serves the queue from the front: a request resumes the body
 // (its state machine, where `await` suspends are flagged `GEN_AWAIT`) until it
 // yields or completes, which settles the front request's promise; an `await`
-// (or a `return(v)` value) registers promise reactions that continue serving
-// the queue from the microtask queue.
+// (or a `return(v)` value) takes `PromiseResolve(%Promise%, v)` and registers
+// promise reactions (without a derived promise) that continue serving the
+// queue from the microtask queue.
 
 /// The `TypeError` of an `%AsyncGeneratorPrototype%` method on a receiver
 /// that is not an async generator (the returned promise rejects with it).
@@ -422,17 +423,25 @@ fn fulfill_front(
     );
 }
 
-/// Register `reaction`'s fulfilled/rejected pair (`env` = the generator in
-/// `generator`) on the value in `value`, `Promise.resolve` semantics.
+/// `Await(value)`: `PromiseResolve(%Promise%, value)` (into `value`), then
+/// register `reaction`'s fulfilled/rejected pair (`env` = the generator in
+/// `generator`) on it with no derived promise. An abrupt `PromiseResolve`
+/// leaves the exception pending and runs `on_throw` instead.
 fn await_value(
     function: &mut FnBuilder<'_>,
     frame: Frame,
     generator: u32,
     value: u32,
     [fulfilled, rejected]: [AsyncGenReaction; 2],
+    on_throw: impl FnOnce(&mut FnBuilder<'_>),
     helpers: Helpers<'_>,
 ) {
-    wasm!(function; LocalGet(value));
+    wasm!(function;
+        LocalGet(value), Call(helpers.promise_resolve()), LocalSet(value),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty),
+    );
+    on_throw(function);
+    wasm!(function; Else, LocalGet(value));
     let mark = function.temp_mark();
     function.root_temp(TempClass::Jsval);
     for reaction in [fulfilled, rejected] {
@@ -441,7 +450,18 @@ fn await_value(
         function.root_temp(TempClass::Jsval);
     }
     function.release_temps(mark);
-    wasm!(function; Call(helpers.promise_then()), Drop);
+    wasm!(function;
+        I64Const(UNDEFINED_BITS), I32Const(0), Call(helpers.promise_react()),
+        End,
+    );
+}
+
+/// Take the pending exception into `local` and clear it.
+fn take_exception(function: &mut FnBuilder<'_>, local: u32) {
+    wasm!(function;
+        GlobalGet(EXC_VALUE_GLOBAL), LocalSet(local),
+        I32Const(0), GlobalSet(EXC_PENDING_GLOBAL), I64Const(0), GlobalSet(EXC_VALUE_GLOBAL),
+    );
 }
 
 /// Call builtin `builtin` directly with argument 0 from `generator`,
@@ -574,7 +594,9 @@ pub(super) fn emit_async_drain(
     wasm!(function; End);
     field(function, generator, abi::GEN_DONE_OFFSET);
     wasm!(function; If(BlockType::Empty));
-    // Completed: `return(v)` awaits `v`; `throw(e)` rejects; `next` is done.
+    // Completed: `return(v)` awaits `v` (AsyncGeneratorAwaitReturn: an
+    // abrupt `PromiseResolve` rejects the request and serving goes on);
+    // `throw(e)` rejects; `next` is done.
     wasm!(function; LocalGet(kind), I32Const(ret), I32Eq, If(BlockType::Empty));
     set_limits(function, generator, abi::GEN_BUSY, true);
     await_value(
@@ -586,6 +608,19 @@ pub(super) fn emit_async_drain(
             AsyncGenReaction::ReturnFulfilled,
             AsyncGenReaction::ReturnRejected,
         ],
+        |function| {
+            take_exception(function, value);
+            set_limits(function, generator, abi::GEN_BUSY, false);
+            settle_front(
+                function,
+                generator,
+                abi::PROMISE_REJECTED,
+                |f| wasm!(f; LocalGet(value)),
+                helpers,
+            );
+            // -> the serving loop (the `if`, `if return`, `if done`, `loop`).
+            wasm!(function; Br(3));
+        },
         helpers,
     );
     wasm!(function; Br(3), End);
@@ -635,7 +670,8 @@ pub(super) fn emit_async_drain(
 /// resumption `env` names ([`step_mode`]; a throw or return resumption makes
 /// it pending, see [`abi::GEN_RESUME_MODE_MASK`]): an `await` registers the reactions that
 /// resume it (the body stays busy); a `yield`, completion or throw settles
-/// the front request.
+/// the front request. An abrupt `PromiseResolve` of an awaited value is
+/// thrown back into the body at once (a loop, not a recursive step).
 pub(super) fn emit_async_step(
     function: &mut FnBuilder<'_>,
     frame: Frame,
@@ -650,7 +686,7 @@ pub(super) fn emit_async_step(
     frame.arg(function, 0);
     wasm!(function; LocalSet(generator));
     frame.arg(function, 1);
-    wasm!(function; LocalSet(sent));
+    wasm!(function; LocalSet(sent), Loop(BlockType::Empty));
     set_limits(function, generator, abi::GEN_BUSY | abi::GEN_RUNNING, true);
     set_limits(function, generator, abi::GEN_AWAIT, false);
     for mode in [abi::GEN_RESUME_MODE_THROW, abi::GEN_RESUME_MODE_RETURN] {
@@ -702,12 +738,21 @@ pub(super) fn emit_async_step(
             AsyncGenReaction::AwaitFulfilled,
             AsyncGenReaction::AwaitRejected,
         ],
+        |function| {
+            // Resume with a throw resumption: -> the step loop (the `if`,
+            // `if await`, `loop`).
+            take_exception(function, sent);
+            wasm!(function;
+                I64Const(step_mode(abi::GEN_RESUME_MODE_THROW)), LocalSet(frame.k),
+                Br(2),
+            );
+        },
         helpers,
     );
     wasm!(function; I64Const(UNDEFINED_BITS), Return, End);
     set_limits(function, generator, abi::GEN_BUSY, false);
     fulfill_front(function, frame, generator, result, false, strings, helpers);
-    wasm!(function; I64Const(UNDEFINED_BITS));
+    wasm!(function; End, I64Const(UNDEFINED_BITS));
 }
 
 /// A promise reaction of the async generator in `env`: resume the body after

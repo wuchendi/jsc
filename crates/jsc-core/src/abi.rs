@@ -422,8 +422,8 @@ pub(crate) const REACTION_ON_REJECTED_OFFSET: u32 = HEADER_SIZE + 12;
 pub(crate) const REACTION_RESULT_OFFSET: u32 = HEADER_SIZE + 20;
 
 /// Reaction slot 3: the `kind` small integer (bit 0 [`REACTION_KIND_THENABLE`],
-/// bit 1 reserved for the async-function resumption, the source state once
-/// queued at [`REACTION_KIND_STATE_SHIFT`]).
+/// bit 1 [`REACTION_KIND_ASYNC_RESUME`], the source state once queued at
+/// [`REACTION_KIND_STATE_SHIFT`]).
 pub(crate) const REACTION_KIND_OFFSET: u32 = HEADER_SIZE + 28;
 
 /// Reaction slot 4: the settlement value, written when queued.
@@ -436,6 +436,11 @@ pub(crate) const REACTION_NEXT_OFFSET: u32 = HEADER_SIZE + 44;
 /// the callable `then`, slot 1 the thenable, slot 2 the promise to resolve),
 /// queued directly, never a reaction on a promise.
 pub(crate) const REACTION_KIND_THENABLE: i32 = 1;
+
+/// Reaction `kind` bit: the record resumes an `async` function body (slot 0
+/// its generator handle, slot 2 its result promise) once the awaited promise
+/// it hangs off settles.
+pub(crate) const REACTION_KIND_ASYNC_RESUME: i32 = 2;
 
 /// The shift of the source state (bits 2-3) in a queued job's `kind`.
 pub(crate) const REACTION_KIND_STATE_SHIFT: i32 = 2;
@@ -903,7 +908,9 @@ pub(crate) const PROMISE_OP_SETTLE_REJECT: i32 = 6;
 /// generator's first step synchronously, and returns the result promise. Each
 /// suspend (`await`) registers a continuation that resumes the generator when the
 /// awaited value settles; completion fulfills (or, on a throw / awaited rejection,
-/// rejects) the result promise.
+/// rejects) the result promise. No longer emitted (the guest `__async_spawn`
+/// drives `async` bodies); the host side goes with the import.
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const PROMISE_OP_ASYNC_SPAWN: i32 = 7;
 
 /// `__promise` op flag: drain the microtask queue and return the first

@@ -838,7 +838,7 @@ backed by the hosts:
 
 | # | import | signature | backs |
 |---|---|---|---|
-| 4 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | `async` spawn (op `7`) only |
+| 4 | `__promise` | `(op: i32, a: i64, b: i64) -> i64` | imported, no longer called |
 | 5 | `__then` | `(p: i64, on_f: i64, on_r: i64) -> i64` | imported, no longer called |
 
 Because of these two, a module does not run under a plain WASI host yet. The
@@ -846,8 +846,8 @@ native host is `run/harness.rs` (`Linker::func_wrap` for the four WASI imports
 and `env`); the browser and Node host is `packages/jsc/src/wasi.ts` plus
 `shim.ts`.
 
-- **`__promise` ops.** Only `7` (async spawn) is still emitted; every other
-  promise operation runs in the guest engine (§6.7).
+- **`__promise` ops.** None is emitted any more: every promise operation,
+  the `async` function driver included, runs in the guest engine (§6.7).
 
 ### 6.2 Guest runtime helpers
 
@@ -868,7 +868,7 @@ function-index order:
 | string to number (§6.5) | `__num_unit`, `__str_ws`, `__dec_parse(data, start, end)`, `__dec_slow`, `__dec_round`, `__dec_left`, `__dec_right`, `__digit_span`, `__radix_pow2`, `__radix_fold`, `__string_to_number(s)`, `__to_number_prim(v)`, `__parse_float(v)`, `__parse_int(v, radix)` |
 | clock, random | `__now()`, `__random()` (§6.5) |
 | misc | `__gen_to_array(gen)`, `__nullish_throw(recv, key, set)`, `__prop_throw(recv, key, mode)`, `__box_f64(x)`, `__to_number(v)` |
-| re-entry | `__invoke1(fn, arg)` (the promise jobs' callback trampoline), `__async_step(gen, sent)`, the two `new Promise` settlers |
+| re-entry | `__invoke1(fn, arg)` (the promise jobs' callback trampoline), `__async_step(gen, sent)` (the `async` driver's step trampoline), the two `new Promise` settlers |
 | constructors | `__new_string(len, two_byte)`, `__new_array(len)`, `__new_promise()` |
 | realm | `__has_own(key, obj)`, then the builtin bodies (§6.4) |
 | conversions (§6.5) | `__to_primitive(v, hint)`, `__to_string(v)`, `__add(a, b)`, `__compare(a, b, op)`, `__array_join(recv, sep)`, `__to_object(v)` |
@@ -881,7 +881,7 @@ function-index order:
 | output (§6.9) | `__out_reserve(need)`, `__path_reserve(need)`, `__refs_reserve(need)`, `__out_byte(b)`, `__out_cp(cp)`, `__out_str(s)`, `__out_uint(n)`, `__out_flush(fd)`, `__report(fd, prefix, v)` |
 | renderer (§6.9) | `__render_top(v)`, `__render(v, depth)`, `__render_heap(p, depth)`, `__render_array(p, depth)`, `__render_object(p, depth)`, `__render_function(p, depth)`, `__render_props(..)`, `__render_entry(e, quote, first, open, depth)`, `__render_key(key, quote)`, `__render_lookup(o, key)`, `__heap_object(v)`, `__str_of(v)`, `__fn_name(v)`, `__date_text(v)` |
 | entry | `_start` (§4.2) |
-| promise engine (§6.7), after the Unicode and libm helpers | `__promise_new(proto)`, `__promise_enqueue(rec)`, `__promise_react(p, on_f, on_r, result, kind)`, `__promise_settle(p, state, v)`, `__promise_then(p, on_f, on_r)`, `__promise_resolve(v)`, `__promise_reject(v)`, `__promise_finally(p, on_finally)`, `__run_job(rec)`, `__drain()`, `__first_unhandled()`, `__promise_await(v)`, `__promise_resolving(p)` |
+| promise engine (§6.7), after the Unicode and libm helpers | `__promise_new(proto)`, `__promise_enqueue(rec)`, `__promise_react(p, on_f, on_r, result, kind)`, `__promise_settle(p, state, v)`, `__promise_then(p, on_f, on_r)`, `__promise_resolve(v)`, `__promise_reject(v)`, `__promise_finally(p, on_finally)`, `__run_job(rec)`, `__drain()`, `__first_unhandled()`, `__promise_await(v)`, `__promise_resolving(p)`, `__async_spawn(gen)`, `__async_drive(gen, result, sent)` |
 
 The string helpers work on code units at either width: `__concat` makes a
 two-byte result iff either operand is two-byte (widening the one-byte side)
@@ -1275,18 +1275,21 @@ carry the in-flight exception: `$exc_pending` and `$exc_value`.
 
 The promise engine is guest code (`emit/promise_engine.rs`): the settlement,
 the reaction lists, the microtask queue and the rejection tracking all live
-in the guest heap and globals. Only `async` function spawning still goes
-through the host (`__promise` op `7`, below).
+in the guest heap and globals, and so does the `async` function driver; no
+promise operation calls the host.
 
 - **Records.** A reaction is one `TYPE_ENV` block of 6 jsval slots:
   `on_fulfilled`, `on_rejected` (`undefined` = passthrough), `result` (the
-  derived promise or `undefined`), `kind` (bit 0 `THENABLE`, bits 2-3 the
-  source state once queued), the settlement value (written when queued) and
+  derived promise or `undefined`), `kind` (bit 0 `THENABLE`, bit 1
+  `ASYNC_RESUME`, bits 2-3 the source state once queued), the settlement
+  value (written when queued) and
   `next` (`HEAP | record` or `0`). The same block is first a reaction on a
   pending promise (a newest-first list from the promise's `reactions` ref),
   then a queued job, so settling never allocates. A `THENABLE` record is a
   `PromiseResolveThenableJob` (`then`, the thenable, the promise to resolve),
-  queued directly.
+  queued directly. An `ASYNC_RESUME` record is an `async` body's `await`
+  continuation (the generator handle in slot 0, the result promise in slot
+  2).
 - **Queue.** `$__job_head` / `$__job_tail` are raw refs to an intrusive FIFO
   of records. `__promise_settle(p, state, v)` resolves or rejects `p`
   (below); settling reverses the reaction list in place into registration
@@ -1299,7 +1302,8 @@ through the host (`__promise` op `7`, below).
   `$__promise_seq`.
 - **Jobs.** `__run_job(rec)` runs a `THENABLE` job as
   `then.call(thenable, resolve, reject)` with a fresh resolving-function pair
-  for its promise (a throw calls that `reject`). A reaction job selects the
+  for its promise (a throw calls that `reject`), and an `ASYNC_RESUME` job by
+  resuming its body through `__async_drive` (below). A reaction job selects the
   callback by the source state; a non-callable one passes the settlement
   through. Otherwise it calls the internal `__invoke1(fn, arg)` trampoline
   (the uniform-ABI `call_indirect`). A throw leaves `$exc_pending` set; the
@@ -1369,17 +1373,27 @@ through the host (`__promise` op `7`, below).
   `seq` (creation order), and `_start` fails the run with
   `Uncaught (in promise) <value>` (exit 1); a late `catch` still counts as a
   handler.
-- **`async` functions** (§7.8) are spawned with `__promise` op `7`: the host
-  allocates the result promise, drives the body's state machine one step at
-  a time through the exported `__async_step(gen, sent)` trampoline, fulfills
-  on completion, rejects on a throw, and on each `await` registers a
-  continuation on the awaited value in its own queue. This driver moves onto
-  the guest engine next (design/runtime-memory.md §3.4); until then host
-  continuations are not driven by `__drain`.
-- **Async generators** (§7.8) need no host support: their request queue and
-  driver are guest builtins that allocate (`__promise_new`) and settle
-  (`__promise_settle`) each request's promise and register their `await`
-  continuations with `__promise_then`.
+- **`async` functions** (§7.8) are spawned by `__async_spawn(gen)`
+  (`AsyncFunctionStart`): it allocates the result promise and calls
+  `__async_drive(gen, result, undefined)`, which advances the body's state
+  machine one suspend through the internal `__async_step(gen, sent)`
+  trampoline. A throw out of the body (the pending exception, cleared)
+  rejects the result promise; completion resolves it with the returned
+  value; otherwise the body suspended on `await v`, and
+  `PromiseResolve(%Promise%, v)` gets an `ASYNC_RESUME` reaction (no derived
+  promise). When it settles, `__run_job` calls `__async_drive` again with
+  the value (fulfilled) or with the reason pending as an exception
+  (rejected), which throws at the `await`. An abrupt `PromiseResolve` (a
+  throwing `constructor` getter) is thrown into the body at once by the same
+  loop. No wasm frame is held across an `await`: every resumption starts
+  from the drain loop.
+- **Async generators** (§7.8): their request queue and driver are guest
+  builtins that allocate (`__promise_new`) and settle (`__promise_settle`)
+  each request's promise; every `await` (of the body, of a `yield` or
+  `return` operand, of `return(v)`) takes `PromiseResolve(%Promise%, v)` and
+  registers its continuation pair with `__promise_react` (no derived
+  promise). An abrupt `PromiseResolve` throws into the body at the `await`
+  (for `return(v)` on a completed generator it rejects the request).
 
 ### 6.8 Host boundary
 
@@ -1389,14 +1403,15 @@ exported `__new_promise()` (pending, `%Promise.prototype%`). Layout knowledge
 lives in the emitter.
 
 Host reads, all through `abi.rs` constants (and `abi.ts`, kept equal by the
-drift test): promise `state @16` / `value @24` and generator `done @24`
-(the `async` spawn driver only).
+drift test): promise `state @16` / `value @24` (the host promise code
+behind the uncalled `env` imports).
 `String.prototype.normalize` runs in the guest over the generated Unicode
 tables (`emit/unicode.rs`): full decomposition, canonical ordering, then
 canonical composition for NFC / NFKC, with lone surrogates passing through and
 an unknown form throwing `RangeError` directly. Console output reads no layouts
-from the host side: the guest writes UTF-8 (§6.9). Host-held jsvals (the
-`async` driver's continuations) stay valid because no block moves.
+from the host side: the guest writes UTF-8 (§6.9). The host holds no jsvals
+across calls: promise jobs and `async` continuations live in the guest
+queue.
 
 ### 6.9 Value rendering
 
@@ -2185,8 +2200,10 @@ source of `const { [yield k]: v } = o`) lives in a frame cell.
 
 **`async`/`await`.** An `async function` (in every position a `function*` may
 take, including `async` methods; no `prototype`) or `async` arrow is a generator whose `await e` is a `yield e`; its
-function value is a wrapper that builds the generator and hands it to the host
-async driver (§6.7), returning the result promise; a parameter binding error
+function value is a wrapper that builds the generator and hands it to the guest
+async driver `__async_spawn` (§6.7), returning the result promise; each `await`
+takes `PromiseResolve(%Promise%, v)` and resumes the body from the microtask
+queue (one tick for a native promise); a parameter binding error
 rejects that promise instead of throwing. An `async` arrow keeps arrow
 semantics: no `prototype`, not a constructor, and `arguments` / `new.target`
 are the enclosing function's, and so is `this` (§7.4). All generator control-flow support applies to `await`; a rejected
@@ -2211,10 +2228,10 @@ the body is busy:
   `{ value, done: false }`, completion with `{ value, done: true }`, and a
   throw out of the body rejects it; the next request is then served.
 - An `await` (flagged suspend) leaves the body busy and registers promise
-  reactions on the operand (`Promise.resolve` semantics); its settlement
-  resumes the body (a rejection throws at the `await`) and continues serving
-  the queue from the microtask queue. Requests made meanwhile, from outside or
-  from the body itself, wait in the queue.
+  reactions on `PromiseResolve(%Promise%, operand)` (a throw of it is thrown
+  at the `await`); its settlement resumes the body (a rejection throws at the
+  `await`) and continues serving the queue from the microtask queue. Requests
+  made meanwhile, from outside or from the body itself, wait in the queue.
 - An abrupt request before the body started completes it. On a completed
   generator `next` fulfills `{ undefined, done: true }`, `throw(e)` rejects
   with `e`, and `return(v)` awaits `v` and fulfills `{ v, done: true }` (or
@@ -2618,10 +2635,6 @@ Each item below is current behaviour of this tree.
   step is a call to the cached `next` (or the `throw` / `return` method).
 - An async generator object renders as `Object [Generator]`; functions
   render as `[Function: f]` whatever their kind.
-- An async generator's `await` / `yield` / `return` operand and an
-  `%AsyncFromSyncIteratorPrototype%` result value skip `PromiseResolve`: a
-  non-promise thenable is used as the value itself, and a native promise is
-  awaited whatever its `constructor`.
 
 **Date**
 
@@ -2642,10 +2655,6 @@ Each item below is current behaviour of this tree.
   host or the `@cdlab/jsc` polyfill and shim. The semantics behind the two
   `env` imports are implemented three times (guest wasm, the Rust host, the
   TypeScript shim).
-- Interim (phase 4 R4): an `async` function body never resumes after its
-  first `await`, because the host spawn driver's continuations are no longer
-  drained (`__drain` runs only the guest queue); the result promise stays
-  pending. The driver moves onto the guest engine in the same stage.
 - Case-mapping tables are Unicode 17.0.0 (Rust std) and normalization tables
   Unicode 18.0.0 (`icu_normalizer` 2.4.0), so behaviour can differ only on code
   points new in 18.0.

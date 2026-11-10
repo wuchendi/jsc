@@ -734,13 +734,12 @@ fn emit_node_inner(
             emit_promise_ctor(executor, *p_local, function, scratch, strings, helpers);
         }
         // Spawn an `async function` body: build the generator (the inner
-        // `MakeGenerator`) and hand it to the host async engine, which allocates
-        // the result promise, drives the first step, and returns the promise.
+        // `MakeGenerator`) and hand it to `__async_spawn`, which allocates the
+        // result promise, drives the body to its first `await`, and returns
+        // the promise.
         IrNode::AsyncSpawn(make_generator) => {
-            function.instruction(&Instruction::I32Const(PROMISE_OP_ASYNC_SPAWN));
             emit_node(make_generator, function, scratch, strings, helpers);
-            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-            function.instruction(&Instruction::Call(helpers.promise));
+            function.instruction(&Instruction::Call(helpers.async_spawn()));
         }
         // The `Date` builtins: allocate/read a `TYPE_DATE` block's f64
         // millisecond payload. `DateNew`/`DateNow` seed from `arg` or the host clock;

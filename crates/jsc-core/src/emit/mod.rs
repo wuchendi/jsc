@@ -48,23 +48,20 @@ use crate::ir::{
 const MEMORY_EXPORT_NAME: &str = abi::MEMORY_EXPORT_NAME;
 
 /// The module and field names of the host promise imports. Every promise
-/// operation runs in the guest engine ([`promise_engine`]) except the
-/// `async` function spawn, which still calls `__promise` (op
-/// [`PROMISE_OP_ASYNC_SPAWN`]); `__then` is imported but never called.
+/// operation, the `async` function driver included, runs in the guest engine
+/// ([`promise_engine`]); `__promise` and `__then` are imported but never
+/// called.
 const PROMISE_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const PROMISE_IMPORT_NAME: &str = abi::PROMISE_IMPORT_NAME;
 const THEN_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
 const THEN_IMPORT_NAME: &str = abi::THEN_IMPORT_NAME;
 
-/// The `__promise` op flag the async-function spawn still uses; see [`abi`].
-const PROMISE_OP_ASYNC_SPAWN: i32 = abi::PROMISE_OP_ASYNC_SPAWN;
-
-/// The export name of the `__invoke1` callback trampoline the host
-/// promise engine calls re-entrantly to run a reaction's guest callback.
+/// The export name of the `__invoke1` callback trampoline (internal to the
+/// guest promise engine; the export goes with the host imports).
 const INVOKE_EXPORT_NAME: &str = abi::INVOKE_EXPORT_NAME;
 
-/// The export name of the `__async_step` generator-step trampoline the
-/// host async engine calls to advance an `async function` body's state machine.
+/// The export name of the `__async_step` generator-step trampoline (internal
+/// to the guest async driver; the export goes with the host imports).
 const ASYNC_STEP_EXPORT_NAME: &str = abi::ASYNC_STEP_EXPORT_NAME;
 
 /// The export names of the guest constructors the hosts allocate through
@@ -875,9 +872,6 @@ struct Helpers<'a> {
     /// The first of the [`dtoa::HELPER_COUNT`] consecutive `Number` to string
     /// helpers (see [`dtoa::emit_helpers`]).
     dtoa: u32,
-    /// The host `__promise` import's function index. Always `4`; only the
-    /// async-function spawn (`PROMISE_OP_ASYNC_SPAWN`) still calls it.
-    promise: u32,
     /// `__now() -> f64`, the WASI clock in ms since the Unix epoch (backing
     /// `Date`); `__random` follows it (see [`Self::random`]).
     now: u32,
@@ -907,14 +901,14 @@ struct Helpers<'a> {
     /// through `__to_primitive`; see [`value::emit_to_number_helper`]).
     /// Call sites skip it for number operands (see [`value::emit_coerce_number`]).
     to_number: u32,
-    /// `__invoke1(fn: i64, arg: i64) -> i64`: the callback trampoline the
-    /// host promise engine calls re-entrantly. Exported under
+    /// `__invoke1(fn: i64, arg: i64) -> i64`: the callback trampoline
+    /// `__run_job` calls to run a reaction's callback. Still exported under
     /// [`INVOKE_EXPORT_NAME`].
     invoke1: u32,
     /// `__async_step(gen: i64, sent: i64) -> i64`: the generator
-    /// single-step trampoline the host async engine calls to advance an
+    /// single-step trampoline `__async_drive` calls to advance an
     /// `async function` body's state machine by one suspend. Appended right after
-    /// `invoke1` (index `invoke1 + 1`), exported under [`ASYNC_STEP_EXPORT_NAME`].
+    /// `invoke1` (index `invoke1 + 1`), still exported under [`ASYNC_STEP_EXPORT_NAME`].
     async_step: u32,
     /// The funcref-TABLE slots of the two `new Promise` settler functions:
     /// `resolve` (fulfills the bound promise) and `reject`. A `new Promise`
@@ -1666,12 +1660,9 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
         EXC_PENDING_GLOBAL,
     );
     exports.export(EXC_VALUE_EXPORT_NAME, ExportKind::Global, EXC_VALUE_GLOBAL);
-    // The `__invoke1` callback trampoline is exported so the host promise
-    // engine can run a `.then`/`.catch`/`.finally` reaction's guest callback
-    // re-entrantly. It is the LAST defined function (appended after every helper).
+    // The `__invoke1` and `__async_step` trampolines are internal to the
+    // guest promise engine; their exports remain until the host imports go.
     exports.export(INVOKE_EXPORT_NAME, ExportKind::Func, helpers.invoke1);
-    // The `__async_step` trampoline is exported so the host async engine
-    // can drive an `async function` body's state machine one suspend at a time.
     exports.export(ASYNC_STEP_EXPORT_NAME, ExportKind::Func, helpers.async_step);
     // The guest constructors: the hosts allocate every string/promise block
     // through these, never by hand.

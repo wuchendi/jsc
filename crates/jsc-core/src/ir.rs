@@ -2159,10 +2159,10 @@ pub enum IrNode {
     },
     /// Spawn an `async function` body: the operand is a
     /// [`IrNode::MakeGenerator`] building the handle for the body compiled as a
-    /// generator state machine (`await` == `yield`). Lowers to the host
-    /// `__promise` import with [`crate::abi::PROMISE_OP_ASYNC_SPAWN`], which
-    /// allocates the result promise, drives the first step, and returns the
-    /// promise. Emitted as the whole body of the wrapper function the `async`
+    /// generator state machine (`await` == `yield`). Lowers to the guest
+    /// engine's `__async_spawn`, which allocates the result promise, drives
+    /// the body to its first `await`, and returns the promise; each `await`
+    /// resumes from the microtask queue. Emitted as the whole body of the wrapper function the `async`
     /// name binds to (`return AsyncSpawn(MakeGenerator{..})`).
     AsyncSpawn(Box<IrNode>),
     /// `new Date()` / `new Date(value)`. Allocates a fresh `TYPE_DATE`
