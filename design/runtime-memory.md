@@ -404,7 +404,7 @@ roots), `$__promise_seq`, `$__rejected_head` (raw ref, root).
 | helper | ports | behaviour |
 |---|---|---|
 | `__promise_new(proto) -> i32` | `alloc_promise` (`promise.rs:703`) | allocate, `seq = $__promise_seq++` |
-| `__promise_settle(p, state, v)` | `settle` (`:530`) | settle-once; `v == p` → reject with a fresh `TypeError` (inline, no export); `v` a promise → adopt via `__promise_react(v, …)` (register as source, `register_source` `:598`); else write state/value, reverse `reactions` in place and append each record to the job queue with slot 3/4 filled; a rejection with no reactions and not `HANDLED` links `p` into the rejected list (`IN_REJECTED_LIST`) |
+| `__promise_settle(p, state, v)` | `settle` (`:530`) | settle-once; `v == p` → reject with a fresh `TypeError` (inline, no export); `v` an object with a callable `then` (native promises included) → enqueue a `PromiseResolveThenableJob` with once-only resolving functions, per the thenable amendment above (an abrupt `Get(v, "then")` rejects); else write state/value, reverse `reactions` in place and append each record to the job queue with slot 3/4 filled; a rejection with no reactions and not `HANDLED` links `p` into the rejected list (`IN_REJECTED_LIST`) |
 | `__promise_react(p, on_f, on_r, result, kind)` | `then` (`:222`), `register_source` | set `HANDLED`; pending → allocate a record and prepend; settled → allocate and enqueue directly |
 | `__promise_then(p, on_f, on_r) -> jsval` | `__then` import | derived promise (species / capability stays in `emit/builtins/promise.rs:349`) + `__promise_react` |
 | `__promise_resolve`, `__promise_finally` | `resolve` (`:274`), `finally` (`:289`) | as today |
