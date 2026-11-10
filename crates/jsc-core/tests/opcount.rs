@@ -272,3 +272,19 @@ fn push_fuel_is_linear() {
         "push fuel is not linear: fuel(5e4) = {half}, fuel(1e5) = {full}"
     );
 }
+
+/// `indexOf` on a `SPARSE` array with an own table (the generic builtin call)
+/// scans only its present elements: the fuel of a search does not grow with
+/// the index gap. It would if `__protos_indexless` rejected the
+/// dictionary-mode `%Array.prototype%`, which sends every plain array to the
+/// per-index `HasProperty` loop (~1e6 steps here).
+#[test]
+fn sparse_index_of_fuel_is_gap_free() {
+    let search = |n: u32| format!("const a = []; a[{n}] = 1; console.log(a.indexOf(1))");
+    let near = measure(&search(10_000)).fuel;
+    let far = measure(&search(1_000_000)).fuel;
+    assert!(
+        far.abs_diff(near) < 10_000,
+        "sparse indexOf scans the gap: fuel(1e4) = {near}, fuel(1e6) = {far}"
+    );
+}
