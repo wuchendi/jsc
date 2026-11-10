@@ -561,6 +561,9 @@ pub(super) enum H {
 
 use ValType::{F64, I32};
 
+/// The number of libm helpers (the engine helpers follow them).
+pub(super) const HELPER_COUNT: usize = TYPES.len();
+
 /// The `(params, results)` of every helper, in [`H`] order.
 const TYPES: [(&[ValType], &[ValType]); 30] = [
     (&[F64, I32], &[F64]),           // __libm_scalbn(x, n)

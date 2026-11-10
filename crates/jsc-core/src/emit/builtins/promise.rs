@@ -1,4 +1,5 @@
-//! `%Promise.prototype%` methods over the host promise engine.
+//! `%Promise.prototype%` methods and the `Promise` statics over the guest
+//! promise engine (`emit/promise_engine.rs`).
 
 use super::array::{CallArg, push_call};
 #[allow(clippy::wildcard_imports)]
@@ -81,8 +82,8 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 }
 
 /// `__promise_self_error() -> i64`: a fresh [`SELF_RESOLUTION`] `TypeError`.
-/// Exported for the host promise engines, which settle every promise: a
-/// promise fulfilled with itself is rejected with this error instead.
+/// `__promise_settle` rejects a promise fulfilled with itself with it (the
+/// host async driver still reaches it through its export).
 pub(in crate::emit) fn emit_promise_self_error(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -345,8 +346,8 @@ fn new_capability(
 
 /// `then(onFulfilled, onRejected)` (`catch = false`) on a promise: the
 /// result promise comes from `SpeciesConstructor(this, %Promise%)` — the
-/// host `__then` chain for `%Promise%`, else `NewPromiseCapability(C)`
-/// settled by two [`SpeciesOp::Reaction`]s `__then` registers — or
+/// engine's `__promise_then` for `%Promise%`, else `NewPromiseCapability(C)`
+/// settled by two [`SpeciesOp::Reaction`]s `__promise_then` registers — or
 /// `catch(onRejected)`: `this.then(undefined, onRejected)` on any receiver.
 pub(super) fn emit_then(
     catch: bool,
@@ -412,14 +413,14 @@ pub(super) fn emit_then(
         closure(function, frame, op, env, out, helpers);
     }
     wasm!(function;
-        LocalGet(this), LocalGet(on_fulfilled), LocalGet(on_rejected), Call(helpers.then), Drop,
+        LocalGet(this), LocalGet(on_fulfilled), LocalGet(on_rejected), Call(helpers.promise_then()), Drop,
         LocalGet(promise),
         End,
     );
 }
 
 /// `finally(onFinally)` on any object: `C = SpeciesConstructor(this,
-/// %Promise%)`; a promise whose `C` is `%Promise%` runs the host op, any
+/// %Promise%)`; a promise whose `C` is `%Promise%` runs `__promise_finally`, any
 /// other receiver `this.then(thenFinally, catchFinally)` (both `onFinally`
 /// when it is not callable).
 pub(super) fn emit_finally(
@@ -575,8 +576,8 @@ pub(super) fn emit_static(
 
 /// `Promise.resolve(x)` (`reject = false`) / `Promise.reject(r)` with
 /// `C = this` (an object, else a `TypeError`): `PromiseResolve(C, x)` /
-/// `NewPromiseCapability(C)` rejected with `r`. `C === %Promise%` takes the
-/// host op (for `resolve` only a non-promise `x`, whose result does not
+/// `NewPromiseCapability(C)` rejected with `r`. `C === %Promise%` takes
+/// `__promise_resolve` / `__promise_reject` (for `resolve` only a non-promise `x`, whose result does not
 /// depend on its `constructor`): `NewPromiseCapability(%Promise%)` reads no
 /// property of `%Promise%`, so no dirty bit is involved.
 fn emit_resolve(
@@ -596,16 +597,16 @@ fn emit_resolve(
     wasm!(function; End);
     let promise = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Promise), helpers);
     wasm!(function; LocalGet(c), I64Const(promise), I64Eq);
-    let op = if reject {
-        PROMISE_OP_REJECT
+    let helper = if reject {
+        helpers.promise_reject()
     } else {
         is_promise(function, x);
         wasm!(function; I32Eqz, I32And);
-        PROMISE_OP_RESOLVE
+        helpers.promise_resolve()
     };
     wasm!(function;
         If(BlockType::Empty),
-        I32Const(op), LocalGet(x), I64Const(UNDEFINED_BITS), Call(helpers.promise), Return,
+        LocalGet(x), Call(helper), Return,
         End,
     );
     if reject {
@@ -821,7 +822,7 @@ fn emit_combinator(
 /// %Promise%` (with its and `%Promise.prototype%`'s dirty bits clear), its
 /// builtin `resolve` and a `%Promise%` instance without own properties skip
 /// the `resolve` call (`nextPromise` is `v`) and register the reactions
-/// through the host `__then` directly.
+/// through `__promise_then` directly.
 fn combinator_value(
     cb: Combinator,
     function: &mut FnBuilder<'_>,
@@ -898,7 +899,7 @@ fn combinator_value(
     }
     wasm!(function;
         LocalGet(cb.fast), If(BlockType::Empty),
-        LocalGet(v), LocalGet(on_fulfilled), LocalGet(on_rejected), Call(helpers.then), Drop,
+        LocalGet(v), LocalGet(on_fulfilled), LocalGet(on_rejected), Call(helpers.promise_then()), Drop,
         Else,
     );
     enter_frame(helpers);

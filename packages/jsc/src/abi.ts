@@ -131,7 +131,7 @@ export const PROMISE_STATE_OFFSET = OBJ_PREFIX_SIZE
 /** Byte offset (from a {@link TYPE_PROMISE} block base) of the settled `value` (`i64`). */
 export const PROMISE_VALUE_OFFSET = OBJ_PREFIX_SIZE + 8
 /** Byte size of a {@link TYPE_PROMISE} block. */
-export const PROMISE_BLOCK_SIZE = OBJ_PREFIX_SIZE + 16
+export const PROMISE_BLOCK_SIZE = OBJ_PREFIX_SIZE + 24
 /** Byte offset (from a {@link TYPE_GENERATOR} block base) of the `done` flag (`i32`). */
 export const GEN_DONE_OFFSET = OBJ_PREFIX_SIZE + 8
 /** Byte offset (from a {@link TYPE_DATE} block base) of the `ms` timestamp (`f64`). */

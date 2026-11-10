@@ -690,55 +690,34 @@ fn emit_node_inner(
         IrNode::IncDec { local, inc, prefix } => {
             emit_inc_dec(*local, *inc, *prefix, function, helpers);
         }
-        // The promise-creation primitives: push the `__promise` op flag,
-        // the value operand, and an unused `b` slot, then call the host import. It
-        // returns the fresh (or, for `resolve` of a promise, adopted) promise jsval.
+        // The promise primitives call the guest promise engine.
         IrNode::PromiseResolve(value) => {
             emit_promise_resolve(value, function, scratch, strings, helpers);
         }
         IrNode::PromiseReject(value) => {
-            emit_promise_call(
-                PROMISE_OP_REJECT,
-                value,
-                &IrNode::Undefined,
-                function,
-                scratch,
-                strings,
-                helpers,
-            );
+            emit_node(value, function, scratch, strings, helpers);
+            function.instruction(&Instruction::Call(helpers.promise_reject()));
         }
-        // `p.finally(fn)`: the finalizer rides in the `b` slot; the host runs it on
+        // `p.finally(fn)`: a derived promise whose reaction runs `fn` on
         // settlement and passes the original settlement through.
         IrNode::PromiseFinally {
             promise,
             on_finally,
         } => {
-            emit_promise_call(
-                PROMISE_OP_FINALLY,
-                promise,
-                on_finally,
-                function,
-                scratch,
-                strings,
-                helpers,
-            );
+            emit_operand(promise, function, scratch, strings, helpers);
+            emit_node(on_finally, function, scratch, strings, helpers);
+            function.instruction(&Instruction::Call(helpers.promise_finally()));
         }
-        // `await p`: drive the microtask queue until `p` settles. A rejection is
-        // surfaced through the exception globals, so unwind if it left one pending.
+        // Top-level `await p`: mark `p` handled, drain the microtask queue, and
+        // yield the fulfillment value; a rejection is left in flight, so unwind
+        // if one is pending.
         IrNode::Await(promise) => {
-            emit_promise_call(
-                PROMISE_OP_AWAIT,
-                promise,
-                &IrNode::Undefined,
-                function,
-                scratch,
-                strings,
-                helpers,
-            );
+            emit_node(promise, function, scratch, strings, helpers);
+            function.instruction(&Instruction::Call(helpers.promise_await()));
             emit_propagate_if_pending(function, helpers);
         }
-        // `p.then(onF, onR)` / `p.catch(onR)`: register reactions on `p` and yield
-        // the chained result promise (the host `__then` import).
+        // `p.then(onF, onR)` / `p.catch(onR)`: register a reaction on `p` and
+        // yield the derived promise.
         IrNode::PromiseThen {
             promise,
             on_fulfilled,
@@ -747,7 +726,7 @@ fn emit_node_inner(
             emit_operand(promise, function, scratch, strings, helpers);
             emit_operand(on_fulfilled, function, scratch, strings, helpers);
             emit_node(on_rejected, function, scratch, strings, helpers);
-            function.instruction(&Instruction::Call(helpers.then));
+            function.instruction(&Instruction::Call(helpers.promise_then()));
         }
         // `new Promise(executor)`: build the promise + resolve/reject settlers, run
         // the executor synchronously (a throw rejects the promise), and yield it.
@@ -758,15 +737,10 @@ fn emit_node_inner(
         // `MakeGenerator`) and hand it to the host async engine, which allocates
         // the result promise, drives the first step, and returns the promise.
         IrNode::AsyncSpawn(make_generator) => {
-            emit_promise_call(
-                PROMISE_OP_ASYNC_SPAWN,
-                make_generator,
-                &IrNode::Undefined,
-                function,
-                scratch,
-                strings,
-                helpers,
-            );
+            function.instruction(&Instruction::I32Const(PROMISE_OP_ASYNC_SPAWN));
+            emit_node(make_generator, function, scratch, strings, helpers);
+            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+            function.instruction(&Instruction::Call(helpers.promise));
         }
         // The `Date` builtins: allocate/read a `TYPE_DATE` block's f64
         // millisecond payload. `DateNew`/`DateNow` seed from `arg` or the host clock;
@@ -2345,36 +2319,8 @@ pub(super) fn emit_cell_set(
     function.instruction(&Instruction::LocalGet(tmp));
 }
 
-/// Emit a call through a function **value** (`IrNode::CallIndirect`), leaving the
-/// callee's boxed jsval result on the stack. Under the env-last ABI it pushes
-/// the `K` padded args, then evaluates the callee once (stashing its block base
-/// in an i32 scratch), pushes the callee's **own environment** as the trailing
-/// `env` argument, then the funcref-table index, and `call_indirect`s.
-///
-/// The callee is evaluated **after** the arguments and its base then read twice
-/// (env, then index) with no intervening evaluation, so a nested indirect call
-/// in an argument cannot clobber the stashed base.
-/// Emit a call to the host `__promise(op, a, b) -> i64` import: push the
-/// `op` flag, then evaluate `a` and `b` into the two jsval slots, then `call`.
-/// Used by `Promise.resolve`/`reject` (`b` unused), `await` (`b` unused), and
-/// `p.finally` (`a` = the promise, `b` = the finalizer).
-pub(super) fn emit_promise_call(
-    op: i32,
-    a: &IrNode,
-    b: &IrNode,
-    function: &mut impl Sink,
-    scratch: u32,
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-) {
-    function.instruction(&Instruction::I32Const(op));
-    emit_operand(a, function, scratch, strings, helpers);
-    emit_node(b, function, scratch, strings, helpers);
-    function.instruction(&Instruction::Call(helpers.promise));
-}
-
-/// Emit `Promise.resolve(value)` of the inline `%Promise%` namespace: the
-/// host op, except for a promise, whose `constructor` decides the result
+/// Emit `Promise.resolve(value)` of the inline `%Promise%` namespace:
+/// `__promise_resolve`, except for a promise, whose `constructor` decides the result
 /// (`PromiseResolve(%Promise%, v)`): the `Promise.resolve` builtin with
 /// `this = %Promise%`.
 fn emit_promise_resolve(
@@ -2427,10 +2373,8 @@ fn emit_promise_resolve(
     function.instruction(&Instruction::Call(helpers.builtin(resolve)));
     emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(PROMISE_OP_RESOLVE));
     function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::Call(helpers.promise));
+    function.instruction(&Instruction::Call(helpers.promise_resolve()));
     leave_frame(helpers);
     function.instruction(&Instruction::End);
 }
@@ -2438,7 +2382,8 @@ fn emit_promise_resolve(
 /// Emit `new Promise(executor)`, leaving the fresh promise's jsval on the
 /// stack.
 ///
-/// Steps: (1) `P = __promise(NEW)`, stashed in the dedicated `p_local`; (2) build
+/// Steps: (1) `P = __promise_new(%Promise.prototype%)`, stashed in the
+/// dedicated `p_local`; (2) build
 /// `resolve`/`reject` FUNCTION values pointing at the settler funcref slots with
 /// `P` in their env slot; (3) call `executor(resolve, reject)` synchronously
 /// through `call_indirect` (env-last ABI), padding the two settlers to the fixed
@@ -2459,11 +2404,13 @@ pub(super) fn emit_promise_ctor(
 ) {
     let exec_base = scratch + 7;
 
-    // P = __promise(NEW, undefined, undefined); stash it in p_local.
-    function.instruction(&Instruction::I32Const(PROMISE_OP_NEW));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::Call(helpers.promise));
+    // P = __promise_new(%Promise.prototype%); stash it in p_local.
+    let proto = intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Promise), helpers);
+    function.instruction(&Instruction::I64Const(proto));
+    function.instruction(&Instruction::Call(helpers.promise_new()));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(HEAP_BITS));
+    function.instruction(&Instruction::I64Or);
     function.instruction(&Instruction::LocalSet(p_local));
 
     // Push the K padded positional args: resolve (a0), reject (a1), then undefined
@@ -2548,11 +2495,10 @@ pub(super) fn emit_promise_ctor(
     // pending flag so execution continues normally with P (now rejected).
     function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::I32Const(PROMISE_OP_SETTLE_REJECT));
     function.instruction(&Instruction::LocalGet(p_local));
+    function.instruction(&Instruction::I32Const(abi::PROMISE_REJECTED));
     function.instruction(&Instruction::GlobalGet(EXC_VALUE_GLOBAL));
-    function.instruction(&Instruction::Call(helpers.promise));
-    function.instruction(&Instruction::Drop);
+    function.instruction(&Instruction::Call(helpers.promise_settle()));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::I64Const(0));

@@ -362,24 +362,82 @@ pub(crate) const MAP_ENTRIES_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
 pub(crate) const MAP_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
 
 /// TYPE BYTE of a `Promise` block: the object-family prefix, then
-/// `[state:i32 @16][pad:u32][value:i64 @24]`.
+/// `[state:i32 @16][reactions:u32 @20][value:i64 @24][seq:u32 @32][rejected_next:u32 @36]`.
 /// `state` is one of [`PROMISE_PENDING`] / [`PROMISE_FULFILLED`] /
 /// [`PROMISE_REJECTED`]; `value` is the settled fulfillment/rejection jsval
-/// (`undefined` while pending). The block is the RENDERABLE mirror of a promise's
-/// settlement — the host promise engine (reactions + microtask queue) owns the
-/// dynamic scheduling state, but writes `state`/`value` back here so [`crate::run`]
-/// can decode a promise from a bare memory snapshot. Maps to `typeof` "object".
+/// (`undefined` while pending); `reactions` is a raw ref to the newest
+/// reaction record (a prepend list, `0` = none); `seq` is the creation
+/// sequence number; `rejected_next` links the rejected-promise list. The guest
+/// promise engine (`emit/promise_engine.rs`) owns all of it. Header flags:
+/// [`PROMISE_FLAG_HANDLED`], [`PROMISE_FLAG_IN_REJECTED_LIST`]. Maps to
+/// `typeof` "object".
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_PROMISE: u8 = 8;
 
 /// Byte offset (from a [`TYPE_PROMISE`] block base) of the i32 `state`.
 pub(crate) const PROMISE_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE;
 
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the u32 raw ref to the
+/// newest reaction record (`0` = none).
+pub(crate) const PROMISE_REACTIONS_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
 /// Byte offset (from a [`TYPE_PROMISE`] block base) of the i64 settled `value`.
 pub(crate) const PROMISE_VALUE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
 
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the u32 creation
+/// sequence number (from the global `$__promise_seq`).
+pub(crate) const PROMISE_SEQ_OFFSET: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the u32 raw link in the
+/// rejected-promise list (`0` = end).
+pub(crate) const PROMISE_REJECTED_NEXT_OFFSET: u32 = OBJ_PREFIX_SIZE + 20;
+
 /// The byte size of a [`TYPE_PROMISE`] block.
-pub(crate) const PROMISE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+pub(crate) const PROMISE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 24;
+
+/// [`TYPE_PROMISE`] header flag (byte [`HEADER_FLAGS_OFFSET`]):
+/// `[[PromiseIsHandled]]` — a reaction was ever registered on the promise.
+pub(crate) const PROMISE_FLAG_HANDLED: u8 = 2;
+
+/// [`TYPE_PROMISE`] header flag: the promise is linked into the
+/// rejected-promise list.
+pub(crate) const PROMISE_FLAG_IN_REJECTED_LIST: u8 = 4;
+
+/// The jsval slot count of a promise reaction / job record: a [`TYPE_ENV`]
+/// block that is first a reaction on a pending promise, then a queued job.
+pub(crate) const REACTION_SLOTS: u32 = 6;
+
+/// The byte size of a reaction record (`TYPE_ENV` header, count, 6 slots).
+pub(crate) const REACTION_BLOCK_SIZE: u32 = HEADER_SIZE + 4 + 8 * REACTION_SLOTS;
+
+/// Reaction slot 0: the `on_fulfilled` callback (or the async-function
+/// generator handle).
+pub(crate) const REACTION_ON_FULFILLED_OFFSET: u32 = HEADER_SIZE + 4;
+
+/// Reaction slot 1: the `on_rejected` callback (`undefined` = passthrough).
+pub(crate) const REACTION_ON_REJECTED_OFFSET: u32 = HEADER_SIZE + 12;
+
+/// Reaction slot 2: the derived promise to settle (`HEAP` jsval) or
+/// `undefined`.
+pub(crate) const REACTION_RESULT_OFFSET: u32 = HEADER_SIZE + 20;
+
+/// Reaction slot 3: the `kind` small integer (bit 0 [`REACTION_KIND_FINALLY`],
+/// bit 1 reserved for the async-function resumption, the source state once
+/// queued at [`REACTION_KIND_STATE_SHIFT`]).
+pub(crate) const REACTION_KIND_OFFSET: u32 = HEADER_SIZE + 28;
+
+/// Reaction slot 4: the settlement value, written when queued.
+pub(crate) const REACTION_VALUE_OFFSET: u32 = HEADER_SIZE + 36;
+
+/// Reaction slot 5: `next`, a `HEAP | record` jsval or `0`.
+pub(crate) const REACTION_NEXT_OFFSET: u32 = HEADER_SIZE + 44;
+
+/// Reaction `kind` bit: `finally` semantics (run the callback for effect,
+/// pass the source settlement through).
+pub(crate) const REACTION_KIND_FINALLY: i32 = 1;
+
+/// The shift of the source state (bits 2-3) in a queued job's `kind`.
+pub(crate) const REACTION_KIND_STATE_SHIFT: i32 = 2;
 
 /// [`TYPE_PROMISE`] `state`: the promise is unsettled.
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -789,33 +847,40 @@ pub(crate) const THEN_IMPORT_NAME: &str = "__then";
 
 /// `__promise` op flag: `Promise.resolve(a)` — a promise already fulfilled
 /// with `a` (or `a` itself when it is already a promise).
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const PROMISE_OP_RESOLVE: i32 = 0;
 
 /// `__promise` op flag: `Promise.reject(a)` — a promise already rejected
 /// with reason `a`.
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const PROMISE_OP_REJECT: i32 = 1;
 
 /// `__promise` op flag: top-level `await a` — drive the microtask queue
 /// until `a` settles, then return its value (or unwind its rejection through the
 /// exception globals).
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const PROMISE_OP_AWAIT: i32 = 2;
 
 /// `__promise` op flag: `a.finally(b)` — run `b` on settlement, then pass
 /// `a`'s original settlement through to the returned chained promise.
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const PROMISE_OP_FINALLY: i32 = 3;
 
 /// `__promise` op flag: allocate a fresh PENDING promise (the backing for
 /// `new Promise(executor)`). Both value operands are ignored.
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const PROMISE_OP_NEW: i32 = 4;
 
 /// `__promise` op flag: fulfill promise `a` with value `b` — the `resolve`
 /// half of a `new Promise` executor's settler pair. A no-op if `a` is already
 /// settled (settle-once).
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const PROMISE_OP_SETTLE_FULFILL: i32 = 5;
 
 /// `__promise` op flag: reject promise `a` with reason `b` — the `reject`
 /// half of a `new Promise` executor's settler pair (and the path a throwing
 /// executor takes). A no-op if `a` is already settled.
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const PROMISE_OP_SETTLE_REJECT: i32 = 6;
 
 /// `__promise` op flag: spawn an `async function` body. Operand `a` is a
@@ -829,6 +894,7 @@ pub(crate) const PROMISE_OP_ASYNC_SPAWN: i32 = 7;
 
 /// `__promise` op flag: drain the microtask queue and return the first
 /// unhandled rejected promise, or `0` if none. Deleted in R4.
+#[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const PROMISE_OP_DRAIN: i32 = 8;
 
 /// The name under which the module exports the `__invoke1(fn: i64, arg: i64) ->

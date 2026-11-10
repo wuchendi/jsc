@@ -1794,10 +1794,10 @@ pub(super) fn emit_from_async(
         FromAsyncOp::Rethrow => {
             wasm!(function;
                 LocalGet(frame.k), I32WrapI64, LocalSet(st),
-                I32Const(PROMISE_OP_SETTLE_REJECT),
                 LocalGet(st), I64Load(fa_slot(FA_PROMISE)),
+                I32Const(abi::PROMISE_REJECTED),
                 LocalGet(st), I64Load(fa_slot(FA_VALUE)),
-                Call(helpers.promise), Drop,
+                Call(helpers.promise_settle()),
                 I64Const(UNDEFINED_BITS),
             );
         }
@@ -1826,8 +1826,8 @@ fn from_async_entry(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers
         LocalGet(st), I64Const(zero), I64Store(fa_slot(FA_K)),
         LocalGet(st), I32Const(PH_START), I32Store(fa_flag(FA_PHASE)),
         LocalGet(st), I32Const(0), I32Store(fa_flag(FA_OPEN)),
-        I32Const(PROMISE_OP_NEW), I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS),
-        Call(helpers.promise), LocalSet(p),
+        I64Const(intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Promise), helpers)),
+        Call(helpers.promise_new()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(p),
         LocalGet(st), LocalGet(p), I64Store(fa_slot(FA_PROMISE)),
         LocalGet(st), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(st64),
     );
@@ -1866,9 +1866,9 @@ fn from_async_reject(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helper
     );
     let reject = |function: &mut FnBuilder<'_>| {
         wasm!(function;
-            I32Const(PROMISE_OP_SETTLE_REJECT),
-            LocalGet(st), I64Load(fa_slot(FA_PROMISE)), LocalGet(reason),
-            Call(helpers.promise), Drop,
+            LocalGet(st), I64Load(fa_slot(FA_PROMISE)),
+            I32Const(abi::PROMISE_REJECTED), LocalGet(reason),
+            Call(helpers.promise_settle()),
         );
     };
     wasm!(function;
@@ -1886,7 +1886,7 @@ fn from_async_reject(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helper
         I64Const(HOLE_BITS), LocalSet(r),
         End,
         LocalGet(r), I64Const(HOLE_BITS), I64Ne, If(BlockType::Empty),
-        I32Const(PROMISE_OP_RESOLVE), LocalGet(r), I64Const(UNDEFINED_BITS), Call(helpers.promise),
+        LocalGet(r), Call(helpers.promise_resolve()),
     );
     let mark = function.temp_mark();
     function.root_temp(TempClass::Jsval);
@@ -1897,7 +1897,7 @@ fn from_async_reject(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helper
     function.root_temp(TempClass::Jsval);
     emit_settler_value(rethrow, st64, function, scratch, helpers);
     function.release_temps(mark);
-    wasm!(function; Call(helpers.then), Drop, Else);
+    wasm!(function; Call(helpers.promise_then()), Drop, Else);
     reject(function);
     wasm!(function; End, Else);
     reject(function);
@@ -1918,7 +1918,7 @@ fn from_async_await(
     let scratch = frame.scratch();
     wasm!(function;
         LocalGet(st), I32Const(phase), I32Store(fa_flag(FA_PHASE)),
-        I32Const(PROMISE_OP_RESOLVE), LocalGet(value), I64Const(UNDEFINED_BITS), Call(helpers.promise),
+        LocalGet(value), Call(helpers.promise_resolve()),
     );
     let mark = function.temp_mark();
     function.root_temp(TempClass::Jsval);
@@ -1938,7 +1938,7 @@ fn from_async_await(
         helpers,
     );
     function.release_temps(mark);
-    wasm!(function; Call(helpers.then), Drop, I64Const(UNDEFINED_BITS), Return);
+    wasm!(function; Call(helpers.promise_then()), Drop, I64Const(UNDEFINED_BITS), Return);
 }
 
 /// The locals of a [`FromAsyncOp::Run`] body.
@@ -2038,9 +2038,9 @@ impl<'a> Run<'a> {
             self.helpers,
         );
         wasm!(function;
-            I32Const(PROMISE_OP_SETTLE_FULFILL),
-            LocalGet(self.st), I64Load(fa_slot(FA_PROMISE)), LocalGet(self.target),
-            Call(self.helpers.promise), Drop,
+            LocalGet(self.st), I64Load(fa_slot(FA_PROMISE)),
+            I32Const(abi::PROMISE_FULFILLED), LocalGet(self.target),
+            Call(self.helpers.promise_settle()),
             I64Const(UNDEFINED_BITS), Return,
         );
     }

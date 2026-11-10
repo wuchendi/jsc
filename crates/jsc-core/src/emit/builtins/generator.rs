@@ -375,20 +375,19 @@ fn queue_head(function: &mut FnBuilder<'_>, generator: u32) {
     wasm!(function; LocalGet(generator), I32WrapI64, I32Load(m32(QUEUE_HEAD)));
 }
 
-/// Settle the front request's promise (`op` = `PROMISE_OP_SETTLE_*`) with
-/// the value `value` pushes, then drop the request.
+/// Settle the front request's promise (`state` = `PROMISE_FULFILLED` /
+/// `PROMISE_REJECTED`) with the value `value` pushes, then drop the request.
 fn settle_front(
     function: &mut FnBuilder<'_>,
     generator: u32,
-    op: i32,
+    state: i32,
     value: impl FnOnce(&mut FnBuilder<'_>),
     helpers: Helpers<'_>,
 ) {
-    wasm!(function; I32Const(op));
     queue_head(function, generator);
-    wasm!(function; I64Load(m64(REQ_PROMISE)));
+    wasm!(function; I64Load(m64(REQ_PROMISE)), I32Const(state));
     value(function);
-    wasm!(function; Call(helpers.promise), Drop);
+    wasm!(function; Call(helpers.promise_settle()));
     // head = head.next; an emptied queue clears the tail too.
     wasm!(function;
         LocalGet(generator), I32WrapI64,
@@ -417,7 +416,7 @@ fn fulfill_front(
     settle_front(
         function,
         generator,
-        PROMISE_OP_SETTLE_FULFILL,
+        abi::PROMISE_FULFILLED,
         |f| emit_node(&result, f, frame.scratch(), strings, helpers),
         helpers,
     );
@@ -442,7 +441,7 @@ fn await_value(
         function.root_temp(TempClass::Jsval);
     }
     function.release_temps(mark);
-    wasm!(function; Call(helpers.then), Drop);
+    wasm!(function; Call(helpers.promise_then()), Drop);
 }
 
 /// Call builtin `builtin` directly with argument 0 from `generator`,
@@ -505,8 +504,8 @@ pub(super) fn emit_async_method(
     wasm!(function; Return, End);
     // The request's promise and record, appended at the tail.
     wasm!(function;
-        I32Const(abi::PROMISE_OP_NEW), I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS),
-        Call(helpers.promise), LocalSet(promise),
+        I64Const(intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Promise), helpers)),
+        Call(helpers.promise_new()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(promise),
         I32Const(REQ_SIZE), Call(helpers.alloc), LocalTee(record),
         I32Const(TYPE_ENV), I32Store8(MemArg { offset: 0, align: 0, memory_index: 0 }),
         LocalGet(record), I32Const(4), I32Store(m32(u64::from(HEADER_SIZE.cast_unsigned()))),
@@ -594,7 +593,7 @@ pub(super) fn emit_async_drain(
     settle_front(
         function,
         generator,
-        PROMISE_OP_SETTLE_REJECT,
+        abi::PROMISE_REJECTED,
         |f| wasm!(f; LocalGet(value)),
         helpers,
     );
@@ -682,7 +681,7 @@ pub(super) fn emit_async_step(
     settle_front(
         function,
         generator,
-        PROMISE_OP_SETTLE_REJECT,
+        abi::PROMISE_REJECTED,
         |f| wasm!(f; LocalGet(result)),
         helpers,
     );
@@ -754,7 +753,7 @@ pub(super) fn emit_async_reaction(
             settle_front(
                 function,
                 generator,
-                PROMISE_OP_SETTLE_REJECT,
+                abi::PROMISE_REJECTED,
                 |f| wasm!(f; LocalGet(value)),
                 helpers,
             );
