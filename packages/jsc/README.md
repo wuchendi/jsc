@@ -3,7 +3,7 @@
 Compile JavaScript to WebAssembly and run it — in the browser or Node — with no
 native runtime. The compiler is the Rust `jsc-core` pipeline (parse → codegen →
 emit) shipped as a wasm-bindgen module (`crates/jsc-wasm`); the emitted program
-module runs on a small in-memory WASI polyfill plus a JS shim.
+module is a pure WASI preview-1 command that runs on a small in-memory polyfill.
 
 ## Usage
 
@@ -34,25 +34,31 @@ Both `compile` and `run` are async: the wasm-bindgen glue (wasm-pack
   `Uncaught ...` line on `stderr` and `exitCode` 1. `run` rejects on a compile
   error or a guest trap.
 
-## Host parity
+## Runtime
 
-`run()` executes the emitted command module without the Rust `wasmtime` runner:
+The emitted module is a WASI command: it imports exactly four
+`wasi_snapshot_preview1` functions (`fd_write`, `clock_time_get`,
+`random_get`, `proc_exit`) and exports exactly `_start` and `memory`. The whole
+runtime (console rendering, the `Uncaught ...` reports, the promise engine, the
+completion value) lives inside the module, so there is no JS-side runtime.
 
-- `src/wasi.ts` is an in-memory `wasi_snapshot_preview1` polyfill (`fd_write`,
-  `clock_time_get`, `random_get`, `proc_exit`) that captures stdout and stderr.
-  Console output, the `Uncaught ...` reports and the completion value are
-  rendered inside the module, so there is no formatter on the JS side.
-- `src/shim.ts` ports the two remaining `env` imports (`__promise` / `__then`)
-  and the promise engine (microtask queue) from
-  `crates/jsc-core/src/run/promise.rs`. Every heap block it creates is
-  allocated by the guest's exported `__new_promise` constructor.
-- `src/abi.ts` copies the runtime ABI constants from
-  `crates/jsc-core/src/abi.rs`.
+`run()` instantiates it against `src/wasi.ts`, an in-memory polyfill of those
+four functions that captures fd 1 and fd 2 as strings; any other import is
+absent, so a module that needs one fails to instantiate. The same polyfill is
+used in Node and the browser.
 
-Every module imports those four WASI functions and two `env` functions, so it
-instantiates here and under the Rust runner, but not yet under a plain WASI
-host. The Rust files are the source of truth for the `env` side; the TS ports
-are maintained by hand, so a Rust-side change to the ABI, value encoding, or
-host behaviour must be mirrored here or the shim drifts silently.
-`tests/run.test.ts` exercises the polyfill and shim end to end against the
-compiled `jsc-wasm` module.
+A `jsc build FILE -o OUT.wasm` artifact also runs under any other preview-1
+host, e.g. `node:wasi`:
+
+```js
+import { readFile } from 'node:fs/promises'
+import { WASI } from 'node:wasi'
+
+const wasi = new WASI({ version: 'preview1', returnOnExit: true })
+const module = await WebAssembly.compile(await readFile('OUT.wasm'))
+const instance = await WebAssembly.instantiate(module, wasi.getImportObject())
+const exitCode = wasi.start(instance)
+```
+
+`tests/run.test.ts` exercises the polyfill end to end against the compiled
+`jsc-wasm` module.

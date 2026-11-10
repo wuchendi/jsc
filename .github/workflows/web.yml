@@ -71,3 +71,14 @@ jobs:
 
       - name: Test (@cdlab/jsc)
         run: bun run --filter @cdlab/jsc test
+
+      # The emitted module is a pure WASI preview-1 command: prove a third host
+      # (besides the wasmtime runner and the @cdlab/jsc polyfill) runs it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: "Smoke: jsc build artifact runs under node:wasi (runs_under_node_wasi)"
+        run: |
+          cargo run -p jsc -- build scripts/smoke/node-wasi.js -o "$RUNNER_TEMP/smoke.wasm"
+          node scripts/node-wasi-smoke.mjs "$RUNNER_TEMP/smoke.wasm" scripts/smoke/node-wasi.out
