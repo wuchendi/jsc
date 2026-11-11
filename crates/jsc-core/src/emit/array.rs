@@ -341,7 +341,8 @@ pub(super) fn emit_array_push_node(
 /// Emit `array.pop()`, leaving the removed last element (or `undefined`
 /// for an empty array) on the stack: the array handle read from `local` is
 /// shrunk IN PLACE — the element at the old last index is read first (a hole
-/// through the prototype chain), then `length` drops by one (a `SPARSE`
+/// through the prototype chain), then `length` drops by one and the vacated
+/// slot is written `HOLE` (a `SPARSE`
 /// array reads the element through `__sparse_get` and shrinks through
 /// `__array_set_length`, which drops it from the property table).
 pub(super) fn emit_array_pop_node(
@@ -390,6 +391,15 @@ pub(super) fn emit_array_pop_node(
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::LocalGet(new_len));
     function.instruction(&Instruction::I32Store(array_len_slot()));
+    // The vacated slot becomes a hole, so the store keeps nothing alive.
+    function.instruction(&Instruction::LocalGet(base));
+    emit_array_elems(function);
+    function.instruction(&Instruction::LocalGet(new_len));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I64Const(HOLE_BITS));
+    function.instruction(&Instruction::I64Store(elem_slot(0)));
     function.instruction(&Instruction::End);
     emit_elem_read(function, removed);
     leave_frame(helpers);
