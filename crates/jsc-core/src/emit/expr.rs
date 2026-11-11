@@ -1907,8 +1907,7 @@ fn emit_private_name(
         align,
         memory_index: 0,
     };
-    function.instruction(&Instruction::I32Const(abi::SYMBOL_BLOCK_SIZE.cast_signed()));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, abi::SYMBOL_BLOCK_SIZE.cast_signed());
     function.instruction(&Instruction::LocalTee(block));
     function.instruction(&Instruction::I32Const(header));
     function.instruction(&Instruction::I32Store(mem(0, 2)));
@@ -2070,8 +2069,7 @@ pub(super) fn emit_func_value(
     function.instruction(&Instruction::LocalSet(env_tmp));
 
     // dst = __alloc(FUNC_BLOCK_SIZE); leave dst (i32) on the stack.
-    function.instruction(&Instruction::I32Const(FUNC_BLOCK_SIZE));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, FUNC_BLOCK_SIZE);
 
     // Write the TYPE_FUNCTION prefix at dst, keeping dst on the stack.
     let flags = fn_flags(kind);
@@ -2117,8 +2115,7 @@ pub(super) fn emit_env_block(
     let count = i32::try_from(captures.len()).unwrap_or(i32::MAX);
 
     // dst = __alloc(HEADER_SIZE + 4 + 8*count).
-    function.instruction(&Instruction::I32Const(HEADER_SIZE + 4 + 8 * count));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, HEADER_SIZE + 4 + 8 * count);
     function.instruction(&Instruction::LocalSet(dst));
 
     // Type byte and count header.
@@ -2171,8 +2168,7 @@ pub(super) fn emit_cell_new(
     emit_node(value, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(scratch + 5));
     // dst = __alloc(CELL_BLOCK_SIZE).
-    function.instruction(&Instruction::I32Const(CELL_BLOCK_SIZE));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, CELL_BLOCK_SIZE);
     function.instruction(&Instruction::LocalSet(dst));
     // Type byte.
     function.instruction(&Instruction::LocalGet(dst));
@@ -2515,8 +2511,7 @@ pub(super) fn emit_settler_value(
 ) {
     let dst = scratch + 3;
     // dst = __alloc(FUNC_BLOCK_SIZE); leave dst (i32) on the stack.
-    function.instruction(&Instruction::I32Const(FUNC_BLOCK_SIZE));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, FUNC_BLOCK_SIZE);
     // Write the TYPE_FUNCTION prefix at dst (a lazy anonymous non-constructor,
     // its info entry right after the user functions'), keeping dst on the stack.
     function.instruction(&Instruction::LocalTee(dst));

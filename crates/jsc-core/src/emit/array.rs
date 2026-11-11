@@ -137,12 +137,13 @@ pub(super) fn emit_array_node(
     } else {
         let len = i32::try_from(elems.len()).unwrap_or(i32::MAX);
         // store = __alloc(8 + 8*n) with its type byte and cap; left on the stack.
-        function.instruction(&Instruction::I32Const(
+        emit_alloc_const(
+            function,
+            helpers,
             abi::ELEMS_DATA_OFFSET
                 .cast_signed()
                 .saturating_add(len.saturating_mul(8)),
-        ));
-        function.instruction(&Instruction::Call(helpers.alloc));
+        );
         function.instruction(&Instruction::LocalTee(dst));
         function.instruction(&Instruction::LocalGet(dst));
         function.instruction(&Instruction::I32Const(TYPE_ELEMS));
@@ -171,8 +172,7 @@ pub(super) fn emit_array_node(
         function.release_temps(mark);
         // The handle: object prefix, `len = n`, `elems = store`.
         function.instruction(&Instruction::LocalSet(store));
-        function.instruction(&Instruction::I32Const(ARRAY_BLOCK_SIZE));
-        function.instruction(&Instruction::Call(helpers.alloc));
+        emit_alloc_const(function, helpers, ARRAY_BLOCK_SIZE);
         function.instruction(&Instruction::LocalSet(dst));
         emit_object_prefix(
             function,

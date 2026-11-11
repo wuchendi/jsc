@@ -124,8 +124,9 @@ fn emit_accessor_block<S: Sink>(
     setter: impl FnOnce(&mut S),
     helpers: Helpers<'_>,
 ) {
+    emit_alloc_const(function, helpers, ACCESSOR_BLOCK_SIZE);
     wasm!(function;
-        I32Const(ACCESSOR_BLOCK_SIZE), Call(helpers.alloc), LocalTee(b),
+        LocalTee(b),
         I32Const(TYPE_ACCESSOR), I32Store8(m8(0)),
         LocalGet(b),
     );
@@ -673,7 +674,10 @@ pub(in crate::emit) fn emit_own_desc(
         LocalGet(e), I32Load(m32(E_ATTRS)), LocalSet(a),
         LocalGet(e), I64Load(m64(E_VALUE)), LocalSet(v),
         End,
-        I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(d),
+    );
+    emit_alloc_const(&mut f, helpers, abi::OBJ_PREFIX_SIZE.cast_signed());
+    wasm!(f;
+        LocalSet(d),
     );
     emit_object_prefix(
         &mut f,

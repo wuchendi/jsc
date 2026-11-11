@@ -64,7 +64,7 @@ Three structural decisions shape the implementation:
   `wasm-encoder` — no C, text, or LLVM intermediate. Builtins are wasm
   functions emitted into every module, installed on static realm objects (§6.4).
 - **One value word.** Every JS value is a single NaN-boxed `i64`; all heap data
-  lives in one linear memory with a bump allocator (§4, §5).
+  lives in one linear memory with a page allocator (§4, §5).
 
 ---
 
@@ -298,7 +298,7 @@ jsval, or the **construct marker** `-(n + 1)` when the callee runs under `new`
 | then | the builtin bodies, one per `Builtin::ALL` entry (`emit/realm.rs`, 142 entries) |
 | then | `__to_primitive`, `__to_string`, `__add`, `__compare`, `__array_join`, `__to_object`, `__json_rep`, `__json_indent`, `__json_revive`, and the rest of §6.2 up to the private-name helpers |
 | then | the renderer helpers (§6.2), then `_start` |
-| last | the Unicode helpers (`emit/unicode.rs`), the `Math` helpers (`emit/libm.rs`), then the promise engine (`emit/promise_engine.rs`, §6.7) |
+| last | the Unicode helpers (`emit/unicode.rs`), the `Math` helpers (`emit/libm.rs`), the promise engine (`emit/promise_engine.rs`, §6.7), then the allocator helpers (`emit/gc.rs`, §5.6) |
 
 **Table.** A funcref table of exactly `n + 2 + 142` entries (min = max), filled
 by one active element segment: slots `0 … n-1` are the user functions, slots
@@ -306,8 +306,9 @@ by one active element segment: slots `0 … n-1` are the user functions, slots
 order. A function value's `func_idx` is a slot in this table. Every module has
 the table, including one without user functions.
 
-**Memory.** One linear memory, `min = 1` page, `max = 8192` pages (512 MiB,
-`abi::MEMORY_MAX_PAGES`), exported as `"memory"`.
+**Memory.** One linear memory, `min` = the pages below the heap start,
+`max = 8192` pages (512 MiB, `abi::MEMORY_MAX_PAGES`), exported as
+`"memory"`.
 
 **Globals.**
 
@@ -315,7 +316,7 @@ None is exported.
 
 | index | name | type | role |
 |---|---|---|---|
-| 0 | `$__heap_ptr` | `i32` | bump-allocator cursor (§5.6) |
+| 0 | `$__heap_ptr` | `i32` | page frontier: the end of the highest heap page obtained (§5.6) |
 | 1 | `$exc_pending` | `i32` | `1` while an exception propagates |
 | 2 | `$exc_value` | `i64` | the in-flight thrown jsval |
 | 3 | `$cf_kind` | `i32` | pending `return`/`break`/`continue` routed through `finally` |
@@ -334,7 +335,13 @@ None is exported.
 | 26–27 | `$__job_head`, `$__job_tail` | `i32` | promise job queue, raw refs (§6.7) |
 | 28 | `$__promise_seq` | `i32` | promise creation counter (§6.7) |
 | 29 | `$__rejected_head` | `i32` | rejected-promise list head, raw ref (§6.7) |
-| 30+ | module cells | `i64` | one cell pointer per module binding (`30 + slot`, §7.1), then one per tagged-template site (§7.4) |
+| 30 | `$__gc_debt` | `i32` | allocation budget left before a collection, initialized to `GC_MIN_BUDGET` (§5.6) |
+| 31 | `$__gc_live` | `i32` | bytes surviving the last sweep (§5.6) |
+| 32 | `$__gc_epoch` | `i32` | mark epoch, `1..=255`, initialized to `1` (§5.1) |
+| 33 | `$__gc_busy` | `i32` | `1` while a collection runs |
+| 34 | `$__gc_free_pages` | `i32` | pages in the free-page pool (§5.6) |
+| 35 | `$__gc_large` | `i32` | head of the large-span list, raw ref (§5.6) |
+| 36+ | module cells | `i64` | one cell pointer per module binding (`36 + slot`, §7.1), then one per tagged-template site (§7.4) |
 
 **Exports.** Exactly `_start: () -> ()` and `memory` (§6.8).
 
@@ -358,15 +365,16 @@ for `8N + 8` bytes, never from `$fp + 8`, which wraps to `0` at `$fp = -8`. The
 collector (M2) scans `[$__sp + 8, SS_SIZE)`. Overflow wraps below `0` and the
 first slot store traps: at `$fp = -8` the static-offset address does not wrap.
 
-**Static region (data segments).** Everything from `SS_SIZE` to the initial
-heap pointer is laid out by the compiler, in this order:
+**Static region (data segments).** Everything from `SS_SIZE` to the heap
+start is laid out by the compiler, in this order:
 
 | range (from `SS_SIZE`) | contents |
 |---|---|
 | `0 … 7` | null guard word; the `u32` at `abi::FN_INFO_ADDR = SS_SIZE + 4` holds the base of the function info table |
 | `8 … 47` | WASI scratch area (`abi::WASI_SCRATCH`): one iovec, `nwritten`, the clock result and the random seed buffer |
 | `48 … 95` | the iovec (`abi::OOM_IOVEC`) and bytes of the static out-of-memory line (§5.6) |
-| `96 …` `abi::STATIC_AREA_END` | the number-conversion scratch and tables: `abi::DEC_SCRATCH`, the decimal parser tables, `abi::NUM_SCRATCH_ADDR`, `abi::RYU_TABLES_ADDR` |
+| `96 …` `abi::GC_PAGE_TABLE` | the number-conversion scratch and tables: `abi::DEC_SCRATCH`, the decimal parser tables, `abi::NUM_SCRATCH_ADDR`, `abi::RYU_TABLES_ADDR` |
+| `abi::GC_PAGE_TABLE …` `abi::STATIC_AREA_END` | the allocator's static state (§5.6): the page table (one byte per page, 8 KiB), the per-class free-list heads and current pages (`u32[19]` each, zero), the class size table (`u32[19]`) |
 | `abi::STATIC_AREA_END …` `abi::STATIC_AREA_END + libm::STATIC_SIZE` | the `Math` block (`emit/libm.rs`): the constant tables of `rem_pio2_large` and `atan`, then the working arrays of `rem_pio2_large` |
 | from `HEAP_BASE = abi::STATIC_AREA_END + libm::STATIC_SIZE` | every distinct string literal and static key, one `TYPE_STRING` block each, 8-byte aligned, `flags = INTERNED` (plus `ARRAY_INDEX` for a canonical index spelling) |
 | next | the function info table: one 8-byte entry `[name: u32 interned key][length: u32]` per funcref slot (user functions, the two settlers, the builtins) |
@@ -375,7 +383,8 @@ heap pointer is laid out by the compiler, in this order:
 | next | the intern table: a power-of-two array of `u32` slots (§5.3) |
 | next | the Unicode tables (case runs, special casing, `Cased` / `Case_Ignorable` / `Alphanumeric` ranges): one raw segment, never traced, generated into `emit/unicode_data.rs` by `tools/unicode-tables` |
 
-`$__heap_ptr` starts right after the Unicode tables, rounded up to 8. Identical literals share one
+The heap starts at the first 64 KiB page boundary after the Unicode tables
+(the initial `$__heap_ptr`). Identical literals share one
 blob, so a literal costs no run-time allocation and its address is its
 interned property key.
 
@@ -425,9 +434,9 @@ Every heap block starts with a 4-byte header (`HEADER_SIZE = 4`):
 | 2 | `flags` | per kind, `0` = default (below) |
 | 3 | `class` | `TYPE_OBJECT` sub-class (§5.2); `0` for every other kind |
 
-Every block base is 8-byte aligned (`BLOCK_ALIGN = 8`): `__alloc` rounds every
-request up and static blobs are padded, so `i64` slots at block offsets ≡ 0
-(mod 8) are naturally aligned. Multi-byte fields are little-endian.
+Every block base is 8-byte aligned (`BLOCK_ALIGN = 8`): heap blocks sit on
+16-byte slot or span boundaries (§5.6) and static blobs are padded, so `i64`
+slots at block offsets ≡ 0 (mod 8) are naturally aligned. Multi-byte fields are little-endian.
 
 The **object family** — `TYPE_ARRAY`, `TYPE_OBJECT`, `TYPE_FUNCTION`,
 `TYPE_MAP`, `TYPE_SET`, `TYPE_PROMISE`, `TYPE_GENERATOR`, `TYPE_DATE` — shares
@@ -743,28 +752,72 @@ in the data segment (§4.2), so it has one identity for the whole run.
   the bound function itself (recognised by its `env`), else the incoming
   `new.target`.
 
-### 5.6 `__alloc` and memory growth
+### 5.6 Allocator, pages and memory growth
 
-`__alloc(size: i32) -> i32` is a bump allocator over the `$__heap_ptr` global,
-which starts at the first free offset after the static region (the module
-declares enough initial pages to hold that region):
+The heap (`emit/gc.rs`, `emit/runtime.rs::emit_alloc`) is a run of 64 KiB
+pages from the first page boundary after the static region up to the
+**frontier** `$__heap_ptr`. Every block comes back zeroed, header included, so
+callers write only the fields they set and a fresh block's `gc` byte is `0`.
 
-1. Round `size` up to 8; `old = __heap_ptr`; `end = u64(old) + u64(size)`
-   (computed in `i64`, so it cannot wrap).
-2. Fast path: if `end <= memory.size * 64 KiB`, set `__heap_ptr = end`, zero the
-   4 header bytes, and return `old`.
-3. Otherwise grow: try `memory.grow(max(need, memory.size))` (at least doubling);
-   if that fails, retry with exactly `need` pages.
-4. If both fail (the 8192-page / 512 MiB maximum is reached), write the static
-   line `abi::OOM_LINE` to fd 2 through its static iovec and call `proc_exit(1)`.
+- **Page table** (`abi::GC_PAGE_TABLE`, one byte per wasm page, 8 KiB,
+  indexed by `address >> 16`): `0` not heap (the shadow stack, the static
+  region, pages above the frontier), `1..=19` a small page of that class,
+  `0xFE` a large-span head, `0xFD` a large-span tail (and any page handed out
+  by `__gc_take_pages` before its caller re-codes it), `0xFC` a page in the
+  free-page pool.
+- **Size classes** (19): `16..=256` by 16 (classes `1..=16`), then `512`,
+  `1024`, `2048` (classes `17..=19`); a size maps to `(size + 15) >> 4` when
+  `<= 256`, else `17 + ceil_log2(size) - 9` (`abi::gc_size_class`). The slot
+  sizes are a static `u32[19]` (`abi::GC_CLASS_SIZES`).
+- **Small page**: a 16-byte header (`class`, `bump` = the first slot never
+  allocated, `live` = slots that survived the last sweep, reserved), then
+  slots of the class size from `page + 16`. Each class has one **current
+  page** (`abi::GC_CUR_PAGES`, `u32[19]`) it bump-allocates from.
+- **Free slot**: `[0xFF TYPE_FREE][0][0][0][next_free: u32 @4]`, on a
+  per-class list headed in the static `u32[19]` at `abi::GC_FREE_HEADS`.
+- **Large span**: a request above 2048 bytes takes `k = ceil((size + 16) /
+  64 KiB)` contiguous pages with a 16-byte pre-header (`pages`,
+  `next_large`), the block at `page + 16`; spans are linked from
+  `$__gc_large`.
 
-**Out of memory.** The report is the fixed `Uncaught RangeError: out of memory`
-line; writing it allocates nothing. An out-of-memory condition inside `try` is
-not catchable; the program terminates with exit code `1`.
+**`__alloc_small(class)`**, the per-class entry: constant-size sites call it
+with the class computed at compile time (`gc::emit_alloc_const`). In order:
 
-**No free.** Nothing is ever freed. Store and table growth abandons the old
-block. Long-running allocation-heavy programs consume memory monotonically up
-to the 512 MiB cap.
+1. Budget: `$__gc_debt -= size(class)`; when it goes negative outside a
+   collection (`$__gc_busy`), the budget is renewed to
+   `max(GC_MIN_BUDGET, $__gc_live)` (`GC_MIN_BUDGET = 4 MiB`). The collector
+   call is not wired yet (`GC_COLLECT_HOOK` in `gc::emit_gc_budget`), so
+   nothing is collected or freed.
+2. Pop the class free list and `memory.fill` the slot with zeros.
+3. Bump the class's current page while the slot fits.
+4. Take one page from `__gc_take_pages(1)`, code it with the class, and make
+   it the current page.
+
+**`__alloc(size)`**, for variable sizes, computes the class and calls
+`__alloc_small`, or for a large size runs the budget step (`k` pages) and
+takes a span from `__gc_take_pages(k)`.
+
+**`__gc_take_pages(k) -> base | 0`** never calls `__alloc`: with at least `k`
+pages in the pool (`$__gc_free_pages`) it takes the first run of `k` free
+pages in the page table and zeroes them; otherwise it advances the frontier,
+growing memory by `max(need, memory.size)` pages (at least doubling) and, if
+that fails, by exactly `need`. Pages above the frontier were never written,
+so they are already zero. It returns `0` when memory cannot supply the
+pages. `__gc_release_pages(base, k)` returns pages to the pool.
+
+**`__gc_sweep()`** (emitted, called by the collector once it lands) clears
+the class lists, walks every small page from its first slot to `bump`, keeps
+the slots whose `gc` byte is `$__gc_epoch`, rewrites every other one as a
+free slot on a page-local list, then returns a page with no survivor to the
+pool (dropping it as its class's current page) or splices its list onto the
+class list and stores its `live`; unmarked large spans are unlinked and
+released; `$__gc_live` becomes the surviving bytes. Blocks in the static
+region are on no heap page and are never swept.
+
+**Out of memory.** A span beyond the cap, or pages memory cannot supply,
+write the static line `abi::OOM_LINE` (`Uncaught RangeError: out of memory`)
+to fd 2 through its static iovec — allocating nothing — and call
+`proc_exit(1)`. An out-of-memory condition inside `try` is not catchable.
 
 ### 5.7 Garbage collection (design; implemented in phase 4)
 
@@ -773,11 +826,10 @@ The layouts above are chosen so a collector can be added without relayout:
 - **Algorithm.** Precise, non-moving, stop-the-world mark-sweep. Non-moving
   because handles are identities and emitted code holds raw `i32` bases. No write barriers; the only heap-store
   sites are `__set`/`__define`, element stores, and cell stores.
-- **Allocation.** Segregated size classes (16..256 by 16, then powers of two to
-  2 KiB) in 64 KiB pages with a per-page class header, so no per-block size
-  word; large objects in a list with a 16-byte pre-header. `__alloc` collects
-  when the allocation budget since the last collection is spent, then grows
-  memory; the 512 MiB cap stays.
+- **Allocation.** The page allocator of §5.6 (size classes, free lists,
+  large spans, eager sweep). `__alloc` collects when the allocation budget
+  since the last collection is spent, then grows memory; the 512 MiB cap
+  stays.
 - **Roots.** A shadow stack in linear memory: each function reserves slots for
   jsvals live across a safepoint (any call that may allocate), clears them on
   entry, and pops them on every exit including the exception paths; the
@@ -864,6 +916,7 @@ function-index order:
 | renderer (§6.9) | `__render_top(v)`, `__render(v, depth)`, `__render_heap(p, depth)`, `__render_array(p, depth)`, `__render_object(p, depth)`, `__render_function(p, depth)`, `__render_props(..)`, `__render_entry(e, quote, first, open, depth)`, `__render_key(key, quote)`, `__render_lookup(o, key)`, `__heap_object(v)`, `__str_of(v)`, `__fn_name(v)`, `__date_text(v)` |
 | entry | `_start` (§4.2) |
 | promise engine (§6.7), after the Unicode and libm helpers | `__promise_new(proto)`, `__promise_enqueue(rec)`, `__promise_react(p, on_f, on_r, result, kind)`, `__promise_settle(p, state, v)`, `__promise_then(p, on_f, on_r)`, `__promise_resolve(v)`, `__promise_reject(v)`, `__promise_finally(p, on_finally)`, `__run_job(rec)`, `__drain()`, `__first_unhandled()`, `__promise_await(v)`, `__promise_resolving(p)`, `__async_spawn(gen)`, `__async_drive(gen, result, sent)` |
+| allocator (§5.6), after the promise engine | `__alloc_small(class)`, `__gc_take_pages(k)`, `__gc_release_pages(base, k)`, `__gc_sweep()` |
 
 The string helpers work on code units at either width: `__concat` makes a
 two-byte result iff either operand is two-byte (widening the one-byte side)

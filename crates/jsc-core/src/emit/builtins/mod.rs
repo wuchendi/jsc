@@ -744,7 +744,10 @@ pub(super) fn emit_to_object(
     wrap(&mut f, abi::CLASS_BOOLEAN, ctor_proto(BuiltinCtor::Boolean));
     wasm!(f;
         End, End, End,
-        I32Const(abi::WRAPPER_BLOCK_SIZE.cast_signed()), Call(helpers.alloc), LocalTee(obj),
+    );
+    emit_alloc_const(&mut f, helpers, abi::WRAPPER_BLOCK_SIZE.cast_signed());
+    wasm!(f;
+        LocalTee(obj),
         LocalGet(class), I32Const(24), I32Shl, I32Const(TYPE_OBJECT), I32Or,
         I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }),
         LocalGet(obj), I32Const(0),

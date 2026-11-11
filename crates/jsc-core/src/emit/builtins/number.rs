@@ -446,7 +446,10 @@ pub(super) fn emit_sum_precise(
     );
     wasm!(function;
         // A `TYPE_RAW` block; `acc` stays the block base with data at `+8`.
-        I32Const(SUM_SLOTS * 8 + 8), Call(helpers.alloc), LocalTee(acc),
+    );
+    emit_alloc_const(function, helpers, SUM_SLOTS * 8 + 8);
+    wasm!(function;
+        LocalTee(acc),
         I32Const(0), I32Const(SUM_SLOTS * 8 + 8), MemoryFill(0),
         LocalGet(acc), I32Const(i32::from(abi::TYPE_RAW)), I32Store8(MemArg { offset: 0, align: 0, memory_index: 0 }),
         LocalGet(acc), I32Const(SUM_SLOTS * 8), I32Store(MemArg { offset: 4, align: 2, memory_index: 0 }),

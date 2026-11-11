@@ -197,3 +197,42 @@ fn symbol_layout_matches_design() {
     assert_eq!(CLASS_ITERATOR, CLASS_SYMBOL + 1);
     assert_eq!(TYPEOF_STRINGS[6], "symbol");
 }
+
+/// Pins the allocator layout to design/runtime-memory.md §5.6: page-table
+/// codes, the small-page header, the large-span pre-header, the free slot
+/// and the minimum budget (Q13).
+#[test]
+fn allocator_layout_matches_design() {
+    use super::{
+        GC_CLASS_COUNT, GC_FREE_NEXT_OFFSET, GC_LARGE_HEADER_SIZE, GC_LARGE_NEXT_OFFSET,
+        GC_LARGE_PAGES_OFFSET, GC_MIN_BUDGET, GC_PAGE_BUMP_OFFSET, GC_PAGE_CLASS_OFFSET,
+        GC_PAGE_FREE, GC_PAGE_HEADER_SIZE, GC_PAGE_LARGE_HEAD, GC_PAGE_LARGE_TAIL,
+        GC_PAGE_LIVE_OFFSET, GC_PAGE_SIZE, GC_SMALL_MAX, HEADER_GC_OFFSET, TYPE_FREE,
+    };
+    assert_eq!(GC_PAGE_SIZE, 65_536);
+    assert_eq!(
+        (GC_PAGE_LARGE_HEAD, GC_PAGE_LARGE_TAIL, GC_PAGE_FREE),
+        (0xFE, 0xFD, 0xFC)
+    );
+    assert_eq!((GC_CLASS_COUNT, GC_SMALL_MAX), (19, 2048));
+    assert_eq!(
+        (
+            GC_PAGE_CLASS_OFFSET,
+            GC_PAGE_BUMP_OFFSET,
+            GC_PAGE_LIVE_OFFSET,
+            GC_PAGE_HEADER_SIZE
+        ),
+        (0, 4, 8, 16)
+    );
+    assert_eq!(
+        (
+            GC_LARGE_PAGES_OFFSET,
+            GC_LARGE_NEXT_OFFSET,
+            GC_LARGE_HEADER_SIZE
+        ),
+        (0, 4, 16)
+    );
+    assert_eq!((TYPE_FREE, GC_FREE_NEXT_OFFSET), (0xFF, 4));
+    assert_eq!(HEADER_GC_OFFSET, 1);
+    assert_eq!(GC_MIN_BUDGET, 4 << 20);
+}
