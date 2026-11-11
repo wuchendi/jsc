@@ -141,6 +141,7 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
     graph.extend(unicode::helper_graph(helpers));
     graph.extend(libm::helper_graph(helpers));
     graph.extend(promise_engine::helper_graph(helpers));
+    graph.extend(gc::helper_graph(helpers));
     graph
 }
 

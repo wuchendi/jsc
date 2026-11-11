@@ -200,8 +200,9 @@ fn create(
 ) {
     let header = TYPE_OBJECT | (i32::from(abi::CLASS_ITERATOR) << 24);
     let proto = intrinsic_bits(Intrinsic::IterPrototype(family), helpers);
+    emit_alloc_const(function, helpers, ITER_BLOCK_SIZE);
     wasm!(function;
-        I32Const(ITER_BLOCK_SIZE), Call(helpers.alloc), LocalTee(obj),
+        LocalTee(obj),
         I32Const(header), I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }),
         LocalGet(obj), I32Const(0),
         I32Store(MemArg { offset: u64::from(abi::OBJ_PROPS_OFFSET), align: 2, memory_index: 0 }),

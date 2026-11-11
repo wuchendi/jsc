@@ -631,17 +631,12 @@ pub(super) fn emit_json_array(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
 /// `__json_object() -> i64`: parse a JSON object (cursor at `{`) into a fresh
 /// `TYPE_OBJECT`, defining each member (key interned) through `__define` in
 /// source order — a duplicate key overwrites the earlier slot in place.
-pub(super) fn emit_json_object(
-    alloc_index: u32,
-    helpers: Helpers<'_>,
-    leaves: &LeafSet,
-) -> Function {
+pub(super) fn emit_json_object(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut function = helper_builder(leaves, &[], &[ROOT_BASE, ROOT_JS, ROOT_JS, RAW_I32]);
     let (obj, k, v, c) = (0, 1, 2, 3);
 
     advance(&mut function); // consume '{'
-    function.instruction(&Instruction::I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()));
-    function.instruction(&Instruction::Call(alloc_index));
+    emit_alloc_const(&mut function, helpers, abi::OBJ_PREFIX_SIZE.cast_signed());
     function.instruction(&Instruction::LocalSet(obj));
     emit_object_prefix(
         &mut function,

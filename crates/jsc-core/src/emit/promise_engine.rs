@@ -35,9 +35,9 @@ use super::{
     Builtin, BuiltinCtor, EXC_PENDING_GLOBAL, EXC_VALUE_GLOBAL, FALSE_BITS, FnBuilder, HEAP_BITS,
     Helpers, Intrinsic, JOB_HEAD_GLOBAL, JOB_TAIL_GLOBAL, LeafSet, PROMISE_SEQ_GLOBAL, RAW_I32,
     REJECTED_HEAD_GLOBAL, ROOT_BASE, ROOT_JS, SPREAD_ARGS_GLOBAL, Sink, StrOffsets, THIS_GLOBAL,
-    TRUE_BITS, UNDEFINED_BITS, abi, elem_slot, emit_argc, emit_array_elems, emit_is_function,
-    emit_is_object, emit_is_pointer, emit_load_type_byte, emit_settler_value, finish_builder,
-    helper_builder, intrinsic_bits, libm, static_key, unicode,
+    TRUE_BITS, UNDEFINED_BITS, abi, elem_slot, emit_alloc_const, emit_argc, emit_array_elems,
+    emit_is_function, emit_is_object, emit_is_pointer, emit_load_type_byte, emit_settler_value,
+    finish_builder, helper_builder, intrinsic_bits, libm, static_key, unicode,
 };
 
 /// Emit each listed instruction in order.
@@ -269,8 +269,9 @@ fn emit_promise_new(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_JS], &[ROOT_BASE]);
     let (proto, base) = (0, 1);
     let size = abi::PROMISE_BLOCK_SIZE.cast_signed();
+    emit_alloc_const(&mut f, helpers, size);
     wasm!(f;
-        I32Const(size), Call(helpers.alloc), LocalSet(base),
+        LocalSet(base),
         // Header word (type byte, zero gc/flags/class) and a zero `props`.
         LocalGet(base), I64Const(i64::from(TYPE_PROMISE)), I64Store(m64(0)),
         LocalGet(base), LocalGet(proto), I64Store(m64(abi::OBJ_PROTO_OFFSET)),
@@ -322,8 +323,9 @@ fn emit_react(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let (rec, pb, state, old) = (5, 6, 7, 8);
     let size = abi::REACTION_BLOCK_SIZE.cast_signed();
     let slots = abi::REACTION_SLOTS.cast_signed();
+    emit_alloc_const(&mut f, helpers, size);
     wasm!(f;
-        I32Const(size), Call(helpers.alloc), LocalSet(rec),
+        LocalSet(rec),
         LocalGet(rec), I32Const(TYPE_ENV), I32Store8(m8(0)),
         LocalGet(rec), I32Const(slots), I32Store(m32(abi::HEADER_SIZE)),
         LocalGet(rec), LocalGet(on_f), I64Store(m64(ON_FULFILLED)),
@@ -490,8 +492,9 @@ fn queue_thenable_job(
 ) {
     let size = abi::REACTION_BLOCK_SIZE.cast_signed();
     let slots = abi::REACTION_SLOTS.cast_signed();
+    emit_alloc_const(f, helpers, size);
     wasm!(f;
-        I32Const(size), Call(helpers.alloc), LocalSet(rec),
+        LocalSet(rec),
         LocalGet(rec), I32Const(TYPE_ENV), I32Store8(m8(0)),
         LocalGet(rec), I32Const(slots), I32Store(m32(abi::HEADER_SIZE)),
         LocalGet(rec), LocalGet(then), I64Store(m64(ON_FULFILLED)),
@@ -872,8 +875,9 @@ fn emit_resolving(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let (p, env) = (0, 1);
     let size = abi::RESOLVING_BLOCK_SIZE.cast_signed();
     let slots = abi::RESOLVING_SLOTS.cast_signed();
+    emit_alloc_const(&mut f, helpers, size);
     wasm!(f;
-        I32Const(size), Call(helpers.alloc), LocalSet(env),
+        LocalSet(env),
         LocalGet(env), I32Const(TYPE_ENV), I32Store8(m8(0)),
         LocalGet(env), I32Const(slots), I32Store(m32(abi::HEADER_SIZE)),
         LocalGet(env), LocalGet(p), I64Store(m64(RESOLVING_PROMISE)),

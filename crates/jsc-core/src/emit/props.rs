@@ -850,9 +850,11 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         End,
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(p), I32Eqz,
         If(BlockType::Empty),
-        // A fresh table: kind 12, count 0, cap 4, live 0.
-        I32Const(P_HEADER + 4 * ENTRY), Call(helpers.alloc), LocalTee(p),
-        I64Const(i64::from(TYPE_PROPS)), I64Store(m64(0)),
+    );
+    // A fresh table: kind 12, count 0, cap 4, live 0.
+    emit_alloc_const(&mut f, helpers, P_HEADER + 4 * ENTRY);
+    wasm!(f;
+        LocalTee(p), I64Const(i64::from(TYPE_PROPS)), I64Store(m64(0)),
         LocalGet(p), I64Const(4), I64Store(m64(P_CAP)),
         LocalGet(o), LocalGet(p), I32Store(m32(OBJ_PROPS)),
         Else,
@@ -971,7 +973,10 @@ pub(super) fn emit_fn_materialize(
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(FUNC_CONSTRUCTOR | FUNC_CLASS_CTOR), I32And,
         I32Const(FUNC_CONSTRUCTOR), I32Eq,
         If(BlockType::Empty),
-        I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(p),
+    );
+    emit_alloc_const(&mut f, helpers, abi::OBJ_PREFIX_SIZE.cast_signed());
+    wasm!(f;
+        LocalSet(p),
     );
     emit_object_prefix(
         &mut f,
@@ -989,7 +994,10 @@ pub(super) fn emit_fn_materialize(
         End,
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(FUNC_GENERATOR), I32And,
         If(BlockType::Empty),
-        I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(p),
+    );
+    emit_alloc_const(&mut f, helpers, abi::OBJ_PREFIX_SIZE.cast_signed());
+    wasm!(f;
+        LocalSet(p),
     );
     emit_object_prefix(
         &mut f,

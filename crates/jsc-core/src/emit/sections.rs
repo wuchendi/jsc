@@ -474,10 +474,10 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
     ]
 }
 
-/// Build the module's global section: the mutable bump-allocator heap pointer
-/// (`$__heap_ptr`, index [`HEAP_PTR_GLOBAL`], starting at `heap_ptr_init` — the
-/// first free offset after all static string-literal data so the allocator never
-/// overwrites them), followed by the exception-unwinding globals — the
+/// Build the module's global section: the page frontier (`$__heap_ptr`,
+/// index [`HEAP_PTR_GLOBAL`], starting at `heap_start`, the first 64 KiB page
+/// boundary after the static region, so the allocator never overwrites it),
+/// followed by the exception-unwinding globals — the
 /// pending flag (`$exc_pending`, i32) and the in-flight value (`$exc_value`, i64),
 /// both zero-initialized. A `throw` sets the latter two; every throwing call site
 /// checks the flag to unwind. Two further zero-initialized globals — the
@@ -485,7 +485,7 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
 /// (`$cf_value`, i64) — carry a `return`/`break`/`continue` through the `finally`
 /// clauses it must run.
 pub(super) fn build_globals(
-    heap_ptr_init: i32,
+    heap_start: i32,
     intern: &InternTable,
     module_cells: u32,
 ) -> GlobalSection {
@@ -510,7 +510,7 @@ pub(super) fn build_globals(
             ConstExpr::i64_const(0),
         )
     };
-    let (heap_ty, heap_init) = mut_i32(heap_ptr_init);
+    let (heap_ty, heap_init) = mut_i32(heap_start);
     globals.global(heap_ty, &heap_init);
     let (pending_ty, pending_init) = mut_i32(0);
     globals.global(pending_ty, &pending_init);
@@ -585,8 +585,14 @@ pub(super) fn build_globals(
     }
     // The promise engine: `$__job_head`, `$__job_tail`, `$__promise_seq`,
     // `$__rejected_head` (all i32, 0).
-    for _ in JOB_HEAD_GLOBAL..MODULE_CELL_GLOBAL_BASE {
+    for _ in JOB_HEAD_GLOBAL..GC_DEBT_GLOBAL {
         let (ty, init) = mut_i32(0);
+        globals.global(ty, &init);
+    }
+    // The collector: `$__gc_debt` (the initial budget), `$__gc_live`,
+    // `$__gc_epoch` (1), `$__gc_busy`, `$__gc_free_pages`, `$__gc_large`.
+    for init in [abi::GC_MIN_BUDGET.cast_signed(), 0, 1, 0, 0, 0] {
+        let (ty, init) = mut_i32(init);
         globals.global(ty, &init);
     }
     // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in
@@ -630,6 +636,11 @@ pub(super) fn emit_data_section(
         0,
         &ConstExpr::i32_const(abi::DEC_POW10.cast_signed()),
         strtod::tables(),
+    );
+    data.active(
+        0,
+        &ConstExpr::i32_const(abi::GC_CLASS_SIZES.cast_signed()),
+        gc::class_sizes(),
     );
     for (text, offset) in segments {
         data.active(0, &ConstExpr::i32_const(offset), str_block(text));

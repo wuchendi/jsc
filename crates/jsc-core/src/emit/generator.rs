@@ -49,10 +49,7 @@ pub(super) fn emit_make_generator(
     };
 
     // 1. Allocate the frame env block: header, u32 count, then `total` cell slots.
-    function.instruction(&Instruction::I32Const(
-        HEADER_SIZE + 4 + 8 * total.cast_signed(),
-    ));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, HEADER_SIZE + 4 + 8 * total.cast_signed());
     function.instruction(&Instruction::LocalSet(env_base));
     function.instruction(&Instruction::LocalGet(env_base));
     function.instruction(&Instruction::I32Const(TYPE_ENV));
@@ -87,8 +84,7 @@ pub(super) fn emit_make_generator(
 
     // 3. Allocate the generator handle and fill its fields (keeping its base on
     // the stack via the tee/get idiom, as `emit_object_node` does).
-    function.instruction(&Instruction::I32Const(GEN_BLOCK_SIZE));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, GEN_BLOCK_SIZE);
     function.instruction(&Instruction::LocalTee(gen_dst));
     let prototype = if limits & abi::GEN_ASYNC == 0 {
         Intrinsic::GeneratorPrototype

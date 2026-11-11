@@ -1809,8 +1809,9 @@ pub(super) fn emit_from_async(
 /// throw.
 fn from_async_entry(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let (st, p, st64) = (frame.base(0), frame.i64(0), frame.y64(1));
+    emit_alloc_const(function, helpers, FA_SIZE);
     wasm!(function;
-        I32Const(FA_SIZE), Call(helpers.alloc), LocalTee(st),
+        LocalTee(st),
         I32Const(TYPE_ENV), I32Store8(MemArg { offset: 0, align: 0, memory_index: 0 }),
         LocalGet(st), I32Const(FA_SLOTS), I32Store(fa_flag(HEADER_SIZE.cast_unsigned())),
     );

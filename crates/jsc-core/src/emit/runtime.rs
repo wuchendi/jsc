@@ -10,93 +10,58 @@ macro_rules! wasm {
     }};
 }
 
-/// Emit the `__alloc(size: i32) -> i32` bump allocator: return the current
-/// `__heap_ptr`, then advance it by `size` rounded up to [`BLOCK_ALIGN`] (so
-/// every block base stays 8-aligned), growing linear memory on demand, and write
-/// the block's [`HEADER_SIZE`] header bytes 0 (the type byte the caller then
-/// stores, plus the reserved `gc`/`flags`/`class` bytes). Every caller requests
-/// at least a header, so `size > 0`.
+/// Emit the generic `__alloc(size: i32) -> i32` for a variable `size > 0`
+/// (every caller requests at least a header): a zeroed block whose base is
+/// [`BLOCK_ALIGN`]-aligned (design/runtime-memory.md §5.6).
 ///
-/// The end offset is computed in `i64` (both operands zero-extended), so neither
-/// the rounding nor the add can wrap; the fast path is one compare against
-/// `memory.size * 64 KiB`. On
-/// overflow the cold path grows by `max(needed, current)` pages (at least
-/// doubling), falling back to exactly the needed pages. When even that fails
-/// (the module's memory `maximum` is reached) it writes the static
-/// [`abi::OOM_LINE`] to fd 2 through its static iovec, allocating nothing, and
-/// calls `proc_exit(1)`. The `i32` param is local 0; extra locals hold the
-/// old pointer (i32), the end offset (i64), and the needed page count (i32).
-pub(super) fn emit_alloc(leaves: &LeafSet) -> Function {
-    let mut function = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I64, RAW_I32]);
-    let (size, old, end, need) = (0, 1, 2, 3);
-    // old = __heap_ptr; end = u64(old) + ((u64(size) + 7) & !7).
-    function.instruction(&Instruction::GlobalGet(HEAP_PTR_GLOBAL));
-    function.instruction(&Instruction::LocalTee(old));
-    function.instruction(&Instruction::I64ExtendI32U);
-    function.instruction(&Instruction::LocalGet(size));
-    function.instruction(&Instruction::I64ExtendI32U);
-    function.instruction(&Instruction::I64Const(i64::from(BLOCK_ALIGN - 1)));
-    function.instruction(&Instruction::I64Add);
-    function.instruction(&Instruction::I64Const(-i64::from(BLOCK_ALIGN)));
-    function.instruction(&Instruction::I64And);
-    function.instruction(&Instruction::I64Add);
-    function.instruction(&Instruction::LocalTee(end));
-    // if end > memory.size << 16: grow.
-    function.instruction(&Instruction::MemorySize(0));
-    function.instruction(&Instruction::I64ExtendI32U);
-    function.instruction(&Instruction::I64Const(16));
-    function.instruction(&Instruction::I64Shl);
-    function.instruction(&Instruction::I64GtU);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // need = ceil(end / 64 KiB) - memory.size (fits i32: end < 2^33).
-    function.instruction(&Instruction::LocalGet(end));
-    function.instruction(&Instruction::I64Const(0xFFFF));
-    function.instruction(&Instruction::I64Add);
-    function.instruction(&Instruction::I64Const(16));
-    function.instruction(&Instruction::I64ShrU);
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::MemorySize(0));
-    function.instruction(&Instruction::I32Sub);
-    function.instruction(&Instruction::LocalSet(need));
-    // Try memory.grow(max(need, memory.size)).
-    function.instruction(&Instruction::LocalGet(need));
-    function.instruction(&Instruction::MemorySize(0));
-    function.instruction(&Instruction::LocalGet(need));
-    function.instruction(&Instruction::MemorySize(0));
-    function.instruction(&Instruction::I32GtU);
-    function.instruction(&Instruction::Select);
-    function.instruction(&Instruction::MemoryGrow(0));
-    function.instruction(&Instruction::I32Const(-1));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // Doubling failed: fall back to exactly `need` pages.
-    function.instruction(&Instruction::LocalGet(need));
-    function.instruction(&Instruction::MemoryGrow(0));
-    function.instruction(&Instruction::I32Const(-1));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    // Out of memory: the static line on fd 2, then `proc_exit(1)`.
+/// A size up to [`abi::GC_SMALL_MAX`] goes to `__alloc_small` with its class
+/// ([`abi::gc_size_class`], computed here as `(size + 15) >> 4` or
+/// `40 - clz(size - 1)`). A larger one takes a large span of
+/// `k = ceil((size + 16) / 64 KiB)` pages: the budget step, then
+/// `__gc_take_pages(k)`; the head page is coded
+/// [`abi::GC_PAGE_LARGE_HEAD`], its pre-header records `k` and links the span
+/// onto `$__gc_large`, and the block starts after the pre-header. A span
+/// beyond the memory cap or pages memory cannot supply end in the static
+/// [`abi::OOM_LINE`] on fd 2 and `proc_exit(1)`. Locals: `size`, the page
+/// count `k`, the span `page`.
+pub(super) fn emit_alloc(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I32]);
+    let (size, k, page) = (0, 1, 2);
+    let max_pages = i32::try_from(abi::MEMORY_MAX_PAGES).unwrap_or(i32::MAX);
+    let header = abi::GC_LARGE_HEADER_SIZE.cast_signed();
     wasm!(function;
-        I32Const(2), I32Const(abi::OOM_IOVEC.cast_signed()), I32Const(1),
-        I32Const(abi::WASI_NWRITTEN.cast_signed()), Call(FD_WRITE_IMPORT), Drop,
-        I32Const(1), Call(PROC_EXIT_IMPORT), Unreachable,
+        LocalGet(size), I32Const(abi::GC_SMALL_MAX.cast_signed()), I32LeU,
+        If(BlockType::Empty),
+        LocalGet(size), I32Const(15), I32Add, I32Const(4), I32ShrU,
+        I32Const(40), LocalGet(size), I32Const(1), I32Sub, I32Clz, I32Sub,
+        LocalGet(size), I32Const(256), I32LeU, Select,
+        Call(helpers.alloc_small()), Return,
+        End,
+        LocalGet(size), I64ExtendI32U, I64Const(i64::from(abi::GC_LARGE_HEADER_SIZE) + 0xFFFF),
+        I64Add, I64Const(16), I64ShrU, I32WrapI64, LocalTee(k), I32Const(max_pages), I32GtU,
+        If(BlockType::Empty),
     );
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::End);
-    // __heap_ptr = end; zero the header at old; return old.
-    function.instruction(&Instruction::LocalGet(end));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::GlobalSet(HEAP_PTR_GLOBAL));
-    function.instruction(&Instruction::LocalGet(old));
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::I32Store(MemArg {
-        offset: 0,
-        align: 2,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalGet(old));
-    function.instruction(&Instruction::End);
+    gc::emit_oom_exit(&mut function);
+    wasm!(function; End);
+    gc::emit_gc_budget(
+        &mut function,
+        |f| wasm!(f; LocalGet(k), I32Const(16), I32Shl),
+    );
+    wasm!(function;
+        LocalGet(k), Call(helpers.gc_take_pages()), LocalTee(page), I32Eqz,
+        If(BlockType::Empty),
+    );
+    gc::emit_oom_exit(&mut function);
+    wasm!(function;
+        End,
+        LocalGet(page), I32Const(16), I32ShrU, I32Const(i32::from(abi::GC_PAGE_LARGE_HEAD)),
+        I32Store8(mem8(u64::from(abi::GC_PAGE_TABLE))),
+        LocalGet(page), LocalGet(k), I32Store(mem32(u64::from(abi::GC_LARGE_PAGES_OFFSET))),
+        LocalGet(page), GlobalGet(GC_LARGE_GLOBAL),
+        I32Store(mem32(u64::from(abi::GC_LARGE_NEXT_OFFSET))),
+        LocalGet(page), GlobalSet(GC_LARGE_GLOBAL),
+        LocalGet(page), I32Const(header), I32Add, End,
+    );
     finish_builder(function)
 }
 
@@ -338,11 +303,10 @@ fn emit_new_elems(function: &mut impl Sink, alloc: u32, cap: u32, store: u32) {
 /// with `len` set and, when `len > 0`, a `cap = len`
 /// [`TYPE_ELEMS`] store whose every element is `undefined`. Local 0 is `len`;
 /// locals 1/2/3 the handle base, the store base, and the element cursor.
-pub(super) fn emit_new_array(alloc: u32, proto: i64, leaves: &LeafSet) -> Function {
+pub(super) fn emit_new_array(helpers: Helpers<'_>, proto: i64, leaves: &LeafSet) -> Function {
     let mut function = helper_builder(leaves, &[RAW_I32], &[ROOT_BASE, ROOT_BASE, RAW_I32]);
     let (len, base, store, at) = (0, 1, 2, 3);
-    function.instruction(&Instruction::I32Const(ARRAY_BLOCK_SIZE));
-    function.instruction(&Instruction::Call(alloc));
+    emit_alloc_const(&mut function, helpers, ARRAY_BLOCK_SIZE);
     function.instruction(&Instruction::LocalSet(base));
     emit_object_prefix(&mut function, base, TYPE_ARRAY, proto);
     function.instruction(&Instruction::LocalGet(base));
@@ -353,7 +317,7 @@ pub(super) fn emit_new_array(alloc: u32, proto: i64, leaves: &LeafSet) -> Functi
     function.instruction(&Instruction::I32Store(mem32(ARRAY_ELEMS_OFFSET)));
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::If(BlockType::Empty));
-    emit_new_elems(&mut function, alloc, len, store);
+    emit_new_elems(&mut function, helpers.alloc, len, store);
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::LocalGet(store));
     function.instruction(&Instruction::I32Store(mem32(ARRAY_ELEMS_OFFSET)));

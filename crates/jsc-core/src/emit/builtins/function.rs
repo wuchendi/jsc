@@ -423,8 +423,9 @@ pub(super) fn emit_bind(
     wasm!(function; I64Store(elem_slot(1)), I32Const(1), LocalSet(shift));
     store_args(function, frame, rec, shift, 1, n, i, tmp);
     let ctor_bits = i32::from(abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_SELF_ALLOC) << 16;
+    emit_alloc_const(function, helpers, abi::FUNC_BLOCK_SIZE.cast_signed());
     wasm!(function;
-        I32Const(abi::FUNC_BLOCK_SIZE.cast_signed()), Call(helpers.alloc), LocalTee(f),
+        LocalTee(f),
         I32Const(TYPE_FUNCTION | (i32::from(abi::FUNC_FLAG_BOUND) << 16)),
         I32Const(ctor_bits), I32Const(0),
         LocalGet(target), I32WrapI64,

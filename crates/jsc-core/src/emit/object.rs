@@ -56,8 +56,7 @@ pub(super) fn emit_object_node(
             .all(|(i, k)| !static_keys[..i].contains(k));
 
     // dst = __alloc(size); header word (TYPE_OBJECT) and `props` (dst + 16, or 0).
-    function.instruction(&Instruction::I32Const(size));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, size);
     function.root_temp(TempClass::Base);
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
@@ -296,8 +295,7 @@ pub(super) fn emit_make_accessor_node(
 
     // dst = __alloc(ACCESSOR_BLOCK_SIZE); write the TYPE_ACCESSOR byte, keeping dst
     // on the operand stack.
-    function.instruction(&Instruction::I32Const(ACCESSOR_BLOCK_SIZE));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, ACCESSOR_BLOCK_SIZE);
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(TYPE_ACCESSOR));
@@ -890,8 +888,7 @@ pub(super) fn emit_map_new_node(
 
     // Handle: __alloc(MAP_BLOCK_SIZE); object prefix; size = 0;
     // entries = rebox(earr).
-    function.instruction(&Instruction::I32Const(MAP_BLOCK_SIZE));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, MAP_BLOCK_SIZE);
     function.instruction(&Instruction::LocalSet(dst));
     emit_object_prefix(
         function,
@@ -1003,8 +1000,7 @@ pub(super) fn emit_date_new_node(
     emit_time_clip(function, time);
 
     // dst = __alloc(DATE_BLOCK_SIZE); write the TYPE_DATE object prefix.
-    function.instruction(&Instruction::I32Const(DATE_BLOCK_SIZE));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, DATE_BLOCK_SIZE);
     function.instruction(&Instruction::LocalSet(dst));
     emit_object_prefix(
         function,
