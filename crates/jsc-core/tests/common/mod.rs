@@ -19,13 +19,21 @@ pub(crate) struct Finished {
     pub(crate) stderr: String,
 }
 
-/// Parse, lower and emit `src`, failing the test on an invalid module.
+/// Whether `JSC_GC_STRESS=1` is set: [`compile`] and [`exec`] then build
+/// every program with `gc_stress` (a collection at every allocation), the CI
+/// `gc-stress` job (design/runtime-memory.md §7.1 `gc_stress_run_suite`).
+pub(crate) fn gc_stress_from_env() -> bool {
+    std::env::var("JSC_GC_STRESS").is_ok_and(|value| value == "1")
+}
+
+/// Parse, lower and emit `src`, failing the test on an invalid module
+/// (`gc_stress` per [`gc_stress_from_env`]).
 pub(crate) fn compile(src: &str, print_completion: bool) -> anyhow::Result<Vec<u8>> {
     compile_with(
         src,
         CompileOptions {
             print_completion,
-            gc_stress: false,
+            gc_stress: gc_stress_from_env(),
         },
     )
 }
@@ -42,13 +50,13 @@ pub(crate) fn compile_with(src: &str, options: CompileOptions) -> anyhow::Result
 }
 
 /// Compile and run `src`, capturing its output. A compile error or a trap is
-/// an `Err`.
+/// an `Err` (`gc_stress` per [`gc_stress_from_env`]).
 pub(crate) fn exec(src: &str, print_completion: bool) -> anyhow::Result<Finished> {
     exec_with(
         src,
         CompileOptions {
             print_completion,
-            gc_stress: false,
+            gc_stress: gc_stress_from_env(),
         },
     )
 }

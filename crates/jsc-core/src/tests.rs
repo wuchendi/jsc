@@ -15,7 +15,7 @@ fn compile_and_run_evaluates_numeric_expression() {
         &ir,
         CompileOptions {
             print_completion: true,
-            gc_stress: false,
+            gc_stress: crate::emit::gc_stress_from_env(),
         },
     );
     let capture = Capture::new();

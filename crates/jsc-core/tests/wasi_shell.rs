@@ -196,19 +196,20 @@ fn oom_static_line_exit1() {
     assert_eq!(done.stderr, "Uncaught RangeError: out of memory\n");
 }
 
-/// `__alloc`'s `proc_exit(1)` inside a microtask (run by the guest drain)
-/// ends the program there: no later job runs.
+/// Out of memory inside a microtask (run by the guest drain) is the
+/// job's `RangeError` (design/runtime-memory.md §5.8): it rejects the
+/// derived promise and the later job runs.
 #[test]
-fn proc_exit_propagates_from_microtask() {
+fn oom_in_microtask_rejects_the_job() {
     let src = "console.log('sync'); \
                Promise.resolve() \
                  .then(() => { let s = 'x'; for (let i = 0; i < 26; i++) { s = s + s } \
                                let a = [...s]; console.log('after oom', a.length) }) \
-                 .then(() => console.log('next job'), () => console.log('next job'));";
+                 .then(() => console.log('fulfilled'), (e) => console.log('next job', e.message));";
     let done = exec(src, false).expect("runs");
-    assert_eq!(done.code, 1);
-    assert_eq!(done.stdout, "sync\n");
-    assert_eq!(done.stderr, "Uncaught RangeError: out of memory\n");
+    assert_eq!(done.stderr, "");
+    assert_eq!(done.code, 0);
+    assert_eq!(done.stdout, "sync\nnext job out of memory\n");
 }
 
 /// One program per builtin family under `emit/builtins/`; `compile` fails the

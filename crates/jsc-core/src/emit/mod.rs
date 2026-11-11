@@ -1568,6 +1568,14 @@ pub struct CompileOptions {
     pub gc_stress: bool,
 }
 
+/// Whether `JSC_GC_STRESS=1` is set: the in-crate test helpers then emit
+/// every program with `gc_stress` (the CI `gc-stress` job,
+/// design/runtime-memory.md §7.1 `gc_stress_run_suite`).
+#[cfg(test)]
+pub(crate) fn gc_stress_from_env() -> bool {
+    std::env::var("JSC_GC_STRESS").is_ok_and(|value| value == "1")
+}
+
 /// Emit a complete WebAssembly command module for `program`: exports
 /// `_start` and `memory`, imports the four WASI functions. See the module
 /// documentation.
