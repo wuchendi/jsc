@@ -90,9 +90,9 @@ pub(crate) const HEAP: u64 = 0x7FFD_0000_0000_0000;
 /// here.
 pub(crate) const HEADER_SIZE: u32 = 4;
 
-/// Header byte 1: the `gc` byte (phase 4: bit 0 = mark). Reserved; every block
-/// is created with it 0.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Header byte 1: the `gc` byte, the mark epoch (design/runtime-memory.md
+/// §5.2): a block is marked iff it equals `$__gc_epoch` (`1..=255`, never
+/// `0`). Every block is created with it 0, so a fresh block is unmarked.
 pub(crate) const HEADER_GC_OFFSET: u32 = 1;
 
 /// Header byte 2: the per-kind `flags` byte, `0` by default: a string's
@@ -808,13 +808,21 @@ pub(crate) const OOM_IOVEC: u32 = WASI_SCRATCH + 40;
 /// Address of the [`OOM_LINE`] bytes, right after its iovec.
 pub(crate) const OOM_LINE_ADDR: u32 = OOM_IOVEC + 8;
 
-/// The line `__alloc` writes to fd 2 before `proc_exit(1)`.
+/// The line `__alloc` writes to fd 2 before `proc_exit(1)` when an
+/// out-of-memory finds the reserve already spent (design/runtime-memory.md
+/// §5.8).
 pub(crate) const OOM_LINE: &str = "Uncaught RangeError: out of memory\n";
+
+/// Address of 8 zero bytes after the [`OOM_LINE`] bytes, read as an empty
+/// one-byte [`TYPE_STRING`] block: the dummy result a string-building helper
+/// returns when its variable-size allocation fails (out of memory,
+/// design/runtime-memory.md §5.8) while the `RangeError` is pending.
+pub(crate) const OOM_EMPTY_STR: u32 = OOM_LINE_ADDR + 40;
 
 /// Address of the static decimal-conversion scratch, 784 bytes: the
 /// `num_digits`, `decimal_point` and `truncated` words, the end index of the
 /// last parsed literal, then the 768-digit buffer.
-pub(crate) const DEC_SCRATCH: u32 = OOM_LINE_ADDR + 40;
+pub(crate) const DEC_SCRATCH: u32 = OOM_EMPTY_STR + 8;
 
 /// Address of the 23 exact `f64` powers of ten (`10^0..=10^22`).
 pub(crate) const DEC_POW10: u32 = DEC_SCRATCH + 784;
@@ -832,7 +840,130 @@ pub(crate) const DEC_POW5_LEN: u32 = 1440;
 pub(crate) const DEC_POWERS: u32 = DEC_POW5 + DEC_POW5_LEN;
 
 /// The first address after the fixed static area, where the string blocks begin.
-pub(crate) const STATIC_AREA_END: u32 = RYU_TABLES_ADDR + RYU_TABLES_SIZE;
+pub(crate) const STATIC_AREA_END: u32 = GC_MARK_STACK + GC_MARK_STACK_SIZE;
+
+/// The size of a GC page: one 64 KiB wasm page. The heap starts at the first
+/// page boundary after the static region (design/runtime-memory.md §5.1).
+pub(crate) const GC_PAGE_SIZE: u32 = 1 << 16;
+
+/// Address of the GC page table, right after the Ryu tables: one byte per
+/// wasm page ([`GC_PAGE_TABLE_SIZE`] bytes), indexed by `address >> 16`. A
+/// code is `0` (not heap: the shadow stack, the static region and pages above
+/// the frontier), a small-page class `1..=`[`GC_CLASS_COUNT`],
+/// [`GC_PAGE_LARGE_HEAD`], [`GC_PAGE_LARGE_TAIL`] or [`GC_PAGE_FREE`].
+pub(crate) const GC_PAGE_TABLE: u32 = RYU_TABLES_ADDR + RYU_TABLES_SIZE;
+
+/// The byte size of [`GC_PAGE_TABLE`]: one entry per page up to
+/// [`MEMORY_MAX_PAGES`] (8 KiB).
+pub(crate) const GC_PAGE_TABLE_SIZE: u32 = 8192;
+
+/// Page-table code: the first page of a large span (its pre-header holds the
+/// span's page count at [`GC_LARGE_PAGES_OFFSET`]).
+pub(crate) const GC_PAGE_LARGE_HEAD: u8 = 0xFE;
+
+/// Page-table code: a page in use that is not a small page nor a large-span
+/// head: a large span's tail pages, and every page `__gc_take_pages` hands out
+/// until its caller re-codes it.
+pub(crate) const GC_PAGE_LARGE_TAIL: u8 = 0xFD;
+
+/// Page-table code: a page in the free-page pool (contents stale; zeroed when
+/// taken again).
+pub(crate) const GC_PAGE_FREE: u8 = 0xFC;
+
+/// The number of small size classes: `16..=256` by 16 (classes `1..=16`),
+/// then `512`, `1024`, `2048` (classes `17..=19`). See [`gc_size_class`].
+pub(crate) const GC_CLASS_COUNT: u32 = 19;
+
+/// The largest small-block size; a larger request takes a large span.
+pub(crate) const GC_SMALL_MAX: u32 = 2048;
+
+/// Address of the per-class free-list heads, a static `u32[GC_CLASS_COUNT]`
+/// after the page table: class `c` at `GC_FREE_HEADS + 4 * (c - 1)`, `0` =
+/// empty. Each free slot links the next at [`GC_FREE_NEXT_OFFSET`].
+pub(crate) const GC_FREE_HEADS: u32 = GC_PAGE_TABLE + GC_PAGE_TABLE_SIZE;
+
+/// Address of the per-class current pages, a static `u32[GC_CLASS_COUNT]`
+/// after the free-list heads: the small page class `c` bump-allocates from
+/// (`0` = none yet).
+pub(crate) const GC_CUR_PAGES: u32 = GC_FREE_HEADS + 4 * GC_CLASS_COUNT;
+
+/// Address of the class size table, a static `u32[GC_CLASS_COUNT]` (data
+/// segment) after the current pages: class `c`'s slot size at
+/// `GC_CLASS_SIZES + 4 * (c - 1)`.
+pub(crate) const GC_CLASS_SIZES: u32 = GC_CUR_PAGES + 4 * GC_CLASS_COUNT;
+
+/// Address of the collector's static mark stack (`u32` block bases) after the
+/// class size table: every collection starts on it, so marking always makes
+/// progress even when no page is left; a deeper stack moves to pages from the
+/// pool (design/runtime-memory.md §5.4).
+pub(crate) const GC_MARK_STACK: u32 = GC_CLASS_SIZES + 4 * GC_CLASS_COUNT;
+
+/// The byte size of [`GC_MARK_STACK`] (1024 entries).
+pub(crate) const GC_MARK_STACK_SIZE: u32 = 4096;
+
+/// The byte size of a small page's header; slots start right after it.
+pub(crate) const GC_PAGE_HEADER_SIZE: u32 = 16;
+
+/// Small-page header: the u32 class (`1..=GC_CLASS_COUNT`).
+pub(crate) const GC_PAGE_CLASS_OFFSET: u32 = 0;
+
+/// Small-page header: the u32 bump address, the first never-allocated slot
+/// (slots from it to the page end are zero).
+pub(crate) const GC_PAGE_BUMP_OFFSET: u32 = 4;
+
+/// Small-page header: the u32 count of slots that survived the last sweep.
+/// Offset 12 is reserved.
+pub(crate) const GC_PAGE_LIVE_OFFSET: u32 = 8;
+
+/// The byte size of a large span's pre-header; the block starts after it.
+pub(crate) const GC_LARGE_HEADER_SIZE: u32 = 16;
+
+/// Large-span pre-header: the u32 page count of the span.
+pub(crate) const GC_LARGE_PAGES_OFFSET: u32 = 0;
+
+/// Large-span pre-header: the u32 link to the next large span (`0` = end),
+/// headed by `$__gc_large`.
+pub(crate) const GC_LARGE_NEXT_OFFSET: u32 = 4;
+
+/// TYPE BYTE of a free small slot: `[0xFF][0][0][0][next_free:u32 @4]`. Never
+/// a user value, never traced.
+pub(crate) const TYPE_FREE: u8 = 0xFF;
+
+/// Byte offset (from a [`TYPE_FREE`] slot) of the u32 link to the next free
+/// slot of the same class (`0` = end).
+pub(crate) const GC_FREE_NEXT_OFFSET: u32 = 4;
+
+/// The minimum allocation budget between collections, in bytes (4 MiB, Q13):
+/// after a collection `$__gc_debt = max(GC_MIN_BUDGET, $__gc_live)`.
+pub(crate) const GC_MIN_BUDGET: u32 = 4 << 20;
+
+/// The out-of-memory reserve in pages (`GC_RESERVE` = 256 KiB,
+/// design/runtime-memory.md §5.8): held out of the page pool so the first
+/// out-of-memory can still hand small requests a block while its
+/// `RangeError` unwinds.
+pub(crate) const GC_RESERVE_PAGES: u32 = 4;
+
+/// The small size class of a `size`-byte request (`1..=GC_CLASS_COUNT`), or
+/// `0` for a large request (`size > GC_SMALL_MAX`): `size <= 256` gives
+/// `(size + 15) >> 4`, else `17 + ceil_log2(size) - 9`.
+pub(crate) const fn gc_size_class(size: u32) -> u32 {
+    if size <= 256 {
+        (size + 15) >> 4
+    } else if size <= GC_SMALL_MAX {
+        40 - (size - 1).leading_zeros()
+    } else {
+        0
+    }
+}
+
+/// The slot size of small class `class` (`1..=GC_CLASS_COUNT`).
+pub(crate) const fn gc_class_size(class: u32) -> u32 {
+    if class <= 16 {
+        class << 4
+    } else {
+        256 << (class - 16)
+    }
+}
 
 /// Address of the static `Number` formatting scratch, right after the
 /// decimal-conversion tables, 16-aligned.

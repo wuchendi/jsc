@@ -89,6 +89,49 @@ jobs:
       - name: Test (nextest)
         run: cargo nextest run --workspace --no-fail-fast --partition count:${{ matrix.part }}/4
 
+  # design/runtime-memory.md §7.1 `gc_stress_run_suite`: the jsc-core run-test
+  # suite once more with JSC_GC_STRESS=1, which makes the shared test helpers
+  # compile every program with `gc_stress` (a full collection at every
+  # allocation); collection must not change any output. Excluded, each
+  # inherently incompatible with a collection per allocation:
+  # - binary(opcount): fuel assertions and the opcount snapshot measure the
+  #   default build (they compile without the shared helpers).
+  # - binary(memory): heap-cap and out-of-memory tests that fill hundreds of
+  #   MiB (a collection per allocation of a ~0.5 GiB heap), plus the
+  #   million-allocation growth tests.
+  # - test(=gc_reclaims_churn), test(=gc_free_list_reuse_zeroes): ~2 GiB and
+  #   ~1M allocations of churn, written to exceed the normal budget.
+  gc-stress:
+    name: gc-stress (nextest ${{ matrix.part }}/4)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
+    env:
+      JSC_GC_STRESS: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain 1.99.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Test under gc_stress (nextest)
+        run: >-
+          cargo nextest run -p jsc-core --no-fail-fast
+          --partition count:${{ matrix.part }}/4
+          -E 'not (binary(opcount) | binary(memory) | test(=gc_reclaims_churn) | test(=gc_free_list_reuse_zeroes))'
+
   test262:
     name: test262 (baseline regression gate)
     runs-on: ubuntu-latest

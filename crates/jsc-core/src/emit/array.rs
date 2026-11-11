@@ -137,12 +137,13 @@ pub(super) fn emit_array_node(
     } else {
         let len = i32::try_from(elems.len()).unwrap_or(i32::MAX);
         // store = __alloc(8 + 8*n) with its type byte and cap; left on the stack.
-        function.instruction(&Instruction::I32Const(
+        emit_alloc_const(
+            function,
+            helpers,
             abi::ELEMS_DATA_OFFSET
                 .cast_signed()
                 .saturating_add(len.saturating_mul(8)),
-        ));
-        function.instruction(&Instruction::Call(helpers.alloc));
+        );
         function.instruction(&Instruction::LocalTee(dst));
         function.instruction(&Instruction::LocalGet(dst));
         function.instruction(&Instruction::I32Const(TYPE_ELEMS));
@@ -171,8 +172,7 @@ pub(super) fn emit_array_node(
         function.release_temps(mark);
         // The handle: object prefix, `len = n`, `elems = store`.
         function.instruction(&Instruction::LocalSet(store));
-        function.instruction(&Instruction::I32Const(ARRAY_BLOCK_SIZE));
-        function.instruction(&Instruction::Call(helpers.alloc));
+        emit_alloc_const(function, helpers, ARRAY_BLOCK_SIZE);
         function.instruction(&Instruction::LocalSet(dst));
         emit_object_prefix(
             function,
@@ -239,15 +239,16 @@ pub(super) fn emit_array_spread(
                 // base = __array_push(base, value).
                 emit_node(value, function, scratch, strings, helpers);
                 function.instruction(&Instruction::Call(helpers.array_push));
+                emit_propagate_if_pending(function, helpers);
             }
             SpreadElem::List(list) => {
                 // base = __array_concat(base, list).
                 emit_node(list, function, scratch, strings, helpers);
                 function.instruction(&Instruction::I32WrapI64);
                 function.instruction(&Instruction::Call(helpers.array_concat));
-                if helpers.has_accessors {
-                    emit_propagate_if_pending(function, helpers);
-                }
+                // A getter inherited by a hole may have thrown, or the store
+                // failed to grow (out of memory).
+                emit_propagate_if_pending(function, helpers);
             }
             SpreadElem::Spread(source) => {
                 // base = __array_concat(base, IterableToList(source)); `base`
@@ -260,10 +261,9 @@ pub(super) fn emit_array_spread(
                 emit_spread_list(value, scratch + 26, function, helpers);
                 function.instruction(&Instruction::I32WrapI64);
                 function.instruction(&Instruction::Call(helpers.array_concat));
-                // A getter inherited by a hole may have thrown.
-                if helpers.has_accessors {
-                    emit_propagate_if_pending(function, helpers);
-                }
+                // A getter inherited by a hole may have thrown, or the store
+                // failed to grow (out of memory).
+                emit_propagate_if_pending(function, helpers);
             }
         }
     }
@@ -333,6 +333,7 @@ pub(super) fn emit_array_push_node(
     function.instruction(&Instruction::I32WrapI64);
     emit_node(value, function, scratch, strings, helpers);
     function.instruction(&Instruction::Call(helpers.array_push));
+    emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::I32Load(array_len_slot()));
     function.instruction(&Instruction::F64ConvertI32U);
     function.instruction(&Instruction::I64ReinterpretF64);
@@ -341,7 +342,8 @@ pub(super) fn emit_array_push_node(
 /// Emit `array.pop()`, leaving the removed last element (or `undefined`
 /// for an empty array) on the stack: the array handle read from `local` is
 /// shrunk IN PLACE — the element at the old last index is read first (a hole
-/// through the prototype chain), then `length` drops by one (a `SPARSE`
+/// through the prototype chain), then `length` drops by one and the vacated
+/// slot is written `HOLE` (a `SPARSE`
 /// array reads the element through `__sparse_get` and shrinks through
 /// `__array_set_length`, which drops it from the property table).
 pub(super) fn emit_array_pop_node(
@@ -390,6 +392,15 @@ pub(super) fn emit_array_pop_node(
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::LocalGet(new_len));
     function.instruction(&Instruction::I32Store(array_len_slot()));
+    // The vacated slot becomes a hole, so the store keeps nothing alive.
+    function.instruction(&Instruction::LocalGet(base));
+    emit_array_elems(function);
+    function.instruction(&Instruction::LocalGet(new_len));
+    function.instruction(&Instruction::I32Const(3));
+    function.instruction(&Instruction::I32Shl);
+    function.instruction(&Instruction::I32Add);
+    function.instruction(&Instruction::I64Const(HOLE_BITS));
+    function.instruction(&Instruction::I64Store(elem_slot(0)));
     function.instruction(&Instruction::End);
     emit_elem_read(function, removed);
     leave_frame(helpers);
@@ -636,6 +647,7 @@ pub(super) fn emit_array_hof<S: Sink>(
             function.instruction(&Instruction::LocalGet(len));
             function.instruction(&Instruction::Call(helpers.new_array()));
             function.instruction(&Instruction::LocalSet(res));
+            emit_propagate_if_pending(function, helpers);
         }
         ArrayHofOp::Filter => {
             // res = a fresh empty array (grown in place per truthy element by
@@ -768,6 +780,7 @@ pub(super) fn emit_array_hof<S: Sink>(
             function.instruction(&Instruction::Call(helpers.array_push));
             function.instruction(&Instruction::Drop);
             function.instruction(&Instruction::End);
+            emit_propagate_if_pending(function, helpers);
         }
         ArrayHofOp::Reduce => {
             // acc = callback(acc, ..), or the first present element seeds it.

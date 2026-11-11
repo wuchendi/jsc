@@ -32,6 +32,7 @@ use wasm_encoder::{
 };
 
 use builder::{FnBuilder, LocalClass, Sink, TempClass};
+use gc::emit_alloc_const;
 use roots::LeafSet;
 
 use crate::abi;
@@ -64,7 +65,8 @@ const CLOCK_TIME_GET_IMPORT: u32 = 1;
 /// The function index of the WASI `random_get` import.
 const RANDOM_GET_IMPORT: u32 = 2;
 
-/// The wasm global index of the bump-allocator heap pointer (`__heap_ptr`).
+/// The wasm global index of the page frontier (`$__heap_ptr`): the end of the
+/// highest GC page ever obtained (see [`gc`]).
 const HEAP_PTR_GLOBAL: u32 = 0;
 
 /// The wasm global index of the pending-exception flag (`$exc_pending`, i32,
@@ -188,10 +190,42 @@ const PROMISE_SEQ_GLOBAL: u32 = 28;
 /// The rejected-promise list head (`$__rejected_head`, raw `i32` ref, init 0).
 const REJECTED_HEAD_GLOBAL: u32 = 29;
 
+/// The collector's allocation budget (`$__gc_debt`, i32 bytes, init
+/// [`abi::GC_MIN_BUDGET`]): every allocation subtracts its slot or span size;
+/// see [`gc`].
+const GC_DEBT_GLOBAL: u32 = 30;
+/// The bytes live after the last sweep (`$__gc_live`, i32, init 0).
+const GC_LIVE_GLOBAL: u32 = 31;
+/// The mark epoch (`$__gc_epoch`, i32, cycles `1..=255`, never 0, init 1).
+const GC_EPOCH_GLOBAL: u32 = 32;
+/// Set while a collection runs (`$__gc_busy`, i32, init 0).
+const GC_BUSY_GLOBAL: u32 = 33;
+/// The number of pages in the free-page pool (`$__gc_free_pages`, i32, init 0).
+const GC_FREE_PAGES_GLOBAL: u32 = 34;
+/// The head of the large-span list (`$__gc_large`, raw `i32` page address,
+/// init 0 = none).
+const GC_LARGE_GLOBAL: u32 = 35;
+/// The mark stack's base (`$__gc_stack`, i32): [`abi::GC_MARK_STACK`] at the
+/// start of every collection, or pages from the pool once it outgrew it.
+const GC_STACK_GLOBAL: u32 = 36;
+/// The mark stack's first free entry (`$__gc_stack_top`, i32).
+const GC_STACK_TOP_GLOBAL: u32 = 37;
+/// The mark stack's end (`$__gc_stack_end`, i32).
+const GC_STACK_END_GLOBAL: u32 = 38;
+/// Set when a mark-stack push found no room (`$__gc_overflow`, i32): the
+/// marking pass is repeated with a rescan of every marked block.
+const GC_OVERFLOW_GLOBAL: u32 = 39;
+/// The out-of-memory reserve (`$__gc_reserve`, raw `i32` page address, init
+/// 0 = not held): [`abi::GC_RESERVE_PAGES`] pages kept out of the pool,
+/// released by the first out-of-memory and taken again by the next
+/// collection (design/runtime-memory.md §5.8).
+const GC_RESERVE_GLOBAL: u32 = 40;
+
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
-/// the renderer, RNG and promise-engine globals and set in `main`'s prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 30;
+/// the renderer, RNG, promise-engine and collector globals and set in `main`'s
+/// prologue).
+const MODULE_CELL_GLOBAL_BASE: u32 = 41;
 
 /// An array hole (see [`abi::HOLE`]): the element-slot bit pattern of a
 /// missing element. Every element read maps it to `undefined`.
@@ -213,9 +247,9 @@ const CF_CONTINUE: i32 = 3;
 
 /// The base heap offset: the first byte of static string-literal data, after
 /// the null guard, the function-table word, the fixed WASI area and the
-/// [`libm`] block. Literal blobs are packed contiguously from here;
-/// the bump allocator (`__alloc`) then starts at the first free offset *after*
-/// them (see [`emit`]).
+/// [`libm`] block. Literal blobs are packed contiguously from here; the GC
+/// heap starts at the first page boundary after the static region (see
+/// [`emit`] and [`gc`]).
 const HEAP_BASE: i32 = abi::STATIC_AREA_END.cast_signed() + libm::STATIC_SIZE;
 
 /// The alignment of every heap block base (see [`abi::BLOCK_ALIGN`]).
@@ -887,8 +921,9 @@ struct Helpers<'a> {
     /// (`new_string + 2`), and the builtin bodies ([`Self::builtin`]), appended
     /// after the settlers so every other index stays stable.
     new_string: u32,
-    /// `__alloc(size) -> i32`: bump-allocate `size` bytes, returning the offset.
-    /// Called inline by array literals.
+    /// `__alloc(size) -> i32`: allocate a zeroed block of `size` bytes (a small
+    /// slot or a large span, see [`gc`]), returning its base. Constant-size
+    /// sites call the per-class entry instead (`gc::emit_alloc_const`).
     alloc: u32,
     /// `__concat(a, b) -> i32`: allocate and build the concatenation of two heap
     /// strings.
@@ -1431,6 +1466,18 @@ fn decl_func_base(table_index: u32, helpers: Helpers<'_>) -> i32 {
         + abi::FUNC_BLOCK_SIZE.cast_signed() * table_index.cast_signed()
 }
 
+/// The static root list's addresses (design/runtime-memory.md §5.4): the
+/// `fn_count` static declaration blocks from `blocks`, then the realm image's
+/// intrinsic and builtin-method blocks ([`realm::static_objects`], the
+/// `Symbol.for` registry among them).
+fn static_roots(blocks: i32, fn_count: i32, realm: i32) -> Vec<u32> {
+    let size = abi::FUNC_BLOCK_SIZE.cast_signed();
+    (0..fn_count)
+        .map(|i| (blocks + size * i).cast_unsigned())
+        .chain(realm::static_objects(realm))
+        .collect()
+}
+
 /// The number of builtin bodies (funcref-table slots after the settlers).
 fn builtin_count() -> i32 {
     i32::try_from(Builtin::ALL.len()).unwrap_or(0)
@@ -1460,6 +1507,7 @@ mod convert;
 mod dtoa;
 mod expr;
 mod function;
+mod gc;
 mod generator;
 mod json_parse;
 mod libm;
@@ -1514,6 +1562,18 @@ use value::*;
 pub struct CompileOptions {
     /// Render the completion value to fd 1 after the final drain.
     pub print_completion: bool,
+    /// Test only (not exposed by the CLI): an allocation budget of `0`, so
+    /// every allocation runs a full collection (design/runtime-memory.md
+    /// §5.6, Q20).
+    pub gc_stress: bool,
+}
+
+/// Whether `JSC_GC_STRESS=1` is set: the in-crate test helpers then emit
+/// every program with `gc_stress` (the CI `gc-stress` job,
+/// design/runtime-memory.md §7.1 `gc_stress_run_suite`).
+#[cfg(test)]
+pub(crate) fn gc_stress_from_env() -> bool {
+    std::env::var("JSC_GC_STRESS").is_ok_and(|value| value == "1")
 }
 
 /// Emit a complete WebAssembly command module for `program`: exports
@@ -1524,13 +1584,12 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     let mut module = Module::new();
 
     // Collect every distinct string literal and assign each a compile-time byte
-    // offset in linear memory. `heap_ptr_init` is the first free offset after all
-    // literal blobs — where the bump allocator begins.
+    // offset in linear memory.
     let (offsets, strings_end) = collect_strings(program);
     // The function info table (user functions, the two `new Promise`
     // settlers, the builtins), the static declaration blocks, and the realm
-    // image follow the string blobs, then the intern table; the bump allocator
-    // begins after it.
+    // image follow the string blobs, then the intern table and the Unicode
+    // tables; the GC heap begins at the next page boundary.
     let n = program.functions.len();
     let fn_count = i32::try_from(n).unwrap_or(i32::MAX);
     let info_count = fn_count + 2 + builtin_count();
@@ -1538,15 +1597,24 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     let realm = blocks + abi::FUNC_BLOCK_SIZE.cast_signed() * fn_count;
     let intern_base = realm + realm::image_size();
     let intern = intern_table(&offsets, intern_base);
-    // The raw Unicode tables end the static region; blocks stay 8-aligned.
+    // The raw Unicode tables and the collector's static root list end the
+    // static region; blocks stay 8-aligned.
     let unicode_base = intern_base + 4 * intern.cap;
+    let roots_base = (unicode_base + unicode::data_size() + 3) & -4;
+    let static_roots = static_roots(blocks, fn_count, realm);
     let layout = FnLayout {
         info: strings_end,
         blocks,
         realm,
         unicode: unicode_base,
     };
-    let heap_ptr_init = (unicode_base + unicode::data_size() + BLOCK_ALIGN - 1) & -BLOCK_ALIGN;
+    let heap_start = gc::heap_start(roots_base + gc::root_list_size(static_roots.len()));
+    let gc_layout = gc::GcLayout {
+        heap_start,
+        roots: roots_base,
+        module_cells: program.module_cells,
+        stress: options.gc_stress,
+    };
 
     // Type/function sections and the resolved helper indices (see
     // [`build_type_and_function_sections`]).
@@ -1557,6 +1625,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
         build_type_and_function_sections(program, &unwind, layout);
     libm::register(&mut types, &mut functions);
     promise_engine::register(&mut types, &mut functions);
+    gc::register(&mut types, &mut functions);
     module.section(&types);
 
     // Import section: exactly the four WASI functions (indices 0..=3).
@@ -1591,12 +1660,12 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     });
     module.section(&tables);
 
-    // Memory section: one linear memory (min: the pages holding the static
-    // data, at least 1; capped at `abi::MEMORY_MAX_PAGES`; `__alloc` grows it
-    // on demand), exported below.
+    // Memory section: one linear memory (min: the pages below the heap;
+    // capped at `abi::MEMORY_MAX_PAGES`; `__gc_take_pages` grows it on
+    // demand), exported below.
     let mut memories = MemorySection::new();
     memories.memory(MemoryType {
-        minimum: u64::from(heap_ptr_init.cast_unsigned().div_ceil(65_536)).max(1),
+        minimum: u64::from(heap_start.cast_unsigned() / abi::GC_PAGE_SIZE),
         maximum: Some(abi::MEMORY_MAX_PAGES),
         memory64: false,
         shared: false,
@@ -1604,9 +1673,9 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     });
     module.section(&memories);
 
-    // Global section: the bump-allocator heap pointer plus the
-    // exception-unwinding globals (see [`build_globals`]).
-    module.section(&build_globals(heap_ptr_init, &intern, program.module_cells));
+    // Global section: the page frontier plus the exception-unwinding globals
+    // (see [`build_globals`]).
+    module.section(&build_globals(heap_start, &intern, gc_layout));
 
     // Export section: exactly `_start` and memory index 0 as "memory".
     let mut exports = ExportSection::new();
@@ -1652,7 +1721,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
             code.function(&emit_function(func, &offsets, helpers, &leaves));
         }
     }
-    code.function(&emit_alloc(&leaves));
+    code.function(&emit_alloc(helpers, &leaves, false));
     code.function(&emit_concat(helpers.alloc, &leaves));
     code.function(&emit_str_eq(&leaves));
     code.function(&emit_str_cmp(&leaves));
@@ -1726,7 +1795,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     code.function(&emit_json_number(helpers, &leaves));
     code.function(&emit_json_value(helpers, &leaves));
     code.function(&emit_json_array(helpers, &leaves));
-    code.function(&emit_json_object(helpers.alloc, helpers, &leaves));
+    code.function(&emit_json_object(helpers, &leaves));
     code.function(&emit_json_parse(helpers, &leaves));
     // `__gen_to_array` — the generator-spread drain — precedes the
     // trampoline so every later index stays stable.
@@ -1763,7 +1832,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     code.function(&emit_settler(abi::PROMISE_REJECTED, helpers, &leaves));
     code.function(&emit_new_string(helpers.alloc, &leaves));
     code.function(&emit_new_array(
-        helpers.alloc,
+        helpers,
         intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Array), helpers),
         &leaves,
     ));
@@ -1805,8 +1874,8 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
         code.function(&helper);
     }
     code.function(&emit_start(&offsets, helpers, options, &leaves));
-    // The families after `_start`, in index order: Unicode, libm, then the
-    // promise engine.
+    // The families after `_start`, in index order: Unicode, libm, the
+    // promise engine, then the allocator and collector.
     for helper in unicode::emit_helpers(helpers, &leaves) {
         code.function(&helper);
     }
@@ -1816,10 +1885,18 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     for helper in promise_engine::emit_helpers(&offsets, helpers, &leaves) {
         code.function(&helper);
     }
+    for helper in gc::emit_helpers(helpers, &leaves, gc_layout) {
+        code.function(&helper);
+    }
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.
     let mut data = emit_data_section(&offsets, &intern, &program.functions, layout);
+    data.active(
+        0,
+        &ConstExpr::i32_const(roots_base),
+        gc::root_list(&static_roots),
+    );
     libm::emit_data(&mut data);
     module.section(&data);
 

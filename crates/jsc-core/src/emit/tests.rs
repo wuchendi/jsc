@@ -13,6 +13,7 @@ fn emit(program: &IrProgram) -> Vec<u8> {
         program,
         CompileOptions {
             print_completion: true,
+            gc_stress: crate::emit::gc_stress_from_env(),
         },
     )
 }
@@ -426,66 +427,135 @@ fn typeof_string_literal_reports_string() {
     assert_eq!(completion(&bytes), "string");
 }
 
-/// The data-segment count and the initial `__heap_ptr` of `bytes`.
+/// The data-segment count and the initial `$__heap_ptr` (the heap start) of
+/// `bytes`.
 fn data_layout(bytes: &[u8]) -> (u32, Option<i32>) {
     let mut data_segments = 0;
-    let mut heap_ptr_init = None;
+    let mut heap_start = None;
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         match payload.expect("valid payload") {
             wasmparser::Payload::DataSection(reader) => {
                 data_segments = reader.count();
             }
             wasmparser::Payload::GlobalSection(reader) => {
-                // The heap pointer is the FIRST global; the
+                // The page frontier is the FIRST global; the
                 // exception-unwinding globals follow it and are ignored here.
-                let heap_ptr = reader
+                let frontier = reader
                     .into_iter()
                     .next()
-                    .expect("at least the heap-pointer global")
+                    .expect("at least the frontier global")
                     .expect("valid global");
-                let mut ops = heap_ptr.init_expr.get_operators_reader();
+                let mut ops = frontier.init_expr.get_operators_reader();
                 if let wasmparser::Operator::I32Const { value } = ops.read().expect("init operator")
                 {
-                    heap_ptr_init = Some(value);
+                    heap_start = Some(value);
                 }
             }
             _ => {}
         }
     }
-    (data_segments, heap_ptr_init)
+    (data_segments, heap_start)
 }
 
 #[test]
-fn string_literal_emits_data_segment_and_advances_heap_ptr() {
+fn string_literal_emits_data_segment_below_the_heap() {
     // The literal "foo" (11 bytes, padded to 16) is one more string blob
-    // segment ahead of the function data, the realm image, and the intern table.
+    // segment ahead of the function data, the realm image, and the intern
+    // table; the heap still starts on a page boundary after them.
     let base = emit(&expr_program(IrNode::Num(42.0)));
     let bytes = emit(&expr_program(IrNode::Str("foo".into())));
     validate(&bytes);
-    let (segments, heap_ptr) = data_layout(&bytes);
-    let (base_segments, base_heap_ptr) = data_layout(&base);
+    let (segments, heap_start) = data_layout(&bytes);
+    let (base_segments, base_heap_start) = data_layout(&base);
     assert_eq!(segments, base_segments + 1, "one more string blob");
-    assert_eq!(heap_ptr, base_heap_ptr.map(|p| p + 16));
+    let heap_start = heap_start.expect("frontier init");
+    assert_eq!(heap_start % abi::GC_PAGE_SIZE.cast_signed(), 0);
+    assert!(Some(heap_start) >= base_heap_start);
 }
 
 #[test]
 fn no_literals_starts_heap_after_the_intern_table() {
     // With no string literals, the static strings (the always-interned
     // "length", the realm's and the builtins' strings), the `__fn_info` table
-    // (the two settlers and the builtins), the realm image and the intern table
-    // precede the bump allocator, in that order.
+    // (the two settlers and the builtins), the realm image, the intern table,
+    // the Unicode tables and the collector's static root list (the realm's
+    // object-family blocks) precede the heap, which starts at the next page
+    // boundary.
     let program = expr_program(IrNode::Num(42.0));
     let bytes = emit(&program);
     validate(&bytes);
     let (offsets, strings_end) = collect_strings(&program);
     let info = abi::FN_INFO_ENTRY_SIZE.cast_signed() * (2 + builtin_count());
-    let intern_base = strings_end + info + realm::image_size();
+    let realm_base = strings_end + info;
+    let intern_base = realm_base + realm::image_size();
     let cap = intern_table(&offsets, intern_base).cap;
-    let end = intern_base + 4 * cap + crate::emit::unicode::data_size();
+    let roots = (intern_base + 4 * cap + crate::emit::unicode::data_size() + 3) & -4;
+    let roots_len = i32::try_from(realm::static_objects(realm_base).len()).expect("count");
+    let end = roots + 4 + 4 * roots_len;
+    let page = abi::GC_PAGE_SIZE.cast_signed();
+    assert_eq!(data_layout(&bytes).1, Some((end + page - 1) / page * page));
+}
+
+/// The size-class rule of design/runtime-memory.md §5.6: `16..=256` by 16,
+/// then 512, 1024, 2048; every size maps to the smallest class holding it.
+#[test]
+fn gc_size_class_table() {
+    let sizes: Vec<u32> = (1..=abi::GC_CLASS_COUNT).map(abi::gc_class_size).collect();
+    let mut want: Vec<u32> = (1..=16).map(|c| 16 * c).collect();
+    want.extend([512, 1024, 2048]);
+    assert_eq!(sizes, want);
+    for size in 1..=abi::GC_SMALL_MAX {
+        let class = abi::gc_size_class(size);
+        assert!((1..=abi::GC_CLASS_COUNT).contains(&class), "size {size}");
+        assert!(abi::gc_class_size(class) >= size, "size {size} fits");
+        assert!(
+            class == 1 || abi::gc_class_size(class - 1) < size,
+            "size {size} takes the smallest class"
+        );
+    }
+    assert_eq!(abi::gc_size_class(abi::GC_SMALL_MAX + 1), 0, "large");
+    let table = crate::emit::gc::class_sizes();
+    let decoded: Vec<u32> = table
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
+        .collect();
+    assert_eq!(decoded, want, "static class table");
+}
+
+/// The page table, the free-list heads, the current pages, the class
+/// table and the static mark stack sit in the fixed static area, below every string block and the
+/// heap, and every block size class keeps bases 8-aligned.
+#[test]
+fn gc_static_layout() {
+    assert_eq!(u64::from(abi::GC_PAGE_TABLE_SIZE), abi::MEMORY_MAX_PAGES);
     assert_eq!(
-        data_layout(&bytes).1,
-        Some((end + crate::emit::BLOCK_ALIGN - 1) & -crate::emit::BLOCK_ALIGN)
+        abi::GC_FREE_HEADS,
+        abi::GC_PAGE_TABLE + abi::GC_PAGE_TABLE_SIZE
     );
+    assert_eq!(
+        abi::GC_CUR_PAGES,
+        abi::GC_FREE_HEADS + 4 * abi::GC_CLASS_COUNT
+    );
+    assert_eq!(
+        abi::GC_CLASS_SIZES,
+        abi::GC_CUR_PAGES + 4 * abi::GC_CLASS_COUNT
+    );
+    assert_eq!(
+        abi::GC_MARK_STACK,
+        abi::GC_CLASS_SIZES + 4 * abi::GC_CLASS_COUNT
+    );
+    assert_eq!(
+        abi::STATIC_AREA_END,
+        abi::GC_MARK_STACK + abi::GC_MARK_STACK_SIZE
+    );
+    assert_eq!(abi::STATIC_AREA_END % abi::BLOCK_ALIGN, 0);
+    for class in 1..=abi::GC_CLASS_COUNT {
+        assert_eq!(abi::gc_class_size(class) % abi::BLOCK_ALIGN, 0);
+    }
+    assert_eq!(abi::GC_PAGE_HEADER_SIZE % abi::BLOCK_ALIGN, 0);
+    assert_eq!(abi::GC_LARGE_HEADER_SIZE % abi::BLOCK_ALIGN, 0);
 }
 
 #[test]
@@ -1538,4 +1608,33 @@ fn number_conversion_leaves() {
     ] {
         assert!(!leaves.is_leaf(helper), "function {helper} allocates");
     }
+}
+
+/// The page helpers and the sweep are non-allocating leaves; the per-class
+/// entry `__alloc_small` is an allocation, so a safepoint (runtime-memory.md
+/// §5.3, §5.6). Every module carries the sweep, so it validates.
+#[test]
+fn gc_page_helpers_are_leaves() {
+    let program = expr_program(IrNode::Num(0.0));
+    let (_, strings_end) = collect_strings(&program);
+    let layout = super::FnLayout {
+        info: strings_end,
+        blocks: strings_end,
+        realm: strings_end,
+        unicode: strings_end,
+    };
+    let unwind = std::cell::RefCell::new(super::Unwind::default());
+    let (.., helpers, _) =
+        super::sections::build_type_and_function_sections(&program, &unwind, layout);
+    let leaves = super::roots::leaf_set(helpers);
+    for helper in [
+        helpers.gc_take_pages(),
+        helpers.gc_release_pages(),
+        helpers.gc_sweep(),
+    ] {
+        assert!(leaves.is_leaf(helper), "function {helper} is a leaf");
+    }
+    assert!(!leaves.is_leaf(helpers.alloc_small()));
+    assert!(!leaves.is_leaf(helpers.alloc));
+    validate(&emit(&program));
 }

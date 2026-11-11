@@ -472,6 +472,9 @@ pub(super) fn emit_str_hash(leaves: &LeafSet) -> Function {
 
 /// `__intern_slot(s: i32) -> i32`: the address of the intern-table slot that
 /// holds the string with `s`'s content, or of the empty slot where it belongs.
+/// The table is weak (design/runtime-memory.md §5.6): a collection turns the
+/// slot of an unreachable heap string into the tombstone `1`, which the probe
+/// passes over and an insertion never reuses.
 pub(super) fn emit_intern_slot(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_BASE], &[RAW_I32, RAW_I32, RAW_I32, RAW_I32]);
     let (s, mask, i, a, c) = (0, 1, 2, 3, 4);
@@ -482,8 +485,12 @@ pub(super) fn emit_intern_slot(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
         GlobalGet(INTERN_BASE_GLOBAL), LocalGet(i), I32Const(2), I32Shl, I32Add, LocalTee(a),
         I32Load(m32(0)), LocalTee(c), I32Eqz,
         If(BlockType::Empty), LocalGet(a), Return, End,
+        // A tombstone (`1`, a collected string) is probed past.
+        LocalGet(c), I32Const(1), I32Ne,
+        If(BlockType::Empty),
         LocalGet(c), LocalGet(s), Call(helpers.str_eq),
         If(BlockType::Empty), LocalGet(a), Return, End,
+        End,
         LocalGet(i), I32Const(1), I32Add, LocalGet(mask), I32And, LocalSet(i),
         Br(0),
         End,
@@ -504,7 +511,10 @@ pub(super) fn emit_intern_find(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
 /// `__intern(s: i32) -> i32`: the interned block with `s`'s content, inserting
 /// `s` itself (flagged `INTERNED`, plus `ARRAY_INDEX` for a canonical index
 /// spelling) on a miss. The table doubles, rehashing into a fresh heap copy,
-/// once more than half its slots are used.
+/// once more than half its slots are used (tombstones included); the copy
+/// keeps only the strings, and `$__intern_count` restarts from them. When the
+/// copy cannot be had (out of memory, design/runtime-memory.md §5.8) the
+/// table stays as it is, with the `RangeError` pending.
 pub(super) fn emit_intern(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(
         leaves,
@@ -535,18 +545,25 @@ pub(super) fn emit_intern(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         // The new table is a `TYPE_RAW` block; `$__intern_base` is its data.
         LocalGet(cap), I32Const(3), I32Shl, I32Const(HEADER_SIZE + 4), I32Add,
         Call(helpers.alloc), LocalTee(a),
-        I32Const(0), LocalGet(cap), I32Const(3), I32Shl, I32Const(HEADER_SIZE + 4), I32Add,
+        // Out of memory (design/runtime-memory.md §5.8): no growth.
+        I32Eqz, If(BlockType::Empty), LocalGet(s), Return, End,
+        LocalGet(a), I32Const(0), LocalGet(cap), I32Const(3), I32Shl, I32Const(HEADER_SIZE + 4), I32Add,
         MemoryFill(0),
         LocalGet(a), I32Const(i32::from(abi::TYPE_RAW)), I32Store8(m8(0)),
         LocalGet(a), LocalGet(cap), I32Const(3), I32Shl, I32Store(m32(u64::from(HEADER_SIZE.cast_unsigned()))),
         LocalGet(a), I32Const(HEADER_SIZE + 4), I32Add, GlobalSet(INTERN_BASE_GLOBAL),
         LocalGet(cap), I32Const(1), I32Shl, GlobalSet(INTERN_CAP_GLOBAL),
+        // Only the strings move (slots `> 1`); the count restarts without
+        // the tombstones.
         I32Const(0), LocalSet(i),
+        I32Const(0), GlobalSet(INTERN_COUNT_GLOBAL),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(cap), I32GeU, BrIf(1),
         LocalGet(old), LocalGet(i), I32Const(2), I32Shl, I32Add, I32Load(m32(0)), LocalTee(c),
+        I32Const(1), I32GtU,
         If(BlockType::Empty),
         LocalGet(c), Call(helpers.intern_slot), LocalGet(c), I32Store(m32(0)),
+        GlobalGet(INTERN_COUNT_GLOBAL), I32Const(1), I32Add, GlobalSet(INTERN_COUNT_GLOBAL),
         End,
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),
@@ -818,7 +835,9 @@ const DEFINE_LOCALS: [LocalClass; 7] = [
 /// starts at capacity 4; a full one is rebuilt with capacity `max(4, 2 *
 /// live)` (the same capacity when tombstones free half), keeping the live
 /// entries in order (and the table's watch flag and bit), and `o`'s `props`
-/// slot is rewritten. A watched table sets its dirty bit when the program
+/// slot is rewritten; when the new table cannot be had (out of memory,
+/// design/runtime-memory.md §5.8) nothing changes and the `RangeError` is
+/// left pending. A watched table sets its dirty bit when the program
 /// tracks them.
 pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(
@@ -850,9 +869,11 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         End,
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(p), I32Eqz,
         If(BlockType::Empty),
-        // A fresh table: kind 12, count 0, cap 4, live 0.
-        I32Const(P_HEADER + 4 * ENTRY), Call(helpers.alloc), LocalTee(p),
-        I64Const(i64::from(TYPE_PROPS)), I64Store(m64(0)),
+    );
+    // A fresh table: kind 12, count 0, cap 4, live 0.
+    emit_alloc_const(&mut f, helpers, P_HEADER + 4 * ENTRY);
+    wasm!(f;
+        LocalTee(p), I64Const(i64::from(TYPE_PROPS)), I64Store(m64(0)),
         LocalGet(p), I64Const(4), I64Store(m64(P_CAP)),
         LocalGet(o), LocalGet(p), I32Store(m32(OBJ_PROPS)),
         Else,
@@ -864,7 +885,7 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         I32Const(4), LocalGet(n), I32Const(4), I32GtU, Select,
         LocalGet(n), LocalGet(cap), I32LeU, Select, LocalSet(cap),
         LocalGet(cap), I32Const(4), I32Shl, I32Const(P_HEADER), I32Add, Call(helpers.alloc), LocalTee(q),
-        LocalGet(p), I32Load(m32(0)), I32Store(m32(0)),
+        I32Eqz, If(BlockType::Empty), Return, End, LocalGet(q), LocalGet(p), I32Load(m32(0)), I32Store(m32(0)),
         LocalGet(q), LocalGet(cap), I32Store(m32(P_CAP)),
         // Copy the live entries in slot order.
         LocalGet(p), I32Const(P_HEADER), I32Add, LocalTee(src),
@@ -971,7 +992,10 @@ pub(super) fn emit_fn_materialize(
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(FUNC_CONSTRUCTOR | FUNC_CLASS_CTOR), I32And,
         I32Const(FUNC_CONSTRUCTOR), I32Eq,
         If(BlockType::Empty),
-        I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(p),
+    );
+    emit_alloc_const(&mut f, helpers, abi::OBJ_PREFIX_SIZE.cast_signed());
+    wasm!(f;
+        LocalSet(p),
     );
     emit_object_prefix(
         &mut f,
@@ -989,7 +1013,10 @@ pub(super) fn emit_fn_materialize(
         End,
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(FUNC_GENERATOR), I32And,
         If(BlockType::Empty),
-        I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(p),
+    );
+    emit_alloc_const(&mut f, helpers, abi::OBJ_PREFIX_SIZE.cast_signed());
+    wasm!(f;
+        LocalSet(p),
     );
     emit_object_prefix(
         &mut f,
@@ -1803,6 +1830,8 @@ pub(super) fn emit_array_set(
         LocalGet(o), LocalGet(i), LocalGet(v), Call(sparse_store), Return,
         End,
         LocalGet(o), LocalGet(i), I32Const(1), I32Add, Call(helpers.array_reserve()),
+        // Out of memory: no store (design/runtime-memory.md §5.8).
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
         // Fill len..i with holes, then store element i.
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(len), LocalGet(i), I32GeU, BrIf(1),
@@ -2252,8 +2281,8 @@ pub(super) fn emit_array_set_length(
         IrNode::Str(ARRAY_LENGTH_STACK.into()),
     );
     emit_node(&error, &mut f, scratch, strings, helpers);
+    emit_set_exc_value(&mut f, helpers);
     wasm!(f;
-        GlobalSet(EXC_VALUE_GLOBAL),
         I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
         I32Const(0), GlobalSet(CF_KIND_GLOBAL),
         Return,
@@ -2336,6 +2365,7 @@ pub(super) fn emit_array_set_length(
         I32LtU,
         If(BlockType::Empty),
         LocalGet(o), LocalGet(n), Call(helpers.array_reserve()),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
         LocalGet(len), LocalSet(j),
     );
     emit_fill_holes(&mut f, o, j, n);

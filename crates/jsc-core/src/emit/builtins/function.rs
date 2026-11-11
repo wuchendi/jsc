@@ -190,6 +190,9 @@ pub(super) fn emit_call(
     wasm!(function;
         I64Load(elem_slot(0)), LocalSet(this),
         LocalGet(n), I32Const(1), I32Sub, LocalTee(n), Call(helpers.new_array()), LocalSet(dst),
+    );
+    return_if_pending(function);
+    wasm!(function;
         I32Const(0), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(n), I32GeU, BrIf(1),
@@ -258,6 +261,9 @@ pub(super) fn emit_apply(
     wasm!(function;
         Call(helpers.to_number), F64ReinterpretI64, I32TruncSatF64U, LocalTee(n),
         Call(helpers.new_array()), LocalSet(dst),
+    );
+    return_if_pending(function);
+    wasm!(function;
         I32Const(0), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(n), I32GeU, BrIf(1),
@@ -414,8 +420,10 @@ pub(super) fn emit_bind(
     wasm!(function;
         LocalGet(frame.argc()), F64ReinterpretI64, I32TruncSatF64U, LocalTee(n),
         I32Const(1), I32Sub, I32Const(0), LocalGet(n), Select, LocalTee(nb),
-        I32Const(2), I32Add, Call(helpers.new_array()), LocalTee(rec),
+        I32Const(2), I32Add, Call(helpers.new_array()), LocalSet(rec),
     );
+    return_if_pending(function);
+    wasm!(function; LocalGet(rec));
     emit_array_elems(function);
     wasm!(function; LocalGet(target), I64Store(elem_slot(0)), LocalGet(rec));
     emit_array_elems(function);
@@ -423,8 +431,9 @@ pub(super) fn emit_bind(
     wasm!(function; I64Store(elem_slot(1)), I32Const(1), LocalSet(shift));
     store_args(function, frame, rec, shift, 1, n, i, tmp);
     let ctor_bits = i32::from(abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_SELF_ALLOC) << 16;
+    emit_alloc_const(function, helpers, abi::FUNC_BLOCK_SIZE.cast_signed());
     wasm!(function;
-        I32Const(abi::FUNC_BLOCK_SIZE.cast_signed()), Call(helpers.alloc), LocalTee(f),
+        LocalTee(f),
         I32Const(TYPE_FUNCTION | (i32::from(abi::FUNC_FLAG_BOUND) << 16)),
         I32Const(ctor_bits), I32Const(0),
         LocalGet(target), I32WrapI64,
@@ -532,6 +541,9 @@ pub(super) fn emit_bound_call(
         LocalGet(c), LocalGet(c), F64Const(Ieee64::from(0.0)), F64Lt, Select,
         I32TruncSatF64U, LocalTee(n),
         LocalGet(nb), I32Add, LocalTee(total), Call(helpers.new_array()), LocalSet(dst),
+    );
+    return_if_pending(function);
+    wasm!(function;
         I32Const(0), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(nb), I32GeU, BrIf(1),

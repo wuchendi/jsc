@@ -597,8 +597,9 @@ fn emit_from(
     );
     let header = TYPE_OBJECT | (i32::from(abi::CLASS_ITERATOR) << 24);
     let wrap_proto = intrinsic_bits(Intrinsic::WrapForValidIteratorPrototype, helpers);
+    emit_alloc_const(function, helpers, WRAP_BLOCK_SIZE);
     wasm!(function;
-        I32Const(WRAP_BLOCK_SIZE), Call(helpers.alloc), LocalTee(obj),
+        LocalTee(obj),
         I32Const(header), I32Store(m32(0)),
         LocalGet(obj), I32Const(0), I32Store(m32(u64::from(abi::OBJ_PROPS_OFFSET))),
         LocalGet(obj), I64Const(wrap_proto), I64Store(m64(u64::from(abi::OBJ_PROTO_OFFSET))),
@@ -677,8 +678,9 @@ fn emit_helper(
     return_if_pending(function);
     let header = TYPE_OBJECT | (i32::from(abi::CLASS_ITERATOR) << 24);
     let proto = intrinsic_bits(Intrinsic::IteratorHelperPrototype, helpers);
+    emit_alloc_const(function, helpers, HELPER_BLOCK_SIZE);
     wasm!(function;
-        I32Const(HELPER_BLOCK_SIZE), Call(helpers.alloc), LocalTee(obj),
+        LocalTee(obj),
         I32Const(header), I32Store(m32(0)),
         LocalGet(obj), I32Const(0), I32Store(m32(u64::from(abi::OBJ_PROPS_OFFSET))),
         LocalGet(obj), I64Const(proto), I64Store(m64(u64::from(abi::OBJ_PROTO_OFFSET))),

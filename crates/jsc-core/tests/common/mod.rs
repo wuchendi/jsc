@@ -19,11 +19,30 @@ pub(crate) struct Finished {
     pub(crate) stderr: String,
 }
 
-/// Parse, lower and emit `src`, failing the test on an invalid module.
+/// Whether `JSC_GC_STRESS=1` is set: [`compile`] and [`exec`] then build
+/// every program with `gc_stress` (a collection at every allocation), the CI
+/// `gc-stress` job (design/runtime-memory.md §7.1 `gc_stress_run_suite`).
+pub(crate) fn gc_stress_from_env() -> bool {
+    std::env::var("JSC_GC_STRESS").is_ok_and(|value| value == "1")
+}
+
+/// Parse, lower and emit `src`, failing the test on an invalid module
+/// (`gc_stress` per [`gc_stress_from_env`]).
 pub(crate) fn compile(src: &str, print_completion: bool) -> anyhow::Result<Vec<u8>> {
+    compile_with(
+        src,
+        CompileOptions {
+            print_completion,
+            gc_stress: gc_stress_from_env(),
+        },
+    )
+}
+
+/// [`compile`] with explicit options.
+pub(crate) fn compile_with(src: &str, options: CompileOptions) -> anyhow::Result<Vec<u8>> {
     let program = jsc_core::frontend::parse(src, jsc_core::frontend::Dialect::Js)?;
     let ir = jsc_core::codegen::lower(&program)?;
-    let wasm = jsc_core::emit::emit(&ir, CompileOptions { print_completion });
+    let wasm = jsc_core::emit::emit(&ir, options);
     wasmparser::Validator::new()
         .validate_all(&wasm)
         .unwrap_or_else(|err| panic!("`{src}` compiled to invalid wasm: {err}"));
@@ -31,9 +50,45 @@ pub(crate) fn compile(src: &str, print_completion: bool) -> anyhow::Result<Vec<u
 }
 
 /// Compile and run `src`, capturing its output. A compile error or a trap is
-/// an `Err`.
+/// an `Err` (`gc_stress` per [`gc_stress_from_env`]).
 pub(crate) fn exec(src: &str, print_completion: bool) -> anyhow::Result<Finished> {
-    let wasm = compile(src, print_completion)?;
+    exec_with(
+        src,
+        CompileOptions {
+            print_completion,
+            gc_stress: gc_stress_from_env(),
+        },
+    )
+}
+
+/// [`exec`] compiled with `gc_stress` (a collection at every allocation).
+pub(crate) fn exec_gc_stress(src: &str, print_completion: bool) -> anyhow::Result<Finished> {
+    exec_with(
+        src,
+        CompileOptions {
+            print_completion,
+            gc_stress: true,
+        },
+    )
+}
+
+/// Assert `src` prints `expected` and exits 0, and that compiled with
+/// `gc_stress` it produces exactly the same exit code and output.
+pub(crate) fn assert_same_under_gc_stress(src: &str, expected: &str) {
+    let plain = exec(src, false).expect("program should compile and not trap");
+    assert_eq!(plain.code, 0, "`{src}` failed: {}", plain.stderr);
+    assert_eq!(plain.stdout, expected, "`{src}` output");
+    let stressed = exec_gc_stress(src, false).expect("runs under gc_stress");
+    assert_eq!(
+        (stressed.code, stressed.stdout, stressed.stderr),
+        (plain.code, plain.stdout, plain.stderr),
+        "`{src}` under gc_stress"
+    );
+}
+
+/// [`exec`] with explicit options.
+pub(crate) fn exec_with(src: &str, options: CompileOptions) -> anyhow::Result<Finished> {
+    let wasm = compile_with(src, options)?;
     let capture = Capture::new();
     let outcome = jsc_core::run::run(&wasm, Sinks::Capture(capture.clone()), None)?;
     Ok(Finished {
