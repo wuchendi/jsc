@@ -675,9 +675,9 @@ fn duplicate_private_names() {
         "class C { get #a() {} set #a(v) {} set #a(v) {} }",
         "class C { m() { return 1 } #a; static m() {} #a() {} }",
     ] {
-        let err = jsc_core::run::compile_and_run(src).expect_err("duplicate names are rejected");
+        let err = common::compile_error(src);
         assert!(
-            err.to_string().contains("duplicate private name #a"),
+            err.contains("duplicate private name #a"),
             "unexpected error for `{src}`: {err}"
         );
     }

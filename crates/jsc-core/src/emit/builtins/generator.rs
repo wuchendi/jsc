@@ -63,7 +63,7 @@ fn done_result(value: u32) -> IrNode {
 /// Read `this` into `this` and argument 0 into `arg`, throwing `text`
 /// unless `this` is a generator.
 fn this_generator(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     this: u32,
     arg: u32,
@@ -85,7 +85,7 @@ fn this_generator(
 }
 
 /// Push the generator's i32 field at `offset`.
-fn field(function: &mut Function, generator: u32, offset: u32) {
+fn field(function: &mut FnBuilder<'_>, generator: u32, offset: u32) {
     wasm!(function;
         LocalGet(generator), I32WrapI64,
         I32Load(MemArg { offset: u64::from(offset), align: 2, memory_index: 0 }),
@@ -94,14 +94,14 @@ fn field(function: &mut Function, generator: u32, offset: u32) {
 
 /// Push `1` when the generator has not started or has completed (no `yield`
 /// is suspended).
-fn not_suspended(function: &mut Function, generator: u32) {
+fn not_suspended(function: &mut FnBuilder<'_>, generator: u32) {
     field(function, generator, abi::GEN_DONE_OFFSET);
     field(function, generator, abi::GEN_STATE_OFFSET);
     wasm!(function; I32Eqz, I32Or);
 }
 
 /// Complete the generator: `done = 1` and a state past every block.
-fn complete(function: &mut Function, generator: u32) {
+fn complete(function: &mut FnBuilder<'_>, generator: u32) {
     for (offset, value) in [
         (abi::GEN_DONE_OFFSET, 1),
         (abi::GEN_STATE_OFFSET, COMPLETED_STATE),
@@ -114,7 +114,7 @@ fn complete(function: &mut Function, generator: u32) {
 }
 
 /// Store `mode` into the generator's [`abi::GEN_RESUME_MODE_MASK`] field.
-fn set_resume_mode(function: &mut Function, generator: u32, mode: u32) {
+fn set_resume_mode(function: &mut FnBuilder<'_>, generator: u32, mode: u32) {
     let limits = MemArg {
         offset: u64::from(abi::GEN_LIMITS_OFFSET),
         align: 2,
@@ -131,7 +131,7 @@ fn set_resume_mode(function: &mut Function, generator: u32, mode: u32) {
 
 /// Make the value in `value` pending as a `mode` resumption's value (see
 /// [`abi::GEN_RESUME_MODE_MASK`]) of the generator in `generator`.
-fn pend_resumption(function: &mut Function, generator: u32, value: u32, mode: u32) {
+fn pend_resumption(function: &mut FnBuilder<'_>, generator: u32, value: u32, mode: u32) {
     set_resume_mode(function, generator, mode);
     wasm!(function;
         LocalGet(value), GlobalSet(EXC_VALUE_GLOBAL),
@@ -141,7 +141,7 @@ fn pend_resumption(function: &mut Function, generator: u32, value: u32, mode: u3
 
 /// `next(value)`: resume at the suspended `yield` with `value`.
 pub(super) fn emit_next(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -170,7 +170,7 @@ pub(super) fn emit_next(
 /// and forwards to a `yield*` delegate, and may suspend again); otherwise
 /// complete the generator and yield `{ value, done: true }`.
 pub(super) fn emit_return(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -212,7 +212,7 @@ pub(super) fn emit_return(
 /// machine with it pending), or, when no `yield` is suspended, complete the
 /// generator and throw it.
 pub(super) fn emit_throw(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -251,8 +251,9 @@ pub(super) fn emit_throw(
 // promise, and serves the queue from the front: a request resumes the body
 // (its state machine, where `await` suspends are flagged `GEN_AWAIT`) until it
 // yields or completes, which settles the front request's promise; an `await`
-// (or a `return(v)` value) registers promise reactions that continue serving
-// the queue from the microtask queue.
+// (or a `return(v)` value) takes `PromiseResolve(%Promise%, v)` and registers
+// promise reactions (without a derived promise) that continue serving the
+// queue from the microtask queue.
 
 /// The `TypeError` of an `%AsyncGeneratorPrototype%` method on a receiver
 /// that is not an async generator (the returned promise rejects with it).
@@ -350,7 +351,7 @@ fn type_error(text: CalleeErrorText<'static>) -> IrNode {
 }
 
 /// Set (`on`) or clear the `limits` `bits` of the generator in `generator`.
-fn set_limits(function: &mut Function, generator: u32, bits: u32, on: bool) {
+fn set_limits(function: &mut FnBuilder<'_>, generator: u32, bits: u32, on: bool) {
     wasm!(function;
         LocalGet(generator), I32WrapI64,
         LocalGet(generator), I32WrapI64, I32Load(m32(u64::from(abi::GEN_LIMITS_OFFSET))),
@@ -365,30 +366,29 @@ fn set_limits(function: &mut Function, generator: u32, bits: u32, on: bool) {
 
 /// Push the `limits` `bits` of the generator in `generator` (nonzero when
 /// any is set).
-fn limits_bits(function: &mut Function, generator: u32, bits: u32) {
+fn limits_bits(function: &mut FnBuilder<'_>, generator: u32, bits: u32) {
     field(function, generator, abi::GEN_LIMITS_OFFSET);
     wasm!(function; I32Const(bits.cast_signed()), I32And);
 }
 
 /// Push the queue's front record base (`0` when empty).
-fn queue_head(function: &mut Function, generator: u32) {
+fn queue_head(function: &mut FnBuilder<'_>, generator: u32) {
     wasm!(function; LocalGet(generator), I32WrapI64, I32Load(m32(QUEUE_HEAD)));
 }
 
-/// Settle the front request's promise (`op` = `PROMISE_OP_SETTLE_*`) with
-/// the value `value` pushes, then drop the request.
+/// Settle the front request's promise (`state` = `PROMISE_FULFILLED` /
+/// `PROMISE_REJECTED`) with the value `value` pushes, then drop the request.
 fn settle_front(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     generator: u32,
-    op: i32,
-    value: impl FnOnce(&mut Function),
+    state: i32,
+    value: impl FnOnce(&mut FnBuilder<'_>),
     helpers: Helpers<'_>,
 ) {
-    wasm!(function; I32Const(op));
     queue_head(function, generator);
-    wasm!(function; I64Load(m64(REQ_PROMISE)));
+    wasm!(function; I64Load(m64(REQ_PROMISE)), I32Const(state));
     value(function);
-    wasm!(function; Call(helpers.promise), Drop);
+    wasm!(function; Call(helpers.promise_settle()));
     // head = head.next; an emptied queue clears the tail too.
     wasm!(function;
         LocalGet(generator), I32WrapI64,
@@ -405,7 +405,7 @@ fn settle_front(
 /// `value`, then drop it.
 #[allow(clippy::too_many_arguments)]
 fn fulfill_front(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     generator: u32,
     value: u32,
@@ -417,35 +417,58 @@ fn fulfill_front(
     settle_front(
         function,
         generator,
-        PROMISE_OP_SETTLE_FULFILL,
+        abi::PROMISE_FULFILLED,
         |f| emit_node(&result, f, frame.scratch(), strings, helpers),
         helpers,
     );
 }
 
-/// Register `reaction`'s fulfilled/rejected pair (`env` = the generator in
-/// `generator`) on the value in `value`, `Promise.resolve` semantics.
+/// `Await(value)`: `PromiseResolve(%Promise%, value)` (into `value`), then
+/// register `reaction`'s fulfilled/rejected pair (`env` = the generator in
+/// `generator`) on it with no derived promise. An abrupt `PromiseResolve`
+/// leaves the exception pending and runs `on_throw` instead.
 fn await_value(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     generator: u32,
     value: u32,
     [fulfilled, rejected]: [AsyncGenReaction; 2],
+    on_throw: impl FnOnce(&mut FnBuilder<'_>),
     helpers: Helpers<'_>,
 ) {
-    wasm!(function; LocalGet(value));
+    wasm!(function;
+        LocalGet(value), Call(helpers.promise_resolve()), LocalSet(value),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty),
+    );
+    on_throw(function);
+    wasm!(function; Else, LocalGet(value));
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Jsval);
     for reaction in [fulfilled, rejected] {
         let slot = helpers.builtin_slot(Builtin::AsyncGeneratorReaction(reaction));
         emit_settler_value(slot, generator, function, frame.scratch(), helpers);
+        function.root_temp(TempClass::Jsval);
     }
-    wasm!(function; Call(helpers.then), Drop);
+    function.release_temps(mark);
+    wasm!(function;
+        I64Const(UNDEFINED_BITS), I32Const(0), Call(helpers.promise_react()),
+        End,
+    );
+}
+
+/// Take the pending exception into `local` and clear it.
+fn take_exception(function: &mut FnBuilder<'_>, local: u32) {
+    wasm!(function;
+        GlobalGet(EXC_VALUE_GLOBAL), LocalSet(local),
+        I32Const(0), GlobalSet(EXC_PENDING_GLOBAL), I64Const(0), GlobalSet(EXC_VALUE_GLOBAL),
+    );
 }
 
 /// Call builtin `builtin` directly with argument 0 from `generator`,
 /// argument 1 from `arg` (or `undefined`) and `env` = `env`, dropping its
 /// result. Only emitted when `K >= 2`.
 fn call_internal(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     builtin: Builtin,
     generator: u32,
@@ -472,7 +495,7 @@ fn call_internal(
 /// queue unless the body is busy.
 pub(super) fn emit_async_method(
     request: AsyncGenRequest,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -483,7 +506,7 @@ pub(super) fn emit_async_method(
         return;
     }
     let (this, arg, promise) = (frame.i64(0), frame.i64(1), frame.i64(2));
-    let (record, tail) = (frame.i32(0), frame.i32(1));
+    let (record, tail) = (frame.base(0), frame.base(1));
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
     frame.arg(function, 0);
     wasm!(function; LocalSet(arg));
@@ -501,8 +524,8 @@ pub(super) fn emit_async_method(
     wasm!(function; Return, End);
     // The request's promise and record, appended at the tail.
     wasm!(function;
-        I32Const(abi::PROMISE_OP_NEW), I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS),
-        Call(helpers.promise), LocalSet(promise),
+        I64Const(intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Promise), helpers)),
+        Call(helpers.promise_new()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(promise),
         I32Const(REQ_SIZE), Call(helpers.alloc), LocalTee(record),
         I32Const(TYPE_ENV), I32Store8(MemArg { offset: 0, align: 0, memory_index: 0 }),
         LocalGet(record), I32Const(4), I32Store(m32(u64::from(HEADER_SIZE.cast_unsigned()))),
@@ -514,7 +537,8 @@ pub(super) fn emit_async_method(
         If(BlockType::Empty),
         LocalGet(this), I32WrapI64, LocalGet(record), I32Store(m32(QUEUE_HEAD)),
         Else,
-        LocalGet(tail), LocalGet(record), I64ExtendI32U, I64Store(m64(REQ_NEXT)),
+        LocalGet(tail), LocalGet(record), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+        I64Store(m64(REQ_NEXT)),
         End,
         LocalGet(this), I32WrapI64, LocalGet(record), I32Store(m32(QUEUE_TAIL)),
     );
@@ -534,7 +558,7 @@ pub(super) fn emit_async_method(
 /// until it empties or the body is busy (executing, or awaiting).
 #[allow(clippy::too_many_lines)]
 pub(super) fn emit_async_drain(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -570,7 +594,9 @@ pub(super) fn emit_async_drain(
     wasm!(function; End);
     field(function, generator, abi::GEN_DONE_OFFSET);
     wasm!(function; If(BlockType::Empty));
-    // Completed: `return(v)` awaits `v`; `throw(e)` rejects; `next` is done.
+    // Completed: `return(v)` awaits `v` (AsyncGeneratorAwaitReturn: an
+    // abrupt `PromiseResolve` rejects the request and serving goes on);
+    // `throw(e)` rejects; `next` is done.
     wasm!(function; LocalGet(kind), I32Const(ret), I32Eq, If(BlockType::Empty));
     set_limits(function, generator, abi::GEN_BUSY, true);
     await_value(
@@ -582,6 +608,19 @@ pub(super) fn emit_async_drain(
             AsyncGenReaction::ReturnFulfilled,
             AsyncGenReaction::ReturnRejected,
         ],
+        |function| {
+            take_exception(function, value);
+            set_limits(function, generator, abi::GEN_BUSY, false);
+            settle_front(
+                function,
+                generator,
+                abi::PROMISE_REJECTED,
+                |f| wasm!(f; LocalGet(value)),
+                helpers,
+            );
+            // -> the serving loop (the `if`, `if return`, `if done`, `loop`).
+            wasm!(function; Br(3));
+        },
         helpers,
     );
     wasm!(function; Br(3), End);
@@ -589,7 +628,7 @@ pub(super) fn emit_async_drain(
     settle_front(
         function,
         generator,
-        PROMISE_OP_SETTLE_REJECT,
+        abi::PROMISE_REJECTED,
         |f| wasm!(f; LocalGet(value)),
         helpers,
     );
@@ -631,9 +670,10 @@ pub(super) fn emit_async_drain(
 /// resumption `env` names ([`step_mode`]; a throw or return resumption makes
 /// it pending, see [`abi::GEN_RESUME_MODE_MASK`]): an `await` registers the reactions that
 /// resume it (the body stays busy); a `yield`, completion or throw settles
-/// the front request.
+/// the front request. An abrupt `PromiseResolve` of an awaited value is
+/// thrown back into the body at once (a loop, not a recursive step).
 pub(super) fn emit_async_step(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -646,7 +686,7 @@ pub(super) fn emit_async_step(
     frame.arg(function, 0);
     wasm!(function; LocalSet(generator));
     frame.arg(function, 1);
-    wasm!(function; LocalSet(sent));
+    wasm!(function; LocalSet(sent), Loop(BlockType::Empty));
     set_limits(function, generator, abi::GEN_BUSY | abi::GEN_RUNNING, true);
     set_limits(function, generator, abi::GEN_AWAIT, false);
     for mode in [abi::GEN_RESUME_MODE_THROW, abi::GEN_RESUME_MODE_RETURN] {
@@ -677,7 +717,7 @@ pub(super) fn emit_async_step(
     settle_front(
         function,
         generator,
-        PROMISE_OP_SETTLE_REJECT,
+        abi::PROMISE_REJECTED,
         |f| wasm!(f; LocalGet(result)),
         helpers,
     );
@@ -698,19 +738,28 @@ pub(super) fn emit_async_step(
             AsyncGenReaction::AwaitFulfilled,
             AsyncGenReaction::AwaitRejected,
         ],
+        |function| {
+            // Resume with a throw resumption: -> the step loop (the `if`,
+            // `if await`, `loop`).
+            take_exception(function, sent);
+            wasm!(function;
+                I64Const(step_mode(abi::GEN_RESUME_MODE_THROW)), LocalSet(frame.k),
+                Br(2),
+            );
+        },
         helpers,
     );
     wasm!(function; I64Const(UNDEFINED_BITS), Return, End);
     set_limits(function, generator, abi::GEN_BUSY, false);
     fulfill_front(function, frame, generator, result, false, strings, helpers);
-    wasm!(function; I64Const(UNDEFINED_BITS));
+    wasm!(function; End, I64Const(UNDEFINED_BITS));
 }
 
 /// A promise reaction of the async generator in `env`: resume the body after
 /// an `await`, or complete a `return(v)` request, then serve the queue.
 pub(super) fn emit_async_reaction(
     reaction: AsyncGenReaction,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -749,7 +798,7 @@ pub(super) fn emit_async_reaction(
             settle_front(
                 function,
                 generator,
-                PROMISE_OP_SETTLE_REJECT,
+                abi::PROMISE_REJECTED,
                 |f| wasm!(f; LocalGet(value)),
                 helpers,
             );

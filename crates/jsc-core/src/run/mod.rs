@@ -1,115 +1,13 @@
-//! Run: execute an emitted WebAssembly module with `wasmtime`.
+//! Run: execute an emitted WebAssembly command module with `wasmtime`.
 //!
-//! This is the final stage of the pipeline. It loads the module bytes produced
-//! by [`crate::emit::emit`] into a [`wasmtime`] engine, instantiates it with no
-//! imports, and calls the exported `main` function (signature `() -> i64`),
-//! returning the resulting jsval bits as a [`u64`].
-//!
-//! [`compile_and_run`] wires the whole compiler together: JavaScript source text
-//! in, a decoded [`Value`] out.
-//!
-//! The module is split by concern: [`harness`] runs the emitted module and wires
-//! the host imports, [`host`] implements those import handlers, and [`value`]
-//! decodes and formats jsvals.
-//!
-//! # jsval NaN-box layout
-//!
-//! A jsval is 64 bits carried through wasm as an `i64` (so the bits survive
-//! every op and the wasmtime return boundary without NaN canonicalization).
-//! Numbers are stored as raw `f64` bits; every other in-scope value sets the
-//! quiet-NaN mask plus a 3-bit tag in payload bits `[50:48]`:
-//!
-//! ```text
-//! QNAN mask = 0x7FF8_0000_0000_0000  (exponent all ones + quiet bit)
-//! NUMBER    iff (bits & QNAN) != QNAN, OR bits == QNAN (canonical number NaN)
-//! tag 0b000 -> the number NaN (canonical NaN 0x7FF8_0000_0000_0000)
-//! tag 0b001 -> boolean (value in bit 0):  FALSE=0x7FF9.., TRUE=0x7FF9..1
-//! tag 0b010 -> null       = 0x7FFA_0000_0000_0000
-//! tag 0b011 -> undefined  = 0x7FFB_0000_0000_0000
-//! tag 0b100 -> unused (`typeof` yields a real interned heap string)
-//! tag 0b101 -> heap pointer: low 32 bits are the byte offset of a heap BLOCK
-//!              base. This is the SINGLE heap tag for every heap kind; the
-//!              concrete kind is a TYPE BYTE at offset 0 of the block (tags
-//!              0b110/0b111 are unused). See the block-header layout below.
-//! ```
-//!
-//! # Heap block header
-//!
-//! Every heap block begins with a `HEADER_SIZE`-byte header: byte `0` is the TYPE
-//! BYTE (0 string, 1 array, 2 object, 3 function, ...), bytes `1..4` are the
-//! reserved `gc`/`flags`/`class` bytes. A string's payload begins at
-//! `HEADER_SIZE`; every object-family kind (array, object, function, ...) opens
-//! with the `props`/`proto` prefix, its payload at `OBJ_PREFIX_SIZE`:
-//!
-//! ```text
-//! type 0  string : [type][flags…][len:u32 LE][utf8]
-//! type 1  array  : [type][…][props:u32][proto:i64][len:u32][elems:u32]
-//! type 13 elems  : [type][…][cap:u32][elem:i64 × cap]
-//! ```
-//!
-//! See [`abi`] for every kind's layout.
-//!
-//! The immediate types (number/boolean/null/undefined/typeof-string) need no
-//! memory. A heap pointer resolves against the module's exported `"memory"`;
-//! [`run`] snapshots those bytes so [`decode`] can read them.
+//! [`harness`] is the WASI runner: the four hand-written
+//! `wasi_snapshot_preview1` imports, `_start`, and the `proc_exit` code.
 
 mod harness;
-mod host;
-mod promise;
-mod value;
 
 #[cfg(test)]
 mod tests;
 
-pub use harness::{compile_and_run, compile_and_run_capturing, run, run_capturing, run_metered};
-pub use value::{Value, decode, format_number, format_value, to_js_string};
-
-use crate::abi;
-
-/// The quiet-NaN mask (see [`abi::QNAN`]): exponent bits all ones plus the quiet
-/// bit set.
-const QNAN: u64 = abi::QNAN;
-
-/// The NaN-boxed heap-pointer header (single heap tag `0b101`, see [`abi::HEAP`]):
-/// a heap jsval is `HEAP | (ptr as u32)`. Used by the `__convert` host import
-/// to box a freshly allocated heap string.
-const HEAP: u64 = abi::HEAP;
-
-/// A string block's `len: u32` and UTF-8 data offsets (see
-/// [`abi::STR_LEN_OFFSET`]).
-const STR_LEN_OFFSET: usize = abi::STR_LEN_OFFSET as usize;
-const STR_DATA_OFFSET: usize = abi::STR_DATA_OFFSET as usize;
-
-/// Heap block TYPE BYTE values (offset 0 of the block); see [`abi`].
-const TYPE_STRING: u8 = abi::TYPE_STRING;
-const TYPE_ARRAY: u8 = abi::TYPE_ARRAY;
-const TYPE_OBJECT: u8 = abi::TYPE_OBJECT;
-const TYPE_FUNCTION: u8 = abi::TYPE_FUNCTION;
-const TYPE_MAP: u8 = abi::TYPE_MAP;
-const TYPE_SET: u8 = abi::TYPE_SET;
-const TYPE_PROMISE: u8 = abi::TYPE_PROMISE;
-const TYPE_GENERATOR: u8 = abi::TYPE_GENERATOR;
-const TYPE_DATE: u8 = abi::TYPE_DATE;
-
-/// Object-family payload offsets (`Date` ms, Map/Set size, Promise
-/// state/value, Generator done); see [`abi`].
-const DATE_MS_OFFSET: usize = abi::DATE_MS_OFFSET as usize;
-const MAP_SIZE_OFFSET: usize = abi::MAP_SIZE_OFFSET as usize;
-const PROMISE_STATE_OFFSET: usize = abi::PROMISE_STATE_OFFSET as usize;
-const PROMISE_VALUE_OFFSET: usize = abi::PROMISE_VALUE_OFFSET as usize;
-const GEN_DONE_OFFSET: usize = abi::GEN_DONE_OFFSET as usize;
-
-/// Array handle and element store offsets; see [`abi::TYPE_ARRAY`].
-const ARRAY_LEN_OFFSET: usize = abi::ARRAY_LEN_OFFSET as usize;
-const ARRAY_ELEMS_OFFSET: usize = abi::ARRAY_ELEMS_OFFSET as usize;
-const ELEMS_DATA_OFFSET: usize = abi::ELEMS_DATA_OFFSET as usize;
-
-/// Promise `state` header values; see [`abi`].
-const PROMISE_PENDING: i32 = abi::PROMISE_PENDING;
-const PROMISE_FULFILLED: i32 = abi::PROMISE_FULFILLED;
-const PROMISE_REJECTED: i32 = abi::PROMISE_REJECTED;
-
-/// The `TYPE_OBJECT` `class` byte of an Error instance; see
-/// [`abi::CLASS_ERROR`]. The renderer prints such an object as its
-/// single-line stack rather than a plain `{ ... }` object.
-const CLASS_ERROR: u8 = abi::CLASS_ERROR;
+pub use harness::{Capture, RunOutcome, Sinks, run};
+#[cfg(test)]
+pub(crate) use harness::{THROWN_PROBE_EXPORT, run_inspect};

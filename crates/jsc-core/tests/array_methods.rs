@@ -50,6 +50,102 @@ const SUB: &str = "class A extends Array {}; ";
 
 // --- function values ---------------------------------------------------------
 
+/// The `indexOf`/`includes` fast path scans the store in the guest: `===` and
+/// `SameValueZero`, holes, content-compared strings, sparse index keys (a huge
+/// `length` costs only the present elements), frozen arrays, and accessor
+/// elements through the generic path.
+#[test]
+fn index_of_fast_path_guest_scan() {
+    both_number("[1, 2, 3, 2].indexOf(2)", 1.0);
+    both_number("[1, 2].indexOf(9)", -1.0);
+    both_number("[].indexOf(undefined)", -1.0);
+    both_number("[NaN].indexOf(NaN)", -1.0);
+    both_number("[-0].indexOf(0)", 0.0);
+    both_number("['a' + 'b'].indexOf('ab')", 0.0);
+    both_number("const o = {}; [{}, o].indexOf(o)", 1.0);
+    both_number("[, undefined].indexOf(undefined)", 1.0);
+    both_number("[1, , 3].indexOf(undefined)", -1.0);
+    both_bool("[NaN].includes(NaN)", true);
+    both_bool("[-0].includes(0)", true);
+    both_bool("[1, , 3].includes(undefined)", true);
+    both_bool("[1, 3].includes(undefined)", false);
+    both_bool("['x'].includes('y')", false);
+    both_number(
+        "const a = []; a[4294967294] = 'z'; a.indexOf('z')",
+        4_294_967_294.0,
+    );
+    both_bool("const a = []; a[4294967294] = 'z'; a.includes('z')", true);
+    both_bool(
+        "const a = []; a[4294967294] = 'z'; a.includes(undefined)",
+        true,
+    );
+    both_number(
+        "const a = [1]; a[5000] = 2; a[3000] = 2; a.indexOf(2)",
+        3000.0,
+    );
+    both_number("const a = Object.freeze([4, 5]); a.indexOf(5)", 1.0);
+    both_bool("const a = Object.freeze([4]); a.includes(4)", true);
+    both_number(
+        "const a = [1]; Object.defineProperty(a, 0, { get() { return 8 } }); a.indexOf(8)",
+        0.0,
+    );
+}
+
+/// A huge `SPARSE` array (frozen or not) is searched over its own index keys
+/// from `fromIndex`: found, not found, a hole reading as `undefined` for
+/// `includes`, and the `length` captured before `fromIndex` runs user code.
+#[test]
+fn index_of_sparse_own_keys() {
+    const HUGE: &str = "const a = []; a[4294967294] = 'z'; ";
+    const FROZEN: &str = "const a = []; a[4294967294] = 'z'; Object.freeze(a); ";
+    both_number(&format!("{HUGE}a.indexOf('y')"), -1.0);
+    both_bool(&format!("{HUGE}a.includes('y')"), false);
+    both_number(
+        &format!("{HUGE}a.indexOf('z', 4294967294)"),
+        4_294_967_294.0,
+    );
+    both_number(&format!("{HUGE}a.indexOf('z', -1)"), 4_294_967_294.0);
+    both_bool(&format!("{HUGE}a.includes(undefined, 4294967294)"), false);
+    both_bool(&format!("{HUGE}a.includes(undefined, 4294967293)"), true);
+    both_number(&format!("{FROZEN}a.indexOf('z')"), 4_294_967_294.0);
+    both_bool(&format!("{FROZEN}a.includes('z')"), true);
+    both_bool(&format!("{FROZEN}a.includes(undefined)"), true);
+    both_number(&format!("{FROZEN}a.indexOf('y')"), -1.0);
+    both_number("const a = Object.freeze([1, 2, 1]); a.indexOf(1, 1)", 2.0);
+    both_number("[1, 2, 1].indexOf(1, 1)", 2.0);
+    both_bool(
+        "const a = [1, 2, 3]; a.includes(undefined, { valueOf() { a.length = 1; return 0; } })",
+        true,
+    );
+    both_number(
+        "const a = [1]; a.indexOf(2, { valueOf() { a.push(2); return 0; } })",
+        -1.0,
+    );
+}
+
+/// An array with accessor elements keeps the per-index path: getters run in
+/// ascending index order even when its table holds them out of order.
+#[test]
+fn index_of_accessor_elements_in_index_order() {
+    const ARR: &str = "const log = []; const a = []; a[2000] = 'p'; \
+        Object.defineProperty(a, 7, { get() { log.push(7); return 'x'; } }); \
+        Object.defineProperty(a, 3, { get() { log.push(3); return 'x'; } }); ";
+    both_string(&format!("{ARR}a.indexOf('x') + ':' + log.join()"), "3:3");
+    both_string(
+        &format!("{ARR}a.includes('x') + ':' + log.join()"),
+        "true:3",
+    );
+    both_string(&format!("{ARR}a.indexOf('q') + ':' + log.join()"), "-1:3,7");
+    both_string(
+        &format!("{ARR}a.includes('q') + ':' + log.join()"),
+        "false:3,7",
+    );
+    both_string(
+        &format!("{ARR}a.indexOf('p') + ':' + log.join()"),
+        "2000:3,7",
+    );
+}
+
 #[test]
 fn new_methods_have_name_and_length() {
     for (name, length) in [

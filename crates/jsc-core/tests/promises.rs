@@ -8,8 +8,10 @@
 #![allow(clippy::expect_used)]
 
 mod common;
-use common::{assert_eval, assert_output, assert_rejected, assert_uncaught};
-use jsc_core::run::compile_and_run;
+use common::{
+    assert_eval, assert_output, assert_rejected, assert_uncaught,
+    assert_unhandled_rejection as assert_unhandled,
+};
 
 // --- Microtask ordering -------------------------------------------------------
 
@@ -520,16 +522,6 @@ fn then_on_a_primitive_throws_a_type_error() {
 
 // --- Unhandled rejections -----------------------------------------------------
 
-/// Run `src` and assert it fails with `Uncaught (in promise) <expected>`.
-fn assert_unhandled(src: &str, expected: &str) {
-    let err = compile_and_run(src).expect_err("program should report an unhandled rejection");
-    assert_eq!(
-        err.to_string(),
-        format!("Uncaught (in promise) {expected}"),
-        "unhandled-rejection message for source `{src}`"
-    );
-}
-
 /// A rejection that never gets a handler fails the run, rendered like an
 /// uncaught exception (Error objects as `Name: message`, primitives as-is).
 #[test]
@@ -859,5 +851,241 @@ fn adoption_ordering_is_unchanged() {
          Promise.resolve().then(() => console.log(\"a\")).then(() => console.log(\"b\")); \
          r(1);",
         "a\ninner 1\nb\nouter 1\n",
+    );
+}
+
+// --- Guest promise engine -----------------------------------------------------
+
+/// Jobs run in spec (V8) order: a reaction registered on a pending promise
+/// is queued only when it settles (after reactions registered meanwhile on
+/// settled promises), `catch` / `finally` reactions queue like `then`, a
+/// promise's reactions run in registration order, top-level `await` resumes
+/// after every job queued before it, and chains interleave link by link.
+#[test]
+fn microtask_order_matches_spec() {
+    assert_output(
+        "let res; const pending = new Promise(r => res = r); \
+         pending.then(v => console.log(\"p1\", v)); \
+         Promise.resolve(1).then(v => console.log(\"r1\", v)); \
+         pending.then(v => console.log(\"p2\", v)); \
+         Promise.reject(\"x\").catch(e => console.log(\"c\", e)); \
+         Promise.resolve(2).finally(() => console.log(\"f\")); \
+         res(\"v\"); \
+         console.log(\"sync\"); \
+         await null; \
+         console.log(\"after await\"); \
+         Promise.resolve().then(() => console.log(\"a1\")).then(() => console.log(\"a2\")) \
+           .then(() => console.log(\"a3\")); \
+         Promise.resolve().then(() => console.log(\"b1\")).then(() => console.log(\"b2\")); \
+         Promise.reject(\"y\").then(v => console.log(\"no\"), e => console.log(\"e\", e)) \
+           .then(() => console.log(\"e2\")); \
+         console.log(\"end\");",
+        "sync\nr1 1\nc x\nf\np1 v\np2 v\nafter await\nend\n\
+         a1\nb1\ne y\na2\nb2\ne2\na3\n",
+    );
+}
+
+/// `async` functions on the guest driver: each `await` of a native promise
+/// resumes one tick later among plain `then` jobs, returning a promise adopts
+/// it through a thenable job (two extra ticks), a rejected `await` throws
+/// into the body, an abrupt `PromiseResolve` (a throwing `constructor`
+/// getter) throws synchronously at the `await`, and a thenable is assimilated
+/// through its `then`.
+#[test]
+fn async_await_order_matches_spec() {
+    assert_output(
+        "async function a() { console.log(\"a1\"); await null; console.log(\"a2\"); \
+           await Promise.resolve(); console.log(\"a3\"); return \"ra\"; } \
+         async function b() { console.log(\"b1\"); await new Promise(r => r()); console.log(\"b2\"); } \
+         const pa = a(); \
+         b(); \
+         Promise.resolve().then(() => console.log(\"t1\")).then(() => console.log(\"t2\")) \
+           .then(() => console.log(\"t3\")); \
+         pa.then(v => console.log(v)); \
+         console.log(\"sync\");",
+        "a1\nb1\nsync\na2\nb2\nt1\na3\nt2\nra\nt3\n",
+    );
+    assert_output(
+        "async function f() { return Promise.resolve(\"x\"); } \
+         f().then(v => console.log(\"f\", v)); \
+         Promise.resolve().then(() => console.log(\"1\")).then(() => console.log(\"2\")) \
+           .then(() => console.log(\"3\")).then(() => console.log(\"4\"));",
+        "1\n2\nf x\n3\n4\n",
+    );
+    assert_output(
+        "async function g() { \
+           try { await Promise.reject(\"boom\"); } catch (e) { console.log(\"caught\", e); } \
+           throw \"out\"; } \
+         g().catch(e => console.log(\"rejected\", e));",
+        "caught boom\nrejected out\n",
+    );
+    assert_output(
+        "const p = Promise.resolve(5); \
+         Object.defineProperty(p, \"constructor\", { get() { throw \"ctor\"; } }); \
+         async function h() { try { await p; } catch (e) { console.log(\"h caught\", e); } } \
+         h(); \
+         console.log(\"after h\");",
+        "h caught ctor\nafter h\n",
+    );
+    assert_output(
+        "const t = { then(r) { console.log(\"then called\"); r(7); } }; \
+         async function k() { const v = await t; console.log(\"k\", v); } \
+         k(); \
+         console.log(\"sync k\");",
+        "sync k\nthen called\nk 7\n",
+    );
+}
+
+/// The reported unhandled rejection is the oldest by CREATION, not by
+/// rejection time, and a handled older one is skipped.
+#[test]
+fn unhandled_rejection_creation_order() {
+    assert_unhandled(
+        "let rejA; const a = new Promise((_, r) => rejA = r); \
+         Promise.reject(\"b\"); rejA(\"a\"); 0",
+        "a",
+    );
+    assert_unhandled(
+        "const a = Promise.reject(\"a\"); const b = Promise.reject(\"b\"); \
+         a.catch(() => {}); 0",
+        "b",
+    );
+    assert_unhandled(
+        "const a = Promise.reject(\"a\"); \
+         Promise.resolve().then(() => a.catch(() => {})); \
+         Promise.reject(\"b\"); 0",
+        "b",
+    );
+}
+
+/// A handler attached after the rejection was tracked — several jobs later,
+/// or after a top-level `await` drained the queue — still counts as handled.
+#[test]
+fn late_catch_counts_as_handled() {
+    assert_output(
+        "const p = Promise.reject(\"late\"); \
+         Promise.resolve().then(() => {}).then(() => {}) \
+           .then(() => p.catch(e => console.log(\"caught\", e)));",
+        "caught late\n",
+    );
+    assert_output(
+        "const p = Promise.reject(\"x\"); await null; \
+         p.catch(e => console.log(\"caught\", e));",
+        "caught x\n",
+    );
+}
+
+/// Resolving a promise with itself rejects it with a fresh in-guest
+/// `TypeError`; unhandled, that rejection fails the run.
+#[test]
+fn promise_self_resolution_type_error() {
+    assert_output(
+        "let res; const p = new Promise(r => res = r); res(p); \
+         p.catch(e => console.log(e instanceof TypeError, e.name, e.message));",
+        "true TypeError Chaining cycle detected for promise #<Promise>\n",
+    );
+    assert_unhandled(
+        "let res; const p = new Promise(r => res = r); res(p); 0",
+        "TypeError: Chaining cycle detected for promise #<Promise>",
+    );
+}
+
+/// Top-level `await` drains the queue: a promise settled several jobs later
+/// yields its value, a rejection settled by a job throws (and the awaited
+/// promise counts as handled), and a non-promise operand still lets queued
+/// jobs run first.
+#[test]
+fn top_level_await_drains() {
+    assert_output(
+        "let res; const p = new Promise(r => res = r); \
+         Promise.resolve().then(() => 1).then(v => v + 1).then(v => res(v * 10)); \
+         console.log(\"got\", await p);",
+        "got 20\n",
+    );
+    assert_uncaught(
+        "let rej; const p = new Promise((_, r) => rej = r); \
+         Promise.resolve().then(() => rej(\"boom\")); await p;",
+        "boom",
+    );
+    assert_output(
+        "const p = Promise.reject(\"r\"); \
+         try { await p; } catch (e) { console.log(\"caught\", e); }",
+        "caught r\n",
+    );
+    assert_output(
+        "Promise.resolve().then(() => console.log(\"job\")); await 0; console.log(\"after\");",
+        "job\nafter\n",
+    );
+}
+
+/// The drain is a loop, not recursion: a 100000-link `then` chain and a
+/// 100000-deep adoption chain settle without growing the wasm stack.
+#[test]
+fn long_then_chain_no_stack_growth() {
+    assert_output(
+        "let p = Promise.resolve(0); \
+         for (let i = 0; i < 100000; i++) p = p.then(v => v + 1); \
+         p.then(v => console.log(v));",
+        "100000\n",
+    );
+    assert_output(
+        "let res; let p = new Promise(r => res = r); \
+         for (let i = 0; i < 100000; i++) { const q = p; p = new Promise(r => r(q)); } \
+         p.then(v => console.log(\"adopted\", v)); res(7);",
+        "adopted 7\n",
+    );
+}
+
+/// Thenables are assimilated per the spec: `await`, `Promise.resolve` and an
+/// executor's `resolve` read `then` (a throwing getter rejects) and call a
+/// callable one in a later job with `this` = the thenable and a fresh
+/// once-only resolving-function pair; a native promise resolution goes the
+/// same way, taking two extra ticks against a sibling chain.
+#[test]
+fn thenable_assimilated_per_spec() {
+    assert_output(
+        "const v = await { then(r) { r(5); } }; console.log(\"await\", v); \
+         try { await { then(_, r) { r(\"no\"); } }; } catch (e) { console.log(\"caught\", e); }",
+        "await 5\ncaught no\n",
+    );
+    assert_output(
+        "Promise.resolve({ v: \"pr\", then(r) { r(this.v); } }) \
+           .then(v => console.log(\"resolve\", v)); \
+         Promise.resolve({ then(r) { r({ then(g) { g(\"deep\"); } }); } }) \
+           .then(v => console.log(\"nested\", v)); \
+         const p = Promise.resolve(1); console.log(Promise.resolve(p) === p); \
+         const q = Promise.resolve(2); q.constructor = Object; \
+         console.log(Promise.resolve(q) === q);",
+        "true\nfalse\nresolve pr\nnested deep\n",
+    );
+    assert_output(
+        "new Promise(r => r({ then(f) { f(\"ex\"); } })).then(v => console.log(\"executor\", v)); \
+         new Promise(r => { r({ then(f) { f(\"kept\"); } }); throw \"lost\"; }) \
+           .then(v => console.log(v), e => console.log(\"bad\", e));",
+        "executor ex\nkept\n",
+    );
+    assert_output(
+        "Promise.resolve({ get then() { throw \"getter\"; } }) \
+           .catch(e => console.log(\"caught\", e)); \
+         new Promise(r => r({ get then() { throw \"exec getter\"; } })) \
+           .catch(e => console.log(\"caught\", e));",
+        "caught getter\ncaught exec getter\n",
+    );
+    assert_output(
+        "Promise.resolve({ then(f, r) { f(1); f(2); r(3); throw 4; } }) \
+           .then(v => console.log(\"once\", v), e => console.log(\"bad\", e)); \
+         Promise.resolve({ then(f, r) { r(\"r1\"); f(\"f1\"); } }) \
+           .then(v => console.log(\"bad\", v), e => console.log(\"rejected\", e));",
+        "once 1\nrejected r1\n",
+    );
+    assert_output(
+        "let sync = true; \
+         Promise.resolve({ then(f) { console.log(\"then sync\", sync); f(0); } }); \
+         sync = false; \
+         const p = Promise.resolve(1); \
+         new Promise(r => r(p)).then(() => console.log(\"adopted\")); \
+         Promise.resolve().then(() => console.log(\"t1\")).then(() => console.log(\"t2\")) \
+           .then(() => console.log(\"t3\"));",
+        "then sync false\nt1\nt2\nadopted\nt3\n",
     );
 }

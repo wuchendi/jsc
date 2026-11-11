@@ -15,7 +15,11 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use jsc_core::run::{Capture, Sinks};
 use wasmparser::{Operator, Parser, Payload};
+
+/// Far above any measured program, so it never runs out in practice.
+const FUEL_BUDGET: u64 = 1 << 40;
 
 const HEADER: &str = "program\tuser_ops\tcall_indirect\tprop_calls\thost_calls\tfuel\treason";
 
@@ -52,17 +56,17 @@ fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/opcount")
 }
 
-/// Measure one program. Function index layout (`emit/mod.rs`): the host
+/// Measure one program. Function index layout (`emit/mod.rs`): the four WASI
 /// imports come first (`0..imports`), then `main`, then the `n` user functions
 /// (`n` = `IrProgram::functions.len()`), then the runtime helpers. "User code"
 /// is code-section bodies `0..=n` (`main` + user functions); a `call` target
-/// below `imports` is a host call; `prop_calls` counts calls to the
+/// below `imports` is a WASI call (`host_calls`); `prop_calls` counts calls to the
 /// property-access helpers `__get`/`__set`/`__has`/`__delete`.
 fn measure(src: &str) -> Row {
     let program = jsc_core::frontend::parse(src, jsc_core::frontend::Dialect::Js).expect("parse");
     let ir = jsc_core::codegen::lower(&program).expect("lower");
     let user_bodies = ir.functions.len() + 1;
-    let wasm = jsc_core::emit::emit(&ir);
+    let wasm = jsc_core::emit::emit(&ir, jsc_core::emit::CompileOptions::default());
 
     let mut imports = 0u32;
     let mut row = Row {
@@ -108,9 +112,15 @@ fn measure(src: &str) -> Row {
         }
     }
 
-    let (out, fuel) = jsc_core::run::run_metered(&wasm).expect("program runs cleanly");
-    assert!(!out.is_empty(), "corpus program printed nothing");
-    row.fuel = fuel;
+    let capture = Capture::new();
+    let outcome = jsc_core::run::run(&wasm, Sinks::Capture(capture.clone()), Some(FUEL_BUDGET))
+        .expect("program runs cleanly");
+    assert_eq!(outcome.code, 0, "{}", capture.stderr());
+    assert!(
+        !capture.stdout().is_empty(),
+        "corpus program printed nothing"
+    );
+    row.fuel = outcome.fuel;
     row
 }
 
@@ -222,6 +232,32 @@ fn opcount_snapshot() {
     );
 }
 
+/// The `__array_push` fast path stays frame-free. The marginal fuel of one
+/// `push_1e5` iteration is measured between 5e4 and 1e5 pushes, so startup and
+/// printing cancel and the single store doubling in that range is under 1
+/// fuel per push. Derivation of [`PUSH_FUEL_BOUND`]: the frame-free loop costs
+/// 207.5 fuel per iteration (`snapshot.tsv`, before the shadow stack, whose
+/// `__array_push` also ran 36 fuel: the fixed helper has the same 36), plus at
+/// most ~12 for scratch write-throughs in the loop, so 207..219. The slow path
+/// adds 38 (21 prologue with both parameter stores, 5 sparse test, 5 reserve
+/// call, 10 reserve body, 2 epilogue, less the fast-path tests it skips), so
+/// at least 245.
+const PUSH_FUEL_BOUND: u64 = 235;
+
+#[test]
+fn push_fast_path_fuel_is_bounded() {
+    let pushes = |n: u32| {
+        format!("const a = []; for (let i = 0; i < {n}; i++) a.push(i); console.log(a.length)")
+    };
+    let half = measure(&pushes(50_000)).fuel;
+    let full = measure(&pushes(100_000)).fuel;
+    let per_push = (full - half) / 50_000;
+    assert!(
+        per_push < PUSH_FUEL_BOUND,
+        "__array_push fast path looks dead: {per_push} fuel per push"
+    );
+}
+
 /// `n` pushes onto one array cost amortized O(1) each: the fuel of 1e5 pushes
 /// stays well under 2.5x the fuel of 5e4 (a per-push copy would be ~4x).
 #[test]
@@ -234,5 +270,21 @@ fn push_fuel_is_linear() {
     assert!(
         full * 2 < half * 5,
         "push fuel is not linear: fuel(5e4) = {half}, fuel(1e5) = {full}"
+    );
+}
+
+/// `indexOf` on a `SPARSE` array with an own table (the generic builtin call)
+/// scans only its present elements: the fuel of a search does not grow with
+/// the index gap. It would if `__protos_indexless` rejected the
+/// dictionary-mode `%Array.prototype%`, which sends every plain array to the
+/// per-index `HasProperty` loop (~1e6 steps here).
+#[test]
+fn sparse_index_of_fuel_is_gap_free() {
+    let search = |n: u32| format!("const a = []; a[{n}] = 1; console.log(a.indexOf(1))");
+    let near = measure(&search(10_000)).fuel;
+    let far = measure(&search(1_000_000)).fuel;
+    assert!(
+        far.abs_diff(near) < 10_000,
+        "sparse indexOf scans the gap: fuel(1e4) = {near}, fuel(1e6) = {far}"
     );
 }

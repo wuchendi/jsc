@@ -4,9 +4,9 @@
  * - {@link compile} runs JavaScript source through the Rust compiler
  *   (`crates/jsc-wasm`, loaded as a wasm-bindgen module) and returns the emitted
  *   WebAssembly module bytes.
- * - {@link run} compiles the source, instantiates the emitted module in a JS
- *   shim ({@link createShim}), calls its exported `main`, and decodes the
- *   result plus anything `console.log` printed.
+ * - {@link run} compiles the source, instantiates the emitted command module
+ *   against the WASI polyfill ({@link createWasi}) alone, calls `_start`, and
+ *   returns its output and exit code.
  *
  * The wasm-bindgen glue uses an async `init()` (wasm-pack `--target web`), so
  * both entry points are async even though the underlying Rust `compile` is
@@ -14,20 +14,24 @@
  */
 
 import initGlue, { compile as wasmCompile } from '../wasm/jsc_wasm.js'
-import {
-  EXC_PENDING_EXPORT_NAME,
-  EXC_VALUE_EXPORT_NAME,
-  MEMORY_EXPORT_NAME,
-} from './abi.js'
-import { createShim, OUT_OF_MEMORY } from './shim.js'
-import { asU64, decode, formatValue } from './value.js'
+import { createWasi, Exit } from './wasi.js'
 
-/** The decoded result of running a program: the final value and captured stdout. */
+/** Options of {@link compile} and {@link run}. */
+export interface CompileOptions {
+  /** Have the module render its completion value after the final drain. */
+  printCompletion?: boolean
+}
+
+/** What a finished program produced. */
 export interface RunResult {
-  /** The last expression statement's value, formatted the way JavaScript prints it. */
-  result: string
-  /** Everything `console.log` printed, in execution order. */
+  /** Everything written to fd 1, without the completion line. */
   stdout: string
+  /** Everything written to fd 2: the `Uncaught ...` reports. */
+  stderr: string
+  /** The `proc_exit` code, or `0` when `_start` returned. */
+  exitCode: number
+  /** The rendered completion value, on a clean exit under `printCompletion`. */
+  completion?: string
 }
 
 // The wasm-bindgen module initializes once; every later call reuses it.
@@ -60,68 +64,56 @@ function ensureInit(): Promise<void> {
  * Throws a JS `Error` on a compile failure; when the underlying diagnostic
  * carries a source span, the message is the compiler's caret block.
  */
-export async function compile(src: string): Promise<Uint8Array> {
+export async function compile(
+  src: string,
+  options?: CompileOptions,
+): Promise<Uint8Array> {
   await ensureInit()
-  return wasmCompile(src)
+  return wasmCompile(src, options)
 }
 
 /**
- * Compile and run JavaScript `src`: instantiate the emitted module in the JS
- * shim, call `main`, and decode the result plus captured `console.log` output.
+ * Compile and run JavaScript `src`.
  *
- * Throws `Error("Uncaught <value>")` when the program throws an exception that
- * is never caught (mirrors `harness.rs`'s uncaught-exception check).
+ * An uncaught exception or unhandled rejection is not a rejection of this
+ * promise: it is the `Uncaught ...` line on `stderr` and `exitCode` 1. The
+ * promise rejects on a compile error or a guest trap.
  */
-export async function run(src: string): Promise<RunResult> {
-  const bytes = await compile(src)
-  const shim = createShim()
+export async function run(
+  src: string,
+  options?: CompileOptions,
+): Promise<RunResult> {
+  const bytes = await compile(src, options)
+  const wasi = createWasi()
   // Compile to a Module first, then instantiate: the `(Module, imports)`
   // overload returns the `Instance` directly (no `{ instance }` wrapper). The
   // glue types `compile` as a generic `Uint8Array`; the bytes are genuinely
   // `ArrayBuffer`-backed (wasm-bindgen returns a fresh `.slice()`), so the
   // narrowing to `BufferSource` is sound.
   const module = await WebAssembly.compile(bytes as Uint8Array<ArrayBuffer>)
-  const instance = await WebAssembly.instantiate(module, shim.imports)
-  shim.bindInstance(instance)
+  // The module imports only the four WASI functions and exports only
+  // `memory` and `_start`.
+  const instance = await WebAssembly.instantiate(module, wasi.imports)
+  wasi.bind(instance.exports.memory as WebAssembly.Memory)
 
-  const main = instance.exports.main as () => bigint
-  // Out of memory (the sticky `__heap_ptr` sentinel, set by a failed guest or
-  // host grow) wins over the trap or result it caused (mirrors `harness.rs`).
-  let bits: bigint
+  let exitCode = 0
   try {
-    bits = asU64(main())
+    ;(instance.exports._start as () => void)()
   } catch (e) {
-    if (shim.heapExhausted()) throw new Error(OUT_OF_MEMORY)
-    throw e
-  }
-  if (shim.heapExhausted()) throw new Error(OUT_OF_MEMORY)
-
-  // Drain microtasks scheduled but never awaited, UNLESS `main` completed
-  // abruptly with a pending exception (mirrors `harness.rs`'s after-`main`
-  // `drain_after_main`).
-  const pendingGlobal = instance.exports[EXC_PENDING_EXPORT_NAME] as
-    | WebAssembly.Global
-    | undefined
-  const excPending = (): number =>
-    pendingGlobal ? Number(pendingGlobal.value) : 0
-  if (excPending() === 0) shim.drainAfterMain()
-
-  // View linear memory AFTER the drain so a promise settled by a microtask
-  // renders its final state (the buffer may also have grown/detached).
-  const mem = instance.exports[MEMORY_EXPORT_NAME] as
-    | WebAssembly.Memory
-    | undefined
-  const memBytes = mem ? new Uint8Array(mem.buffer) : new Uint8Array(0)
-
-  // Uncaught-exception check: a set `$exc_pending` after `main` means an
-  // exception propagated all the way out. Render `$exc_value` and surface it.
-  if (excPending() !== 0) {
-    const valueGlobal = instance.exports[EXC_VALUE_EXPORT_NAME] as
-      | WebAssembly.Global
-      | undefined
-    const valueBits = valueGlobal ? asU64(valueGlobal.value as bigint) : 0n
-    throw new Error(`Uncaught ${formatValue(decode(valueBits, memBytes))}`)
+    if (!(e instanceof Exit)) throw e
+    exitCode = e.code
   }
 
-  return { result: formatValue(decode(bits, memBytes)), stdout: shim.stdout() }
+  // On a clean exit the completion is the module's last fd 1 write: one
+  // `fd_write` of the rendered value and a newline.
+  const completion =
+    options?.printCompletion && exitCode === 0
+      ? wasi.popStdoutWrite().slice(0, -1)
+      : undefined
+  return {
+    stdout: wasi.stdout(),
+    stderr: wasi.stderr(),
+    exitCode,
+    ...(completion === undefined ? {} : { completion }),
+  }
 }

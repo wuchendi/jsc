@@ -13,7 +13,7 @@ pub(super) fn emit_inc_dec(
     local: u32,
     inc: bool,
     prefix: bool,
-    function: &mut Function,
+    function: &mut impl Sink,
     helpers: Helpers<'_>,
 ) {
     let step = if inc {
@@ -22,6 +22,9 @@ pub(super) fn emit_inc_dec(
         Instruction::F64Sub
     };
     emit_coerce_number(function, local, helpers);
+    // Two writes follow: the coercion's and the update's.
+    function.note_numeric_def(local);
+    function.note_numeric_def(local);
     if prefix {
         // new = old ± 1; store and yield the new value.
         function.instruction(&Instruction::LocalGet(local));
@@ -42,6 +45,37 @@ pub(super) fn emit_inc_dec(
     }
 }
 
+/// `ToNumber` two operands stashed in raw locals, in order. `s0` is passed by
+/// value (the callee roots it) and is a number afterwards, but `s1` may still
+/// hold the heap value of `rhs` across that call, so the cold arm roots it in a
+/// temp slot. Neither arm writes a slot on the path where `s0` is a number.
+fn emit_coerce_operands(
+    function: &mut impl Sink,
+    s0: u32,
+    s1: u32,
+    rhs: &IrNode,
+    helpers: Helpers<'_>,
+) {
+    emit_is_number(function, s0);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    let mark = function.temp_mark();
+    if !yields_number(rhs) {
+        function.instruction(&Instruction::LocalGet(s1));
+        function.root_node(rhs);
+        function.instruction(&Instruction::Drop);
+    }
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::Call(helpers.to_number));
+    function.instruction(&Instruction::LocalSet(s0));
+    emit_propagate_if_pending(function, helpers);
+    function.release_temps(mark);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+    emit_coerce_number(function, s1, helpers);
+}
+
 /// Emit the numeric remainder `lhs % rhs`. wasm has no `f64.rem`, so compute the
 /// JS truncated remainder `a - b * trunc(a / b)` (which takes the dividend's
 /// sign). Both operands are stashed in the scratch locals (coerced with
@@ -50,19 +84,19 @@ pub(super) fn emit_inc_dec(
 pub(super) fn emit_mod(
     lhs: &IrNode,
     rhs: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let s0 = scratch;
-    let s1 = scratch + 1;
-    emit_node(lhs, function, scratch, strings, helpers);
+    let (s0, s1) = (scratch + NUM_A, scratch + NUM_B);
+    let mark = function.temp_mark();
+    emit_operand(lhs, function, scratch, strings, helpers);
     emit_node(rhs, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(s1));
     function.instruction(&Instruction::LocalSet(s0));
-    emit_coerce_number(function, s0, helpers);
-    emit_coerce_number(function, s1, helpers);
+    function.release_temps(mark);
+    emit_coerce_operands(function, s0, s1, rhs, helpers);
     // a
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::F64ReinterpretI64);
@@ -87,19 +121,19 @@ fn emit_arith(
     op: BinOp,
     lhs: &IrNode,
     rhs: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let s0 = scratch;
-    let s1 = scratch + 1;
-    emit_node(lhs, function, scratch, strings, helpers);
+    let (s0, s1) = (scratch + NUM_A, scratch + NUM_B);
+    let mark = function.temp_mark();
+    emit_operand(lhs, function, scratch, strings, helpers);
     emit_node(rhs, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(s1));
     function.instruction(&Instruction::LocalSet(s0));
-    emit_coerce_number(function, s0, helpers);
-    emit_coerce_number(function, s1, helpers);
+    function.release_temps(mark);
+    emit_coerce_operands(function, s0, s1, rhs, helpers);
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::LocalGet(s1));
@@ -126,19 +160,19 @@ fn emit_bitwise(
     op: BinOp,
     lhs: &IrNode,
     rhs: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let s0 = scratch;
-    let s1 = scratch + 1;
-    emit_node(lhs, function, scratch, strings, helpers);
+    let (s0, s1) = (scratch + NUM_A, scratch + NUM_B);
+    let mark = function.temp_mark();
+    emit_operand(lhs, function, scratch, strings, helpers);
     emit_node(rhs, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(s1));
     function.instruction(&Instruction::LocalSet(s0));
-    emit_coerce_number(function, s0, helpers);
-    emit_coerce_number(function, s1, helpers);
+    function.release_temps(mark);
+    emit_coerce_operands(function, s0, s1, rhs, helpers);
     emit_to_int32(function, s0);
     emit_to_int32(function, s1);
     let (int_op, convert) = match op {
@@ -165,7 +199,7 @@ fn emit_bitwise(
 /// the i64 range still wrap correctly. NaN and ±Infinity make `m` NaN, and `-0`
 /// makes it `+0`; the saturating unsigned truncation maps both to `0` and
 /// reinterprets `[2^31, 2^32)` as the negative int32 range.
-fn emit_to_int32(function: &mut Function, local: u32) {
+fn emit_to_int32(function: &mut impl Sink, local: u32) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::F64Trunc);
@@ -186,24 +220,23 @@ fn emit_to_int32(function: &mut Function, local: u32) {
 /// Every argument is converted with `ToNumber` (a user `valueOf`/`toString`
 /// runs, and may throw); the conversion is emitted behind one `is_number` test
 /// and skipped for an argument that always yields a number. The unary ops then
-/// unbox their single argument to `f64`, apply a native wasm op (or the host
-/// `__method` [`abi::METHOD_OP_MATH`] function for the transcendentals), and
-/// rebox. `Min`/`Max` fold the native `f64.min`/`f64.max` (which propagate NaN
+/// unbox their single argument to `f64`, apply a native wasm op (or the guest
+/// [`libm`] helper for the transcendentals), and rebox. `Min`/`Max` fold the native `f64.min`/`f64.max` (which propagate NaN
 /// and order `-0`/`+0` like JS) over the arguments starting from the identity
 /// (`+Infinity` for min, `-Infinity` for max), so the empty-args case yields
 /// the correct infinity; `Hypot` folds its scaled sum of squares the same way
 /// ([`emit_math_spread`]). `Pow` delegates to [`emit_pow`]; the binary
 /// `Atan2` / `Imul` evaluate both arguments before converting either.
 #[allow(clippy::too_many_lines)] // one flat dispatch over the methods
-pub(super) fn emit_math_call(
+pub(super) fn emit_math_call<S: Sink>(
     op: MathOp,
     args: &[IrNode],
-    function: &mut Function,
+    function: &mut S,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let x = |function: &mut Function, local: u32| {
+    let x = |function: &mut S, local: u32| {
         function.instruction(&Instruction::LocalGet(local));
         function.instruction(&Instruction::F64ReinterpretI64);
     };
@@ -216,20 +249,26 @@ pub(super) fn emit_math_call(
             emit_math_spread(op, &spread, function, scratch, strings, helpers);
         }
         MathOp::Random => {
-            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-            emit_host_math(abi::MATH_FN_RANDOM, None, function, helpers);
+            // In `[0, 1)`, so never NaN: the f64 bits are the jsval.
+            function.instruction(&Instruction::Call(helpers.random()));
+            function.instruction(&Instruction::I64ReinterpretF64);
         }
         MathOp::Atan2 | MathOp::Imul => {
-            let (s0, s1) = (scratch, scratch + 1);
-            emit_node(&args[0], function, scratch, strings, helpers);
+            let (s0, s1) = (scratch + NUM_A, scratch + NUM_B);
+            let mark = function.temp_mark();
+            emit_operand(&args[0], function, scratch, strings, helpers);
             emit_node(&args[1], function, scratch, strings, helpers);
             function.instruction(&Instruction::LocalSet(s1));
             function.instruction(&Instruction::LocalSet(s0));
-            emit_coerce_number(function, s0, helpers);
-            emit_coerce_number(function, s1, helpers);
+            function.release_temps(mark);
+            emit_coerce_operands(function, s0, s1, &args[1], helpers);
             if op == MathOp::Atan2 {
                 function.instruction(&Instruction::LocalGet(s0));
-                emit_host_math(abi::MATH_FN_ATAN2, Some(s1), function, helpers);
+                function.instruction(&Instruction::F64ReinterpretI64);
+                function.instruction(&Instruction::LocalGet(s1));
+                function.instruction(&Instruction::F64ReinterpretI64);
+                function.instruction(&Instruction::Call(helpers.libm(libm::H::Atan2)));
+                emit_box_f64(function, helpers);
             } else {
                 emit_to_int32(function, s0);
                 emit_to_int32(function, s1);
@@ -251,27 +290,30 @@ pub(super) fn emit_math_call(
             };
             emit_node(&args[0], function, scratch, strings, helpers);
             // A single-use number operand stays on the stack.
+            let s0 = scratch + NUM_A;
             let stashed = !(yields_number(&args[0]) && (native.is_some() || op == MathOp::Fround));
             if stashed {
-                function.instruction(&Instruction::LocalSet(scratch));
+                function.instruction(&Instruction::LocalSet(s0));
                 if !yields_number(&args[0]) {
-                    emit_coerce_number(function, scratch, helpers);
+                    emit_coerce_number(function, s0, helpers);
                 }
             }
-            if let Some(code) = host_math_code(op) {
-                function.instruction(&Instruction::LocalGet(scratch));
-                emit_host_math(code, None, function, helpers);
+            if let Some(helper) = libm::unary_helper(op) {
+                function.instruction(&Instruction::LocalGet(s0));
+                function.instruction(&Instruction::F64ReinterpretI64);
+                function.instruction(&Instruction::Call(helpers.libm(helper)));
+                emit_box_f64(function, helpers);
                 return;
             }
             if op == MathOp::Clz32 {
-                emit_to_int32(function, scratch);
+                emit_to_int32(function, s0);
                 function.instruction(&Instruction::I32Clz);
                 function.instruction(&Instruction::F64ConvertI32U);
                 function.instruction(&Instruction::I64ReinterpretF64);
                 return;
             }
             if stashed {
-                function.instruction(&Instruction::LocalGet(scratch));
+                function.instruction(&Instruction::LocalGet(s0));
             }
             function.instruction(&Instruction::F64ReinterpretI64);
             if let Some(native) = native {
@@ -285,31 +327,31 @@ pub(super) fn emit_math_call(
                 // `[-0.5, -0]` rounds to `-0`; differs from wasm's banker's
                 // `f64.nearest` (e.g. `round(2.5) == 3`, not `2`).
                 function.instruction(&Instruction::F64Floor);
-                x(function, scratch);
+                x(function, s0);
                 function.instruction(&Instruction::F64Floor);
                 function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
                 function.instruction(&Instruction::F64Add);
-                x(function, scratch);
-                x(function, scratch);
+                x(function, s0);
+                x(function, s0);
                 function.instruction(&Instruction::F64Floor);
                 function.instruction(&Instruction::F64Sub);
                 function.instruction(&Instruction::F64Const(Ieee64::from(0.5)));
                 function.instruction(&Instruction::F64Lt);
                 // `select(floor, floor + 1, frac < 0.5)`.
                 function.instruction(&Instruction::Select);
-                x(function, scratch);
+                x(function, s0);
                 function.instruction(&Instruction::F64Copysign);
             } else {
                 // `Sign`: `select(x, copysign(1, x), x == 0 || x != x)`
                 // (keeps `±0` and NaN).
                 function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
-                x(function, scratch);
+                x(function, s0);
                 function.instruction(&Instruction::F64Copysign);
-                x(function, scratch);
+                x(function, s0);
                 function.instruction(&Instruction::F64Const(Ieee64::from(0.0)));
                 function.instruction(&Instruction::F64Eq);
-                x(function, scratch);
-                x(function, scratch);
+                x(function, s0);
+                x(function, s0);
                 function.instruction(&Instruction::F64Ne);
                 function.instruction(&Instruction::I32Or);
                 function.instruction(&Instruction::Select);
@@ -317,45 +359,6 @@ pub(super) fn emit_math_call(
             emit_box_f64(function, helpers);
         }
     }
-}
-
-/// The host [`abi::METHOD_OP_MATH`] function code of a unary `Math` method
-/// without an exact wasm instruction, or `None`.
-fn host_math_code(op: MathOp) -> Option<i64> {
-    Some(match op {
-        MathOp::Cbrt => abi::MATH_FN_CBRT,
-        MathOp::Log => abi::MATH_FN_LOG,
-        MathOp::Log2 => abi::MATH_FN_LOG2,
-        MathOp::Log10 => abi::MATH_FN_LOG10,
-        MathOp::Log1p => abi::MATH_FN_LOG1P,
-        MathOp::Exp => abi::MATH_FN_EXP,
-        MathOp::Expm1 => abi::MATH_FN_EXPM1,
-        MathOp::Sin => abi::MATH_FN_SIN,
-        MathOp::Cos => abi::MATH_FN_COS,
-        MathOp::Tan => abi::MATH_FN_TAN,
-        MathOp::Asin => abi::MATH_FN_ASIN,
-        MathOp::Acos => abi::MATH_FN_ACOS,
-        MathOp::Atan => abi::MATH_FN_ATAN,
-        MathOp::Sinh => abi::MATH_FN_SINH,
-        MathOp::Cosh => abi::MATH_FN_COSH,
-        MathOp::Tanh => abi::MATH_FN_TANH,
-        MathOp::Asinh => abi::MATH_FN_ASINH,
-        MathOp::Acosh => abi::MATH_FN_ACOSH,
-        MathOp::Atanh => abi::MATH_FN_ATANH,
-        _ => return None,
-    })
-}
-
-/// Call the host `Math` function `code` on the number jsval on the stack
-/// (and the one in i64 local `second`), leaving its number jsval.
-fn emit_host_math(code: i64, second: Option<u32>, function: &mut Function, helpers: Helpers<'_>) {
-    function.instruction(&Instruction::I32Const(abi::METHOD_OP_MATH));
-    match second {
-        Some(local) => function.instruction(&Instruction::LocalGet(local)),
-        None => function.instruction(&Instruction::I64Const(UNDEFINED_BITS)),
-    };
-    function.instruction(&Instruction::I64Const(code));
-    function.instruction(&Instruction::Call(helpers.method));
 }
 
 /// The first of the i64 slots variadic `Math.min`/`Math.max` stash evaluated
@@ -377,7 +380,7 @@ const MIN_MAX_STASH_LEN: usize = 6;
 fn emit_min_max(
     op: MathOp,
     args: &[IrNode],
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -393,6 +396,8 @@ fn emit_min_max(
         f64::NEG_INFINITY
     };
     let interleaved = args.iter().skip(1).all(is_inert);
+    let s0 = scratch + NUM_A;
+    let mark = function.temp_mark();
     if !interleaved && args.len() > MIN_MAX_STASH_LEN {
         let items = args.iter().cloned().map(SpreadElem::Item).collect();
         let spread = IrNode::ArraySpread(items);
@@ -400,8 +405,10 @@ fn emit_min_max(
         return;
     }
     if !interleaved {
+        // Rooted until folded: a later argument is still a heap value in its
+        // raw stash slot while an earlier one's `ToNumber` runs.
         for arg in args {
-            emit_node(arg, function, scratch, strings, helpers);
+            emit_operand(arg, function, scratch, strings, helpers);
         }
         for i in (0..args.len()).rev() {
             function.instruction(&Instruction::LocalSet(stash_slot(scratch, i)));
@@ -416,8 +423,8 @@ fn emit_min_max(
                 function.instruction(&fold);
                 continue;
             }
-            function.instruction(&Instruction::LocalSet(scratch));
-            scratch
+            function.instruction(&Instruction::LocalSet(s0));
+            s0
         } else {
             stash_slot(scratch, i)
         };
@@ -428,6 +435,7 @@ fn emit_min_max(
         function.instruction(&Instruction::F64ReinterpretI64);
         function.instruction(&fold);
     }
+    function.release_temps(mark);
     emit_box_f64(function, helpers);
 }
 
@@ -495,7 +503,7 @@ fn yields_number(node: &IrNode) -> bool {
 pub(super) fn emit_math_spread(
     op: MathOp,
     args: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -553,22 +561,23 @@ pub(super) fn emit_math_spread(
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32GeU);
     function.instruction(&Instruction::BrIf(1));
-    // acc = op(acc, ToNumber(array[idx])). The element sits in `scratch`,
-    // idle once the array is built.
+    // acc = op(acc, ToNumber(array[idx])). The element sits in the raw `elem`:
+    // passed by value to `ToNumber`, a number afterwards.
+    let elem = scratch + NUM_A;
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::LocalGet(idx));
     function.instruction(&Instruction::I32Const(8));
     function.instruction(&Instruction::I32Mul);
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::I64Load(elem_slot(0)));
-    function.instruction(&Instruction::LocalSet(scratch));
-    emit_coerce_number(function, scratch, helpers);
+    function.instruction(&Instruction::LocalSet(elem));
+    emit_coerce_number(function, elem, helpers);
     if is_hypot {
-        emit_hypot_step(function, scratch, acc, ssq, flags);
+        emit_hypot_step(function, elem, acc, ssq, flags);
     } else {
         function.instruction(&Instruction::LocalGet(acc));
         function.instruction(&Instruction::F64ReinterpretI64);
-        function.instruction(&Instruction::LocalGet(scratch));
+        function.instruction(&Instruction::LocalGet(elem));
         function.instruction(&Instruction::F64ReinterpretI64);
         if is_min {
             function.instruction(&Instruction::F64Min);
@@ -618,12 +627,12 @@ pub(super) fn emit_math_spread(
 /// [`emit_math_spread`]): an infinite or NaN `|x|` sets flag bit 1 / 2; a
 /// new largest `|x|` rescales `ssq` to `1 + ssq * (scale / |x|)²` and becomes
 /// `scale`; any other nonzero `|x|` adds `(|x| / scale)²`.
-fn emit_hypot_step(function: &mut Function, x: u32, scale: u32, ssq: u32, flags: u32) {
-    let get = |function: &mut Function, local: u32| {
+fn emit_hypot_step<S: Sink>(function: &mut S, x: u32, scale: u32, ssq: u32, flags: u32) {
+    let get = |function: &mut S, local: u32| {
         function.instruction(&Instruction::LocalGet(local));
         function.instruction(&Instruction::F64ReinterpretI64);
     };
-    let set_flag = |function: &mut Function, bit: i64| {
+    let set_flag = |function: &mut S, bit: i64| {
         function.instruction(&Instruction::LocalGet(flags));
         function.instruction(&Instruction::I64Const(bit));
         function.instruction(&Instruction::I64Or);
@@ -651,7 +660,7 @@ fn emit_hypot_step(function: &mut Function, x: u32, scale: u32, ssq: u32, flags:
     function.instruction(&Instruction::F64Gt);
     function.instruction(&Instruction::If(BlockType::Empty));
     // ssq = 1 + ssq * (scale / x)²; scale = x.
-    let ratio_squared = |function: &mut Function, num: u32, den: u32| {
+    let ratio_squared = |function: &mut S, num: u32, den: u32| {
         for _ in 0..2 {
             get(function, num);
             get(function, den);
@@ -711,26 +720,26 @@ fn emit_hypot_step(function: &mut Function, x: u32, scale: u32, ssq: u32, flags:
 /// locals) cannot clobber them — the same evaluate-then-store discipline as
 /// [`emit_mod`].
 #[allow(clippy::too_many_lines)]
-pub(super) fn emit_pow(
+pub(super) fn emit_pow<S: Sink>(
     base: &IrNode,
     exp: &IrNode,
-    function: &mut Function,
+    function: &mut S,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     /// Push the f64 held (as bits) in i64 local `local`.
-    fn get(function: &mut Function, local: u32) {
+    fn get(function: &mut impl Sink, local: u32) {
         function.instruction(&Instruction::LocalGet(local));
         function.instruction(&Instruction::F64ReinterpretI64);
     }
     /// Pop an f64 into i64 local `local` (as bits).
-    fn set(function: &mut Function, local: u32) {
+    fn set(function: &mut impl Sink, local: u32) {
         function.instruction(&Instruction::I64ReinterpretF64);
         function.instruction(&Instruction::LocalSet(local));
     }
     /// `local = local * other`.
-    fn mul_into(function: &mut Function, local: u32, other: u32) {
+    fn mul_into(function: &mut impl Sink, local: u32, other: u32) {
         get(function, local);
         get(function, other);
         function.instruction(&Instruction::F64Mul);
@@ -738,7 +747,7 @@ pub(super) fn emit_pow(
     }
     /// `res = base^cnt` for an integer `cnt` in `[0, f64::MAX]` by
     /// square-and-multiply over a halving counter (consumes `base` and `cnt`).
-    fn int_pow(function: &mut Function, res: u32, base: u32, cnt: u32) {
+    fn int_pow(function: &mut impl Sink, res: u32, base: u32, cnt: u32) {
         function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
         set(function, res);
         // while cnt >= 1 { if cnt is odd { result *= base }; base *= base;
@@ -771,34 +780,32 @@ pub(super) fn emit_pow(
         function.instruction(&Instruction::End); // loop
         function.instruction(&Instruction::End); // block
     }
-    let f64c = |function: &mut Function, v: f64| {
+    let f64c = |function: &mut S, v: f64| {
         function.instruction(&Instruction::F64Const(Ieee64::from(v)));
     };
 
-    // i64 scratch locals hold f64 bit patterns (reinterpreted on read); the i32
-    // scratch at `scratch + 3` (unused during pow, which never allocates) holds the
-    // negative-exponent flag. `scratch + 4` (the short-circuit-operand temp, dead
-    // on any path that evaluates a `**` sub-expression) holds the fractional part,
-    // and `scratch + 24` / `+25` (`Date` field-method slots; no child
-    // sub-expression is live while pow runs) keep the original base and integer
-    // count for the fractional stage and the underflow fallback.
-    let s_base = scratch;
-    let s_res = scratch + 1;
-    let s_cnt = scratch + 2;
-    let s_neg = scratch + 3;
-    let s_frac = scratch + 4;
+    // All raw i64 (never rooted): the operands are numbers once coerced and
+    // nothing else here is a jsval. The locals hold f64 bit patterns, except
+    // `s_neg`, the negative-exponent flag as 0/1. `+24`..`+28` are the `Date`
+    // field-method slots; no child sub-expression is live while pow runs.
+    let s_base = scratch + NUM_A;
+    let s_cnt = scratch + NUM_B;
     let s_orig = scratch + 24;
     let s_cnt0 = scratch + 25;
+    let s_res = scratch + 26;
+    let s_frac = scratch + 27;
+    let s_neg = scratch + 28;
 
     // Evaluate both operands onto the stack FIRST, then stash (exp is on top), so a
     // nested `**`/`Math.pow` inside `exp` finishes before any scratch local is set
     // and cannot clobber the stashed base — the same discipline as [`emit_mod`].
-    emit_node(base, function, scratch, strings, helpers);
+    let mark = function.temp_mark();
+    emit_operand(base, function, scratch, strings, helpers);
     emit_node(exp, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(s_cnt));
     function.instruction(&Instruction::LocalSet(s_base));
-    emit_coerce_number(function, s_base, helpers);
-    emit_coerce_number(function, s_cnt, helpers);
+    function.release_temps(mark);
+    emit_coerce_operands(function, s_base, s_cnt, exp, helpers);
 
     // The whole computation leaves its answer in `res`; special cases branch out.
     function.instruction(&Instruction::Block(BlockType::Empty));
@@ -837,6 +844,7 @@ pub(super) fn emit_pow(
     get(function, s_cnt);
     f64c(function, 0.0);
     function.instruction(&Instruction::F64Lt);
+    function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::LocalSet(s_neg));
 
     // aexp = abs(exp), then split into frac = aexp - trunc(aexp) (0 ≤ frac < 1;
@@ -891,6 +899,7 @@ pub(super) fn emit_pow(
     // as `(1 / orig)^cnt` instead, which reaches the subnormal range, and skip the
     // reciprocal.
     function.instruction(&Instruction::LocalGet(s_neg));
+    function.instruction(&Instruction::I32WrapI64);
     get(function, s_frac);
     f64c(function, 0.0);
     function.instruction(&Instruction::F64Eq);
@@ -913,7 +922,7 @@ pub(super) fn emit_pow(
     function.instruction(&Instruction::LocalGet(s_cnt0));
     function.instruction(&Instruction::LocalSet(s_cnt));
     int_pow(function, s_res, s_base, s_cnt);
-    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::I64Const(0));
     function.instruction(&Instruction::LocalSet(s_neg));
     function.instruction(&Instruction::End);
 
@@ -955,6 +964,7 @@ pub(super) fn emit_pow(
 
     // if neg { result = 1.0 / result }.
     function.instruction(&Instruction::LocalGet(s_neg));
+    function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::If(BlockType::Empty));
     f64c(function, 1.0);
     get(function, s_res);
@@ -973,13 +983,13 @@ pub(super) fn emit_pow(
 /// `Boolean(x)` is emitted inline: JS truthiness (via [`emit_cond`]) selects
 /// between the boxed `true`/`false` jsvals, no host call. `Number(x)` is the
 /// shared `ToNumber`, `String(x)` the guest `__to_string`; `parseInt` /
-/// `parseFloat` convert their argument with `__to_string` and parse it on the
-/// host (`__parse_int` / the `__convert` parse-float op).
+/// `parseFloat` convert their argument with `__to_string` and parse it with
+/// the guest `__parse_int` / `__parse_float`.
 pub(super) fn emit_convert_call(
     op: ConvertOp,
     arg: &IrNode,
     radix: Option<&IrNode>,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1003,9 +1013,9 @@ pub(super) fn emit_convert_call(
         return;
     }
     if matches!(op, ConvertOp::ParseInt) {
-        // `__parse_int(ToString(s), radix)`: an omitted radix is passed as
-        // `undefined`. Both operands are evaluated before the conversion.
-        emit_node(arg, function, scratch, strings, helpers);
+        // `__parse_int(ToString(s), ToInt32(radix))`: an omitted radix is
+        // `undefined`. Both operands are evaluated before the conversions.
+        emit_operand(arg, function, scratch, strings, helpers);
         match radix {
             Some(radix) => emit_node(radix, function, scratch, strings, helpers),
             None => {
@@ -1015,12 +1025,15 @@ pub(super) fn emit_convert_call(
         function.instruction(&Instruction::LocalSet(scratch + 1));
         function.instruction(&Instruction::LocalSet(scratch));
         emit_to_string_jsval(function, scratch, helpers);
-        function.instruction(&Instruction::LocalGet(scratch + 1));
-        function.instruction(&Instruction::Call(helpers.parse_int));
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_coerce_number(function, scratch + 1, helpers);
+        function.instruction(&Instruction::LocalGet(scratch));
+        emit_to_int32(function, scratch + 1);
+        function.instruction(&Instruction::Call(helpers.parse_int()));
         return;
     }
     // `String(x)` is `ToString` in the guest; `parseFloat` parses the
-    // argument's `ToString` on the host.
+    // argument's `ToString` with the guest `__parse_float`.
     emit_node(arg, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(scratch));
     if matches!(op, ConvertOp::String) {
@@ -1028,16 +1041,15 @@ pub(super) fn emit_convert_call(
     }
     emit_to_string_jsval(function, scratch, helpers);
     if matches!(op, ConvertOp::ParseFloat) {
-        function.instruction(&Instruction::I32Const(CONVERT_OP_PARSE_FLOAT));
-        function.instruction(&Instruction::Call(helpers.convert));
+        function.instruction(&Instruction::Call(helpers.parse_float()));
     }
 }
 
 /// Replace a symbol in i64 local `local` with its `SymbolDescriptiveString`:
 /// `"Symbol(" + description + ")"`, an `undefined` description as `""`. The
 /// i64 local `local + 1` is clobbered.
-fn emit_symbol_descriptive_string(
-    function: &mut Function,
+pub(super) fn emit_symbol_descriptive_string(
+    function: &mut impl Sink,
     local: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1072,7 +1084,7 @@ fn emit_symbol_descriptive_string(
 
 /// Push `ToString` of the jsval in `local` as a heap-string jsval (via the
 /// guest `__to_string`), propagating a throw from a user `toString`/`valueOf`.
-fn emit_to_string_jsval(function: &mut Function, local: u32, helpers: Helpers<'_>) {
+fn emit_to_string_jsval(function: &mut impl Sink, local: u32, helpers: Helpers<'_>) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::Call(helpers.to_str()));
     function.instruction(&Instruction::I64ExtendI32U);
@@ -1082,41 +1094,31 @@ fn emit_to_string_jsval(function: &mut Function, local: u32, helpers: Helpers<'_
 }
 
 /// Emit the array fast path `IrNode::MethodCall`, leaving its result jsval
-/// on the stack: the receiver, then (`indexOf`/`includes`) the `METHOD_OP_*`
-/// flag, the argument (`undefined` when missing) and an unused `undefined`
-/// slot, then a `call` of the host `__method` import. `join` runs in the guest
-/// (`__array_join`) so an element's `ToString` can call a user `toString`
-/// (which may throw).
+/// on the stack: the receiver and the argument (`undefined` when missing),
+/// then `__array_search` (`indexOf`/`includes`) or `__array_join` (`join`,
+/// which may run a throwing user `toString`).
 pub(super) fn emit_method_call(
     op: MethodOp,
     recv: &IrNode,
     args: &[IrNode],
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    emit_node(recv, function, scratch, strings, helpers);
-    let flag = match op {
-        MethodOp::Join => None,
-        MethodOp::IndexOf => Some(METHOD_OP_INDEX_OF),
-        MethodOp::Includes => Some(METHOD_OP_INCLUDES),
-    };
-    if let Some(flag) = flag {
-        function.instruction(&Instruction::I32Const(flag));
-    }
+    emit_operand(recv, function, scratch, strings, helpers);
     match args.first() {
         Some(arg) => emit_node(arg, function, scratch, strings, helpers),
         None => {
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
     }
-    if flag.is_some() {
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::Call(helpers.method));
-    } else {
+    if op == MethodOp::Join {
         function.instruction(&Instruction::Call(helpers.array_join()));
         emit_propagate_if_pending(function, helpers);
+    } else {
+        function.instruction(&Instruction::I32Const(i32::from(op == MethodOp::Includes)));
+        function.instruction(&Instruction::Call(helpers.array_search));
     }
 }
 
@@ -1129,17 +1131,18 @@ pub(super) fn emit_method_call(
 fn emit_add(
     lhs: &IrNode,
     rhs: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let s0 = scratch;
-    let s1 = scratch + 1;
-    emit_node(lhs, function, scratch, strings, helpers);
+    let (s0, s1) = (scratch + NUM_A, scratch + NUM_B);
+    let mark = function.temp_mark();
+    emit_operand(lhs, function, scratch, strings, helpers);
     emit_node(rhs, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(s1));
     function.instruction(&Instruction::LocalSet(s0));
+    function.release_temps(mark);
 
     // either_heap = is_pointer(s0) | is_pointer(s1).
     emit_is_pointer(function, s0);
@@ -1170,7 +1173,7 @@ pub(super) fn emit_binary(
     op: BinOp,
     lhs: &IrNode,
     rhs: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1196,14 +1199,15 @@ pub(super) fn emit_binary(
         // dispatch). Each path yields an i32 wasm bool that is boxed as a
         // boolean jsval (TRUE/FALSE) via `select`.
         BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
-            let s0 = scratch;
-            let s1 = scratch + 1;
+            let (s0, s1) = (scratch + NUM_A, scratch + NUM_B);
             function.instruction(&Instruction::I64Const(TRUE_BITS));
             function.instruction(&Instruction::I64Const(FALSE_BITS));
-            emit_node(lhs, function, scratch, strings, helpers);
+            let mark = function.temp_mark();
+            emit_operand(lhs, function, scratch, strings, helpers);
             emit_node(rhs, function, scratch, strings, helpers);
             function.instruction(&Instruction::LocalSet(s1));
             function.instruction(&Instruction::LocalSet(s0));
+            function.release_temps(mark);
 
             // both_strings = is_string(s0) & is_string(s1).
             emit_is_string(function, s0);
@@ -1269,7 +1273,7 @@ pub(super) fn emit_binary(
         BinOp::LooseEq | BinOp::LooseNe => {
             function.instruction(&Instruction::I64Const(TRUE_BITS));
             function.instruction(&Instruction::I64Const(FALSE_BITS));
-            emit_node(lhs, function, scratch, strings, helpers);
+            emit_operand(lhs, function, scratch, strings, helpers);
             emit_node(rhs, function, scratch, strings, helpers);
             function.instruction(&Instruction::Call(helpers.loose_eq));
             emit_propagate_if_pending(function, helpers);
@@ -1294,7 +1298,7 @@ pub(super) fn emit_strict_eq(
     lhs: &IrNode,
     rhs: &IrNode,
     negate: bool,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1302,10 +1306,12 @@ pub(super) fn emit_strict_eq(
     let s0 = scratch;
     let s1 = scratch + 1;
     // Evaluate both operands to the stack, then stash (rhs is on top).
-    emit_node(lhs, function, scratch, strings, helpers);
+    let mark = function.temp_mark();
+    emit_operand(lhs, function, scratch, strings, helpers);
     emit_node(rhs, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(s1));
     function.instruction(&Instruction::LocalSet(s0));
+    function.release_temps(mark);
 
     // Boolean-boxing operands for the final `select`.
     function.instruction(&Instruction::I64Const(TRUE_BITS));
@@ -1356,4 +1362,206 @@ pub(super) fn emit_strict_eq(
     }
     // Box the resulting i1 as TRUE/FALSE.
     function.instruction(&Instruction::Select);
+}
+
+/// The precision passed to `clock_time_get`: one millisecond, in nanoseconds.
+const CLOCK_PRECISION_NS: i64 = 1_000_000;
+
+/// The `splitmix64` increment.
+const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// The natural-alignment memarg of an i64 load or store at `offset`.
+fn i64_mem(offset: u64) -> MemArg {
+    MemArg {
+        offset,
+        align: 3,
+        memory_index: 0,
+    }
+}
+
+/// `__now() -> f64`: the WASI realtime clock in (fractional) milliseconds
+/// since the Unix epoch, `0` when the clock fails. The callers apply `TimeClip`.
+pub(super) fn emit_now(leaves: &LeafSet) -> Function {
+    use Instruction as I;
+    let clock = abi::WASI_CLOCK.cast_signed();
+    let mut f = helper_builder(leaves, &[], &[]);
+    for op in [
+        I::I32Const(0),
+        I::I64Const(CLOCK_PRECISION_NS),
+        I::I32Const(clock),
+        I::Call(CLOCK_TIME_GET_IMPORT),
+        I::I32Eqz,
+        I::If(BlockType::Result(ValType::F64)),
+        I::I32Const(clock),
+        I::I64Load(i64_mem(0)),
+        I::F64ConvertI64U,
+        I::F64Const(Ieee64::from(1e6)),
+        I::F64Div,
+        I::Else,
+        I::F64Const(Ieee64::from(0.0)),
+        I::End,
+        I::End,
+    ] {
+        f.instruction(&op);
+    }
+    finish_builder(f)
+}
+
+/// Push `splitmix64(x)` of the i64 local `x`, using the i64 local `z`.
+fn emit_splitmix(f: &mut FnBuilder<'_>, x: u32, z: u32) {
+    use Instruction as I;
+    let xor_shift = |f: &mut FnBuilder<'_>, shift: i64| {
+        for op in [
+            I::LocalGet(z),
+            I::LocalGet(z),
+            I::I64Const(shift),
+            I::I64ShrU,
+            I::I64Xor,
+        ] {
+            f.instruction(&op);
+        }
+    };
+    for op in [
+        I::LocalGet(x),
+        I::I64Const(SPLITMIX_GAMMA.cast_signed()),
+        I::I64Add,
+        I::LocalSet(z),
+    ] {
+        f.instruction(&op);
+    }
+    for (shift, factor) in [
+        (30, 0xBF58_476D_1CE4_E5B9_u64),
+        (27, 0x94D0_49BB_1331_11EB_u64),
+    ] {
+        xor_shift(f, shift);
+        for op in [I::I64Const(factor.cast_signed()), I::I64Mul, I::LocalSet(z)] {
+            f.instruction(&op);
+        }
+    }
+    xor_shift(f, 31);
+}
+
+/// `__random() -> f64`: one xorshift128+ step over `$__rng0/$__rng1`, uniform
+/// in `[0, 1)` with 52 bits. The first call seeds the state with `random_get`,
+/// or from the clock through `splitmix64` when that fails; an all-zero seed
+/// (a fixed point of the generator) is replaced by a non-zero constant.
+pub(super) fn emit_random(leaves: &LeafSet) -> Function {
+    use Instruction as I;
+    let (s1, s0, x, z) = (0, 1, 2, 3);
+    let seed = abi::WASI_SEED.cast_signed();
+    let clock = abi::WASI_CLOCK.cast_signed();
+    let state_is_zero = [
+        I::GlobalGet(RNG0_GLOBAL),
+        I::GlobalGet(RNG1_GLOBAL),
+        I::I64Or,
+        I::I64Eqz,
+    ];
+    let mut f = helper_builder(leaves, &[], &[RAW_I64; 4]);
+    for op in &state_is_zero {
+        f.instruction(op);
+    }
+    for op in [
+        I::If(BlockType::Empty),
+        I::I32Const(seed),
+        I::I32Const(16),
+        I::Call(RANDOM_GET_IMPORT),
+        I::I32Eqz,
+        I::If(BlockType::Empty),
+        I::I32Const(seed),
+        I::I64Load(i64_mem(0)),
+        I::GlobalSet(RNG0_GLOBAL),
+        I::I32Const(seed),
+        I::I64Load(i64_mem(8)),
+        I::GlobalSet(RNG1_GLOBAL),
+        I::Else,
+        // Reads as 0 ns if the clock fails too.
+        I::I32Const(clock),
+        I::I64Const(0),
+        I::I64Store(i64_mem(0)),
+        I::I32Const(0),
+        I::I64Const(CLOCK_PRECISION_NS),
+        I::I32Const(clock),
+        I::Call(CLOCK_TIME_GET_IMPORT),
+        I::Drop,
+        I::I32Const(clock),
+        I::I64Load(i64_mem(0)),
+        I::LocalSet(x),
+    ] {
+        f.instruction(&op);
+    }
+    emit_splitmix(&mut f, x, z);
+    f.instruction(&I::GlobalSet(RNG0_GLOBAL));
+    for op in [
+        I::LocalGet(x),
+        I::I64Const(SPLITMIX_GAMMA.cast_signed()),
+        I::I64Add,
+        I::LocalSet(x),
+    ] {
+        f.instruction(&op);
+    }
+    emit_splitmix(&mut f, x, z);
+    f.instruction(&I::GlobalSet(RNG1_GLOBAL));
+    f.instruction(&I::End);
+    for op in &state_is_zero {
+        f.instruction(op);
+    }
+    for op in [
+        I::If(BlockType::Empty),
+        I::I64Const(SPLITMIX_GAMMA.cast_signed()),
+        I::GlobalSet(RNG0_GLOBAL),
+        I::I64Const(1),
+        I::GlobalSet(RNG1_GLOBAL),
+        I::End,
+        I::End,
+    ] {
+        f.instruction(&op);
+    }
+    emit_rng_step(&mut f, s1, s0);
+    finish_builder(f)
+}
+
+/// Emit one xorshift128+ step over the RNG globals and push the next `f64`,
+/// ending the function. `s1` and `s0` are i64 locals.
+fn emit_rng_step(f: &mut FnBuilder<'_>, s1: u32, s0: u32) {
+    use Instruction as I;
+    for op in [
+        // s1 = state0, s0 = state1, state0 = s0.
+        I::GlobalGet(RNG0_GLOBAL),
+        I::LocalSet(s1),
+        I::GlobalGet(RNG1_GLOBAL),
+        I::LocalTee(s0),
+        I::GlobalSet(RNG0_GLOBAL),
+        // s1 ^= s1 << 23
+        I::LocalGet(s1),
+        I::LocalGet(s1),
+        I::I64Const(23),
+        I::I64Shl,
+        I::I64Xor,
+        I::LocalSet(s1),
+        // s1 ^= s1 >> 17, then ^= s0, then ^= s0 >> 26; state1 = s1.
+        I::LocalGet(s1),
+        I::LocalGet(s1),
+        I::I64Const(17),
+        I::I64ShrU,
+        I::I64Xor,
+        I::LocalGet(s0),
+        I::I64Xor,
+        I::LocalGet(s0),
+        I::I64Const(26),
+        I::I64ShrU,
+        I::I64Xor,
+        I::GlobalSet(RNG1_GLOBAL),
+        // Bits 12.. of state0 as the mantissa of a double in [1, 2), minus 1.
+        I::GlobalGet(RNG0_GLOBAL),
+        I::I64Const(12),
+        I::I64ShrU,
+        I::I64Const(0x3FF0_0000_0000_0000),
+        I::I64Or,
+        I::F64ReinterpretI64,
+        I::F64Const(Ieee64::from(1.0)),
+        I::F64Sub,
+        I::End,
+    ] {
+        f.instruction(&op);
+    }
 }

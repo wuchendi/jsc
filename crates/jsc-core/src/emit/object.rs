@@ -21,7 +21,7 @@ pub(super) fn emit_object_node(
     proto: Option<&IrNode>,
     class: u8,
     reserve: u32,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -58,6 +58,7 @@ pub(super) fn emit_object_node(
     // dst = __alloc(size); header word (TYPE_OBJECT) and `props` (dst + 16, or 0).
     function.instruction(&Instruction::I32Const(size));
     function.instruction(&Instruction::Call(helpers.alloc));
+    function.root_temp(TempClass::Base);
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
     let header = i64::from(TYPE_OBJECT) | i64::from(class) << 24;
@@ -183,7 +184,7 @@ fn attrs_of(key: &PropKey, value: &IrNode) -> u32 {
 fn emit_define_entry(
     key: &PropKey,
     value: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -209,7 +210,7 @@ fn emit_define_entry(
             let desc = half | DESC_HAS_ENUMERABLE | DESC_HAS_CONFIGURABLE | attrs.cast_signed();
             function.instruction(&Instruction::I32Const(desc));
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-            emit_node(getter, function, scratch, strings, helpers);
+            emit_operand(getter, function, scratch, strings, helpers);
             emit_node(setter, function, scratch, strings, helpers);
             function.instruction(&Instruction::Call(helpers.define_own()));
             function.instruction(&Instruction::Drop);
@@ -231,7 +232,7 @@ pub(super) fn emit_define_props_node(
     obj: &IrNode,
     local: u32,
     entries: &[(PropKey, IrNode)],
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -250,7 +251,7 @@ pub(super) fn emit_define_props_node(
 }
 
 /// Rebox the object block base still on the stack as a heap jsval.
-fn emit_object_rebox(function: &mut Function) {
+fn emit_object_rebox(function: &mut impl Sink) {
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
     function.instruction(&Instruction::I64Or);
@@ -271,7 +272,7 @@ fn emit_object_rebox(function: &mut Function) {
 pub(super) fn emit_make_accessor_node(
     getter: &IrNode,
     setter: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -331,7 +332,7 @@ pub(super) fn emit_make_accessor_node(
 pub(super) fn emit_object_builtin_node(
     op: ObjectBuiltinOp,
     arg: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -378,7 +379,7 @@ pub(super) fn emit_object_builtin_node(
 pub(super) fn emit_object_has_node(
     key: &IrNode,
     obj: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -410,7 +411,7 @@ pub(super) const HAS_INSTANCE_NOT_CALLABLE: CalleeErrorText<'static> = [
 pub(super) fn emit_instanceof_node(
     value: &IrNode,
     kind: &InstanceOfKind,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -421,7 +422,7 @@ pub(super) fn emit_instanceof_node(
     // evaluates.
     let cur = scratch + 19;
     let tgt = scratch + 20;
-    emit_node(value, function, scratch, strings, helpers);
+    emit_operand(value, function, scratch, strings, helpers);
     let ctor = match kind {
         InstanceOfKind::Ctor(rhs) => {
             emit_node(rhs, function, scratch, strings, helpers);
@@ -481,7 +482,7 @@ pub(super) fn emit_instanceof_node(
 /// its realm `proto` and no own `@@hasInstance` (a table without
 /// `HAS_SYMBOL_KEYS` is skipped inline; otherwise `__prop_find` decides, so
 /// `%Array%`'s own `@@species` getter keeps the fast arm).
-fn emit_builtin_rhs_intact(function: &mut Function, ctor: BuiltinCtor, helpers: Helpers<'_>) {
+fn emit_builtin_rhs_intact(function: &mut impl Sink, ctor: BuiltinCtor, helpers: Helpers<'_>) {
     let props = MemArg {
         offset: u64::from(abi::OBJ_PROPS_OFFSET),
         align: 2,
@@ -555,7 +556,7 @@ fn emit_builtin_rhs_intact(function: &mut Function, ctor: BuiltinCtor, helpers: 
 /// "prototype")` (an object, else a `TypeError`) is searched for on `V`'s
 /// `proto` chain. Clobbers `cur`, `tgt`, and `+17`/`+18`.
 pub(super) fn emit_instanceof_operator(
-    function: &mut Function,
+    function: &mut impl Sink,
     cur: u32,
     tgt: u32,
     ordinary: bool,
@@ -669,7 +670,7 @@ pub(super) fn emit_instanceof_operator(
 /// Get(C, "prototype")` (an object, else a `TypeError`) is searched for on
 /// `V`'s `proto` chain. Leaves a `true`/`false` jsval.
 fn emit_ordinary_chain(
-    function: &mut Function,
+    function: &mut impl Sink,
     cur: u32,
     tgt: u32,
     scratch: u32,
@@ -716,7 +717,7 @@ fn emit_ordinary_chain(
 /// Walk the `proto` chain of the object in i64 local `cur` for pointer
 /// identity with the object in i64 local `tgt`, leaving `true` iff some link
 /// is the SAME block (a chain ends at `null`). Clobbers `cur`.
-fn emit_proto_chain_match(function: &mut Function, cur: u32, tgt: u32) {
+fn emit_proto_chain_match(function: &mut impl Sink, cur: u32, tgt: u32) {
     let proto_slot = MemArg {
         offset: OBJ_PROTO_OFFSET,
         align: 3,
@@ -759,7 +760,7 @@ fn emit_proto_chain_match(function: &mut Function, cur: u32, tgt: u32) {
 }
 
 /// Push i32 `1` if the function in i64 local `f` is a bound function.
-fn emit_is_bound(function: &mut Function, f: u32) {
+fn emit_is_bound(function: &mut impl Sink, f: u32) {
     function.instruction(&Instruction::LocalGet(f));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load8U(MemArg {
@@ -773,7 +774,7 @@ fn emit_is_bound(function: &mut Function, f: u32) {
 
 /// Replace the bound function in i64 local `f` by its target (the first
 /// element of its `env` array, DESIGN.md §5.5).
-fn emit_bound_target(function: &mut Function, f: u32) {
+fn emit_bound_target(function: &mut impl Sink, f: u32) {
     function.instruction(&Instruction::LocalGet(f));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I64Load(MemArg {
@@ -790,7 +791,7 @@ fn emit_bound_target(function: &mut Function, f: u32) {
 /// `OrdinaryHasInstance` step 2 inside [`emit_instanceof_operator`]'s loop (two
 /// frames deep): a bound function in i64 local `f` restarts
 /// `InstanceofOperator` on its target.
-fn emit_bound_restart(function: &mut Function, f: u32) {
+fn emit_bound_restart(function: &mut impl Sink, f: u32) {
     emit_is_bound(function, f);
     function.instruction(&Instruction::If(BlockType::Empty));
     emit_bound_target(function, f);
@@ -807,16 +808,18 @@ fn emit_bound_restart(function: &mut Function, f: u32) {
 pub(super) fn emit_object_delete_node(
     obj: &IrNode,
     key: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (s_obj, s_key) = (scratch + 14, scratch + 15);
-    emit_node(obj, function, scratch, strings, helpers);
+    let mark = function.temp_mark();
+    emit_operand(obj, function, scratch, strings, helpers);
     emit_node(key, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(s_key));
     function.instruction(&Instruction::LocalSet(s_obj));
+    function.release_temps(mark);
     if !never_nullish(obj) {
         let key = IrNode::Local(s_key);
         emit_nullish_guard(function, s_obj, &key, false, scratch, strings, helpers);
@@ -836,7 +839,7 @@ pub(super) fn emit_object_delete_node(
 /// or a cycle) propagates.
 pub(super) fn emit_json_stringify_node(
     arg: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -863,7 +866,7 @@ pub(super) fn emit_json_stringify_node(
 /// slot holds the backing array's heap jsval.
 pub(super) fn emit_map_new_node(
     set: bool,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     helpers: Helpers<'_>,
 ) {
@@ -933,14 +936,14 @@ pub(super) fn date_ms_slot() -> MemArg {
 /// handle jsval on the stack. The time value is computed first — `value`'s
 /// own time value when it is a Date (`thisTimeValue`, not `ToPrimitive`),
 /// else `ToPrimitive(value)` parsed by [`emit_date_parse_call`] when a
-/// string and `ToNumber` of it otherwise; when `arg` is `None`, the host wall clock (`__now`,
+/// string and `ToNumber` of it otherwise; when `arg` is `None`, the WASI wall clock (guest `__now`,
 /// already an f64) — and passed through [`emit_time_clip`], the single point
 /// every stored Date time value goes through. Only then is a
 /// [`DATE_BLOCK_SIZE`] block bump-allocated, its object-family prefix
 /// written and its f64 payload set.
 pub(super) fn emit_date_new_node(
     arg: Option<&IrNode>,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1027,7 +1030,7 @@ pub(super) fn emit_date_new_node(
 /// the string jsval in i64 `string` (as `this`, no arguments), leaving the
 /// time value it denotes (a number jsval, `NaN` when the format is not
 /// accepted) on the stack. The parser runs no user code and never throws.
-pub(super) fn emit_date_parse_call(function: &mut Function, string: u32, helpers: Helpers<'_>) {
+pub(super) fn emit_date_parse_call(function: &mut impl Sink, string: u32, helpers: Helpers<'_>) {
     function.instruction(&Instruction::LocalGet(string));
     function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
     for _ in 0..helpers.max_args {
@@ -1046,7 +1049,7 @@ const MAX_TIME_VALUE: f64 = 8.64e15;
 /// `TimeClip` (ES2024 §21.4.1.31) of the f64 on the stack, leaving its bits in
 /// i64 `out`: `NaN` unless finite with `|t| <= 8.64e15`, else `t` truncated
 /// toward zero with `-0` normalized to `+0`.
-pub(super) fn emit_time_clip(function: &mut Function, out: u32) {
+pub(super) fn emit_time_clip(function: &mut impl Sink, out: u32) {
     function.instruction(&Instruction::I64ReinterpretF64);
     function.instruction(&Instruction::LocalSet(out));
     // trunc(t) + 0 turns a -0 into +0.
@@ -1067,9 +1070,9 @@ pub(super) fn emit_time_clip(function: &mut Function, out: u32) {
     function.instruction(&Instruction::LocalSet(out));
 }
 
-/// Emit `Date.now()`: the host `__now` clock (an f64 ms count) through
+/// Emit `Date.now()`: the guest `__now` clock (an f64 ms count) through
 /// [`emit_time_clip`] (a time value is integral), boxed as a number jsval.
-pub(super) fn emit_date_now_node(function: &mut Function, scratch: u32, helpers: Helpers<'_>) {
+pub(super) fn emit_date_now_node(function: &mut impl Sink, scratch: u32, helpers: Helpers<'_>) {
     let time = scratch + 24;
     function.instruction(&Instruction::Call(helpers.now));
     emit_time_clip(function, time);
@@ -1110,7 +1113,7 @@ fn invalid_time_value() -> IrNode {
 pub(super) fn emit_date_field(
     op: DateOp,
     recv_local: u32,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1170,7 +1173,7 @@ pub(super) fn emit_date_field(
 /// the f64 timestamp BITS in `bits` (finite-guarded by the caller). Uses FLOOR
 /// division so a pre-epoch (negative) timestamp splits correctly (`tod` stays in
 /// `0..MS_PER_DAY`). `t0`/`t1` are extra i64 temps.
-fn emit_days_tod(function: &mut Function, bits: u32, days: u32, tod: u32, t0: u32, t1: u32) {
+fn emit_days_tod(function: &mut impl Sink, bits: u32, days: u32, tod: u32, t0: u32, t1: u32) {
     // total = floor(reinterpret(bits)) -> t0.
     function.instruction(&Instruction::LocalGet(bits));
     function.instruction(&Instruction::F64ReinterpretI64);
@@ -1213,7 +1216,7 @@ fn emit_days_tod(function: &mut Function, bits: u32, days: u32, tod: u32, t0: u3
 /// pre-epoch range (the `era` numerator adjusts for negative day counts).
 #[allow(clippy::too_many_arguments)]
 fn emit_date_civil(
-    function: &mut Function,
+    function: &mut impl Sink,
     days: u32,
     year: u32,
     month: u32,
@@ -1337,7 +1340,7 @@ fn emit_date_civil(
 /// jsval). Uses the `Date` scratch slots (`D0`..`D5` = `scratch+24..+29`) plus
 /// one low i64 temp; a `Date` method takes no arguments, so no child
 /// sub-expression is live in these slots.
-fn emit_date_int_field(op: DateOp, bits: u32, function: &mut Function, scratch: u32) {
+fn emit_date_int_field(op: DateOp, bits: u32, function: &mut impl Sink, scratch: u32) {
     let days = scratch + 26;
     let tod = scratch + 27;
     emit_days_tod(function, bits, days, tod, scratch + 25, scratch + 28);
@@ -1444,7 +1447,7 @@ fn emit_date_int_field(op: DateOp, bits: u32, function: &mut Function, scratch: 
 /// and each separator/digit written at its known payload offset. A year
 /// outside `0..=9999` is the expanded `±YYYYYY` form, three bytes longer: every
 /// field after the year is written through `at` = `bptr + 3` instead of `bptr`.
-fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Helpers<'_>) {
+fn emit_date_iso(bits: u32, function: &mut impl Sink, scratch: u32, helpers: Helpers<'_>) {
     let days = scratch + 26;
     let tod = scratch + 1;
     let year = scratch + 29;
@@ -1545,7 +1548,7 @@ fn emit_date_iso(bits: u32, function: &mut Function, scratch: u32, helpers: Help
 /// Write the `toISOString()` year field of the i64 `year` at the start of the
 /// string block in `bptr`: four digits, or (when the shift in i32 `at` is
 /// nonzero) a sign and six digits of `|year|`, kept in i64 `abs_year`.
-fn emit_iso_year(function: &mut Function, bptr: u32, at: u32, year: u32, abs_year: u32) {
+fn emit_iso_year(function: &mut impl Sink, bptr: u32, at: u32, year: u32, abs_year: u32) {
     function.instruction(&Instruction::LocalGet(at));
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::LocalGet(bptr));
@@ -1649,10 +1652,10 @@ impl DateText {
 /// `Date` scratch slots of [`emit_date_iso`] plus `+0` and the i32 slots
 /// `+8..+12`.
 #[allow(clippy::too_many_lines)]
-fn emit_date_string(
+fn emit_date_string<S: Sink>(
     text: DateText,
     bits: u32,
-    function: &mut Function,
+    function: &mut S,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1670,7 +1673,7 @@ fn emit_date_string(
     let payload = u64::from(abi::STR_DATA_OFFSET);
     let (tail_start, tail) = text.tail();
     let half = text.date_half();
-    let wasm = |function: &mut Function, ops: &[Instruction<'_>]| {
+    let wasm = |function: &mut S, ops: &[Instruction<'_>]| {
         for op in ops {
             function.instruction(op);
         }
@@ -1910,7 +1913,7 @@ fn emit_date_string(
 
 /// Write one fixed ASCII byte `ch` at payload offset `pos` of the string block in
 /// `bptr` (payload begins at `STR_DATA_OFFSET`).
-fn emit_iso_byte(function: &mut Function, bptr: u32, pos: u64, ch: u8) {
+fn emit_iso_byte(function: &mut impl Sink, bptr: u32, pos: u64, ch: u8) {
     function.instruction(&Instruction::LocalGet(bptr));
     function.instruction(&Instruction::I32Const(i32::from(ch)));
     function.instruction(&Instruction::I32Store8(MemArg {
@@ -1923,7 +1926,7 @@ fn emit_iso_byte(function: &mut Function, bptr: u32, pos: u64, ch: u8) {
 /// Write the low `ndigits` decimal digits of the i64 in `value` as zero-padded
 /// ASCII at payload offset `pos` (most-significant first) of the string block in
 /// `bptr`.
-fn emit_iso_digits(function: &mut Function, bptr: u32, pos: u64, value: u32, ndigits: u32) {
+fn emit_iso_digits(function: &mut impl Sink, bptr: u32, pos: u64, value: u32, ndigits: u32) {
     for i in 0..ndigits {
         let power = 10_i64.pow(ndigits - 1 - i);
         function.instruction(&Instruction::LocalGet(bptr));
@@ -1949,17 +1952,17 @@ fn emit_iso_digits(function: &mut Function, bptr: u32, pos: u64, value: u32, ndi
 /// treats `map.set()` as `set(undefined, undefined)`); `.set`/`.add` yield the
 /// receiver handle (chainable), `.has`/`.delete` box their `1`/`0` result as a
 /// boolean jsval, `.clear` tombstones every entry and yields `undefined`.
-pub(super) fn emit_map_op(
+pub(super) fn emit_map_op<S: Sink>(
     op: MapOp,
     handle: u32,
     args: &[IrNode],
-    function: &mut Function,
+    function: &mut S,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     // Push argument slot `i`, or `undefined` when the call supplied fewer.
-    let push_arg = |function: &mut Function, i: usize| match args.get(i) {
+    let push_arg = |function: &mut S, i: usize| match args.get(i) {
         Some(arg) => emit_node(arg, function, scratch, strings, helpers),
         None => {
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
@@ -2016,7 +2019,7 @@ pub(super) fn emit_map_op(
 /// DESIGN.md §5.2). The backing keeps its length, so a live
 /// iterator continues at its index and sees the entries added after the
 /// `clear`. Uses the i32 scratch locals `scratch + 8` / `+ 9`.
-fn emit_map_clear(handle: u32, function: &mut Function, scratch: u32) {
+fn emit_map_clear(handle: u32, function: &mut impl Sink, scratch: u32) {
     let (at, end) = (scratch + 8, scratch + 9);
     let slot = |offset| MemArg {
         offset,
@@ -2084,13 +2087,13 @@ pub(super) fn emit_copy_data_node(
     target: &IrNode,
     source: &IrNode,
     exclude: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    emit_node(target, function, scratch, strings, helpers);
-    emit_node(source, function, scratch, strings, helpers);
+    emit_operand(target, function, scratch, strings, helpers);
+    emit_operand(source, function, scratch, strings, helpers);
     emit_node(exclude, function, scratch, strings, helpers);
     function.instruction(&Instruction::Call(helpers.copy_data));
 }
@@ -2102,8 +2105,8 @@ pub(super) fn emit_copy_data_node(
 /// The compares run on `f64`, where every non-number jsval (a boxed tag) and the
 /// canonical NaN read as NaN and so fail all three — a string key or `NaN`
 /// is never mistaken for index `0`.
-fn emit_index_in_bounds(function: &mut Function, s0: u32, s1: u32, len_offset: u64) {
-    let key_f64 = |function: &mut Function| {
+fn emit_index_in_bounds<S: Sink>(function: &mut S, s0: u32, s1: u32, len_offset: u64) {
+    let key_f64 = |function: &mut S| {
         function.instruction(&Instruction::LocalGet(s1));
         function.instruction(&Instruction::F64ReinterpretI64);
     };
@@ -2134,7 +2137,7 @@ fn emit_index_in_bounds(function: &mut Function, s0: u32, s1: u32, len_offset: u
 /// Push i32 `1` when the key jsval in `s1` is an integer index in bounds for
 /// the heap array in `s0` ([`emit_index_in_bounds`]) and the array is not
 /// `SPARSE` (whose elements past its store are not in it), else `0`.
-fn emit_dense_index_in_bounds(function: &mut Function, s0: u32, s1: u32) {
+fn emit_dense_index_in_bounds(function: &mut impl Sink, s0: u32, s1: u32) {
     emit_index_in_bounds(function, s0, s1, ARRAY_LEN_OFFSET);
     emit_sparse_test(function, s0);
     function.instruction(&Instruction::I32Eqz);
@@ -2142,7 +2145,7 @@ fn emit_dense_index_in_bounds(function: &mut Function, s0: u32, s1: u32) {
 }
 
 /// Push i32 nonzero when the heap array jsval in `s0` is `SPARSE`, else `0`.
-fn emit_sparse_test(function: &mut Function, s0: u32) {
+fn emit_sparse_test(function: &mut impl Sink, s0: u32) {
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load8U(MemArg {
@@ -2163,7 +2166,7 @@ fn emit_sparse_test(function: &mut Function, s0: u32) {
 /// [`emit_index_in_bounds`] rejects. A non-string key is left untouched. `tmp`
 /// is a free i64 scratch local.
 fn emit_index_string_key(
-    function: &mut Function,
+    function: &mut impl Sink,
     s1: u32,
     tmp: u32,
     strings: &StrOffsets,
@@ -2182,12 +2185,9 @@ fn emit_index_string_key(
     function.instruction(&Instruction::Else);
     // tmp = ToNumber(key); if String(tmp) === key then key = tmp.
     function.instruction(&Instruction::LocalGet(s1));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
-    function.instruction(&Instruction::Call(helpers.convert));
+    function.instruction(&Instruction::Call(helpers.to_number_prim()));
     function.instruction(&Instruction::LocalTee(tmp));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-    function.instruction(&Instruction::Call(helpers.convert));
-    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::Call(helpers.num_to_str()));
     function.instruction(&Instruction::LocalGet(s1));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::Call(helpers.str_eq));
@@ -2204,7 +2204,7 @@ fn emit_index_string_key(
 
 /// Push the u32 field at byte `offset` of the block whose jsval is in `s0`,
 /// reboxed as a number jsval.
-pub(super) fn emit_u32_field_boxed(function: &mut Function, s0: u32, offset: u64) {
+pub(super) fn emit_u32_field_boxed(function: &mut impl Sink, s0: u32, offset: u64) {
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load(MemArg {
@@ -2219,7 +2219,7 @@ pub(super) fn emit_u32_field_boxed(function: &mut Function, s0: u32, offset: u64
 /// Emit the string-index char build for `s0[s1]`: `__str_index` on the wrapped
 /// pointer and unsigned-truncated index, then rebox the returned base offset as
 /// a heap jsval. Assumes `s1` is in bounds (the caller gates it).
-fn emit_str_index_boxed(function: &mut Function, s0: u32, s1: u32, helpers: Helpers<'_>) {
+fn emit_str_index_boxed(function: &mut impl Sink, s0: u32, s1: u32, helpers: Helpers<'_>) {
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalGet(s1));
@@ -2257,7 +2257,7 @@ pub(super) fn emit_index_node(
     obj: &IrNode,
     index: &IrNode,
     checked: bool,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2267,10 +2267,12 @@ pub(super) fn emit_index_node(
     // Evaluate the operand and the index jsval (the operand rides the operand
     // stack, so a nested read in the index cannot clobber it), then stash both
     // into the dedicated high slots.
-    emit_node(obj, function, scratch, strings, helpers);
+    let mark = function.temp_mark();
+    emit_operand(obj, function, scratch, strings, helpers);
     emit_node(index, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(s1));
     function.instruction(&Instruction::LocalSet(s0));
+    function.release_temps(mark);
     if checked && !never_nullish(obj) {
         emit_nullish_guard(
             function,
@@ -2301,7 +2303,7 @@ pub(super) fn emit_index_node(
 pub(super) fn emit_size_read(
     sealed: bool,
     obj: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2314,7 +2316,7 @@ pub(super) fn emit_size_read(
         recv,
         ProtoKind::Collection,
         sealed,
-        scratch + 3,
+        scratch + KIND_TMP,
         helpers,
     );
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
@@ -2338,7 +2340,7 @@ pub(super) fn emit_size_read(
 /// Push `__get(s0, key)` for the receiver in `s0` and the property key `index`
 /// (its jsval stashed in `s1`; a computed key is looked up, never inserted).
 fn emit_get_call(
-    function: &mut Function,
+    function: &mut impl Sink,
     s0: u32,
     index: &IrNode,
     s1: u32,
@@ -2356,7 +2358,7 @@ fn emit_get_call(
 /// string, each leaving the read block early; every other key or receiver (a
 /// primitive included) falls through to the one `__get`.
 fn emit_index_dynamic(
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     s0: u32,
     s1: u32,
@@ -2432,7 +2434,7 @@ fn emit_index_dynamic(
 
 /// Push `__get(s0, ToPropertyKey(s1))` for the receiver in `s0` and the key
 /// jsval in `s1` (a lookup: a never-interned key reads `undefined`).
-fn emit_get_dynamic(function: &mut Function, s0: u32, s1: u32, helpers: Helpers<'_>) {
+fn emit_get_dynamic(function: &mut impl Sink, s0: u32, s1: u32, helpers: Helpers<'_>) {
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::LocalGet(s1));
     function.instruction(&Instruction::I32Const(0));
@@ -2465,7 +2467,7 @@ pub(super) fn emit_index_set_node(
     obj: &IrNode,
     index: &IrNode,
     value: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2476,12 +2478,14 @@ pub(super) fn emit_index_set_node(
     // Evaluate the operand, the index jsval, and the assigned value on the
     // operand stack (so a nested member access in a later operand cannot clobber
     // an earlier one), then stash them into the dedicated high slots.
-    emit_node(obj, function, scratch, strings, helpers);
-    emit_node(index, function, scratch, strings, helpers);
+    let mark = function.temp_mark();
+    emit_operand(obj, function, scratch, strings, helpers);
+    emit_operand(index, function, scratch, strings, helpers);
     emit_node(value, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(sval));
     function.instruction(&Instruction::LocalSet(s1));
     function.instruction(&Instruction::LocalSet(s0));
+    function.release_temps(mark);
     if !never_nullish(obj) {
         emit_nullish_guard(
             function,
@@ -2543,18 +2547,20 @@ pub(super) fn emit_super_get_node(
     this: &IrNode,
     key: &IrNode,
     home: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (s_this, s_key, s_home) = (scratch + 14, scratch + 15, scratch + 16);
-    emit_node(this, function, scratch, strings, helpers);
-    emit_node(key, function, scratch, strings, helpers);
+    let mark = function.temp_mark();
+    emit_operand(this, function, scratch, strings, helpers);
+    emit_operand(key, function, scratch, strings, helpers);
     emit_node(home, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(s_home));
     function.instruction(&Instruction::LocalSet(s_key));
     function.instruction(&Instruction::LocalSet(s_this));
+    function.release_temps(mark);
     if !never_nullish(home) {
         let key = IrNode::Local(s_key);
         emit_nullish_guard(function, s_home, &key, false, scratch, strings, helpers);
@@ -2573,20 +2579,22 @@ pub(super) fn emit_super_get_node(
 /// interned) with the pending-exception check; yields `value`.
 pub(super) fn emit_super_set_node(
     [this, key, home, value]: [&IrNode; 4],
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (s_this, s_key, s_home, s_val) = (scratch + 14, scratch + 15, scratch + 16, scratch + 17);
-    emit_node(this, function, scratch, strings, helpers);
-    emit_node(key, function, scratch, strings, helpers);
-    emit_node(home, function, scratch, strings, helpers);
+    let mark = function.temp_mark();
+    emit_operand(this, function, scratch, strings, helpers);
+    emit_operand(key, function, scratch, strings, helpers);
+    emit_operand(home, function, scratch, strings, helpers);
     emit_node(value, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(s_val));
     function.instruction(&Instruction::LocalSet(s_home));
     function.instruction(&Instruction::LocalSet(s_key));
     function.instruction(&Instruction::LocalSet(s_this));
+    function.release_temps(mark);
     if !never_nullish(home) {
         let key = IrNode::Local(s_key);
         emit_nullish_guard(function, s_home, &key, true, scratch, strings, helpers);
@@ -2603,7 +2611,7 @@ pub(super) fn emit_super_set_node(
 /// Emit `__set(s0, ToPropertyKey(index), sval)` (the key interned) followed
 /// by the pending-exception check.
 fn emit_set_call(
-    function: &mut Function,
+    function: &mut impl Sink,
     s0: u32,
     index: &IrNode,
     s1: u32,
@@ -2626,8 +2634,8 @@ fn emit_set_call(
 /// an element the array does not own, growth by index, sparse elements,
 /// canonical index strings, `length`, named properties), followed by the
 /// pending-exception check. The caller tracks the enclosing dispatch frame.
-fn emit_index_set_array(
-    function: &mut Function,
+fn emit_index_set_array<S: Sink>(
+    function: &mut S,
     s0: u32,
     s1: u32,
     sval: u32,
@@ -2635,7 +2643,7 @@ fn emit_index_set_array(
 ) {
     // The address of element `i` (elems + 8*i; the slot MemArg adds the
     // data offset).
-    let elem_addr = |function: &mut Function| {
+    let elem_addr = |function: &mut S| {
         function.instruction(&Instruction::LocalGet(s0));
         function.instruction(&Instruction::I32WrapI64);
         emit_array_elems(function);
@@ -2676,7 +2684,7 @@ fn emit_index_set_array(
 /// `recv`/`key` and unwind like `throw`. The caller tracks every enclosing
 /// control frame.
 pub(super) fn emit_prop_throw_call(
-    function: &mut Function,
+    function: &mut impl Sink,
     recv: u32,
     key: u32,
     mode: i32,
@@ -2701,7 +2709,7 @@ pub(super) fn emit_prop_throw_call(
 /// temps. Delegating with a `Local` `value` keeps the store's scratch intact.
 pub(super) fn emit_index_op_set_node(
     node: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2846,7 +2854,7 @@ fn never_nullish(node: &IrNode) -> bool {
 pub(super) fn emit_nullish_check_node(
     value: &IrNode,
     key: &str,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2868,7 +2876,7 @@ pub(super) fn emit_nullish_check_node(
 /// is evaluated only on that throw path. The not-nullish path falls through with
 /// the stack untouched.
 pub(super) fn emit_nullish_guard(
-    function: &mut Function,
+    function: &mut impl Sink,
     recv: u32,
     key: &IrNode,
     set: bool,
@@ -2900,20 +2908,25 @@ pub(super) fn emit_nullish_guard(
 /// [`NULLISH_ERROR_STRS`] fragments plus `String(key)`:
 /// `Cannot read properties of null (reading 'x')`, with `.stack` prefixed
 /// `TypeError: `.
-pub(super) fn emit_nullish_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_nullish_throw(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
     // Params occupy locals 0..3; the shared `TypeError`-helper locals follow.
     let (recv, key, set) = (0, 1, 2);
     let scratch = 3;
     let msg = scratch + 24;
-    let mut function = Function::new(type_error_helper_locals());
+    let mut function = helper_builder(leaves, &[ROOT_JS, ROOT_JS, RAW_I32], &[]);
+    declare_error_scratch(&mut function);
     let at = |s: &str| strings.get(s).copied().unwrap_or(HEAP_BASE);
-    let select = |function: &mut Function, if_set: &str, if_read: &str| {
+    let select = |function: &mut FnBuilder<'_>, if_set: &str, if_read: &str| {
         function.instruction(&Instruction::I32Const(at(if_set)));
         function.instruction(&Instruction::I32Const(at(if_read)));
         function.instruction(&Instruction::LocalGet(set));
         function.instruction(&Instruction::Select);
     };
-    let concat = |function: &mut Function| {
+    let concat = |function: &mut FnBuilder<'_>| {
         function.instruction(&Instruction::Call(helpers.concat));
     };
 
@@ -2928,11 +2941,13 @@ pub(super) fn emit_nullish_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> 
     concat(&mut function);
     select(&mut function, NULLISH_SET_MID, NULLISH_READ_MID);
     concat(&mut function);
+    // The partial message sits under the conversion's safepoint.
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Base);
     function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-    function.instruction(&Instruction::Call(helpers.convert));
-    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::Call(helpers.msg_str()));
     concat(&mut function);
+    function.release_temps(mark);
     function.instruction(&Instruction::I32Const(at(NULLISH_SUFFIX)));
     concat(&mut function);
     function.instruction(&Instruction::I64ExtendI32U);
@@ -2942,33 +2957,22 @@ pub(super) fn emit_nullish_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> 
 
     emit_raise_type_error(&mut function, msg, scratch, strings, helpers);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
-/// The locals of a `TypeError`-building helper after its params: the full
-/// `emit_main` scratch layout (so `emit_node` can build the error object as it
-/// would in `main`), then the message and stack string jsvals at `scratch + 24`
-/// and `scratch + 25`.
-pub(super) fn type_error_helper_locals() -> Vec<(u32, ValType)> {
-    vec![
-        (3, ValType::I64),
-        (1, ValType::I32),
-        (3, ValType::I64),
-        (1, ValType::I32),
-        (5, ValType::I32),
-        (1, ValType::I64),
-        (7, ValType::I64),
-        (1, ValType::I32),
-        (2, ValType::I64),
-        (2, ValType::I64),
-    ]
+/// [`declare_scratch`] (so `emit_node` can build the error object as it would
+/// in `main`) plus the message and stack string jsvals at `scratch + 24` and
+/// `scratch + 25`.
+pub(super) fn declare_error_scratch(builder: &mut FnBuilder<'_>) {
+    declare_scratch(builder);
+    builder.locals(2, ROOT_JS);
 }
 
 /// Raise a `TypeError` whose message string jsval is in local `msg`:
 /// build `stack = "TypeError: " + msg` into `msg + 1`, the error object, stash it
 /// in `$exc_value`, set the pending flag and clear any routed completion.
 fn emit_raise_type_error(
-    function: &mut Function,
+    function: &mut impl Sink,
     msg: u32,
     scratch: u32,
     strings: &StrOffsets,
@@ -3006,20 +3010,23 @@ fn emit_raise_type_error(
 /// a primitive `recv` — `Cannot create property '<String(key)>' on
 /// <number|string|boolean> '<String(recv)>'`; every other mode wraps
 /// `String(key)` in its [`PROP_KEYED_MSGS`] fragments.
-pub(super) fn emit_prop_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Function {
+pub(super) fn emit_prop_throw(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
     let (recv, key, mode) = (0, 1, 2);
     let scratch = 3;
     let msg = scratch + 24;
-    let mut function = Function::new(type_error_helper_locals());
+    let mut function = helper_builder(leaves, &[ROOT_JS, ROOT_JS, RAW_I32], &[]);
+    declare_error_scratch(&mut function);
     let at = |s: &str| strings.get(s).copied().unwrap_or(HEAP_BASE);
-    let concat = |function: &mut Function| {
+    let concat = |function: &mut FnBuilder<'_>| {
         function.instruction(&Instruction::Call(helpers.concat));
     };
-    let to_string = |function: &mut Function, local: u32| {
+    let to_string = |function: &mut FnBuilder<'_>, local: u32| {
         function.instruction(&Instruction::LocalGet(local));
-        function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-        function.instruction(&Instruction::Call(helpers.convert));
-        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::Call(helpers.msg_str()));
     };
 
     function.instruction(&Instruction::LocalGet(mode));
@@ -3046,14 +3053,18 @@ pub(super) fn emit_prop_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Fun
     concat(&mut function);
     function.instruction(&Instruction::I32Const(at(PRIM_CREATE_QUOTE)));
     concat(&mut function);
+    // The partial message sits under the conversion's safepoint.
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Base);
     to_string(&mut function, recv);
     concat(&mut function);
+    function.release_temps(mark);
     function.instruction(&Instruction::I32Const(at(PRIM_CREATE_SUFFIX)));
     concat(&mut function);
     function.instruction(&Instruction::Else);
     // prefix(mode) + String(key) + suffix(mode), each fragment picked from
     // PROP_KEYED_MSGS by a `select` chain on `mode`.
-    let pick = |function: &mut Function,
+    let pick = |function: &mut FnBuilder<'_>,
                 part: fn(&(i32, &'static str, &'static str)) -> &'static str| {
         let [first, rest @ ..] = &PROP_KEYED_MSGS;
         function.instruction(&Instruction::I32Const(at(part(first))));
@@ -3078,5 +3089,5 @@ pub(super) fn emit_prop_throw(strings: &StrOffsets, helpers: Helpers<'_>) -> Fun
 
     emit_raise_type_error(&mut function, msg, scratch, strings, helpers);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }

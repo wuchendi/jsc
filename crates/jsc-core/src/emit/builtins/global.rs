@@ -6,14 +6,14 @@ use super::*;
 use crate::emit::realm::NumberTest;
 
 /// Store `ToNumber(argument 0)` into `n`, returning on a pending throw.
-fn number_arg(function: &mut Function, frame: Frame, n: u32, helpers: Helpers<'_>) {
+fn number_arg(function: &mut FnBuilder<'_>, frame: Frame, n: u32, helpers: Helpers<'_>) {
     frame.arg(function, 0);
     wasm!(function; Call(helpers.to_number), LocalSet(n));
     return_if_pending(function);
 }
 
 /// Turn the i32 condition on the stack into a boolean jsval.
-fn push_bool(function: &mut Function) {
+fn push_bool(function: &mut FnBuilder<'_>) {
     wasm!(function;
         If(BlockType::Result(ValType::I64)),
         I64Const(TRUE_BITS), Else, I64Const(FALSE_BITS), End,
@@ -21,7 +21,7 @@ fn push_bool(function: &mut Function) {
 }
 
 /// `isNaN(number)`: whether `ToNumber(number)` is NaN.
-pub(super) fn emit_is_nan(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+pub(super) fn emit_is_nan(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let n = frame.i64(0);
     number_arg(function, frame, n, helpers);
     wasm!(function;
@@ -32,7 +32,7 @@ pub(super) fn emit_is_nan(function: &mut Function, frame: Frame, helpers: Helper
 
 /// `isFinite(number)`: whether `ToNumber(number)` is neither NaN nor an
 /// infinity (`n - n` is 0 exactly for finite `n`).
-pub(super) fn emit_is_finite(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+pub(super) fn emit_is_finite(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let n = frame.i64(0);
     number_arg(function, frame, n, helpers);
     wasm!(function;
@@ -45,17 +45,17 @@ pub(super) fn emit_is_finite(function: &mut Function, frame: Frame, helpers: Hel
 /// `Number.isInteger` / `isSafeInteger` / `isFinite` / `isNaN`: the test on a
 /// number argument, `false` for anything else (no coercion). A non-number
 /// jsval reads as a NaN `f64`, which fails every test but `isNaN`'s.
-pub(super) fn emit_number_is(test: NumberTest, function: &mut Function, frame: Frame) {
+pub(super) fn emit_number_is(test: NumberTest, function: &mut FnBuilder<'_>, frame: Frame) {
     let v = frame.i64(0);
     frame.arg(function, 0);
     wasm!(function; LocalSet(v));
-    let finite = |function: &mut Function| {
+    let finite = |function: &mut FnBuilder<'_>| {
         wasm!(function;
             LocalGet(v), F64ReinterpretI64, LocalGet(v), F64ReinterpretI64, F64Sub,
             F64Const(0.0.into()), F64Eq,
         );
     };
-    let integral = |function: &mut Function| {
+    let integral = |function: &mut FnBuilder<'_>| {
         finite(function);
         wasm!(function;
             LocalGet(v), F64ReinterpretI64, F64Trunc, LocalGet(v), F64ReinterpretI64, F64Eq,
@@ -86,7 +86,7 @@ pub(super) fn emit_number_is(test: NumberTest, function: &mut Function, frame: F
 /// `parseFloat(s)` / `parseInt(s)` calls lower to, over the arguments.
 pub(super) fn emit_parse(
     int: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,

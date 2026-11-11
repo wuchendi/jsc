@@ -1,4 +1,5 @@
-//! `%Promise.prototype%` methods over the host promise engine.
+//! `%Promise.prototype%` methods and the `Promise` statics over the guest
+//! promise engine (`emit/promise_engine.rs`).
 
 use super::array::{CallArg, push_call};
 #[allow(clippy::wildcard_imports)]
@@ -80,14 +81,16 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(["then", CONSTRUCTOR, "resolve"])
 }
 
-/// `__promise_self_error() -> i64`: a fresh [`SELF_RESOLUTION`] `TypeError`.
-/// Exported for the host promise engines, which settle every promise: a
-/// promise fulfilled with itself is rejected with this error instead.
+/// The `() -> i64` self-resolution constructor: a fresh [`SELF_RESOLUTION`]
+/// `TypeError`. `__promise_settle` rejects a promise fulfilled with itself
+/// with it.
 pub(in crate::emit) fn emit_promise_self_error(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
+    leaves: &LeafSet,
 ) -> Function {
-    let mut function = Function::new(type_error_helper_locals());
+    let mut function = FnBuilder::new(leaves);
+    declare_error_scratch(&mut function);
     emit_node(
         &callee_type_error(SELF_RESOLUTION),
         &mut function,
@@ -96,7 +99,7 @@ pub(in crate::emit) fn emit_promise_self_error(
         helpers,
     );
     wasm!(function; End);
-    function
+    finish_builder(function)
 }
 
 /// The IR fragments the bodies emit, over the locals of `K = k`, for the
@@ -118,7 +121,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
 const CONSTRUCTOR: &str = "constructor";
 
 /// Push `1` when the jsval in `local` is a promise.
-fn is_promise(function: &mut Function, local: u32) {
+fn is_promise(function: &mut FnBuilder<'_>, local: u32) {
     emit_is_pointer(function, local);
     wasm!(function; If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
@@ -184,7 +187,7 @@ fn method_then(
 /// callable in i64 `f` (a throw left pending); `undef` is an i64 local
 /// holding `undefined`.
 fn call(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     f: u32,
     arg: Option<u32>,
@@ -212,7 +215,7 @@ fn construct(frame: Frame, c: u32, executor: u32) -> IrNode {
 /// Emit `node` in the body's scratch layout into i64 `out`, returning
 /// `undefined` when it throws.
 fn emit_into(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     node: &IrNode,
     out: u32,
@@ -225,7 +228,7 @@ fn emit_into(
 }
 
 /// Push element `i` of the array jsval in i64 `array`.
-fn element(function: &mut Function, array: u32, i: u64) {
+fn element(function: &mut FnBuilder<'_>, array: u32, i: u64) {
     wasm!(function; LocalGet(array), I32WrapI64);
     emit_array_elems(function);
     wasm!(function; I64Load(elem_slot(i)));
@@ -233,7 +236,7 @@ fn element(function: &mut Function, array: u32, i: u64) {
 
 /// A fresh array of the jsvals in `items` into i64 `out` (`tmp` a free i32
 /// local).
-fn record(function: &mut Function, items: &[u32], out: u32, tmp: u32, helpers: Helpers<'_>) {
+fn record(function: &mut FnBuilder<'_>, items: &[u32], out: u32, tmp: u32, helpers: Helpers<'_>) {
     let n = i32::try_from(items.len()).unwrap_or(0);
     wasm!(function; I32Const(n), Call(helpers.new_array()), LocalSet(tmp));
     for (i, &item) in (0u64..).zip(items) {
@@ -246,7 +249,7 @@ fn record(function: &mut Function, items: &[u32], out: u32, tmp: u32, helpers: H
 
 /// A fresh closure running `op` over the `env` in i64 `env`, into i64 `out`.
 fn closure(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     op: SpeciesOp,
     env: u32,
@@ -265,7 +268,7 @@ fn closure(
 /// constructor is the result, anything else throws. `C === %Promise%` with
 /// `%Promise%`'s dirty bit clear skips the `@@species` read.
 fn species_constructor(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     o: u32,
     c: u32,
@@ -318,7 +321,7 @@ fn species_constructor(
 /// record, into the i64 locals `promise`, `resolve` and `reject` (both
 /// callable, else a `TypeError`). Uses `y64(1)` and `z64(0)`.
 fn new_capability(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     c: u32,
     [promise, resolve, reject]: [u32; 3],
@@ -343,12 +346,12 @@ fn new_capability(
 
 /// `then(onFulfilled, onRejected)` (`catch = false`) on a promise: the
 /// result promise comes from `SpeciesConstructor(this, %Promise%)` — the
-/// host `__then` chain for `%Promise%`, else `NewPromiseCapability(C)`
-/// settled by two [`SpeciesOp::Reaction`]s `__then` registers — or
+/// engine's `__promise_then` for `%Promise%`, else `NewPromiseCapability(C)`
+/// settled by two [`SpeciesOp::Reaction`]s `__promise_then` registers — or
 /// `catch(onRejected)`: `this.then(undefined, onRejected)` on any receiver.
 pub(super) fn emit_then(
     catch: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -410,18 +413,18 @@ pub(super) fn emit_then(
         closure(function, frame, op, env, out, helpers);
     }
     wasm!(function;
-        LocalGet(this), LocalGet(on_fulfilled), LocalGet(on_rejected), Call(helpers.then), Drop,
+        LocalGet(this), LocalGet(on_fulfilled), LocalGet(on_rejected), Call(helpers.promise_then()), Drop,
         LocalGet(promise),
         End,
     );
 }
 
 /// `finally(onFinally)` on any object: `C = SpeciesConstructor(this,
-/// %Promise%)`; a promise whose `C` is `%Promise%` runs the host op, any
+/// %Promise%)`; a promise whose `C` is `%Promise%` runs `__promise_finally`, any
 /// other receiver `this.then(thenFinally, catchFinally)` (both `onFinally`
 /// when it is not callable).
 pub(super) fn emit_finally(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -474,7 +477,7 @@ pub(super) fn emit_finally(
 
 /// Throw [`NOT_CONSTRUCTOR`] unless the jsval in i64 `c` is a constructor.
 fn require_constructor(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     c: u32,
     strings: &StrOffsets,
@@ -491,9 +494,10 @@ fn require_constructor(
 /// `PromiseResolve(C, v)` for the constructor in i64 `c` and the value in
 /// i64 `v`, into i64 `promise`: a promise whose `constructor` is `C` itself,
 /// else a fresh capability of `C` (a constructor, else a `TypeError`)
-/// resolved with `v`.
+/// resolved with `v`. `C === %Promise%` is the engine's `__promise_resolve`
+/// (`NewPromiseCapability(%Promise%)` reads no property of `%Promise%`).
 fn promise_resolve(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     c: u32,
     v: u32,
@@ -502,7 +506,14 @@ fn promise_resolve(
     helpers: Helpers<'_>,
 ) {
     let (resolve, reject, same, undef) = (frame.y64(5), frame.x64(1), frame.i32(1), frame.i64(3));
-    wasm!(function; I32Const(0), LocalSet(same));
+    let ctor = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Promise), helpers);
+    wasm!(function;
+        LocalGet(c), I64Const(ctor), I64Eq,
+        If(BlockType::Empty),
+        LocalGet(v), Call(helpers.promise_resolve()), LocalSet(promise),
+    );
+    return_if_pending(function);
+    wasm!(function; Else, I32Const(0), LocalSet(same));
     is_promise(function, v);
     wasm!(function;
         If(BlockType::Empty),
@@ -529,14 +540,14 @@ fn promise_resolve(
     call(function, frame, resolve, Some(v), undef, helpers);
     wasm!(function; Drop);
     return_if_pending(function);
-    wasm!(function; End);
+    wasm!(function; End, End);
 }
 
 /// Push i32 `1` when `c` (i64) is `%Promise%` and, under dirty tracking,
 /// none of `intrinsics` has its dirty bit set; without dirty tracking the
 /// bits prove nothing, so `0`.
 fn is_clean_promise_ctor(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     c: u32,
     intrinsics: &[Intrinsic],
     helpers: Helpers<'_>,
@@ -559,7 +570,7 @@ fn is_clean_promise_ctor(
 /// Emit the body of the `Promise` static `op`.
 pub(super) fn emit_static(
     op: PromiseStaticOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -573,13 +584,12 @@ pub(super) fn emit_static(
 
 /// `Promise.resolve(x)` (`reject = false`) / `Promise.reject(r)` with
 /// `C = this` (an object, else a `TypeError`): `PromiseResolve(C, x)` /
-/// `NewPromiseCapability(C)` rejected with `r`. `C === %Promise%` takes the
-/// host op (for `resolve` only a non-promise `x`, whose result does not
-/// depend on its `constructor`): `NewPromiseCapability(%Promise%)` reads no
-/// property of `%Promise%`, so no dirty bit is involved.
+/// `NewPromiseCapability(C)` rejected with `r` (`C === %Promise%`:
+/// `__promise_reject`, as `NewPromiseCapability(%Promise%)` reads no property
+/// of `%Promise%`).
 fn emit_resolve(
     reject: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -592,21 +602,14 @@ fn emit_resolve(
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, NOT_CONSTRUCTOR, strings, helpers);
     wasm!(function; End);
-    let promise = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Promise), helpers);
-    wasm!(function; LocalGet(c), I64Const(promise), I64Eq);
-    let op = if reject {
-        PROMISE_OP_REJECT
-    } else {
-        is_promise(function, x);
-        wasm!(function; I32Eqz, I32And);
-        PROMISE_OP_RESOLVE
-    };
-    wasm!(function;
-        If(BlockType::Empty),
-        I32Const(op), LocalGet(x), I64Const(UNDEFINED_BITS), Call(helpers.promise), Return,
-        End,
-    );
     if reject {
+        let promise = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Promise), helpers);
+        wasm!(function;
+            LocalGet(c), I64Const(promise), I64Eq,
+            If(BlockType::Empty),
+            LocalGet(x), Call(helpers.promise_reject()), Return,
+            End,
+        );
         let (resolve, settle) = (frame.y64(5), frame.x64(1));
         require_constructor(function, frame, c, strings, helpers);
         new_capability(function, frame, c, [out, resolve, settle], strings, helpers);
@@ -705,7 +708,7 @@ impl Combinator {
             on_fulfilled: frame.y64(1),
             on_rejected: frame.x64(0),
             index: frame.y32(0),
-            values: frame.y32(1),
+            values: frame.base(7),
             fast: frame.y32(2),
         }
     }
@@ -725,7 +728,7 @@ impl Combinator {
 /// (`IfAbruptRejectPromise`).
 fn emit_combinator(
     op: CombinatorOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -819,10 +822,10 @@ fn emit_combinator(
 /// %Promise%` (with its and `%Promise.prototype%`'s dirty bits clear), its
 /// builtin `resolve` and a `%Promise%` instance without own properties skip
 /// the `resolve` call (`nextPromise` is `v`) and register the reactions
-/// through the host `__then` directly.
+/// through `__promise_then` directly.
 fn combinator_value(
     cb: Combinator,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -896,7 +899,7 @@ fn combinator_value(
     }
     wasm!(function;
         LocalGet(cb.fast), If(BlockType::Empty),
-        LocalGet(v), LocalGet(on_fulfilled), LocalGet(on_rejected), Call(helpers.then), Drop,
+        LocalGet(v), LocalGet(on_fulfilled), LocalGet(on_rejected), Call(helpers.promise_then()), Drop,
         Else,
     );
     enter_frame(helpers);
@@ -919,7 +922,7 @@ fn combinator_value(
 /// abrupt path closes nothing).
 fn combinator_done(
     cb: Combinator,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -952,7 +955,7 @@ fn combinator_done(
 
 /// `state[1] += delta` (`remainingElements`) for the combinator state array
 /// in i64 `state`, pushing the new count's bits (`0` once it is `+0`).
-fn adjust_remaining(function: &mut Function, state: u32, delta: f64) {
+fn adjust_remaining(function: &mut FnBuilder<'_>, state: u32, delta: f64) {
     wasm!(function; LocalGet(state), I32WrapI64);
     emit_array_elems(function);
     element(function, state, 1);
@@ -967,7 +970,7 @@ fn adjust_remaining(function: &mut Function, state: u32, delta: f64) {
 /// `this`; an internal closure reads its captured values from `env`.
 pub(super) fn emit_species(
     op: SpeciesOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1073,7 +1076,7 @@ pub(super) fn emit_species(
 fn emit_element(
     combinator: CombinatorOp,
     reject: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,

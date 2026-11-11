@@ -1,6 +1,95 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// A builder with the user-function layout: `params` parameters (the `K`
+/// jsval arguments, `env`, and a raw `argc` when present), the IR locals up to
+/// `locals` as jsvals, then the 33 scratch locals of [`emit_main`].
+pub(super) fn user_builder(params: u32, locals: u32, leaves: &LeafSet) -> FnBuilder<'_> {
+    use LocalClass::{Base, Jsval, Raw};
+    let mut b = FnBuilder::new(leaves);
+    for param in 0..params {
+        b.param(if param + 1 == params {
+            Raw(ValType::I64)
+        } else {
+            Jsval
+        });
+    }
+    b.locals(locals - params + 3, Jsval); // IR locals, scratch +0..+2
+    b.locals(1, Base); // +3
+    b.locals(3, Jsval); // +4..+6
+    b.locals(1, Base); // +7
+    b.locals(1, Base); // +8
+    b.locals(2, Raw(ValType::I32)); // +9, +10 (integers)
+    b.locals(2, Base); // +11, +12
+    b.locals(1, Jsval); // +13
+    b.locals(7, Jsval); // +14..+20
+    b.locals(1, Base); // +21
+    b.locals(2, Jsval); // +22, +23
+    b.locals(6, Raw(ValType::I64)); // +24..+29 (Date arithmetic)
+    b.locals(1, Raw(ValType::I32)); // +30 (KIND_TMP)
+    b.locals(2, Raw(ValType::I64)); // +31, +32 (NUM_A, NUM_B)
+    b
+}
+
+/// The raw `i32` scratch local of a receiver kind test (`scratch + KIND_TMP`):
+/// a base read and dropped with no safepoint in between, so never rooted.
+pub(super) const KIND_TMP: u32 = 30;
+
+/// The raw `i64` scratch of the numeric operators (`scratch + NUM_A`, `NUM_B`):
+/// operands stashed for their `ToNumber` and tag tests. Never rooted: a heap
+/// value in one is only passed by value, or rooted by the cold coerce arm.
+pub(super) const NUM_A: u32 = 31;
+pub(super) const NUM_B: u32 = 32;
+
+/// A jsval local or parameter, written through to its root slot when live.
+pub(super) const ROOT_JS: LocalClass = LocalClass::Jsval;
+/// An `i32` block base or property key, rooted as `HEAP | base` when live.
+pub(super) const ROOT_BASE: LocalClass = LocalClass::Base;
+/// An `i32` integer, interior address, or base kept alive by another root.
+pub(super) const RAW_I32: LocalClass = LocalClass::Raw(ValType::I32);
+/// Raw `i64` bits that are not a jsval.
+pub(super) const RAW_I64: LocalClass = LocalClass::Raw(ValType::I64);
+/// A raw `f64`.
+pub(super) const RAW_F64: LocalClass = LocalClass::Raw(ValType::F64);
+
+/// A builder for a hand-written helper with the given parameter and local
+/// classes, numbered in order from local 0.
+pub(super) fn helper_builder<'a>(
+    leaves: &'a LeafSet,
+    params: &[LocalClass],
+    locals: &[LocalClass],
+) -> FnBuilder<'a> {
+    let mut builder = FnBuilder::new(leaves);
+    for class in params {
+        builder.param(*class);
+    }
+    for class in locals {
+        builder.local(*class);
+    }
+    builder
+}
+
+/// Declare the 24 expression-scratch locals `+0..+23` of [`user_builder`],
+/// for helpers that build a value through `emit_node`.
+pub(super) fn declare_scratch(builder: &mut FnBuilder<'_>) {
+    builder.locals(3, ROOT_JS); // +0..+2
+    builder.locals(1, ROOT_BASE); // +3
+    builder.locals(3, ROOT_JS); // +4..+6
+    builder.locals(2, ROOT_BASE); // +7, +8
+    builder.locals(2, RAW_I32); // +9, +10 (integers)
+    builder.locals(2, ROOT_BASE); // +11, +12
+    builder.locals(8, ROOT_JS); // +13..+20
+    builder.locals(1, ROOT_BASE); // +21
+    builder.locals(2, ROOT_JS); // +22, +23
+}
+
+/// Finish a user-code builder; a violated invariant is a compiler bug.
+pub(super) fn finish_builder(builder: FnBuilder<'_>) -> Function {
+    builder
+        .finish()
+        .unwrap_or_else(|error| unreachable!("function builder: {error}"))
+}
+
 /// Emit the `main` entry function body from the program's top-level statements.
 ///
 /// The result is the last expression statement's value, left on the stack;
@@ -11,6 +100,7 @@ pub(super) fn emit_main(
     program: &IrProgram,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
+    leaves: &LeafSet,
 ) -> Function {
     // One i64 local per top-level variable, plus three trailing i64 scratch
     // locals (indices `program.locals`/`+1`/`+2`) used to inspect operand bits:
@@ -43,18 +133,9 @@ pub(super) fn emit_main(
     // Six more i64 slots (`+24`..`+29`) are the `Date` field-method scratch: the
     // guest-side civil-from-days / time-of-day arithmetic runs entirely over these
     // (a `Date` method takes no arguments, so no child sub-expression is live).
-    let mut function = Function::new(vec![
-        (program.locals + 3, ValType::I64),
-        (1, ValType::I32),
-        (3, ValType::I64),
-        (1, ValType::I32),
-        (5, ValType::I32),
-        (1, ValType::I64),
-        (7, ValType::I64),
-        (1, ValType::I32),
-        (2, ValType::I64),
-        (6, ValType::I64),
-    ]);
+    // One raw i32 (`+30`, `KIND_TMP`) holds a receiver's kind for one test, and two
+    // raw i64 (`+31`/`+32`, `NUM_A`/`NUM_B`) stash the numeric operators' operands.
+    let mut function = user_builder(0, program.locals, leaves);
     let scratch = program.locals;
     // Fresh unwinding state for this function body: no active `try`
     // handler, control-nesting depth 0.
@@ -92,7 +173,73 @@ pub(super) fn emit_main(
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     }
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
+}
+
+/// Emit `_start` (§2.4): run `main`, drain unless it threw, report an uncaught
+/// exception or the first unhandled rejection on fd 2 with `proc_exit(1)`, and
+/// otherwise print the completion value when asked.
+pub(super) fn emit_start(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    options: CompileOptions,
+    leaves: &LeafSet,
+) -> Function {
+    use Instruction as I;
+    let mut f = FnBuilder::new(leaves);
+    let (value, unhandled) = (f.local(LocalClass::Jsval), f.local(LocalClass::Jsval));
+    let at = |text| I::I32Const(static_key(strings, text));
+    for op in [
+        I::Call(IMPORT_FUNC_COUNT),
+        I::LocalSet(value),
+        I::GlobalGet(EXC_PENDING_GLOBAL),
+        I::I32Eqz,
+        I::If(BlockType::Empty),
+        I::Call(helpers.drain()),
+        I::End,
+        I::GlobalGet(EXC_PENDING_GLOBAL),
+        I::If(BlockType::Empty),
+        I::I32Const(2),
+        at("Uncaught "),
+        I::GlobalGet(EXC_VALUE_GLOBAL),
+        I::Call(helpers.report()),
+        I::I32Const(1),
+        I::Call(PROC_EXIT_IMPORT),
+        I::Unreachable,
+        I::End,
+        I::Call(helpers.first_unhandled()),
+        I::LocalTee(unhandled),
+        I::I64Eqz,
+        I::I32Eqz,
+        I::If(BlockType::Empty),
+        I::I32Const(2),
+        at("Uncaught (in promise) "),
+        I::LocalGet(unhandled),
+        I::I32WrapI64,
+        I::I64Load(MemArg {
+            offset: PROMISE_VALUE_OFFSET,
+            align: 3,
+            memory_index: 0,
+        }),
+        I::Call(helpers.report()),
+        I::I32Const(1),
+        I::Call(PROC_EXIT_IMPORT),
+        I::Unreachable,
+        I::End,
+    ] {
+        f.instruction(&op);
+    }
+    if options.print_completion {
+        f.instruction(&I::I32Const(1));
+        f.instruction(&at(""));
+        f.instruction(&I::LocalGet(value));
+        f.instruction(&I::Call(helpers.report()));
+    }
+    // A line left unfinished by a throwing `console.log` argument.
+    f.instruction(&I::I32Const(1));
+    f.instruction(&I::Call(helpers.out_flush()));
+    f.instruction(&I::End);
+    finish_builder(f)
 }
 
 /// Emit a user-defined function body.
@@ -107,8 +254,8 @@ pub(super) fn emit_function(
     func: &IrFunction,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
+    leaves: &LeafSet,
 ) -> Function {
-    let declared = func.locals - func.params;
     // Body-declared locals plus the same scratch-local layout as [`emit_main`]:
     // three i64 (`func.locals`/`+1`/`+2`) to inspect operand bits and stash the
     // value of `obj[i] = v`, one i32 (`+3`) for block allocation, three i64
@@ -124,18 +271,7 @@ pub(super) fn emit_function(
     // state-machine result, and six i64 (`+24`..`+29`) for the `Date`
     // field-method arithmetic. See [`emit_main`] for the full rationale
     // and the same-kind-nesting limitation.
-    let mut function = Function::new(vec![
-        (declared + 3, ValType::I64),
-        (1, ValType::I32),
-        (3, ValType::I64),
-        (1, ValType::I32),
-        (5, ValType::I32),
-        (1, ValType::I64),
-        (7, ValType::I64),
-        (1, ValType::I32),
-        (2, ValType::I64),
-        (6, ValType::I64),
-    ]);
+    let mut function = user_builder(func.params, func.locals, leaves);
     let scratch = func.locals;
     // Fresh unwinding state for this function body.
     helpers.unwind.borrow_mut().reset();
@@ -150,7 +286,7 @@ pub(super) fn emit_function(
     );
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the unwinding transfer for an in-flight exception.
@@ -170,7 +306,7 @@ pub(super) fn emit_function(
 /// post-call check (see [`emit_propagate_if_pending`]) re-fires and unwinds one
 /// frame further, until `main` returns and the run stage surfaces the exception.
 /// No call site needs to know which unwinding target is active.
-pub(super) fn emit_throw_return(function: &mut Function, helpers: Helpers<'_>) {
+pub(super) fn emit_throw_return(function: &mut impl Sink, helpers: Helpers<'_>) {
     // The nearest enclosing `try`'s catch-dispatch block, as a `br`
     // immediate relative to the current control-nesting depth, or `None` when no
     // `try` is active in this function.
@@ -206,12 +342,12 @@ pub(super) fn leave_frame(helpers: Helpers<'_>) {
 
 /// Emit a post-call check that unwinds if a callee left an exception in flight.
 /// Inserted after every user-function / callback invocation (but not
-/// after pure host builtins, which cannot throw): the callee's `i64` result is
+/// after pure builtins, which cannot throw): the callee's `i64` result is
 /// already on top of the stack, so this reads `$exc_pending` and, when set,
 /// runs [`emit_throw_return`] to unwind one more frame. On the no-exception path
 /// the `if` falls through leaving the callee's result untouched, so the check is
 /// transparent to the surrounding expression.
-pub(super) fn emit_propagate_if_pending(function: &mut Function, helpers: Helpers<'_>) {
+pub(super) fn emit_propagate_if_pending(function: &mut impl Sink, helpers: Helpers<'_>) {
     function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::If(BlockType::Empty));
     // The `if` opens a control frame around the throw transfer; count it so a
@@ -241,7 +377,7 @@ fn nearest_finalizer_rel(helpers: Helpers<'_>) -> Option<u32> {
 /// returned directly. Either path first clears the OTHER in-flight completion
 /// channel (`$exc_pending`) so at most one abrupt completion stays pending — this
 /// is how a `return` inside a `finally` overrides a still-pending throw.
-pub(super) fn emit_return_transfer(function: &mut Function, helpers: Helpers<'_>) {
+pub(super) fn emit_return_transfer(function: &mut impl Sink, helpers: Helpers<'_>) {
     if let Some(rel) = nearest_finalizer_rel(helpers) {
         function.instruction(&Instruction::GlobalSet(CF_VALUE_GLOBAL));
         function.instruction(&Instruction::I32Const(0));
@@ -274,7 +410,7 @@ pub(super) fn emit_return_transfer(function: &mut Function, helpers: Helpers<'_>
 /// direct path clears the pending channels so a `break`/`continue` inside a
 /// `finally` overrides whatever completion triggered it.
 pub(super) fn emit_loop_transfer(
-    function: &mut Function,
+    function: &mut impl Sink,
     helpers: Helpers<'_>,
     kind: i32,
     label: u32,
@@ -342,7 +478,7 @@ pub(super) fn labeled_target_rel(helpers: Helpers<'_>, id: u32, want_continue: b
 /// fires here. `break_label`/`continue_label` are the loop targets in scope at
 /// the enclosing `try`'s own depth (the same values threaded to the finally body).
 pub(super) fn emit_resume_pending_completion(
-    function: &mut Function,
+    function: &mut impl Sink,
     helpers: Helpers<'_>,
     break_label: Option<u32>,
     continue_label: Option<u32>,
@@ -374,7 +510,7 @@ pub(super) fn emit_resume_pending_completion(
 /// SAME loop it originally targeted. `want_continue` picks the loop's continue vs
 /// break landing block for the labeled targets.
 fn emit_loop_resume(
-    function: &mut Function,
+    function: &mut impl Sink,
     helpers: Helpers<'_>,
     kind: i32,
     nearest_label: Option<u32>,
@@ -431,12 +567,12 @@ fn emit_loop_resume(
 /// frame around `body` (which is expected to diverge via a loop transfer). The
 /// optional `$cf_value` guard `v` disambiguates the labeled-loop target;
 /// omitting it reproduces the original unguarded kind check.
-fn emit_kind_guard(
-    function: &mut Function,
+fn emit_kind_guard<S: Sink>(
+    function: &mut S,
     helpers: Helpers<'_>,
     kind: i32,
     value_check: Option<i64>,
-    body: impl FnOnce(&mut Function, Helpers<'_>),
+    body: impl FnOnce(&mut S, Helpers<'_>),
 ) {
     function.instruction(&Instruction::GlobalGet(CF_KIND_GLOBAL));
     function.instruction(&Instruction::I32Const(kind));

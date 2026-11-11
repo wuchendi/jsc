@@ -2,8 +2,8 @@
 //! takes `ToString(RequireObjectCoercible(this))` and coerces its arguments in
 //! the guest (a user `toString` / `valueOf` may run, and throw), then works on
 //! the code units at each string's width (one-byte Latin-1 or two-byte
-//! UTF-16, DESIGN.md §5.2), producing canonical strings; only the
-//! case mappings, `localeCompare` and `normalize` run a host `__method` op.
+//! UTF-16, DESIGN.md §5.2), producing canonical strings; only
+//! `localeCompare` is `__str_cmp`, code-unit order.
 //! `toString` / `valueOf` are `thisStringValue`.
 
 #[allow(clippy::wildcard_imports)]
@@ -72,45 +72,12 @@ fn coercion_order(op: StringOp) -> [u32; 2] {
     }
 }
 
-/// The host op flag of `op` when the call-site arguments `args` are already
-/// of the types its coercions produce (string / number literals; a missing
-/// argument is `undefined`), so that on a string receiver the builtin is
-/// exactly its host op, inline; with whether that op may refuse its input
-/// (`normalize`; then the call site falls back to the builtin, which throws).
-pub(in crate::emit) fn inline_host_op(op: StringOp, args: &[IrNode]) -> Option<(i32, bool)> {
-    let ready = |coerce: Coerce, arg: Option<&IrNode>| {
-        matches!(
-            (coerce, arg),
-            (Coerce::None, _)
-                | (Coerce::OptString | Coerce::Number, None)
-                | (Coerce::String | Coerce::OptString, Some(IrNode::Str(_)))
-                | (Coerce::Number, Some(IrNode::Num(_)))
-        )
-    };
-    // Case mapping takes its Latin-1 fast path in the builtin.
-    if case_upper(op).is_some() {
-        return None;
-    }
-    let [first, second] = coercions(op);
-    if !(ready(first, args.first()) && ready(second, args.get(1))) {
-        return None;
-    }
-    // Only `normalize` with a form that is not a literal valid one may refuse.
-    let may_fail = op == StringOp::Normalize
-        && match args.first() {
-            None => false,
-            Some(IrNode::Str(form)) => !["NFC", "NFD", "NFKC", "NFKD"]
-                .iter()
-                .any(|valid| form == valid),
-            Some(_) => true,
-        };
-    op.flag().map(|flag| (flag, may_fail))
-}
-
-/// Push i32 `1` when the `__method` result on the stack is the refusal
-/// sentinel `METHOD_RANGE_ERROR`.
-pub(in crate::emit) fn emit_is_method_refusal(function: &mut Function) {
-    wasm!(function; I64Const(abi::METHOD_RANGE_ERROR.cast_signed()), I64Eq);
+/// Whether `op` with the call-site arguments `args` already of the types its
+/// coercions produce (string / number literals; a missing argument is
+/// `undefined`) runs inline: on a string receiver the builtin is exactly its
+/// code-unit body.
+pub(in crate::emit) fn inline_str_cmp(op: StringOp, args: &[IrNode]) -> bool {
+    op == StringOp::LocaleCompare && matches!(args, [IrNode::Str(_)])
 }
 
 /// The `TypeError` text of `String.prototype.<name>` on a `null`/`undefined`
@@ -305,12 +272,12 @@ const NULLISH_TO_OBJECT: CalleeErrorText<'static> = [
 const REPEAT_COUNT: [&str; 2] = ["Invalid count value: ", "RangeError: Invalid count value: "];
 
 /// The `RangeError` of a `repeat` / `padStart` / `padEnd` result past
-/// [`MAX_STRING_LENGTH`].
+/// [`MAX_STRING_LENGTH`], or of a case mapping that grows past it.
 const STRING_LENGTH: [&str; 2] = ["Invalid string length", "RangeError: Invalid string length"];
 
 /// The longest string a `repeat` / `padStart` / `padEnd` builds, in code
 /// units (`2^29 - 24`, as V8).
-const MAX_STRING_LENGTH: f64 = 536_870_888.0;
+pub(in crate::emit) const MAX_STRING_LENGTH: f64 = 536_870_888.0;
 
 /// The own keys of a `match` result besides its element.
 const MATCH_KEYS: [&str; 3] = ["index", "input", "groups"];
@@ -362,7 +329,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 /// `String.prototype.toString()` / `valueOf()`: `thisStringValue(this)`.
 pub(super) fn emit_this_value(
     value_of: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -378,7 +345,7 @@ pub(super) fn emit_this_value(
         frame,
         s,
         abi::CLASS_STRING,
-        emit_is_string,
+        |f, l| emit_is_string(f, l),
         text,
         strings,
         helpers,
@@ -389,16 +356,15 @@ pub(super) fn emit_this_value(
 /// The generic `String.prototype.<op>(a0, a1)`: `ToString(this)` (a
 /// `null`/`undefined` receiver throws), the argument coercions of
 /// [`coercions`] in [`coercion_order`], `repeat`'s count check, then the
-/// code-unit body ([`emit_units`]) or the host op, whose refusal sentinels
-/// throw; `match` builds its result array. `concat`, `matchAll`, `replace`
-/// and `replaceAll` continue in their own bodies after the receiver. Before
+/// code-unit body ([`emit_units`]); `match` builds its result array.
+/// `concat`, `matchAll`, `replace` and `replaceAll` continue in their own bodies after the receiver. Before
 /// `ToString(this)`, an object first argument of `match` / `matchAll` /
 /// `replace` / `replaceAll` / `search` / `split` with the method's
 /// well-known symbol is called instead ([`emit_dispatch`]); after it,
 /// `includes` / `startsWith` / `endsWith` refuse an `IsRegExp` argument.
 pub(super) fn emit_method(
     op: StringOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -426,7 +392,7 @@ pub(super) fn emit_method(
         frame.arg(function, i);
         wasm!(function; LocalSet(out));
         // Each coercion is skipped for a value already of its type.
-        let coerce_string = |function: &mut Function| {
+        let coerce_string = |function: &mut FnBuilder<'_>| {
             is_string(function, out);
             wasm!(function; I32Eqz, If(BlockType::Empty));
             to_string(function, out, helpers);
@@ -482,19 +448,26 @@ pub(super) fn emit_method(
         push_str(function, strings, "");
         wasm!(function; LocalSet(a0), End);
     }
-    let Some(flag) = op.flag() else {
-        emit_units(op, function, frame, strings, helpers);
-        if op == StringOp::Match {
-            wasm!(function; LocalSet(r));
-            emit_match_result(function, frame, s, a0, r, strings, helpers);
-        }
-        return;
-    };
     if let Some(upper) = case_upper(op) {
-        emit_case_map(upper, op, flag, function, frame, strings, helpers);
+        emit_case_map(upper, function, frame, strings, helpers);
         return;
     }
-    emit_host_op(op, flag, function, frame, strings, helpers);
+    if op == StringOp::Normalize {
+        emit_normalize(function, frame, strings, helpers);
+        return;
+    }
+    if op == StringOp::LocaleCompare {
+        wasm!(function;
+            LocalGet(s), I32WrapI64, LocalGet(a0), I32WrapI64, Call(helpers.str_cmp),
+            F64ConvertI32S, I64ReinterpretF64,
+        );
+        return;
+    }
+    emit_units(op, function, frame, strings, helpers);
+    if op == StringOp::Match {
+        wasm!(function; LocalSet(r));
+        emit_match_result(function, frame, s, a0, r, strings, helpers);
+    }
 }
 
 /// The receiver of [`emit_method`] into i64 temp 0: `this`, a
@@ -503,7 +476,7 @@ pub(super) fn emit_method(
 /// `includes` / `startsWith` / `endsWith`.
 fn emit_receiver(
     op: StringOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -538,18 +511,17 @@ fn case_upper(op: StringOp) -> Option<bool> {
 /// `toUpperCase` / `toLowerCase` (and the `toLocale*` twins) over the string
 /// in i64 temp 0: a one-byte receiver whose mapping stays one-byte at the
 /// same length (lowercasing always; uppercasing unless it holds `µ`, `ß` or
-/// `ÿ`) maps per unit in the guest, anything else runs the host op `flag`.
+/// `ÿ`) maps per unit, anything else runs the table-driven `__case_map`,
+/// which refuses a result past [`MAX_STRING_LENGTH`].
 fn emit_case_map(
     upper: bool,
-    op: StringOp,
-    flag: i32,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let locals = i32_locals(frame);
-    let s = Str::at(&locals, 0);
+    let s = Str::at(frame, &locals, 0);
     let [i, c, ok, dst] = [locals[3], locals[4], locals[5], locals[6]];
     s.open(function, frame.i64(0));
     wasm!(function; LocalGet(s.w), I32Eqz, LocalSet(ok));
@@ -605,35 +577,48 @@ fn emit_case_map(
     });
     wasm!(function; LocalGet(dst));
     box_heap(function);
-    wasm!(function; Else);
-    emit_host_op(op, flag, function, frame, strings, helpers);
+    wasm!(function;
+        Else,
+        LocalGet(s.p), I32Const(i32::from(upper)), Call(helpers.case_map()), LocalTee(dst), I32Eqz,
+        If(BlockType::Empty),
+    );
+    throw_range_error(function, frame, STRING_LENGTH, None, strings, helpers);
+    wasm!(function; End, LocalGet(dst));
+    box_heap(function);
     wasm!(function; End);
 }
 
-/// The host op `flag` of `op` over the receiver string in i64 temp 0 and the
-/// coerced arguments in i64 temps 1 and 2; `normalize`'s refusal sentinel
-/// throws.
-fn emit_host_op(
-    op: StringOp,
-    flag: i32,
-    function: &mut Function,
+/// `normalize` over the string in i64 temp 0 with the form (a string or
+/// `undefined`) in i64 temp 1: an unknown form throws, as does a result past
+/// [`MAX_STRING_LENGTH`].
+fn emit_normalize(
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (s, a0, a1, r) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let (s, a0) = (frame.i64(0), frame.i64(1));
+    let locals = i32_locals(frame);
+    let [form, dst] = [locals[0], locals[1]];
     wasm!(function;
-        LocalGet(s), I32Const(flag), LocalGet(a0), LocalGet(a1), Call(helpers.method), LocalSet(r),
+        LocalGet(a0), I64Const(UNDEFINED_BITS), I64Eq,
+        If(BlockType::Result(ValType::I32)),
+        I32Const(crate::emit::unicode::FORM_COMPOSE),
+        Else,
+        LocalGet(a0), I32WrapI64, Call(helpers.normalize_form()),
+        End,
+        LocalTee(form), I32Const(0), I32LtS,
+        If(BlockType::Empty),
     );
-    if op == StringOp::Normalize {
-        wasm!(function;
-            LocalGet(r), I64Const(abi::METHOD_RANGE_ERROR.cast_signed()), I64Eq,
-            If(BlockType::Empty),
-        );
-        throw_range_error(function, frame, NORMALIZE_FORM, None, strings, helpers);
-        wasm!(function; End);
-    }
-    wasm!(function; LocalGet(r));
+    throw_range_error(function, frame, NORMALIZE_FORM, None, strings, helpers);
+    wasm!(function;
+        End,
+        LocalGet(s), I32WrapI64, LocalGet(form), Call(helpers.normalize()), LocalTee(dst), I32Eqz,
+        If(BlockType::Empty),
+    );
+    throw_range_error(function, frame, STRING_LENGTH, None, strings, helpers);
+    wasm!(function; End, LocalGet(dst));
+    box_heap(function);
 }
 
 /// The well-known symbol `op` dispatches to on an object first argument.
@@ -674,7 +659,7 @@ fn not_callable_text(symbol: WellKnown) -> CalleeErrorText<'static> {
 /// `ToBoolean(Get(v, @@match))` (no object has `[[RegExpMatcher]]`); the
 /// `@@match` value is left in i64 `m`. A throw returns.
 fn emit_is_regexp(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     v: u32,
     m: u32,
@@ -699,7 +684,7 @@ fn emit_is_regexp(
 /// `IsRegExp` throws `text`.
 fn emit_refuse_regexp(
     text: CalleeErrorText<'static>,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -726,7 +711,7 @@ fn emit_refuse_regexp(
 fn emit_dispatch(
     op: StringOp,
     symbol: WellKnown,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -743,7 +728,7 @@ fn emit_dispatch(
     } {
         let flags = frame.x64(1);
         let locals = i32_locals(frame);
-        let (fv, g) = (Str::at(&locals, 0), Str::at(&locals, 3));
+        let (fv, g) = (Str::at(frame, &locals, 0), Str::at(frame, &locals, 3));
         let [from, at, j, ok] = [locals[9], locals[10], locals[11], locals[12]];
         emit_is_regexp(function, frame, a0, m, strings, helpers);
         wasm!(function;
@@ -800,7 +785,7 @@ fn emit_dispatch(
 /// and the arguments `args` (i64 locals), leaving its result; arguments past
 /// `K` go in a published spread argument array.
 fn call_with(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     callee: u32,
     this: u32,
@@ -815,7 +800,7 @@ fn call_with(
         }
     }
     if args.len() > frame.k as usize {
-        let spread = frame.scratch() + 35;
+        let spread = frame.scratch() + 38;
         let n = i32::try_from(args.len()).unwrap_or(i32::MAX);
         wasm!(function;
             I32Const(n), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
@@ -840,7 +825,7 @@ fn call_with(
 /// Throw a `RangeError` with `text` (`[message, stack]`), followed by the
 /// jsval in i64 local `value` when given.
 fn throw_range_error(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     text: [&str; 2],
     value: Option<u32>,
@@ -863,7 +848,7 @@ fn throw_range_error(
 /// over the string in `s`: `null` for `-1`, else `[p]` with the own data
 /// properties `index`, `input` and `groups` (`undefined`).
 fn emit_match_result(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     s: u32,
     p: u32,
@@ -893,7 +878,7 @@ fn emit_match_result(
 }
 
 /// Append the string in i64 `v` to the string in i64 `acc`.
-fn append(function: &mut Function, acc: u32, v: u32, helpers: Helpers<'_>) {
+fn append(function: &mut FnBuilder<'_>, acc: u32, v: u32, helpers: Helpers<'_>) {
     wasm!(function;
         LocalGet(acc), I32WrapI64, LocalGet(v), I32WrapI64, Call(helpers.concat),
         I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(acc),
@@ -902,7 +887,7 @@ fn append(function: &mut Function, acc: u32, v: u32, helpers: Helpers<'_>) {
 
 /// `concat(...args)` over the string in `s`: append `ToString` of each
 /// argument in order (the spread argument array is captured in `x64(0)`).
-fn emit_concat(function: &mut Function, frame: Frame, s: u32, helpers: Helpers<'_>) {
+fn emit_concat(function: &mut FnBuilder<'_>, frame: Frame, s: u32, helpers: Helpers<'_>) {
     let (v, spread) = (frame.i64(1), frame.x64(0));
     let (n, i) = (frame.i32(0), frame.i32(1));
     push_argc(function, frame);
@@ -915,12 +900,10 @@ fn emit_concat(function: &mut Function, frame: Frame, s: u32, helpers: Helpers<'
     wasm!(function; LocalGet(s));
 }
 
-/// The i32 locals the code-unit bodies use: the frame's i32 temps, then the
-/// i32 locals of its IR scratch layout ([`Frame::scratch`]), which only an IR
-/// fragment clobbers — a thrown error (which returns) or `match`'s result
-/// array (built last).
+/// The raw i32 locals the code-unit bodies use for integers and for blocks
+/// no safepoint separates from their last use; a [`Str`]'s base is rooted
+/// separately, see [`Str::at`].
 fn i32_locals(frame: Frame) -> [u32; 18] {
-    let x = frame.scratch();
     [
         frame.i32(0),
         frame.i32(1),
@@ -932,14 +915,14 @@ fn i32_locals(frame: Frame) -> [u32; 18] {
         frame.y32(1),
         frame.y32(2),
         frame.y32(3),
-        x + 3,
-        x + 7,
-        x + 8,
-        x + 9,
-        x + 10,
-        x + 11,
-        x + 12,
-        x + 21,
+        frame.w32(0),
+        frame.w32(1),
+        frame.w32(2),
+        frame.w32(3),
+        frame.w32(4),
+        frame.w32(5),
+        frame.w32(6),
+        frame.w32(7),
     ]
 }
 
@@ -971,17 +954,17 @@ struct Str {
 }
 
 impl Str {
-    /// Three consecutive locals of `locals` from `at`.
-    fn at(locals: &[u32; 18], at: usize) -> Self {
+    /// The rooted base `at` with the two locals of `locals` after `at`.
+    fn at(frame: Frame, locals: &[u32; 18], at: u32) -> Self {
         Self {
-            p: locals[at],
-            w: locals[at + 1],
-            n: locals[at + 2],
+            p: frame.base(at),
+            w: locals[at as usize + 1],
+            n: locals[at as usize + 2],
         }
     }
 
     /// Set the views from the string jsval in i64 `v`.
-    fn open(self, function: &mut Function, v: u32) {
+    fn open(self, function: &mut FnBuilder<'_>, v: u32) {
         wasm!(function; LocalGet(v), I32WrapI64, LocalSet(self.p));
         emit_str_two_byte(function, self.p);
         wasm!(function; LocalSet(self.w), LocalGet(self.p));
@@ -990,7 +973,7 @@ impl Str {
     }
 
     /// Push the code unit at the index `index` pushes.
-    fn unit(self, function: &mut Function, index: impl Fn(&mut Function)) {
+    fn unit(self, function: &mut FnBuilder<'_>, index: impl Fn(&mut FnBuilder<'_>)) {
         wasm!(function; LocalGet(self.w), If(BlockType::Result(ValType::I32)), LocalGet(self.p));
         index(function);
         wasm!(function; I32Const(1), I32Shl, I32Add, I32Load16U(mem16()), Else, LocalGet(self.p));
@@ -999,12 +982,12 @@ impl Str {
     }
 
     /// Push the code unit at the index in i32 local `i`.
-    fn unit_at(self, function: &mut Function, i: u32) {
+    fn unit_at(self, function: &mut FnBuilder<'_>, i: u32) {
         emit_str_unit(function, self.p, i, self.w);
     }
 
     /// Push the address of the unit at the index `index` pushes.
-    fn addr(self, function: &mut Function, index: impl Fn(&mut Function)) {
+    fn addr(self, function: &mut FnBuilder<'_>, index: impl Fn(&mut FnBuilder<'_>)) {
         wasm!(function; LocalGet(self.p));
         index(function);
         wasm!(function;
@@ -1015,9 +998,9 @@ impl Str {
     /// Store the unit `unit` pushes at the index `index` pushes.
     fn store(
         self,
-        function: &mut Function,
-        index: impl Fn(&mut Function),
-        unit: impl Fn(&mut Function),
+        function: &mut FnBuilder<'_>,
+        index: impl Fn(&mut FnBuilder<'_>),
+        unit: impl Fn(&mut FnBuilder<'_>),
     ) {
         wasm!(function; LocalGet(self.w), If(BlockType::Empty), LocalGet(self.p));
         index(function);
@@ -1032,24 +1015,24 @@ impl Str {
 }
 
 /// Box the i32 block base on the stack as a heap jsval.
-fn box_heap(function: &mut Function) {
+fn box_heap(function: &mut FnBuilder<'_>) {
     wasm!(function; I64ExtendI32U, I64Const(HEAP_BITS), I64Or);
 }
 
 /// Push the signed i32 local `x` as a number jsval.
-fn push_number(function: &mut Function, x: u32) {
+fn push_number(function: &mut FnBuilder<'_>, x: u32) {
     wasm!(function; LocalGet(x), F64ConvertI32S, I64ReinterpretF64);
 }
 
 /// Box the i32 `0` / `1` on the stack as `false` / `true`.
-fn box_bool(function: &mut Function) {
+fn box_bool(function: &mut FnBuilder<'_>) {
     wasm!(function; I64ExtendI32U, I64Const(abi::FALSE.cast_signed()), I64Or);
 }
 
 /// i32 `out` = `ToIntegerOrInfinity` of the number jsval in i64 `v`
 /// (`undefined` selects what `default` pushes), saturated to the i32 range
 /// (`NaN` is `0`).
-fn emit_int(function: &mut Function, v: u32, default: impl Fn(&mut Function), out: u32) {
+fn emit_int(function: &mut FnBuilder<'_>, v: u32, default: impl Fn(&mut FnBuilder<'_>), out: u32) {
     wasm!(function;
         LocalGet(v), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Result(ValType::I32)),
     );
@@ -1058,7 +1041,7 @@ fn emit_int(function: &mut Function, v: u32, default: impl Fn(&mut Function), ou
 }
 
 /// Clamp the signed i32 local `x` to `0..=hi` (an i32 local).
-fn emit_clamp(function: &mut Function, x: u32, hi: u32) {
+fn emit_clamp(function: &mut FnBuilder<'_>, x: u32, hi: u32) {
     wasm!(function;
         LocalGet(x), I32Const(0), LocalGet(x), I32Const(0), I32GtS, Select, LocalSet(x),
         LocalGet(x), LocalGet(hi), LocalGet(x), LocalGet(hi), I32LtS, Select, LocalSet(x),
@@ -1067,7 +1050,7 @@ fn emit_clamp(function: &mut Function, x: u32, hi: u32) {
 
 /// The relative index in i32 local `x` against the length `n` (i32 local):
 /// a negative one counts from the end; clamped to `0..=n`.
-fn emit_relative(function: &mut Function, x: u32, n: u32) {
+fn emit_relative(function: &mut FnBuilder<'_>, x: u32, n: u32) {
     wasm!(function;
         LocalGet(x), I32Const(0), I32LtS,
         If(BlockType::Empty), LocalGet(x), LocalGet(n), I32Add, LocalSet(x), End,
@@ -1078,7 +1061,7 @@ fn emit_relative(function: &mut Function, x: u32, n: u32) {
 /// Push `ToUint16` / `ToUint32` (`modulus` `2^16` / `2^32`) of the number
 /// jsval in i64 `v` as an i32: the truncated value modulo `modulus`, exact
 /// for every double (`x` is f64 scratch); `NaN` and the infinities are `0`.
-fn emit_to_uint(function: &mut Function, v: u32, modulus: f64, x: u32) {
+fn emit_to_uint(function: &mut FnBuilder<'_>, v: u32, modulus: f64, x: u32) {
     wasm!(function;
         LocalGet(v), F64ReinterpretI64, F64Trunc, LocalTee(x),
         LocalGet(x), F64Const(Ieee64::from(modulus)), F64Div, F64Floor,
@@ -1087,9 +1070,18 @@ fn emit_to_uint(function: &mut Function, v: u32, modulus: f64, x: u32) {
     );
 }
 
+/// Push `1` when the code unit in i32 local `c` is a `StrWhiteSpaceChar`.
+pub(in crate::emit) fn emit_is_whitespace(function: &mut FnBuilder<'_>, c: u32) {
+    emit_unit_in(function, c, WHITESPACE);
+}
+
 /// Push i32 `1` when the code unit in i32 local `c` is in `ranges`
 /// (inclusive).
-fn emit_unit_in(function: &mut Function, c: u32, ranges: impl IntoIterator<Item = (i32, i32)>) {
+fn emit_unit_in(
+    function: &mut FnBuilder<'_>,
+    c: u32,
+    ranges: impl IntoIterator<Item = (i32, i32)>,
+) {
     wasm!(function; I32Const(0));
     for (lo, hi) in ranges {
         if lo == hi {
@@ -1104,11 +1096,11 @@ fn emit_unit_in(function: &mut Function, c: u32, ranges: impl IntoIterator<Item 
 /// `from` pushes, as many as `count` pushes (in range); `[dst, n, i]` are
 /// i32 scratch, `n` holding the count.
 fn emit_substring(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     alloc: u32,
     src: Str,
-    from: impl Fn(&mut Function),
-    count: impl Fn(&mut Function),
+    from: impl Fn(&mut FnBuilder<'_>),
+    count: impl Fn(&mut FnBuilder<'_>),
     [dst, n, i]: [u32; 3],
 ) {
     count(function);
@@ -1131,12 +1123,12 @@ fn emit_substring(
 /// [`emit_substring`] appended to the string in i64 `acc` (nothing for an
 /// empty range).
 fn emit_append_units(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     helpers: Helpers<'_>,
     acc: u32,
     src: Str,
-    from: impl Fn(&mut Function),
-    count: impl Fn(&mut Function),
+    from: impl Fn(&mut FnBuilder<'_>),
+    count: impl Fn(&mut FnBuilder<'_>),
     tmp: [u32; 3],
 ) {
     count(function);
@@ -1151,9 +1143,9 @@ fn emit_append_units(
 /// block `dst`, at least as wide: `memory.copy` at the same width, else a
 /// widening unit loop (`i` is i32 scratch).
 fn emit_copy_units(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     dst: Str,
-    at: impl Fn(&mut Function),
+    at: impl Fn(&mut FnBuilder<'_>),
     src: Str,
     n: u32,
     i: u32,
@@ -1180,7 +1172,7 @@ fn emit_copy_units(
 
 /// i32 `ok` = whether the units of `t` occur in `s` at the index in i32
 /// local `k` (`k + t.n <= s.n`); `j` is i32 scratch.
-fn emit_matches_at(function: &mut Function, s: Str, k: u32, t: Str, j: u32, ok: u32) {
+fn emit_matches_at(function: &mut FnBuilder<'_>, s: Str, k: u32, t: Str, j: u32, ok: u32) {
     wasm!(function;
         I32Const(1), LocalSet(ok), I32Const(0), LocalSet(j),
         Block(BlockType::Empty), Loop(BlockType::Empty),
@@ -1199,7 +1191,14 @@ fn emit_matches_at(function: &mut Function, s: Str, k: u32, t: Str, j: u32, ok: 
 /// `StringIndexOf(s, t, from)` into i32 `out`: the first index `>= from`
 /// (an i32 local in `0..=s.n`) where `t` occurs, else `-1`; `[j, ok]` are
 /// i32 scratch.
-fn emit_index_of(function: &mut Function, s: Str, t: Str, from: u32, out: u32, [j, ok]: [u32; 2]) {
+fn emit_index_of(
+    function: &mut FnBuilder<'_>,
+    s: Str,
+    t: Str,
+    from: u32,
+    out: u32,
+    [j, ok]: [u32; 2],
+) {
     wasm!(function;
         LocalGet(from), LocalSet(out),
         Block(BlockType::Empty), Loop(BlockType::Empty),
@@ -1218,7 +1217,7 @@ fn emit_index_of(function: &mut Function, s: Str, t: Str, from: u32, out: u32, [
 /// The last index `<= from` (an i32 local with `from + t.n <= s.n`) where
 /// `t` occurs in `s` into i32 `out`, else `-1`; `[j, ok]` are i32 scratch.
 fn emit_last_index_of(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     s: Str,
     t: Str,
     from: u32,
@@ -1244,13 +1243,13 @@ fn emit_last_index_of(
 /// after a lead (the surrogate rule of DESIGN.md §5.2); `c`
 /// is i32 scratch.
 fn emit_lone_surrogates(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     s: Str,
     i: u32,
     c: u32,
-    lone: impl FnOnce(&mut Function),
+    lone: impl FnOnce(&mut FnBuilder<'_>),
 ) {
-    let next = |f: &mut Function| wasm!(f; LocalGet(i), I32Const(1), I32Add);
+    let next = |f: &mut FnBuilder<'_>| wasm!(f; LocalGet(i), I32Const(1), I32Add);
     wasm!(function; I32Const(0), LocalSet(i));
     count_loop(function, i, s.n, |function| {
         s.unit_at(function, i);
@@ -1281,13 +1280,13 @@ fn emit_lone_surrogates(
 /// `match`, the index).
 fn emit_units(
     op: StringOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let locals = i32_locals(frame);
-    let s = Str::at(&locals, 0);
+    let s = Str::at(frame, &locals, 0);
     s.open(function, frame.i64(0));
     match op {
         StringOp::CharAt | StringOp::At | StringOp::CharCodeAt | StringOp::CodePointAt => {
@@ -1320,13 +1319,13 @@ fn emit_units(
 /// `undefined`.
 fn emit_unit_at(
     op: StringOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let locals = i32_locals(frame);
-    let s = Str::at(&locals, 0);
+    let s = Str::at(frame, &locals, 0);
     let [pos, unit, next, trail] = [locals[3], locals[4], locals[5], locals[6]];
     emit_int(function, frame.i64(1), |f| wasm!(f; I32Const(0)), pos);
     if op == StringOp::At {
@@ -1378,9 +1377,9 @@ fn emit_unit_at(
 /// `slice(start, end)` (relative indices) / `substring(start, end)`
 /// (clamped, swapped when reversed): the units between, `end` defaulting to
 /// the length.
-fn emit_slice(op: StringOp, function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+fn emit_slice(op: StringOp, function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let locals = i32_locals(frame);
-    let s = Str::at(&locals, 0);
+    let s = Str::at(frame, &locals, 0);
     let [a, b, lo] = [locals[3], locals[4], locals[5]];
     let tmp = [locals[6], locals[7], locals[8]];
     emit_int(function, frame.i64(1), |f| wasm!(f; I32Const(0)), a);
@@ -1417,9 +1416,9 @@ fn emit_slice(op: StringOp, function: &mut Function, frame: Frame, helpers: Help
 
 /// `trim` / `trimStart` / `trimEnd()`: the units between the leading and/or
 /// trailing [`WHITESPACE`]; the receiver itself when nothing is stripped.
-fn emit_trim(op: StringOp, function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+fn emit_trim(op: StringOp, function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let locals = i32_locals(frame);
-    let s = Str::at(&locals, 0);
+    let s = Str::at(frame, &locals, 0);
     let [start, end, unit, last] = [locals[3], locals[4], locals[5], locals[6]];
     let tmp = [locals[7], locals[8], locals[9]];
     wasm!(function; I32Const(0), LocalSet(start), LocalGet(s.n), LocalSet(end));
@@ -1474,9 +1473,14 @@ fn emit_trim(op: StringOp, function: &mut Function, frame: Frame, helpers: Helpe
 /// `repeat(count)` past its count checks: `""` for an empty receiver or a
 /// zero count, else the receiver once, then the result so far copied onto
 /// its end until it is `count` times as long.
-fn emit_repeat(function: &mut Function, frame: Frame, strings: &StrOffsets, helpers: Helpers<'_>) {
+fn emit_repeat(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     let locals = i32_locals(frame);
-    let s = Str::at(&locals, 0);
+    let s = Str::at(frame, &locals, 0);
     let [count, total, dst, done] = [locals[3], locals[4], locals[5], locals[6]];
     let d = Str {
         p: dst,
@@ -1526,14 +1530,14 @@ fn emit_repeat(function: &mut Function, frame: Frame, strings: &StrOffsets, help
 /// the receiver, narrowed.
 fn emit_pad(
     op: StringOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let locals = i32_locals(frame);
-    let s = Str::at(&locals, 0);
-    let t = Str::at(&locals, 3);
+    let s = Str::at(frame, &locals, 0);
+    let t = Str::at(frame, &locals, 3);
     let [total, width, dst, fill, idx, spare] = [
         locals[6], locals[7], locals[8], locals[9], locals[10], locals[11],
     ];
@@ -1579,7 +1583,7 @@ fn emit_pad(
     } else {
         (Some(s.n), None)
     };
-    let at = |f: &mut Function, local: Option<u32>| {
+    let at = |f: &mut FnBuilder<'_>, local: Option<u32>| {
         f.instruction(&local.map_or(Instruction::I32Const(0), Instruction::LocalGet));
     };
     wasm!(function; I32Const(0), LocalSet(idx));
@@ -1607,14 +1611,14 @@ fn emit_pad(
 /// check.
 fn emit_search(
     op: StringOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let locals = i32_locals(frame);
-    let s = Str::at(&locals, 0);
-    let t = Str::at(&locals, 3);
+    let s = Str::at(frame, &locals, 0);
+    let t = Str::at(frame, &locals, 3);
     let [k, out, c] = [locals[6], locals[7], locals[8]];
     let scratch = [locals[9], locals[10]];
     let a1 = frame.i64(2);
@@ -1706,20 +1710,20 @@ fn emit_search(
 /// `split(separator, limit)`: at most `ToUint32(limit)` (default `2^32 - 1`)
 /// pieces — none for `0`; the receiver for an `undefined` separator; each
 /// unit for `""`; else the units between the separator's occurrences.
-fn emit_split(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+fn emit_split(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let locals = i32_locals(frame);
-    let s = Str::at(&locals, 0);
-    let t = Str::at(&locals, 3);
+    let s = Str::at(frame, &locals, 0);
+    let t = Str::at(frame, &locals, 3);
     let [lim, a, pos, cnt] = [locals[6], locals[7], locals[8], locals[9]];
     let scratch = [locals[10], locals[11]];
     let tmp = [locals[12], locals[13], locals[14]];
     let (recv, sep, limit, list) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));
-    let push = |function: &mut Function, value: &dyn Fn(&mut Function)| {
+    let push = |function: &mut FnBuilder<'_>, value: &dyn Fn(&mut FnBuilder<'_>)| {
         wasm!(function; LocalGet(list), I32WrapI64);
         value(function);
         wasm!(function; Call(helpers.array_push), Drop);
     };
-    let piece = |function: &mut Function| {
+    let piece = |function: &mut FnBuilder<'_>| {
         push(function, &|f| {
             wasm!(f; LocalGet(tmp[0]));
             box_heap(f);
@@ -1792,9 +1796,14 @@ fn emit_split(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
 /// `isWellFormed()`: whether the receiver holds no lone surrogate;
 /// `toWellFormed()`: a copy with each lone surrogate replaced by U+FFFD (the
 /// receiver itself when one-byte, which holds no surrogate).
-fn emit_well_formed(op: StringOp, function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+fn emit_well_formed(
+    op: StringOp,
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    helpers: Helpers<'_>,
+) {
     let locals = i32_locals(frame);
-    let s = Str::at(&locals, 0);
+    let s = Str::at(frame, &locals, 0);
     let [i, c, ok, dst] = [locals[3], locals[4], locals[5], locals[6]];
     wasm!(function; LocalGet(s.w), I32Eqz, If(BlockType::Result(ValType::I64)));
     if op == StringOp::IsWellFormed {
@@ -1830,7 +1839,7 @@ fn emit_well_formed(op: StringOp, function: &mut Function, frame: Frame, helpers
 /// its `GetSubstitution` patterns expanded ([`emit_substitution`]).
 fn emit_replace(
     op: StringOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1838,7 +1847,7 @@ fn emit_replace(
     let (s, search, replacer, r) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (acc, v) = (frame.x64(0), frame.x64(1));
     let locals = i32_locals(frame);
-    let (sv, t) = (Str::at(&locals, 0), Str::at(&locals, 3));
+    let (sv, t) = (Str::at(frame, &locals, 0), Str::at(frame, &locals, 3));
     let [pos, end, from] = [locals[9], locals[10], locals[11]];
     let tmp = [locals[15], locals[16], locals[17]];
     frame.arg(function, 0);
@@ -1924,23 +1933,23 @@ fn emit_replace(
 /// match `[pos, end)` of [`emit_replace`] to its result: `$$` is `$`, `$&`
 /// the match, `` $` `` the units before it, `$'` those after it; every other
 /// `$` (a capture reference, with none captured, or `$<`) stays literal.
-fn emit_substitution(function: &mut Function, frame: Frame, helpers: Helpers<'_>) {
+fn emit_substitution(function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
     let acc = frame.x64(0);
     let locals = i32_locals(frame);
     let (sv, t, tm) = (
-        Str::at(&locals, 0),
-        Str::at(&locals, 3),
-        Str::at(&locals, 6),
+        Str::at(frame, &locals, 0),
+        Str::at(frame, &locals, 3),
+        Str::at(frame, &locals, 6),
     );
     let [pos, end, k, lit, c] = [locals[9], locals[10], locals[11], locals[12], locals[13]];
     let tmp = [locals[15], locals[16], locals[17]];
-    let append_units = |function: &mut Function,
+    let append_units = |function: &mut FnBuilder<'_>,
                         src: Str,
-                        from: &dyn Fn(&mut Function),
-                        count: &dyn Fn(&mut Function)| {
+                        from: &dyn Fn(&mut FnBuilder<'_>),
+                        count: &dyn Fn(&mut FnBuilder<'_>)| {
         emit_append_units(function, helpers, acc, src, from, count, tmp);
     };
-    let when = |function: &mut Function, unit: u8| {
+    let when = |function: &mut FnBuilder<'_>, unit: u8| {
         wasm!(function; LocalGet(c), I32Const(unit.into()), I32Eq, If(BlockType::Empty));
     };
     tm.open(function, frame.i64(2));
@@ -2001,16 +2010,15 @@ fn emit_substitution(function: &mut Function, frame: Frame, helpers: Helpers<'_>
 /// block of room enough, which ends at the units written and is narrowed.
 pub(super) fn emit_from_char_code(
     code_point: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (value, spread) = (frame.i64(0), frame.x64(0));
     let locals = i32_locals(frame);
-    let [argc, idx, len, dst, width, unit] = [
-        locals[0], locals[1], locals[2], locals[3], locals[4], locals[5],
-    ];
+    let [argc, idx, len, width, unit] = [locals[0], locals[1], locals[2], locals[4], locals[5]];
+    let dst = frame.base(3);
     let point = frame.f64(0);
     let d = Str {
         p: dst,
@@ -2099,16 +2107,17 @@ pub(super) fn emit_from_char_code(
 /// template).raw)`, then each `ToString(raw[i])` for `i < LengthOfArrayLike(
 /// raw)`, interleaved with `ToString` of the substitutions while they last.
 pub(super) fn emit_raw(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (raw, v, acc, spread) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.x64(0));
-    let (len, i, key, n) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let (len, i, next, n) = (frame.i32(0), frame.i32(1), frame.i32(2), frame.i32(3));
+    let key = frame.base(2);
     // The spread argument array, before a getter or `toString` can republish it.
     wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(spread));
-    let to_object = |function: &mut Function| {
+    let to_object = |function: &mut FnBuilder<'_>| {
         emit_is_nullish(function, raw);
         wasm!(function; If(BlockType::Empty));
         throw_type_error(function, frame, NULLISH_TO_OBJECT, strings, helpers);
@@ -2144,11 +2153,11 @@ pub(super) fn emit_raw(
         append(function, acc, v, helpers);
         // A substitution follows every literal but the last, while any is left.
         wasm!(function;
-            LocalGet(i), I32Const(1), I32Add, LocalTee(key),
-            LocalGet(len), I32LtU, LocalGet(key), LocalGet(n), I32LtU, I32And,
+            LocalGet(i), I32Const(1), I32Add, LocalTee(next),
+            LocalGet(len), I32LtU, LocalGet(next), LocalGet(n), I32LtU, I32And,
             If(BlockType::Empty),
         );
-        arg_at(function, frame, key, spread, v);
+        arg_at(function, frame, next, spread, v);
         to_string(function, v, helpers);
         append(function, acc, v, helpers);
         wasm!(function; End);
@@ -2158,7 +2167,7 @@ pub(super) fn emit_raw(
 
 /// Push `1` when the jsval in `local` is a string: the heap tag in its top 16
 /// bits, then the kind byte.
-fn is_string(function: &mut Function, local: u32) {
+fn is_string(function: &mut FnBuilder<'_>, local: u32) {
     wasm!(function;
         LocalGet(local), I64Const(48), I64ShrU, I64Const(HEAP_BITS >> 48), I64Eq,
         If(BlockType::Result(ValType::I32)),
@@ -2171,7 +2180,7 @@ fn is_string(function: &mut Function, local: u32) {
 
 /// Replace the jsval in i64 local `v` by its `ToString` (a heap string), returning when a
 /// user `toString` throws.
-pub(super) fn to_string(function: &mut Function, v: u32, helpers: Helpers<'_>) {
+pub(super) fn to_string(function: &mut FnBuilder<'_>, v: u32, helpers: Helpers<'_>) {
     wasm!(function;
         LocalGet(v), Call(helpers.to_str()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(v),
     );

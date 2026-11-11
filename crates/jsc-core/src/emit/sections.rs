@@ -21,14 +21,9 @@ pub(super) fn build_type_and_function_sections<'a>(
     TypeSection,
     FunctionSection,
     Helpers<'a>,
-    u32,
-    u32,
-    u32,
-    u32,
-    u32,
-    u32,
-    u32,
+    [u32; IMPORT_FUNC_COUNT as usize],
 ) {
+    use ValType::{I32, I64};
     let mut types = TypeSection::new();
     let mut functions = FunctionSection::new();
     types.ty().function([], [ValType::I64]); // type 0: main
@@ -49,7 +44,7 @@ pub(super) fn build_type_and_function_sections<'a>(
     }
 
     // Every DEFINED function index is shifted up by IMPORT_FUNC_COUNT because the
-    // host imports occupy the lowest function indices: `main` is function
+    // WASI imports occupy the lowest function indices: `main` is function
     // `IMPORT_FUNC_COUNT`, user function `i` is `i + 1 + IMPORT_FUNC_COUNT`, and
     // the helpers follow in the order `helper_types` lists them (and `emit`
     // appends their bodies).
@@ -60,15 +55,6 @@ pub(super) fn build_type_and_function_sections<'a>(
     };
     let helpers = Helpers {
         unwind,
-        // The host imports, in declaration order: `print` 0, `__convert` 1,
-        // `__method` 2, `__promise` 3, `__then` 4, `__now` 5, `__parse_int` 6.
-        print: 0,
-        convert: 1,
-        method: 2,
-        promise: 3,
-        then: 4,
-        now: 5,
-        parse_int: 6,
         alloc: index(),
         concat: index(),
         str_eq: index(),
@@ -117,6 +103,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         json_escape: index(),
         json_str: index(),
         same_value_zero: index(),
+        array_search: index(),
         map_find: index(),
         map_set: index(),
         map_get: index(),
@@ -137,6 +124,27 @@ pub(super) fn build_type_and_function_sections<'a>(
         prop_throw: index(),
         box_f64: index(),
         to_number: index(),
+        dtoa: {
+            let first = index();
+            for _ in 1..dtoa::HELPER_COUNT {
+                index();
+            }
+            first
+        },
+        // The number parsers (`strtod`), in emission order.
+        strtod: {
+            let first = index();
+            for _ in 0..13 {
+                index();
+            }
+            first
+        },
+        // `__now`, then `__random` (read back as `now + 1`).
+        now: {
+            let first = index();
+            index();
+            first
+        },
         // The `__invoke1` callback trampoline is appended after every helper
         // above; the `__async_step` trampoline follows it, then the two
         // `new Promise` settler functions.
@@ -153,6 +161,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         gathers_arguments: program_any(program, |n| matches!(n, IrNode::SpreadArgsGlobal)),
         has_accessors: program_has_accessors(program),
         dirty_tracking: program_tests_dirty_bits(program),
+        unicode: layout.unicode,
         fn_info: layout.info,
     };
     // Helper types follow the main (type 0) and uniform (type 1) types, one
@@ -171,60 +180,37 @@ pub(super) fn build_type_and_function_sections<'a>(
     functions.function(fn_type);
     functions.function(fn_type);
 
-    // Append the host import types LAST so they never disturb
-    // the main/uniform/helper type indices above. All three are declared in the
-    // IMPORT section (not the FunctionSection), so each adds a type but no defined
-    // function: `print(bits: i64, flag: i32) -> ()`,
-    // `__convert(bits: i64, op: i32) -> i64`, and
-    // `__method(recv: i64, op: i32, arg0: i64, arg1: i64) -> i64`.
-    let print_type = next_type;
-    types.ty().function([ValType::I64, ValType::I32], []);
-    let convert_type = next_type + 1;
-    types
-        .ty()
-        .function([ValType::I64, ValType::I32], [ValType::I64]);
-    let method_type = next_type + 2;
-    types.ty().function(
-        [ValType::I64, ValType::I32, ValType::I64, ValType::I64],
-        [ValType::I64],
-    );
-    // The host promise import types: `__promise(op: i32, a: i64, b: i64) ->
-    // i64` and `__then(p: i64, on_f: i64, on_r: i64) -> i64`.
-    let promise_type = next_type + 3;
-    types
-        .ty()
-        .function([ValType::I32, ValType::I64, ValType::I64], [ValType::I64]);
-    let then_type = next_type + 4;
-    types
-        .ty()
-        .function([ValType::I64, ValType::I64, ValType::I64], [ValType::I64]);
-    // The host wall-clock import type (backing `Date`): `__now() -> f64`.
-    let now_type = next_type + 5;
-    types.ty().function([], [ValType::F64]);
-    // The host `parseInt` import type: `__parse_int(s: i64, radix: i64) -> i64`.
-    let parse_int_type = next_type + 6;
-    types
-        .ty()
-        .function([ValType::I64, ValType::I64], [ValType::I64]);
+    // Append the import types LAST so they never disturb the main/uniform/
+    // helper type indices above. Imports add a type but no defined function.
+    let signatures: [(&[ValType], &[ValType]); IMPORT_FUNC_COUNT as usize] = [
+        (&[I32, I32, I32, I32], &[I32]), // fd_write(fd, iovs, iovs_len, nwritten)
+        (&[I32, I64, I32], &[I32]),      // clock_time_get(id, precision, time)
+        (&[I32, I32], &[I32]),           // random_get(buf, buf_len)
+        (&[I32], &[]),                   // proc_exit(rval)
+    ];
+    let import_base = next_type;
+    for (params, results) in signatures {
+        types
+            .ty()
+            .function(params.iter().copied(), results.iter().copied());
+    }
+    let import_types = std::array::from_fn(|i| import_base + u32::try_from(i).unwrap_or(0));
+    let next_type = next_type + IMPORT_FUNC_COUNT;
 
-    // The exported guest constructors, the LAST defined functions:
-    // `__new_string(len: i32, two_byte: i32) -> i32`, `__new_array(len: i32)
-    // -> i32`, and `__new_promise() -> i32`. Their types follow the import
-    // types.
+    // The block constructors: `new_string(len: i32, two_byte: i32) -> i32`
+    // and `__new_array(len: i32) -> i32`. Their types follow the import types.
     types
         .ty()
         .function([ValType::I32, ValType::I32], [ValType::I32]);
-    functions.function(next_type + 7);
+    functions.function(next_type);
     types.ty().function([ValType::I32], [ValType::I32]);
-    functions.function(next_type + 8);
-    types.ty().function([], [ValType::I32]);
-    functions.function(next_type + 9);
+    functions.function(next_type + 1);
     // The realm functions follow: `__has_own(key: i32, obj: i64) -> i32`,
     // then the builtin bodies with the uniform type.
     types
         .ty()
         .function([ValType::I32, ValType::I64], [ValType::I32]);
-    functions.function(next_type + 10);
+    functions.function(next_type + 2);
     for _ in Builtin::ALL {
         functions.function(fn_type);
     }
@@ -240,8 +226,8 @@ pub(super) fn build_type_and_function_sections<'a>(
     // i32)`, `__own_desc(obj: i64, key: i32) -> i64`, `__set_integrity(obj:
     // i64, level: i32)`, `__test_integrity(obj: i64, level: i32) -> i32`,
     // `__own_enum(obj: i64, key: i32) -> i32` and `__set_proto(o: i32, proto:
-    // i64) -> i32`; then the exported `__promise_self_error() -> i64`; then
-    // `__symbol_get(v: i64, sym: i32) -> i64`; then the `super` property
+    // i64) -> i32`; then the self-resolution `TypeError` constructor `() ->
+    // i64`; then `__symbol_get(v: i64, sym: i32) -> i64`; then the `super` property
     // helpers `__super_get(home: i64, key: i32, recv: i64) -> i64` and
     // `__super_set(home: i64, key: i32, v: i64, recv: i64)`; then the
     // private-name helpers `__private_find(o: i64, key: i32) -> i32`,
@@ -322,25 +308,29 @@ pub(super) fn build_type_and_function_sections<'a>(
         ),
         (&[ValType::I64, ValType::I64, ValType::I32], &[ValType::I64]),
     ];
-    for (ty, (params, results)) in (next_type + 11..).zip(conversions) {
+    let render_type = next_type + 3 + u32::try_from(conversions.len()).unwrap_or(0);
+    for (ty, (params, results)) in (next_type + 3..).zip(conversions) {
+        types
+            .ty()
+            .function(params.iter().copied(), results.iter().copied());
+        functions.function(ty);
+    }
+    for (ty, (params, results)) in (render_type..).zip(render::TYPES) {
         types
             .ty()
             .function(params.iter().copied(), results.iter().copied());
         functions.function(ty);
     }
 
-    (
-        types,
-        functions,
-        helpers,
-        print_type,
-        convert_type,
-        method_type,
-        promise_type,
-        then_type,
-        now_type,
-        parse_int_type,
-    )
+    let unicode_type = render_type + u32::try_from(render::TYPES.len()).unwrap_or(0);
+    for (ty, (params, results)) in (unicode_type..).zip(unicode::TYPES) {
+        types
+            .ty()
+            .function(params.iter().copied(), results.iter().copied());
+        functions.function(ty);
+    }
+
+    (types, functions, helpers, import_types)
 }
 
 /// The `(params, results)` of every runtime helper, in function-index order
@@ -415,10 +405,12 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         (&[I32], &[I32]),
         (&[I64], &[I32]),
         // The Map/Set helpers: `__same_value_zero(a, b) -> i32`,
+        // `__array_search(recv, needle, includes) -> i64`,
         // `__map_find(handle, key) -> i32`, `__map_set(handle, key, val)`,
         // `__map_get(handle, key) -> i64`, `__map_has(handle, key) -> i32`,
         // `__map_delete(handle, key) -> i32`.
         (&[I64, I64], &[I32]),
+        (&[I64, I64, I32], &[I64]),
         (&[I32, I64], &[I32]),
         (&[I32, I64, I64], &[]),
         (&[I32, I64], &[I64]),
@@ -446,6 +438,36 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
         // `__box_f64(x) -> i64` and `__to_number(v) -> i64`.
         (&[F64], &[I64]),
         (&[I64], &[I64]),
+        // The `Number` to string helpers, in `dtoa::emit_helpers` order.
+        (&[I64, I64], &[I64, I64]),
+        (&[I32, I32], &[I64, I64]),
+        (&[I64, I64, I64, I32], &[I64]),
+        (&[I64, I32], &[I32]),
+        (&[I64], &[I64, I32]),
+        (&[I32, I32], &[I32]),
+        (&[I64], &[I32]),
+        (&[I64], &[I32, I32, I32]),
+        (&[I64, I32, I32], &[I32]),
+        (&[I64, I32], &[I32]),
+        (&[I64], &[I32]),
+        (&[I64], &[I32]),
+        // The number parsers, in `strtod`'s emission order.
+        (&[I32, I32], &[I32]),           // __num_unit(data, i)
+        (&[I32], &[I32]),                // __str_ws(c)
+        (&[I32, I32, I32], &[F64]),      // __dec_parse(data, start, end)
+        (&[], &[I64]),                   // __dec_slow()
+        (&[], &[I64]),                   // __dec_round()
+        (&[I32], &[]),                   // __dec_left(shift)
+        (&[I32], &[]),                   // __dec_right(shift)
+        (&[I32, I32, I32, I32], &[I32]), // __digit_span(data, start, end, radix)
+        (&[I32, I32, I32, I32], &[F64]), // __radix_pow2(data, start, end, bits)
+        (&[I32, I32, I32, I32], &[F64]), // __radix_fold(data, start, end, radix)
+        (&[I32], &[F64]),                // __string_to_number(s)
+        (&[I64], &[I64]),                // __to_number_prim(v)
+        (&[I64], &[I64]),                // __parse_float(v)
+        (&[I64, I32], &[I64]),           // __parse_int(v, radix)
+        (&[], &[F64]),                   // __now()
+        (&[], &[F64]),                   // __random()
         // The `__invoke1(fn, arg)` and `__async_step(gen, sent)` trampolines.
         (&[I64, I64], &[I64]),
         (&[I64, I64], &[I64]),
@@ -548,6 +570,25 @@ pub(super) fn build_globals(
     // DIRTY_GLOBAL), all clear at startup and never cleared. Internal.
     let (dirty_ty, dirty_init) = mut_i32(0);
     globals.global(dirty_ty, &dirty_init);
+    // The renderer's output buffer, recursion path and ref table (all i32, 0).
+    for _ in OUT_BUF_GLOBAL..SP_GLOBAL {
+        let (ty, init) = mut_i32(0);
+        globals.global(ty, &init);
+    }
+    // The shadow-stack pointer ($__sp, i32, index SP_GLOBAL), empty at startup.
+    let (sp_ty, sp_init) = mut_i32((abi::SHADOW_STACK_SIZE - abi::SHADOW_FP_BIAS).cast_signed());
+    globals.global(sp_ty, &sp_init);
+    // The `Math.random` state (i64, 0 = not seeded yet).
+    for _ in RNG0_GLOBAL..JOB_HEAD_GLOBAL {
+        let (ty, init) = mut_i64();
+        globals.global(ty, &init);
+    }
+    // The promise engine: `$__job_head`, `$__job_tail`, `$__promise_seq`,
+    // `$__rejected_head` (all i32, 0).
+    for _ in JOB_HEAD_GLOBAL..MODULE_CELL_GLOBAL_BASE {
+        let (ty, init) = mut_i32(0);
+        globals.global(ty, &init);
+    }
     // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in
     // `main`'s prologue before any user code runs.
     for _ in 0..module_cells {
@@ -563,7 +604,7 @@ pub(super) fn build_globals(
 /// counts code units), its `flags` already `INTERNED`, plus `TWO_BYTE` for
 /// UTF-16 data and `ARRAY_INDEX` for a canonical index spelling, in ascending
 /// offset order for deterministic output, then the intern table's u32 slots,
-/// the function data, and the realm image.
+/// the function data, the realm image, and the Unicode tables.
 pub(super) fn emit_data_section(
     offsets: &StrOffsets,
     intern: &InternTable,
@@ -573,6 +614,23 @@ pub(super) fn emit_data_section(
     let mut segments: Vec<(&JsStr, i32)> = offsets.iter().collect();
     segments.sort_by_key(|(_, offset)| *offset);
     let mut data = DataSection::new();
+    // The static out-of-memory line and its iovec.
+    let line = abi::OOM_LINE.as_bytes();
+    let mut oom = Vec::with_capacity(8 + line.len());
+    oom.extend_from_slice(&abi::OOM_LINE_ADDR.to_le_bytes());
+    oom.extend_from_slice(&u32::try_from(line.len()).unwrap_or(0).to_le_bytes());
+    oom.extend_from_slice(line);
+    data.active(0, &ConstExpr::i32_const(abi::OOM_IOVEC.cast_signed()), oom);
+    data.active(
+        0,
+        &ConstExpr::i32_const(abi::RYU_TABLES_ADDR.cast_signed()),
+        dtoa::tables(),
+    );
+    data.active(
+        0,
+        &ConstExpr::i32_const(abi::DEC_POW10.cast_signed()),
+        strtod::tables(),
+    );
     for (text, offset) in segments {
         data.active(0, &ConstExpr::i32_const(offset), str_block(text));
     }
@@ -589,6 +647,7 @@ pub(super) fn emit_data_section(
         &ConstExpr::i32_const(layout.realm),
         realm::image(layout.realm, first_builtin_slot, offsets),
     );
+    data.active(0, &ConstExpr::i32_const(layout.unicode), unicode::data());
     data
 }
 
@@ -705,6 +764,8 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
     let realm_strs = realm::strings()
         .chain(builtins::strings())
         .chain(convert::strings())
+        .chain(dtoa::STRINGS)
+        .chain(render::STRINGS)
         .chain([STACK_KEY])
         .chain(FN_KEYS);
     for text in realm_strs {

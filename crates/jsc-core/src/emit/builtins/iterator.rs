@@ -321,7 +321,7 @@ fn limit_error() -> IrNode {
 /// Emit the body of the `Iterator` builtin `op`.
 pub(super) fn emit(
     op: IteratorOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -353,7 +353,7 @@ pub(super) fn emit(
 /// Call the function in i64 `callee` with `this` = i64 `this` and no
 /// arguments into i64 `out`, returning on a throw.
 fn call0(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     callee: u32,
     this: u32,
@@ -369,7 +369,7 @@ fn call0(
 /// i64 `this` (`undefined` when `None`) on the i64 locals `args` (past `K`
 /// published as the spread argument array); a throw is left pending.
 fn call_args(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     callee: u32,
     this: Option<u32>,
@@ -384,7 +384,7 @@ fn call_args(
         }
     }
     if args.len() > frame.k as usize {
-        let spread = frame.scratch() + 35;
+        let spread = frame.scratch() + 38;
         let n = i32::try_from(args.len()).unwrap_or(i32::MAX);
         wasm!(function;
             I32Const(n), Call(helpers.new_array()),
@@ -416,7 +416,7 @@ fn call_args(
 /// `this` and `env` = i64 `env` (`0` when `None`), no arguments; a throw
 /// is left pending.
 fn call_protocol(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     op: ProtocolOp,
     this: u32,
     env: Option<u32>,
@@ -439,7 +439,7 @@ fn call_protocol(
 /// with an exception pending, then return: the pending exception is set
 /// aside (in i64 `saved`) around `GetMethod(it, "return")` and its call
 /// and rethrown, whatever they do.
-fn close_pending(function: &mut Function, it: u32, saved: u32, helpers: Helpers<'_>) {
+fn close_pending(function: &mut FnBuilder<'_>, it: u32, saved: u32, helpers: Helpers<'_>) {
     wasm!(function;
         GlobalGet(EXC_VALUE_GLOBAL), LocalSet(saved),
         I32Const(0), GlobalSet(EXC_PENDING_GLOBAL),
@@ -456,7 +456,7 @@ fn close_pending(function: &mut Function, it: u32, saved: u32, helpers: Helpers<
 /// Throw a `TypeError` with `text`, leaving it pending (no return), so the
 /// caller's abrupt path follows.
 fn raise_type(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     text: CalleeErrorText<'_>,
     strings: &StrOffsets,
@@ -483,7 +483,7 @@ struct Flattenable<'a> {
     not_object: CalleeErrorText<'static>,
     /// The abrupt path, entered with the exception pending; it must not
     /// fall through.
-    abrupt: &'a dyn Fn(&mut Function),
+    abrupt: &'a dyn Fn(&mut FnBuilder<'_>),
 }
 
 /// `GetIteratorFlattenable(o, strings)` into the record `it` / `next`: a
@@ -492,7 +492,7 @@ struct Flattenable<'a> {
 /// which must yield an object; then `GetIteratorDirect` (`next` read once).
 /// Every throw runs `abrupt`.
 fn emit_flattenable(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     op: &Flattenable<'_>,
     strings: &StrOffsets,
@@ -507,7 +507,7 @@ fn emit_flattenable(
         not_object,
         abrupt,
     } = *op;
-    let if_pending = |function: &mut Function| {
+    let if_pending = |function: &mut FnBuilder<'_>| {
         wasm!(function; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
         abrupt(function);
         wasm!(function; End);
@@ -558,14 +558,19 @@ fn emit_flattenable(
 /// `next` read once), then the iterator itself when `%Iterator.prototype%`
 /// is on its `proto` chain (`OrdinaryHasInstance(%Iterator%, it)`), else a
 /// fresh `%WrapForValidIteratorPrototype%` wrapper of the record.
-fn emit_from(function: &mut Function, frame: Frame, strings: &StrOffsets, helpers: Helpers<'_>) {
+fn emit_from(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     let (o, method, it, next) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (p, obj) = (frame.x64(0), frame.i32(0));
+    let (p, obj) = (frame.x64(0), frame.base(0));
     let proto = m64(u64::from(abi::OBJ_PROTO_OFFSET));
     let iterator_proto = intrinsic_bits(Intrinsic::IteratorPrototype, helpers);
     frame.arg(function, 0);
     wasm!(function; LocalSet(o));
-    let abrupt = |function: &mut Function| wasm!(function; I64Const(UNDEFINED_BITS), Return);
+    let abrupt = |function: &mut FnBuilder<'_>| wasm!(function; I64Const(UNDEFINED_BITS), Return);
     let op = Flattenable {
         o,
         it,
@@ -616,13 +621,13 @@ fn emit_from(function: &mut Function, frame: Frame, strings: &StrOffsets, helper
 /// stepped before its first `next`).
 fn emit_helper(
     kind: HelperKind,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let (o, arg, next, saved) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let (obj, limit) = (frame.i32(0), frame.f64(0));
+    let (obj, limit) = (frame.base(0), frame.f64(0));
     let index = match kind {
         HelperKind::Map => 0,
         HelperKind::Filter => 1,
@@ -724,7 +729,7 @@ impl Helper {
     fn new(frame: Frame) -> Self {
         Self {
             this: frame.i64(0),
-            h: frame.i32(0),
+            h: frame.base(0),
             it: frame.i64(1),
             next: frame.i64(2),
             r: frame.i64(3),
@@ -751,12 +756,12 @@ enum Abrupt {
 }
 
 /// Store generator state `state` into the helper.
-fn set_state(function: &mut Function, n: Helper, state: i32) {
+fn set_state(function: &mut FnBuilder<'_>, n: Helper, state: i32) {
     wasm!(function; LocalGet(n.h), I32Const(state), I32Store(m32(HELPER_STATE_OFFSET)));
 }
 
 /// Leave the helper body with the pending exception under `abrupt`.
-fn leave_abrupt(function: &mut Function, n: Helper, abrupt: Abrupt, helpers: Helpers<'_>) {
+fn leave_abrupt(function: &mut FnBuilder<'_>, n: Helper, abrupt: Abrupt, helpers: Helpers<'_>) {
     set_state(function, n, COMPLETED);
     match abrupt {
         Abrupt::Propagate => wasm!(function; I64Const(UNDEFINED_BITS), Return),
@@ -765,7 +770,7 @@ fn leave_abrupt(function: &mut Function, n: Helper, abrupt: Abrupt, helpers: Hel
 }
 
 /// [`leave_abrupt`] when an exception is pending.
-fn if_abrupt(function: &mut Function, n: Helper, abrupt: Abrupt, helpers: Helpers<'_>) {
+fn if_abrupt(function: &mut FnBuilder<'_>, n: Helper, abrupt: Abrupt, helpers: Helpers<'_>) {
     wasm!(function; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
     leave_abrupt(function, n, abrupt, helpers);
     wasm!(function; End);
@@ -773,7 +778,7 @@ fn if_abrupt(function: &mut Function, n: Helper, abrupt: Abrupt, helpers: Helper
 
 /// Complete the helper and return `{ value: undefined, done: true }`.
 fn finish(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     n: Helper,
     frame: Frame,
     strings: &StrOffsets,
@@ -787,7 +792,7 @@ fn finish(
 /// `IteratorStep` of the record i64 `it` / `next` into `n.r`, pushing i32
 /// `1` once done; a throw leaves under `abrupt`.
 fn step(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     n: Helper,
     (it, next): (u32, u32),
     abrupt: Abrupt,
@@ -802,7 +807,7 @@ fn step(
 /// `IteratorValue` of the step result `n.r` into `n.v`; a throw leaves
 /// under `abrupt`.
 fn step_value(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     n: Helper,
     abrupt: Abrupt,
     strings: &StrOffsets,
@@ -817,7 +822,7 @@ fn step_value(
 /// `IteratorStepValue` of the underlying record into `n.v`: done completes
 /// the helper (`{ value: undefined, done: true }`).
 fn step_underlying(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     n: Helper,
     frame: Frame,
     strings: &StrOffsets,
@@ -832,7 +837,7 @@ fn step_underlying(
 
 /// Suspend the helper yielding the jsval in i64 `value`.
 fn yield_value(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     n: Helper,
     value: u32,
     frame: Frame,
@@ -852,7 +857,7 @@ fn yield_value(
 
 /// `Call(callback, undefined, « n.v, 𝔽(counter) »)` into `n.m`, then the
 /// counter incremented; a throw closes the underlying iterator.
-fn call_callback(function: &mut Function, n: Helper, frame: Frame, helpers: Helpers<'_>) {
+fn call_callback(function: &mut FnBuilder<'_>, n: Helper, frame: Frame, helpers: Helpers<'_>) {
     wasm!(function;
         LocalGet(n.h), F64Load(m64(HELPER_COUNTER_OFFSET)), LocalTee(n.counter),
         I64ReinterpretF64, LocalSet(n.cv),
@@ -871,7 +876,7 @@ fn call_callback(function: &mut Function, n: Helper, frame: Frame, helpers: Help
 /// (`GeneratorValidate`'s brand check), then its state into i32 `state`:
 /// running throws, completed returns `{ value: undefined, done: true }`.
 fn helper_receiver(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     n: Helper,
     state: u32,
     frame: Frame,
@@ -907,7 +912,7 @@ fn helper_receiver(
 /// `%IteratorHelperPrototype%.next()`: `GeneratorResume` of the helper's
 /// closure (DESIGN.md §7.9), running until its next yield or completion.
 fn emit_helper_next(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -945,7 +950,7 @@ fn emit_helper_next(
 
 /// `map`: the mapped value of the next underlying value.
 fn next_map(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     n: Helper,
     frame: Frame,
     strings: &StrOffsets,
@@ -958,7 +963,7 @@ fn next_map(
 
 /// `filter`: the next underlying value the predicate selects.
 fn next_filter(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     n: Helper,
     frame: Frame,
     strings: &StrOffsets,
@@ -980,7 +985,7 @@ fn next_filter(
 
 /// Count one step of a `take` / `drop` limit: `remaining - 1` unless
 /// `+∞` (`remaining` in `n.counter`).
-fn count_down(function: &mut Function, n: Helper) {
+fn count_down(function: &mut FnBuilder<'_>, n: Helper) {
     wasm!(function;
         LocalGet(n.counter), F64Const(Ieee64::from(f64::INFINITY)), F64Ne, If(BlockType::Empty),
         LocalGet(n.h), LocalGet(n.counter), F64Const(Ieee64::from(1.0)), F64Sub,
@@ -993,7 +998,7 @@ fn count_down(function: &mut Function, n: Helper) {
 /// (`IteratorClose` under a return completion) and the helper completes;
 /// else the next underlying value.
 fn next_take(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     n: Helper,
     frame: Frame,
     strings: &StrOffsets,
@@ -1018,7 +1023,7 @@ fn next_take(
 /// completing when the underlying iterator ends first; then the next
 /// underlying value.
 fn next_drop(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     n: Helper,
     frame: Frame,
     strings: &StrOffsets,
@@ -1044,13 +1049,13 @@ fn next_drop(
 /// throws). A throw from the mapper, the opening or the inner iterator
 /// closes the underlying iterator.
 fn next_flat_map(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     n: Helper,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let abrupt = |function: &mut Function| leave_abrupt(function, n, Abrupt::Close, helpers);
+    let abrupt = |function: &mut FnBuilder<'_>| leave_abrupt(function, n, Abrupt::Close, helpers);
     wasm!(function;
         Loop(BlockType::Empty),
         LocalGet(n.h), I64Load(m64(HELPER_INNER_OFFSET)), I64Const(UNDEFINED_BITS), I64Eq,
@@ -1095,7 +1100,7 @@ fn next_flat_map(
 /// under it), then the underlying iterator, and the helper completes.
 /// `{ value: undefined, done: true }` either way.
 fn emit_helper_return(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1167,7 +1172,7 @@ impl Eager {
             res: frame.y64(3),
             cv: frame.y64(4),
             counter: frame.f64(0),
-            list: frame.i32(0),
+            list: frame.base(0),
         }
     }
 }
@@ -1175,7 +1180,7 @@ impl Eager {
 /// `IteratorStepValue` of the record `e.o` / `e.next` into `e.v`, branching
 /// to label depth `done` once done; a throw propagates (no close).
 fn eager_step(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     e: Eager,
     done: u32,
     strings: &StrOffsets,
@@ -1195,7 +1200,7 @@ fn eager_step(
 /// `0`), else the first value (counter `1`), an empty iterator throwing a
 /// `TypeError`.
 fn eager_reduce_start(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     e: Eager,
     frame: Frame,
     strings: &StrOffsets,
@@ -1222,7 +1227,7 @@ fn eager_reduce_start(
 /// completion; a throw from that propagates) and return `found` (the
 /// stepped value) or else `bits`.
 fn eager_early(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     e: Eager,
     (select, found, bits): (bool, bool, i64),
     frame: Frame,
@@ -1262,7 +1267,7 @@ fn eager_early(
 /// (counter `1`; an empty iterator is a `TypeError`).
 fn emit_eager(
     kind: EagerKind,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1359,7 +1364,7 @@ fn emit_eager(
 /// `%WrapForValidIteratorPrototype%` wrapper (`RequireInternalSlot(O,
 /// [[Iterated]])`), then its wrapped `[[Iterator]]` into i64 `it`.
 fn wrap_receiver(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     this: u32,
     it: u32,
@@ -1388,7 +1393,7 @@ fn wrap_receiver(
 /// `%WrapForValidIteratorPrototype%.next()`: `Call(next, iterator)` of the
 /// wrapped record, its result returned as is.
 fn emit_wrap_next(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1412,7 +1417,7 @@ fn emit_wrap_next(
 /// "return")` of the wrapped iterator; `{ value: undefined, done: true }`
 /// when nullish, else its call's result as is.
 fn emit_wrap_return(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1441,7 +1446,7 @@ fn emit_wrap_return(
 /// otherwise `Set(this, key, v, true)`.
 fn emit_ignoring_setter(
     key: i32,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,

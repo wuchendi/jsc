@@ -3,7 +3,7 @@
 //! four forms and `localeCompare` in code-unit order.
 
 mod common;
-use common::{assert_bool, assert_number, assert_string};
+use common::{assert_bool, assert_number, assert_output, assert_string};
 
 // case mapping
 
@@ -55,6 +55,74 @@ fn case_mapping_locale() {
     assert_string("\"ΑΣ\".toLocaleLowerCase()", "ας");
     assert_bool("\"a\\uD800b\".toLocaleUpperCase() === \"A\\uD800B\"", true);
     assert_string("\"ﬀ\".toLocaleUpperCase()", "FF");
+}
+
+/// The table-driven mapping: multi-unit `SpecialCasing`, supplementary
+/// scalars, narrowing, and `Final_Sigma` over case-ignorable context.
+#[test]
+fn case_map_special_casing_and_final_sigma() {
+    assert_string("\"ﬃ\".toUpperCase()", "FFI");
+    assert_bool("\"\\u0149\".toUpperCase() === \"\\u02BCN\"", true);
+    assert_bool(
+        "\"\\u0390\".toUpperCase() === \"\\u0399\\u0308\\u0301\"",
+        true,
+    );
+    assert_bool("\"x\\u0130\".toLowerCase() === \"xi\\u0307\"", true);
+    assert_bool("\"\\u{10400}\".toLowerCase() === \"\\u{10428}\"", true);
+    assert_bool("\"\\u{10428}\".toUpperCase() === \"\\u{10400}\"", true);
+    assert_bool(
+        "\"\\u0100\\u0102\".toLowerCase() === \"\\u0101\\u0103\"",
+        true,
+    );
+    assert_bool("\"\\u0178\".toLowerCase() === \"ÿ\"", true);
+    assert_string("\"Σ\".toLowerCase()", "σ");
+    assert_string("\"ΑΣ\".toLowerCase()", "ας");
+    assert_string("\"ΑΣΑ\".toLowerCase()", "ασα");
+    assert_string("\"Α'Σ\".toLowerCase()", "α'ς");
+    assert_string("\"ΑΣ'Α\".toLowerCase()", "ασ'α");
+    assert_string("\"ΑΣ'\".toLowerCase()", "ας'");
+    assert_string("\"1Σ\".toLowerCase()", "1σ");
+}
+
+/// A lone surrogate passes through and ends the `Final_Sigma` context; a
+/// well-formed pair stays one scalar.
+#[test]
+fn case_map_lone_surrogate_passthrough() {
+    assert_bool("\"\\uD800ß\".toUpperCase() === \"\\uD800SS\"", true);
+    assert_bool(
+        "\"\\uDC00\\u0101\".toUpperCase() === \"\\uDC00\\u0100\"",
+        true,
+    );
+    assert_bool(
+        "\"\\uD83D\\uDE00a\\uD83D\".toUpperCase() === \"\\uD83D\\uDE00A\\uD83D\"",
+        true,
+    );
+    assert_bool("\"Α\\uD800Σ\".toLowerCase() === \"α\\uD800σ\"", true);
+    assert_bool("\"ΑΣ\\uD800Α\".toLowerCase() === \"ας\\uD800α\"", true);
+}
+
+/// Plain-object keys are never quoted (design/runtime-memory.md §2.3), so
+/// these print bare whatever their characters;
+/// `render_arguments_key_non_ascii_alphanumeric` is the real check of the
+/// `Alphanumeric` table.
+#[test]
+fn render_key_non_ascii_alphanumeric() {
+    assert_output("console.log({ é: 1, 中: 2 })", "{ é: 1, 中: 2 }\n");
+    assert_output("console.log({ \"\\u{1D400}\": 1 })", "{ 𝐀: 1 }\n");
+    assert_output("console.log({ \"€\": 1 })", "{ €: 1 }\n");
+    assert_output("console.log({ \"a😀\": 1 })", "{ a😀: 1 }\n");
+}
+
+/// `arguments` is the object kind whose keys the renderer quotes; its bare
+/// check consults the `Alphanumeric` table by code point.
+#[test]
+fn render_arguments_key_non_ascii_alphanumeric() {
+    assert_output(
+        "function f() { arguments[\"é\"] = 1; arguments[\"€\"] = 2; \
+         arguments[\"\\u{1D400}\"] = 3; arguments[\"a😀\"] = 4; arguments[\"中\"] = 5; \
+         console.log(arguments) } f()",
+        "[Arguments] { é: 1, '€': 2, 𝐀: 3, 'a😀': 4, 中: 5 }\n",
+    );
 }
 
 /// Wrap `body` so the script yields `"<error name>|<message>"` for the error
@@ -119,6 +187,72 @@ fn normalize_preserves_lone_surrogates() {
     assert_bool(
         "\"e\\u0301\\uDC00e\\u0301\".normalize() === \"\\u00E9\\uDC00\\u00E9\"",
         true,
+    );
+}
+
+/// A field of the conformance file (space-separated hex) as a JS literal.
+fn js_field(field: &str) -> String {
+    let escapes: Vec<String> = field
+        .split_whitespace()
+        .map(|cp| format!("\\u{{{cp}}}"))
+        .collect();
+    format!("\"{}\"", escapes.concat())
+}
+
+/// The UAX #15 invariants of `NormalizationTest.txt` over the fixture sample:
+/// each form, per column, maps to the expected column.
+#[test]
+fn normalize_all_forms_conformance_sample() {
+    let rows: Vec<String> = include_str!("normalization_sample.txt")
+        .lines()
+        .filter(|line| !line.starts_with(['#', '@']))
+        .map(|line| {
+            let fields: Vec<String> = line.split(';').map(js_field).collect();
+            format!("[{}]", fields.join(","))
+        })
+        .collect();
+    assert!(rows.len() > 500, "fixture has {} rows", rows.len());
+    let program = format!(
+        "const rows = [{}];
+         const forms = [
+           [\"NFC\", [1, 1, 1, 3, 3]],
+           [\"NFD\", [2, 2, 2, 4, 4]],
+           [\"NFKC\", [3, 3, 3, 3, 3]],
+           [\"NFKD\", [4, 4, 4, 4, 4]],
+         ];
+         let r = \"ok\";
+         for (let i = 0; i < rows.length; i++) {{
+           for (let f = 0; f < forms.length; f++) {{
+             for (let c = 0; c < 5; c++) {{
+               if (r === \"ok\" && rows[i][c].normalize(forms[f][0]) !== rows[i][forms[f][1][c]]) {{
+                 r = \"row \" + i + \" \" + forms[f][0] + \" column \" + c;
+               }}
+             }}
+           }}
+         }}
+         r",
+        rows.join(",")
+    );
+    assert_string(&program, "ok");
+}
+
+/// A form that is not exactly one of the four names throws, wherever it came
+/// from, and the form is coerced before it is checked.
+#[test]
+fn normalize_invalid_form_range_error() {
+    let text = "RangeError|The normalization form should be one of NFC, NFD, NFKC, NFKD.";
+    for form in [
+        "\"\"", "\"NF\"", "\"NFK\"", "\"NFCC\"", "\"NFKE\"", "\"nfd\"", "\"NFC \"", "null", "1",
+    ] {
+        assert_string(&caught(&format!("\"a\".normalize({form})")), text);
+        assert_string(
+            &caught(&format!("const f = {form}; \"\\u0100\".normalize(f)")),
+            text,
+        );
+    }
+    assert_string(
+        &caught("\"a\".normalize({ toString() { return \"NFKD\"; } })"),
+        "none",
     );
 }
 

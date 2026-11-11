@@ -1,13 +1,13 @@
 //! The single source of truth for the compiler's runtime ABI: the value
-//! encoding, heap-block layout, and host-import contract shared between the
-//! [`crate::emit`] side (which bakes these numbers into the wasm module it
-//! generates) and the [`crate::run`] side (which decodes the resulting values,
-//! backs the host imports, and reads the exported globals).
+//! encoding, heap-block layout, static memory map and module shape (the four
+//! `wasi_snapshot_preview1` imports, the `_start` and `memory` exports) that
+//! [`crate::emit`] bakes into the wasm module it generates. The
+//! [`crate::run`] WASI runner links the imports and calls `_start`; it reads no
+//! layout.
 //!
-//! Every constant has exactly one definition here; each module keeps a locally-typed alias
-//! (`i64`/`i32` on the emit side, `u64`/`u8`/`usize` on the run side) that
-//! *derives* its value from the canonical constant below, so a change here
-//! propagates to both sides and the two can no longer disagree.
+//! Every constant has exactly one definition here; the emitter keeps
+//! locally-typed aliases (`i64`/`i32`) that *derive* their value from the
+//! canonical constant below.
 //!
 //! ## Value encoding — NaN-boxing
 //!
@@ -55,8 +55,7 @@ pub(crate) const TRUE: u64 = 0x7FF9_0000_0000_0001;
 pub(crate) const NULL: u64 = 0x7FFA_0000_0000_0000;
 
 /// The NaN-boxed `undefined` jsval: [`QNAN`] plus tag `0b011`. Stands in for a
-/// bare `return;`, a program with no expression statement, and host-side
-/// fallbacks.
+/// bare `return;` and a program with no expression statement.
 pub(crate) const UNDEFINED: u64 = 0x7FFB_0000_0000_0000;
 
 /// An array hole: an element slot with no element (a literal elision, a
@@ -301,13 +300,22 @@ pub(crate) const FUNC_FLAG_GENERATOR: u8 = 128;
 /// `%AsyncGeneratorPrototype%` instead.
 pub(crate) const FUNC_FLAG_ASYNC: u8 = 2;
 
+/// Size in bytes of the shadow-stack region `[0, SHADOW_STACK_SIZE)`. The stack
+/// body is `[SHADOW_FP_BIAS, SHADOW_STACK_SIZE)`, growing down from its end
+/// (`$__sp` starts at `SHADOW_STACK_SIZE - SHADOW_FP_BIAS`). See DESIGN.md §4.2.
+pub(crate) const SHADOW_STACK_SIZE: u32 = 1 << 20;
+
+/// Frame-pointer bias: slot `k` is at `$fp + SHADOW_FP_BIAS + 8k`, so addresses
+/// `0..8` never hold stack data and a raw ref of `0` always reads zero.
+pub(crate) const SHADOW_FP_BIAS: u32 = 8;
+
 /// Linear-memory address of the u32 holding the base of the static function
 /// info table (inside the null guard below the first static string): entry
 /// `func_idx` is [`FN_INFO_ENTRY_SIZE`] bytes at `base + FN_INFO_ENTRY_SIZE *
 /// func_idx`, holding the function's interned `name` key at
 /// [`FN_INFO_NAME_OFFSET`] and its `length` at [`FN_INFO_LENGTH_OFFSET`]
-/// (`__fn_info`). `__fn_materialize` and the host renderers read it.
-pub(crate) const FN_INFO_ADDR: u32 = 4;
+/// (`__fn_info`). `__fn_materialize` and the guest renderer read it.
+pub(crate) const FN_INFO_ADDR: u32 = SHADOW_STACK_SIZE + 4;
 
 /// The byte size of one function info entry (see [`FN_INFO_ADDR`]).
 pub(crate) const FN_INFO_ENTRY_SIZE: u32 = 8;
@@ -353,24 +361,101 @@ pub(crate) const MAP_ENTRIES_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
 pub(crate) const MAP_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
 
 /// TYPE BYTE of a `Promise` block: the object-family prefix, then
-/// `[state:i32 @16][pad:u32][value:i64 @24]`.
+/// `[state:i32 @16][reactions:u32 @20][value:i64 @24][seq:u32 @32][rejected_next:u32 @36]`.
 /// `state` is one of [`PROMISE_PENDING`] / [`PROMISE_FULFILLED`] /
 /// [`PROMISE_REJECTED`]; `value` is the settled fulfillment/rejection jsval
-/// (`undefined` while pending). The block is the RENDERABLE mirror of a promise's
-/// settlement — the host promise engine (reactions + microtask queue) owns the
-/// dynamic scheduling state, but writes `state`/`value` back here so [`crate::run`]
-/// can decode a promise from a bare memory snapshot. Maps to `typeof` "object".
+/// (`undefined` while pending); `reactions` is a raw ref to the newest
+/// reaction record (a prepend list, `0` = none); `seq` is the creation
+/// sequence number; `rejected_next` links the rejected-promise list. The guest
+/// promise engine (`emit/promise_engine.rs`) owns all of it. Header flags:
+/// [`PROMISE_FLAG_HANDLED`], [`PROMISE_FLAG_IN_REJECTED_LIST`]. Maps to
+/// `typeof` "object".
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_PROMISE: u8 = 8;
 
 /// Byte offset (from a [`TYPE_PROMISE`] block base) of the i32 `state`.
 pub(crate) const PROMISE_STATE_OFFSET: u32 = OBJ_PREFIX_SIZE;
 
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the u32 raw ref to the
+/// newest reaction record (`0` = none).
+pub(crate) const PROMISE_REACTIONS_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
 /// Byte offset (from a [`TYPE_PROMISE`] block base) of the i64 settled `value`.
 pub(crate) const PROMISE_VALUE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
 
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the u32 creation
+/// sequence number (from the global `$__promise_seq`).
+pub(crate) const PROMISE_SEQ_OFFSET: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// Byte offset (from a [`TYPE_PROMISE`] block base) of the u32 raw link in the
+/// rejected-promise list (`0` = end).
+pub(crate) const PROMISE_REJECTED_NEXT_OFFSET: u32 = OBJ_PREFIX_SIZE + 20;
+
 /// The byte size of a [`TYPE_PROMISE`] block.
-pub(crate) const PROMISE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+pub(crate) const PROMISE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 24;
+
+/// [`TYPE_PROMISE`] header flag (byte [`HEADER_FLAGS_OFFSET`]):
+/// `[[PromiseIsHandled]]` — a reaction was ever registered on the promise.
+pub(crate) const PROMISE_FLAG_HANDLED: u8 = 2;
+
+/// [`TYPE_PROMISE`] header flag: the promise is linked into the
+/// rejected-promise list.
+pub(crate) const PROMISE_FLAG_IN_REJECTED_LIST: u8 = 4;
+
+/// The jsval slot count of a promise reaction / job record: a [`TYPE_ENV`]
+/// block that is first a reaction on a pending promise, then a queued job.
+pub(crate) const REACTION_SLOTS: u32 = 6;
+
+/// The byte size of a reaction record (`TYPE_ENV` header, count, 6 slots).
+pub(crate) const REACTION_BLOCK_SIZE: u32 = HEADER_SIZE + 4 + 8 * REACTION_SLOTS;
+
+/// Reaction slot 0: the `on_fulfilled` callback (or the async-function
+/// generator handle).
+pub(crate) const REACTION_ON_FULFILLED_OFFSET: u32 = HEADER_SIZE + 4;
+
+/// Reaction slot 1: the `on_rejected` callback (`undefined` = passthrough).
+pub(crate) const REACTION_ON_REJECTED_OFFSET: u32 = HEADER_SIZE + 12;
+
+/// Reaction slot 2: the derived promise to settle (`HEAP` jsval) or
+/// `undefined`.
+pub(crate) const REACTION_RESULT_OFFSET: u32 = HEADER_SIZE + 20;
+
+/// Reaction slot 3: the `kind` small integer (bit 0 [`REACTION_KIND_THENABLE`],
+/// bit 1 [`REACTION_KIND_ASYNC_RESUME`], the source state once queued at
+/// [`REACTION_KIND_STATE_SHIFT`]).
+pub(crate) const REACTION_KIND_OFFSET: u32 = HEADER_SIZE + 28;
+
+/// Reaction slot 4: the settlement value, written when queued.
+pub(crate) const REACTION_VALUE_OFFSET: u32 = HEADER_SIZE + 36;
+
+/// Reaction slot 5: `next`, a `HEAP | record` jsval or `0`.
+pub(crate) const REACTION_NEXT_OFFSET: u32 = HEADER_SIZE + 44;
+
+/// Reaction `kind` bit: the record is a `PromiseResolveThenableJob` (slot 0
+/// the callable `then`, slot 1 the thenable, slot 2 the promise to resolve),
+/// queued directly, never a reaction on a promise.
+pub(crate) const REACTION_KIND_THENABLE: i32 = 1;
+
+/// Reaction `kind` bit: the record resumes an `async` function body (slot 0
+/// its generator handle, slot 2 its result promise) once the awaited promise
+/// it hangs off settles.
+pub(crate) const REACTION_KIND_ASYNC_RESUME: i32 = 2;
+
+/// The shift of the source state (bits 2-3) in a queued job's `kind`.
+pub(crate) const REACTION_KIND_STATE_SHIFT: i32 = 2;
+
+/// The jsval slot count of a resolving-function pair's shared `env`: a
+/// [`TYPE_ENV`] block of the promise and its `alreadyResolved` flag.
+pub(crate) const RESOLVING_SLOTS: u32 = 2;
+
+/// The byte size of a resolving-function `env` block.
+pub(crate) const RESOLVING_BLOCK_SIZE: u32 = HEADER_SIZE + 4 + 8 * RESOLVING_SLOTS;
+
+/// Resolving-function `env` slot 0: the promise the pair settles.
+pub(crate) const RESOLVING_PROMISE_OFFSET: u32 = HEADER_SIZE + 4;
+
+/// Resolving-function `env` slot 1: `alreadyResolved` (a boolean jsval).
+pub(crate) const RESOLVING_DONE_OFFSET: u32 = HEADER_SIZE + 12;
 
 /// [`TYPE_PROMISE`] `state`: the promise is unsettled.
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -478,7 +563,7 @@ pub(crate) const GEN_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 32;
 /// TYPE BYTE of a `Date` block: the object-family prefix, then `[ms:f64 @16]`. The
 /// single f64 payload is the timestamp in milliseconds since the Unix epoch — the
 /// same value `Date.now()` / `d.getTime()` yield. `new Date(ms)` stores its
-/// numeric argument; `new Date()` stores the host clock (the `__now` import).
+/// numeric argument; `new Date()` stores the WASI clock (the guest `__now`).
 /// Maps to `typeof` "object".
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
 pub(crate) const TYPE_DATE: u8 = 10;
@@ -494,7 +579,7 @@ pub(crate) const DATE_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
 /// property's getter and setter FUNCTION VALUES (the `undefined` bits
 /// when a half is absent). It is the value of an [`ATTR_ACCESSOR`] property
 /// table entry, so `__get` invokes the getter with `this = receiver` and
-/// `__set` the setter. Never a program-visible value; the host decoders render
+/// `__set` the setter. Never a program-visible value; the guest renderer renders
 /// the property as `[Getter]` / `[Setter]` / `[Getter/Setter]`.
 /// The two i64 payloads land 8-byte aligned at [`ACCESSOR_GET_OFFSET`] /
 /// [`ACCESSOR_SET_OFFSET`]. Maps to no `typeof` (never observed directly).
@@ -607,6 +692,12 @@ pub(crate) const ELEMS_DATA_OFFSET: u32 = 8;
 /// symbols are static blocks in the realm image.
 pub(crate) const TYPE_SYMBOL: u8 = 14;
 
+/// TYPE BYTE of an internal raw buffer: `[type=19][pad×3][len:u32][data]`,
+/// a collector leaf whose `len` bytes from offset `8` hold no references (the
+/// grown intern table, the `Math.sumPrecise` accumulator, the console render
+/// output, path and ref buffers). Never a user value.
+pub(crate) const TYPE_RAW: u8 = 19;
+
 /// Byte offset (from a [`TYPE_SYMBOL`] block base) of the `description` jsval
 /// (an `i64`: a string jsval or `undefined`).
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -680,268 +771,91 @@ pub(crate) const STR_DATA_OFFSET: u32 = 8;
 /// never exported, since the run stage never reads it.
 pub(crate) const THIS_GLOBAL_INDEX: u32 = 5;
 
-/// The module name of every host env import (`print`/`__convert`/`__method`).
-pub(crate) const IMPORT_MODULE: &str = "env";
+/// The import module of the four WASI preview-1 functions.
+pub(crate) const WASI_MODULE: &str = "wasi_snapshot_preview1";
 
-/// The field name of the host `print` import backing `console.log`.
-pub(crate) const PRINT_IMPORT_NAME: &str = "print";
+/// The WASI `fd_write` import.
+pub(crate) const WASI_FD_WRITE_NAME: &str = "fd_write";
 
-/// The field name of the host `__convert` import backing the
-/// `String`/`Number`/`parseFloat` conversions.
-pub(crate) const CONVERT_IMPORT_NAME: &str = "__convert";
+/// The WASI `clock_time_get` import.
+pub(crate) const WASI_CLOCK_TIME_GET_NAME: &str = "clock_time_get";
 
-/// The field name of the host `__method` import backing the non-callback
-/// array/string methods.
-pub(crate) const METHOD_IMPORT_NAME: &str = "__method";
+/// The WASI `random_get` import.
+pub(crate) const WASI_RANDOM_GET_NAME: &str = "random_get";
 
-/// The field name of the host `__promise` import backing the promise
-/// primitives that take at most a single value operand: `Promise.resolve(v)`,
-/// `Promise.reject(v)`, top-level `await p`, and `p.finally(fn)`. It receives a
-/// `PROMISE_OP_*` flag plus two jsval slots (`a`, `b`) and returns a jsval (a
-/// promise for resolve/reject/finally, or the awaited value for await).
-pub(crate) const PROMISE_IMPORT_NAME: &str = "__promise";
+/// The WASI `proc_exit` import.
+pub(crate) const WASI_PROC_EXIT_NAME: &str = "proc_exit";
 
-/// The field name of the host `__then` import backing `p.then(onF, onR)`
-/// / `p.catch(onR)`. It receives the promise plus the two reaction handlers
-/// (`undefined` for a missing handler) and returns the chained result promise.
-pub(crate) const THEN_IMPORT_NAME: &str = "__then";
+/// The command-module entry point export.
+pub(crate) const START_EXPORT_NAME: &str = "_start";
 
-/// The field name of the host `__now` import backing
-/// `Date.now()` / `new Date()`. It takes no arguments and returns the current
-/// wall-clock time as an f64 count of milliseconds since the Unix epoch.
-pub(crate) const NOW_IMPORT_NAME: &str = "__now";
+/// Address of the static WASI scratch area, 40 bytes: one iovec, `nwritten`,
+/// the 8-byte clock result and the 16-byte random seed buffer.
+pub(crate) const WASI_SCRATCH: u32 = SHADOW_STACK_SIZE + 8;
 
-/// The field name of the host `__parse_int` import backing `parseInt(s, radix)`.
-/// It receives the string and radix jsvals (`undefined` for an omitted radix) and
-/// returns the parsed number jsval.
-pub(crate) const PARSE_INT_IMPORT_NAME: &str = "__parse_int";
+/// Address of the `nwritten` word of the WASI scratch area.
+pub(crate) const WASI_NWRITTEN: u32 = WASI_SCRATCH + 8;
 
-/// `__promise` op flag: `Promise.resolve(a)` — a promise already fulfilled
-/// with `a` (or `a` itself when it is already a promise).
-pub(crate) const PROMISE_OP_RESOLVE: i32 = 0;
+/// Address of the 8-byte `clock_time_get` result in the WASI scratch area.
+pub(crate) const WASI_CLOCK: u32 = WASI_SCRATCH + 16;
 
-/// `__promise` op flag: `Promise.reject(a)` — a promise already rejected
-/// with reason `a`.
-pub(crate) const PROMISE_OP_REJECT: i32 = 1;
+/// Address of the 16-byte `random_get` seed buffer in the WASI scratch area.
+pub(crate) const WASI_SEED: u32 = WASI_SCRATCH + 24;
 
-/// `__promise` op flag: top-level `await a` — drive the microtask queue
-/// until `a` settles, then return its value (or unwind its rejection through the
-/// exception globals).
-pub(crate) const PROMISE_OP_AWAIT: i32 = 2;
+/// Address of the static iovec of [`OOM_LINE`], right after the scratch area.
+pub(crate) const OOM_IOVEC: u32 = WASI_SCRATCH + 40;
 
-/// `__promise` op flag: `a.finally(b)` — run `b` on settlement, then pass
-/// `a`'s original settlement through to the returned chained promise.
-pub(crate) const PROMISE_OP_FINALLY: i32 = 3;
+/// Address of the [`OOM_LINE`] bytes, right after its iovec.
+pub(crate) const OOM_LINE_ADDR: u32 = OOM_IOVEC + 8;
 
-/// `__promise` op flag: allocate a fresh PENDING promise (the backing for
-/// `new Promise(executor)`). Both value operands are ignored.
-pub(crate) const PROMISE_OP_NEW: i32 = 4;
+/// The line `__alloc` writes to fd 2 before `proc_exit(1)`.
+pub(crate) const OOM_LINE: &str = "Uncaught RangeError: out of memory\n";
 
-/// `__promise` op flag: fulfill promise `a` with value `b` — the `resolve`
-/// half of a `new Promise` executor's settler pair. A no-op if `a` is already
-/// settled (settle-once).
-pub(crate) const PROMISE_OP_SETTLE_FULFILL: i32 = 5;
+/// Address of the static decimal-conversion scratch, 784 bytes: the
+/// `num_digits`, `decimal_point` and `truncated` words, the end index of the
+/// last parsed literal, then the 768-digit buffer.
+pub(crate) const DEC_SCRATCH: u32 = OOM_LINE_ADDR + 40;
 
-/// `__promise` op flag: reject promise `a` with reason `b` — the `reject`
-/// half of a `new Promise` executor's settler pair (and the path a throwing
-/// executor takes). A no-op if `a` is already settled.
-pub(crate) const PROMISE_OP_SETTLE_REJECT: i32 = 6;
+/// Address of the 23 exact `f64` powers of ten (`10^0..=10^22`).
+pub(crate) const DEC_POW10: u32 = DEC_SCRATCH + 784;
 
-/// `__promise` op flag: spawn an `async function` body. Operand `a` is a
-/// freshly built generator handle (the async body compiled as a state machine,
-/// `await` == `yield`); the host allocates the result promise, drives the
-/// generator's first step synchronously, and returns the result promise. Each
-/// suspend (`await`) registers a continuation that resumes the generator when the
-/// awaited value settles; completion fulfills (or, on a throw / awaited rejection,
-/// rejects) the result promise.
-pub(crate) const PROMISE_OP_ASYNC_SPAWN: i32 = 7;
+/// Address of the 65-entry `u16` decimal left-shift table.
+pub(crate) const DEC_SHIFT_TABLE: u32 = DEC_POW10 + 184;
 
-/// The name under which the module exports the `__invoke1(fn: i64, arg: i64) ->
-/// i64` callback trampoline. The host promise engine calls it re-entrantly
-/// to run a `.then`/`.catch`/`.finally` reaction's guest callback with the settled
-/// value, receiving the callback's result (or, on a throw, an ignored result plus
-/// a set `__exc_pending` global).
-pub(crate) const INVOKE_EXPORT_NAME: &str = "__invoke1";
+/// Address of the packed decimal digits of `5^1..=5^63`.
+pub(crate) const DEC_POW5: u32 = DEC_SHIFT_TABLE + 130;
 
-/// The name under which the module exports the `__async_step(gen: i64, sent: i64)
-/// -> i64` generator single-step trampoline. The host async driver calls
-/// it re-entrantly to advance an `async function` body's state machine by one
-/// suspend: it `call_indirect`s the state machine with `(sent, gen)`, returns the
-/// yielded/returned value, and leaves the handle's `done` flag (and any thrown
-/// exception via `__exc_pending`) for the host to read.
-pub(crate) const ASYNC_STEP_EXPORT_NAME: &str = "__async_step";
+/// Byte length of the digits at [`DEC_POW5`].
+pub(crate) const DEC_POW5_LEN: u32 = 1440;
 
-/// The name under which the module exports the `__alloc(size: i32) -> base: i32`
-/// bump allocator. It rounds `size` up to [`BLOCK_ALIGN`], zeroes the block's
-/// [`HEADER_SIZE`] header bytes, and returns the 8-aligned base; on exhaustion it
-/// stores [`HEAP_PTR_OOM`] and traps.
-pub(crate) const ALLOC_EXPORT_NAME: &str = "__alloc";
+/// Address of the 19-entry table of decimal-conversion shift steps.
+pub(crate) const DEC_POWERS: u32 = DEC_POW5 + DEC_POW5_LEN;
 
-/// The name under which the module exports the `__new_string(len: i32,
-/// two_byte: i32) -> base: i32` constructor: a [`TYPE_STRING`] block of `len`
-/// code units — `len` Latin-1 bytes, or with `two_byte` (`0`/`1`)
-/// [`STR_FLAG_TWO_BYTE`] set and `2 * len` bytes of UTF-16LE units — with
-/// `len` set and the data at [`STR_DATA_OFFSET`] for the caller to fill. The
-/// hosts allocate every string through it, in canonical form (one-byte iff
-/// every unit is `<= 0xFF`).
-pub(crate) const NEW_STRING_EXPORT_NAME: &str = "__new_string";
+/// The first address after the fixed static area, where the string blocks begin.
+pub(crate) const STATIC_AREA_END: u32 = RYU_TABLES_ADDR + RYU_TABLES_SIZE;
 
-/// The name under which the module exports the `__new_array(len: i32) -> base:
-/// i32` constructor: a [`TYPE_ARRAY`] handle with `len` set and a `cap = len`
-/// [`TYPE_ELEMS`] store (none when `len` is 0) whose every element is
-/// `undefined`. The hosts allocate every array through it.
-pub(crate) const NEW_ARRAY_EXPORT_NAME: &str = "__new_array";
+/// Address of the static `Number` formatting scratch, right after the
+/// decimal-conversion tables, 16-aligned.
+pub(crate) const NUM_SCRATCH_ADDR: u32 = (DEC_POWERS + 19 + 15) & !15;
 
-/// The name under which the module exports the `__new_promise() -> base: i32`
-/// constructor: a pending [`TYPE_PROMISE`] block (value `undefined`). The hosts
-/// allocate every promise through it.
-pub(crate) const NEW_PROMISE_EXPORT_NAME: &str = "__new_promise";
+/// Size of [`NUM_SCRATCH_ADDR`].
+pub(crate) const NUM_SCRATCH_SIZE: u32 = 2048;
 
-/// The name under which the module exports the `__promise_self_error() -> i64`
-/// constructor: a fresh `TypeError` ("Chaining cycle detected for promise
-/// #<Promise>"). The host promise engines reject a promise resolved with
-/// itself (Promise Resolve Functions step 7) with it.
-pub(crate) const PROMISE_SELF_ERROR_EXPORT_NAME: &str = "__promise_self_error";
+/// Address of the static Ryu power-of-5 tables, right after the scratch.
+pub(crate) const RYU_TABLES_ADDR: u32 = NUM_SCRATCH_ADDR + NUM_SCRATCH_SIZE;
 
-/// The name under which the module exports its linear memory; [`crate::run`]
-/// reads it back to resolve heap pointers.
+/// Size of the Ryu tables (828 bytes), rounded up to keep the string blocks
+/// aligned.
+pub(crate) const RYU_TABLES_SIZE: u32 = 832;
+
+/// The name under which the module exports its linear memory (the WASI
+/// imports read and write guest buffers through it).
 pub(crate) const MEMORY_EXPORT_NAME: &str = "memory";
 
-/// The name under which the bump-allocator heap-pointer global is exported so
-/// the run stage can detect the [`HEAP_PTR_OOM`] sentinel (hosts only read it;
-/// they allocate through the constructor exports).
-pub(crate) const HEAP_PTR_EXPORT_NAME: &str = "__heap_ptr";
-
 /// The linear-memory cap in 64 KiB wasm pages (512 MiB), declared as the
-/// module's memory `maximum`: a guest `__alloc` or host allocation that cannot
-/// grow memory within it is out of memory.
+/// module's memory `maximum`: an `__alloc` that cannot grow memory within it is
+/// out of memory.
 pub(crate) const MEMORY_MAX_PAGES: u64 = 8192;
-
-/// The sticky out-of-memory sentinel stored in the heap-pointer global when an
-/// allocation cannot grow memory (as `i32`, i.e. `0xFFFF_FFFF`). Every later
-/// allocation fails against it, and the run stage reports it as
-/// `Uncaught RangeError: out of memory`.
-pub(crate) const HEAP_PTR_OOM: i32 = -1;
-
-/// The name under which the pending-exception flag global (`$exc_pending`, i32)
-/// is exported so the run stage can detect an uncaught exception after `main`
-/// returns. `0` = none, `1` = an exception is propagating.
-pub(crate) const EXC_PENDING_EXPORT_NAME: &str = "__exc_pending";
-
-/// The name under which the in-flight exception value global (`$exc_value`, i64)
-/// is exported so the run stage can render an uncaught exception.
-pub(crate) const EXC_VALUE_EXPORT_NAME: &str = "__exc_value";
-
-/// `print` import flag: format the jsval and follow it with a single
-/// space — used for every `console.log` argument except the last.
-pub(crate) const PRINT_FLAG_SEP: i32 = 0;
-
-/// `print` import flag: format the jsval and follow it with a newline —
-/// used for the last `console.log` argument.
-pub(crate) const PRINT_FLAG_END: i32 = 1;
-
-/// `print` import flag: emit only a newline, ignoring the (dummy) jsval
-/// operand — used for a zero-argument `console.log()`.
-pub(crate) const PRINT_FLAG_NEWLINE: i32 = 2;
-
-/// `__convert` op flag: stringify the argument (`String(x)`).
-pub(crate) const CONVERT_OP_TO_STRING: i32 = 0;
-
-/// `__convert` op flag: coerce the argument to a number (`Number(x)`).
-pub(crate) const CONVERT_OP_TO_NUMBER: i32 = 1;
-
-/// `__convert` op flag: parse a leading float (`parseFloat(x)`).
-pub(crate) const CONVERT_OP_PARSE_FLOAT: i32 = 3;
-
-/// `__method` op flag: array `indexOf`.
-pub(crate) const METHOD_OP_INDEX_OF: i32 = 0;
-
-/// `__method` op flag: array `includes`.
-pub(crate) const METHOD_OP_INCLUDES: i32 = 1;
-
-/// `__method` op flag: `toUpperCase`.
-pub(crate) const METHOD_OP_TO_UPPER: i32 = 4;
-
-/// `__method` op flag: `toLowerCase`.
-pub(crate) const METHOD_OP_TO_LOWER: i32 = 5;
-
-/// `__method` op flag: `Number.prototype.toString(radix)` (a number receiver,
-/// `arg0` an integral radix in `2..=36`).
-pub(crate) const METHOD_OP_NUMBER_TO_STRING: i32 = 17;
-
-/// `__method` op flag: `String.prototype.localeCompare` (string, code-unit
-/// order).
-pub(crate) const METHOD_OP_LOCALE_COMPARE: i32 = 22;
-
-/// `__method` op flag: `String.prototype.normalize` (string, a form string or
-/// `undefined`).
-pub(crate) const METHOD_OP_NORMALIZE: i32 = 23;
-
-/// `__method` result: the argument is out of range (an unknown `normalize`
-/// form); the calling builtin throws a `RangeError`.
-pub(crate) const METHOD_RANGE_ERROR: u64 = UNDEFINED | 2;
-
-/// `__method` op flag: `Number.prototype.toFixed(f)` (a finite number
-/// receiver, `arg0` an integral `f` in `0..=100`).
-pub(crate) const METHOD_OP_NUMBER_TO_FIXED: i32 = 40;
-
-/// `__method` op flag: `Number.prototype.toExponential(f)` (a finite number
-/// receiver, `arg0` an integral `f` in `0..=100`, or `undefined` for the
-/// shortest round-tripping digits).
-pub(crate) const METHOD_OP_NUMBER_TO_EXPONENTIAL: i32 = 41;
-
-/// `__method` op flag: `Number.prototype.toPrecision(p)` (a finite number
-/// receiver, `arg0` an integral `p` in `1..=100`).
-pub(crate) const METHOD_OP_NUMBER_TO_PRECISION: i32 = 42;
-
-/// `__method` op flag: a host `Math` function. The receiver is the first
-/// number operand, `arg0` the second (`Math.atan2`'s `x`; `undefined` for
-/// the unary functions) and `arg1` the raw `MATH_FN_*` code; the result is a
-/// number jsval.
-pub(crate) const METHOD_OP_MATH: i32 = 43;
-
-/// `METHOD_OP_MATH` function code: `Math.cbrt`.
-pub(crate) const MATH_FN_CBRT: i64 = 0;
-/// `METHOD_OP_MATH` function code: `Math.log`.
-pub(crate) const MATH_FN_LOG: i64 = 1;
-/// `METHOD_OP_MATH` function code: `Math.log2`.
-pub(crate) const MATH_FN_LOG2: i64 = 2;
-/// `METHOD_OP_MATH` function code: `Math.log10`.
-pub(crate) const MATH_FN_LOG10: i64 = 3;
-/// `METHOD_OP_MATH` function code: `Math.log1p`.
-pub(crate) const MATH_FN_LOG1P: i64 = 4;
-/// `METHOD_OP_MATH` function code: `Math.exp`.
-pub(crate) const MATH_FN_EXP: i64 = 5;
-/// `METHOD_OP_MATH` function code: `Math.expm1`.
-pub(crate) const MATH_FN_EXPM1: i64 = 6;
-/// `METHOD_OP_MATH` function code: `Math.sin`.
-pub(crate) const MATH_FN_SIN: i64 = 7;
-/// `METHOD_OP_MATH` function code: `Math.cos`.
-pub(crate) const MATH_FN_COS: i64 = 8;
-/// `METHOD_OP_MATH` function code: `Math.tan`.
-pub(crate) const MATH_FN_TAN: i64 = 9;
-/// `METHOD_OP_MATH` function code: `Math.asin`.
-pub(crate) const MATH_FN_ASIN: i64 = 10;
-/// `METHOD_OP_MATH` function code: `Math.acos`.
-pub(crate) const MATH_FN_ACOS: i64 = 11;
-/// `METHOD_OP_MATH` function code: `Math.atan`.
-pub(crate) const MATH_FN_ATAN: i64 = 12;
-/// `METHOD_OP_MATH` function code: `Math.atan2` (`y` the receiver, `x` in `arg0`).
-pub(crate) const MATH_FN_ATAN2: i64 = 13;
-/// `METHOD_OP_MATH` function code: `Math.sinh`.
-pub(crate) const MATH_FN_SINH: i64 = 14;
-/// `METHOD_OP_MATH` function code: `Math.cosh`.
-pub(crate) const MATH_FN_COSH: i64 = 15;
-/// `METHOD_OP_MATH` function code: `Math.tanh`.
-pub(crate) const MATH_FN_TANH: i64 = 16;
-/// `METHOD_OP_MATH` function code: `Math.asinh`.
-pub(crate) const MATH_FN_ASINH: i64 = 17;
-/// `METHOD_OP_MATH` function code: `Math.acosh`.
-pub(crate) const MATH_FN_ACOSH: i64 = 18;
-/// `METHOD_OP_MATH` function code: `Math.atanh`.
-pub(crate) const MATH_FN_ATANH: i64 = 19;
-/// `METHOD_OP_MATH` function code: `Math.random` (operands ignored).
-pub(crate) const MATH_FN_RANDOM: i64 = 20;
 
 #[cfg(test)]
 #[path = "abi_drift_tests.rs"]

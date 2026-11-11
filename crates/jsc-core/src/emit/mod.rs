@@ -3,14 +3,13 @@
 //! This is the final backend stage. It walks an [`IrNode`] tree and produces the
 //! raw bytes of a valid WebAssembly module using the [`wasm_encoder`] crate.
 //!
-//! The emitted module exports exactly one function under the name **`"main"`**
-//! with the signature `() -> i64` (no parameters, a single `i64` result). The
-//! `i64` result is a NaN-boxed jsval (see [`crate::run`] for the layout); using
-//! an `i64` carrier — not `f64` — guarantees the value's bits survive every
-//! wasm op and the wasmtime return boundary without NaN canonicalization. The
-//! run/CLI stages depend on this exact export name and signature. `main`
-//! declares one `i64` local per top-level variable; the program's value is the
-//! value of its last expression statement, which is left on the operand stack.
+//! The emitted module is a self-contained WASI preview-1 command: it imports
+//! exactly `fd_write`, `clock_time_get`, `random_get` and `proc_exit` from
+//! `wasi_snapshot_preview1` and exports exactly `_start: () -> ()` and
+//! `memory`. The internal `main: () -> i64` runs the top-level statements and
+//! returns the completion value as a NaN-boxed jsval; `_start` wraps it with
+//! the drain, the uncaught reports and the optional completion print. An `i64`
+//! carrier — not `f64` — keeps the value's bits intact through every wasm op.
 //!
 //! Any user-defined functions are emitted as additional wasm functions
 //! (indices `1..`, signature `(i64, ..) -> i64`), so a call expression lowers
@@ -32,6 +31,9 @@ use wasm_encoder::{
     TableType, TypeSection, ValType,
 };
 
+use builder::{FnBuilder, LocalClass, Sink, TempClass};
+use roots::LeafSet;
+
 use crate::abi;
 use crate::ir::{
     ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind,
@@ -40,117 +42,27 @@ use crate::ir::{
     PrivateError, PropKey, ProtoKind, SpreadCallee, SpreadElem,
 };
 
-/// The name of the entry function exported from the emitted module.
-const EXPORT_NAME: &str = "main";
-
 /// The name under which the module's linear memory is exported (see
-/// [`abi::MEMORY_EXPORT_NAME`]). [`crate::run`] reads it back to resolve heap
-/// pointers.
+/// [`abi::MEMORY_EXPORT_NAME`]).
 const MEMORY_EXPORT_NAME: &str = abi::MEMORY_EXPORT_NAME;
 
-/// The module and field name of the host `print` import backing `console.log`.
-/// [`crate::run`] supplies this function through a `wasmtime::Linker`.
-const PRINT_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
-const PRINT_IMPORT_NAME: &str = abi::PRINT_IMPORT_NAME;
+/// The number of imported functions: the four WASI imports (`fd_write`,
+/// `clock_time_get`, `random_get`, `proc_exit`) at indices `0..=3`. Every
+/// defined function, funcref-table element and function export index is
+/// shifted up by this count.
+const IMPORT_FUNC_COUNT: u32 = 4;
 
-/// The module and field name of the host `__convert` import backing the
-/// `String`/`Number`/`parseFloat` conversions. It receives the
-/// argument jsval plus a `CONVERT_OP_*` flag and returns the converted jsval,
-/// reusing the run stage's `format_value`/parse helpers (and allocating a heap
-/// string in guest memory for `String`).
-const CONVERT_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
-const CONVERT_IMPORT_NAME: &str = abi::CONVERT_IMPORT_NAME;
+/// The function index of the WASI `fd_write` import.
+const FD_WRITE_IMPORT: u32 = 0;
 
-/// `__convert` op flags; see [`abi`].
-const CONVERT_OP_TO_STRING: i32 = abi::CONVERT_OP_TO_STRING;
-const CONVERT_OP_TO_NUMBER: i32 = abi::CONVERT_OP_TO_NUMBER;
-const CONVERT_OP_PARSE_FLOAT: i32 = abi::CONVERT_OP_PARSE_FLOAT;
+/// The function index of the WASI `proc_exit` import.
+const PROC_EXIT_IMPORT: u32 = 3;
 
-/// The module and field name of the host `__method` import backing the
-/// non-callback array/string methods. It receives the receiver jsval, a
-/// `METHOD_OP_*` flag, and two argument jsval slots (padded with `undefined` when
-/// the method takes fewer), branches on the receiver's runtime TYPE BYTE for the
-/// overloaded `indexOf`/`slice`, and returns the result jsval (allocating a heap
-/// string/array in guest memory when it builds one).
-const METHOD_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
-const METHOD_IMPORT_NAME: &str = abi::METHOD_IMPORT_NAME;
+/// The function index of the WASI `clock_time_get` import.
+const CLOCK_TIME_GET_IMPORT: u32 = 1;
 
-/// The module and field names of the host promise imports: `__promise`
-/// backs the single-value primitives (`Promise.resolve`/`reject`, top-level
-/// `await`, `p.finally`) and `__then` backs `p.then`/`p.catch`. [`crate::run`]
-/// supplies both through a `wasmtime::Linker`, driving the host-side promise
-/// engine (reactions + microtask queue).
-const PROMISE_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
-const PROMISE_IMPORT_NAME: &str = abi::PROMISE_IMPORT_NAME;
-const THEN_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
-const THEN_IMPORT_NAME: &str = abi::THEN_IMPORT_NAME;
-const NOW_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
-const NOW_IMPORT_NAME: &str = abi::NOW_IMPORT_NAME;
-const PARSE_INT_IMPORT_MODULE: &str = abi::IMPORT_MODULE;
-const PARSE_INT_IMPORT_NAME: &str = abi::PARSE_INT_IMPORT_NAME;
-
-/// `__promise` op flags; see [`abi`].
-const PROMISE_OP_RESOLVE: i32 = abi::PROMISE_OP_RESOLVE;
-const PROMISE_OP_REJECT: i32 = abi::PROMISE_OP_REJECT;
-const PROMISE_OP_AWAIT: i32 = abi::PROMISE_OP_AWAIT;
-const PROMISE_OP_FINALLY: i32 = abi::PROMISE_OP_FINALLY;
-const PROMISE_OP_NEW: i32 = abi::PROMISE_OP_NEW;
-const PROMISE_OP_SETTLE_FULFILL: i32 = abi::PROMISE_OP_SETTLE_FULFILL;
-const PROMISE_OP_SETTLE_REJECT: i32 = abi::PROMISE_OP_SETTLE_REJECT;
-const PROMISE_OP_ASYNC_SPAWN: i32 = abi::PROMISE_OP_ASYNC_SPAWN;
-
-/// The export name of the `__invoke1` callback trampoline the host
-/// promise engine calls re-entrantly to run a reaction's guest callback.
-const INVOKE_EXPORT_NAME: &str = abi::INVOKE_EXPORT_NAME;
-
-/// The export name of the `__async_step` generator-step trampoline the
-/// host async engine calls to advance an `async function` body's state machine.
-const ASYNC_STEP_EXPORT_NAME: &str = abi::ASYNC_STEP_EXPORT_NAME;
-
-/// The export names of the bump allocator and the guest constructors the
-/// hosts allocate through (see [`abi`]).
-const ALLOC_EXPORT_NAME: &str = abi::ALLOC_EXPORT_NAME;
-const NEW_STRING_EXPORT_NAME: &str = abi::NEW_STRING_EXPORT_NAME;
-const NEW_ARRAY_EXPORT_NAME: &str = abi::NEW_ARRAY_EXPORT_NAME;
-const NEW_PROMISE_EXPORT_NAME: &str = abi::NEW_PROMISE_EXPORT_NAME;
-const PROMISE_SELF_ERROR_EXPORT_NAME: &str = abi::PROMISE_SELF_ERROR_EXPORT_NAME;
-
-/// `__method` op flags; see [`abi`].
-const METHOD_OP_INDEX_OF: i32 = abi::METHOD_OP_INDEX_OF;
-const METHOD_OP_INCLUDES: i32 = abi::METHOD_OP_INCLUDES;
-
-/// The name under which the bump-allocator heap pointer global is exported so the
-/// run stage can detect the out-of-memory sentinel.
-const HEAP_PTR_EXPORT_NAME: &str = abi::HEAP_PTR_EXPORT_NAME;
-
-/// The name under which the pending-exception flag global (`$exc_pending`, i32) is
-/// exported so the run stage can detect an uncaught exception after `main` returns.
-/// `0` = no exception in flight, `1` = an exception is propagating.
-const EXC_PENDING_EXPORT_NAME: &str = abi::EXC_PENDING_EXPORT_NAME;
-
-/// The name under which the in-flight exception value global (`$exc_value`, i64) is
-/// exported so the run stage can render an uncaught exception. Holds the
-/// thrown jsval bits; only meaningful while `$exc_pending` is `1`.
-const EXC_VALUE_EXPORT_NAME: &str = abi::EXC_VALUE_EXPORT_NAME;
-
-/// The number of imported functions the module declares: the host `print`
-/// function occupies function index `0`, the host `__convert` function
-/// index `1`, and the host `__method` function index `2`, so
-/// every DEFINED function — `main`, the user functions, and the runtime helpers —
-/// plus the funcref-table element indices and the exported `main` index all shift
-/// up by this count.
-///
-/// Two more imports — `__promise` (index 3) and `__then` (index 4) — back the
-/// host promise engine, and `__now` (index 5) is the host wall clock backing
-/// `Date.now()` / `new Date()`, and `__parse_int` (index 6) backs
-/// `parseInt(s, radix)`, so the count is `7`.
-const IMPORT_FUNC_COUNT: u32 = 7;
-
-/// `print` import flags; see [`abi`]: a value plus a trailing space, a
-/// value plus a newline, or a newline alone for zero-argument `console.log()`.
-const PRINT_FLAG_SEP: i32 = abi::PRINT_FLAG_SEP;
-const PRINT_FLAG_END: i32 = abi::PRINT_FLAG_END;
-const PRINT_FLAG_NEWLINE: i32 = abi::PRINT_FLAG_NEWLINE;
+/// The function index of the WASI `random_get` import.
+const RANDOM_GET_IMPORT: u32 = 2;
 
 /// The wasm global index of the bump-allocator heap pointer (`__heap_ptr`).
 const HEAP_PTR_GLOBAL: u32 = 0;
@@ -235,10 +147,51 @@ const SPREAD_ARGS_GLOBAL: u32 = 13;
 /// [`abi::PROPS_WATCHED`] and bit index `i`. Bits are never cleared. Internal.
 const DIRTY_GLOBAL: u32 = 14;
 
+/// The output buffer: base, UTF-8 length and capacity (`$__out_buf`, all i32,
+/// init 0). Empty between lines; see [`render`].
+const OUT_BUF_GLOBAL: u32 = 15;
+/// See [`OUT_BUF_GLOBAL`].
+const OUT_LEN_GLOBAL: u32 = 16;
+/// See [`OUT_BUF_GLOBAL`].
+const OUT_CAP_GLOBAL: u32 = 17;
+
+/// The renderer's recursion-path block: base and capacity (i32, init 0).
+const PATH_BUF_GLOBAL: u32 = 18;
+/// See [`PATH_BUF_GLOBAL`].
+const PATH_CAP_GLOBAL: u32 = 19;
+
+/// The renderer's ref table: base, capacity and entry count (i32, init 0).
+const REFS_BUF_GLOBAL: u32 = 20;
+/// See [`REFS_BUF_GLOBAL`].
+const REFS_CAP_GLOBAL: u32 = 21;
+/// See [`REFS_BUF_GLOBAL`].
+const REFS_LEN_GLOBAL: u32 = 22;
+
+/// The wasm global index of the shadow-stack pointer (`$__sp`, i32, init
+/// `SS_SIZE - 8`); see [`builder`].
+const SP_GLOBAL: u32 = 23;
+
+/// The `Math.random` xorshift128+ state (`$__rng0`, `$__rng1`, i64, init 0);
+/// all-zero until `__random` seeds it on the first call.
+const RNG0_GLOBAL: u32 = 24;
+/// See [`RNG0_GLOBAL`].
+const RNG1_GLOBAL: u32 = 25;
+
+/// The promise engine's job queue: raw `i32` refs to the oldest and newest
+/// queued reaction/job record (`$__job_head`, `$__job_tail`, init 0 = empty);
+/// see [`promise_engine`].
+const JOB_HEAD_GLOBAL: u32 = 26;
+/// See [`JOB_HEAD_GLOBAL`].
+const JOB_TAIL_GLOBAL: u32 = 27;
+/// The promise creation counter (`$__promise_seq`, i32, init 0).
+const PROMISE_SEQ_GLOBAL: u32 = 28;
+/// The rejected-promise list head (`$__rejected_head`, raw `i32` ref, init 0).
+const REJECTED_HEAD_GLOBAL: u32 = 29;
+
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
-/// the dirty-bits global and set in `main`'s prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 15;
+/// the renderer, RNG and promise-engine globals and set in `main`'s prologue).
+const MODULE_CELL_GLOBAL_BASE: u32 = 30;
 
 /// An array hole (see [`abi::HOLE`]): the element-slot bit pattern of a
 /// missing element. Every element read maps it to `undefined`.
@@ -258,11 +211,12 @@ const CF_BREAK: i32 = 2;
 /// [`CF_KIND_GLOBAL`] value for a pending `continue`.
 const CF_CONTINUE: i32 = 3;
 
-/// The base heap offset: the first byte of static string-literal data (offset 0
-/// is reserved as a null guard). Literal blobs are packed contiguously from here;
+/// The base heap offset: the first byte of static string-literal data, after
+/// the null guard, the function-table word, the fixed WASI area and the
+/// [`libm`] block. Literal blobs are packed contiguously from here;
 /// the bump allocator (`__alloc`) then starts at the first free offset *after*
 /// them (see [`emit`]).
-const HEAP_BASE: i32 = 8;
+const HEAP_BASE: i32 = abi::STATIC_AREA_END.cast_signed() + libm::STATIC_SIZE;
 
 /// The alignment of every heap block base (see [`abi::BLOCK_ALIGN`]).
 const BLOCK_ALIGN: i32 = abi::BLOCK_ALIGN.cast_signed();
@@ -370,10 +324,8 @@ const MAP_SIZE_OFFSET: u64 = abi::MAP_SIZE_OFFSET as u64;
 const MAP_ENTRIES_OFFSET: u64 = abi::MAP_ENTRIES_OFFSET as u64;
 const MAP_BLOCK_SIZE: i32 = abi::MAP_BLOCK_SIZE.cast_signed();
 
-/// Field offsets and size of a `Promise` block (see [`abi::TYPE_PROMISE`]).
-const PROMISE_STATE_OFFSET: u64 = abi::PROMISE_STATE_OFFSET as u64;
+/// The settled-value offset of a `Promise` block (see [`abi::TYPE_PROMISE`]).
 const PROMISE_VALUE_OFFSET: u64 = abi::PROMISE_VALUE_OFFSET as u64;
-const PROMISE_BLOCK_SIZE: i32 = abi::PROMISE_BLOCK_SIZE.cast_signed();
 
 /// Type byte, payload offset, and size of a `Date` block. Maps to `typeof`
 /// "object". See [`abi::TYPE_DATE`].
@@ -883,30 +835,15 @@ struct Helpers<'a> {
     /// place (push/pop a handler, bump/restore the depth) without re-plumbing a
     /// `&mut` through every helper.
     unwind: &'a RefCell<Unwind>,
-    /// The host `print` import's function index. Imports occupy the
-    /// lowest function indices, so this is always `0`; `console.log` lowers to
-    /// `call`s of it.
-    print: u32,
-    /// The host `__convert` import's function index. Always `1` (the
-    /// second import); `String`/`Number`/`parseFloat` lower to `call`s of it.
-    convert: u32,
-    /// The host `__method` import's function index. Always `2` (the third
-    /// import); the non-callback array/string methods lower to `call`s of it.
-    method: u32,
-    /// The host `__promise` import's function index. Always `3` (the fourth
-    /// import); `Promise.resolve`/`reject`, `await`, and `p.finally` lower to
-    /// `call`s of it.
-    promise: u32,
-    /// The host `__then` import's function index. Always `4` (the fifth
-    /// import); `p.then`/`p.catch` lower to `call`s of it.
-    then: u32,
-    /// The host `__now` import's function index (backing `Date`). Always `5` (the
-    /// sixth import); `Date.now()` / `new Date()` lower to `call`s of it. The
-    /// import returns an f64 (ms since the Unix epoch).
+    /// The first of the [`dtoa::HELPER_COUNT`] consecutive `Number` to string
+    /// helpers (see [`dtoa::emit_helpers`]).
+    dtoa: u32,
+    /// `__now() -> f64`, the WASI clock in ms since the Unix epoch (backing
+    /// `Date`); `__random` follows it (see [`Self::random`]).
     now: u32,
-    /// The host `__parse_int(s: i64, radix: i64) -> i64` import's function
-    /// index. Always `6` (the seventh import); `parseInt` lowers to `call`s of it.
-    parse_int: u32,
+    /// `__num_unit`, the first of the [`strtod`] number parsers; the others
+    /// follow it (see the accessors).
+    strtod: u32,
     /// `__gen_to_array(gen: i64) -> i64`: drive a generator to
     /// exhaustion via `call_indirect`, collecting its yielded values into a fresh
     /// array — the drain backing `[...gen]` / `f(...gen)` spread. Emitted just
@@ -930,14 +867,13 @@ struct Helpers<'a> {
     /// through `__to_primitive`; see [`value::emit_to_number_helper`]).
     /// Call sites skip it for number operands (see [`value::emit_coerce_number`]).
     to_number: u32,
-    /// `__invoke1(fn: i64, arg: i64) -> i64`: the callback trampoline the
-    /// host promise engine calls re-entrantly. Exported under
-    /// [`INVOKE_EXPORT_NAME`].
+    /// `__invoke1(fn: i64, arg: i64) -> i64`: the callback trampoline
+    /// `__run_job` calls to run a reaction's callback.
     invoke1: u32,
     /// `__async_step(gen: i64, sent: i64) -> i64`: the generator
-    /// single-step trampoline the host async engine calls to advance an
+    /// single-step trampoline `__async_drive` calls to advance an
     /// `async function` body's state machine by one suspend. Appended right after
-    /// `invoke1` (index `invoke1 + 1`), exported under [`ASYNC_STEP_EXPORT_NAME`].
+    /// `invoke1` (index `invoke1 + 1`).
     async_step: u32,
     /// The funcref-TABLE slots of the two `new Promise` settler functions:
     /// `resolve` (fulfills the bound promise) and `reject`. A `new Promise`
@@ -946,11 +882,10 @@ struct Helpers<'a> {
     /// `settle_resolve_slot` is also the user function count.
     settle_resolve_slot: u32,
     settle_reject_slot: u32,
-    /// `__new_string(len: i32, two_byte: i32) -> i32`: the exported string
-    /// constructor, followed by `__new_array` (`new_string + 1`),
-    /// `__new_promise` (`new_string + 2`), `__has_own` (`new_string + 3`), and the builtin
-    /// bodies ([`Self::builtin`]), appended after the settlers so every other
-    /// index stays stable.
+    /// `new_string(len: i32, two_byte: i32) -> i32`: the string block
+    /// constructor, followed by `__new_array` (`new_string + 1`), `__has_own`
+    /// (`new_string + 2`), and the builtin bodies ([`Self::builtin`]), appended
+    /// after the settlers so every other index stays stable.
     new_string: u32,
     /// `__alloc(size) -> i32`: bump-allocate `size` bytes, returning the offset.
     /// Called inline by array literals.
@@ -1020,7 +955,7 @@ struct Helpers<'a> {
     /// `__json_str(v) -> str_base`: the recursive `JSON.stringify` serializer
     /// — returns the heap-string base offset of `v`'s JSON form, composing pieces
     /// with `__concat`, delegating string escaping to [`Self::json_escape`] and
-    /// finite-number formatting to the existing `__convert` import, and calling
+    /// finite-number formatting to the guest number formatter, and calling
     /// itself for nested array/object elements. Backs [`crate::ir::IrNode::JsonStringify`].
     json_str: u32,
     /// `__same_value_zero(a: i64, b: i64) -> i32`: `SameValueZero` over two
@@ -1028,6 +963,9 @@ struct Helpers<'a> {
     /// identical bits — so `NaN` matches `NaN` and `+0` matches `-0` — everything
     /// else by identity bits). The key equality of the `__map_*` linear scans.
     same_value_zero: u32,
+    /// `__array_search(recv: i64, needle: i64, includes: i32) -> i64` (see
+    /// [`builtins::emit_array_search`]): the `indexOf`/`includes` fast path.
+    array_search: u32,
     /// `__map_find(handle: i32, key: i64) -> i32`: the byte address of the
     /// matching key slot in a Map/Set's backing array (a `__same_value_zero` linear scan over
     /// the even element slots, skipping `HOLE` tombstones), or `-1` on a miss. Shared by get/has/set/delete.
@@ -1089,6 +1027,8 @@ struct Helpers<'a> {
     /// Whether the program tests an intrinsics dirty bit (DESIGN.md §6.4). When
     /// `false`, `__set` / `__define` / `__delete` do not set the bits.
     dirty_tracking: bool,
+    /// Base address of the Unicode tables (see [`unicode`]).
+    unicode: i32,
     /// Base address of the `__fn_info` table (see [`FnLayout`]). The static
     /// declaration blocks follow it ([`decl_func_base`]). `__fn_materialize`
     /// is the helper right after `__define` (`define + 1`).
@@ -1096,6 +1036,81 @@ struct Helpers<'a> {
 }
 
 impl Helpers<'_> {
+    /// `__num_unit(data: i32, i: i32) -> i32`: a code unit behind a tagged pointer.
+    fn num_unit(self) -> u32 {
+        self.strtod
+    }
+
+    /// `__str_ws(c: i32) -> i32`: whether a unit is a `StrWhiteSpaceChar`.
+    fn str_ws(self) -> u32 {
+        self.strtod + 1
+    }
+
+    /// `__dec_parse(data: i32, start: i32, end: i32) -> f64`: the longest `StrDecimalLiteral` prefix, correctly rounded.
+    fn dec_parse(self) -> u32 {
+        self.strtod + 2
+    }
+
+    /// `__dec_slow() -> i64`: Simple Decimal Conversion of the digit buffer.
+    fn dec_slow(self) -> u32 {
+        self.strtod + 3
+    }
+
+    /// `__dec_round() -> i64`: the digit buffer's integer part, rounded.
+    fn dec_round(self) -> u32 {
+        self.strtod + 4
+    }
+
+    /// `__dec_left(shift: i32)`: multiply the digit buffer by `2^shift`.
+    fn dec_left(self) -> u32 {
+        self.strtod + 5
+    }
+
+    /// `__dec_right(shift: i32)`: divide the digit buffer by `2^shift`.
+    fn dec_right(self) -> u32 {
+        self.strtod + 6
+    }
+
+    /// `__digit_span(data, start, end, radix) -> i32`: the end of a digit run.
+    fn digit_span(self) -> u32 {
+        self.strtod + 7
+    }
+
+    /// `__radix_pow2(data, start, end, bits) -> f64`: exact power-of-two radix.
+    fn radix_pow2(self) -> u32 {
+        self.strtod + 8
+    }
+
+    /// `__radix_fold(data, start, end, radix) -> f64`: `f64` digit accumulation.
+    fn radix_fold(self) -> u32 {
+        self.strtod + 9
+    }
+
+    /// `__string_to_number(s: i32) -> f64`: `StringToNumber`.
+    fn string_to_number(self) -> u32 {
+        self.strtod + 10
+    }
+
+    /// `__to_number_prim(v: i64) -> i64`: `ToNumber` of a non-symbol primitive.
+    fn to_number_prim(self) -> u32 {
+        self.strtod + 11
+    }
+
+    /// `__parse_float(v: i64) -> i64`: `parseFloat` of a string jsval.
+    fn parse_float(self) -> u32 {
+        self.strtod + 12
+    }
+
+    /// `__random() -> f64`, the `Math.random` generator (right after `__now`).
+    fn random(self) -> u32 {
+        self.now + 1
+    }
+
+    /// `__parse_int(v: i64, radix: i32) -> i64`: `parseInt` of a string jsval.
+    fn parse_int(self) -> u32 {
+        self.strtod + 13
+    }
+
     /// Base address of the realm image (see [`realm`]): right after the
     /// static declaration blocks.
     fn realm(self) -> i32 {
@@ -1103,15 +1118,75 @@ impl Helpers<'_> {
     }
 
     /// `__has_own(key, obj) -> i32`: whether `obj` has the own property `key`
-    /// (see [`props::emit_has_own`]), right after `__new_promise`.
+    /// (see [`props::emit_has_own`]), right after `__new_array`.
     fn has_own(self) -> u32 {
-        self.new_string + 3
+        self.new_string + 2
     }
 
     /// The wasm function index of `builtin`'s body; the bodies follow
     /// `__has_own` in [`Builtin::ALL`] order.
     fn builtin(self, builtin: Builtin) -> u32 {
-        self.new_string + 4 + builtin.index()
+        self.new_string + 3 + builtin.index()
+    }
+
+    /// `__umul128(a, b) -> (low, high)`.
+    fn umul128(self) -> u32 {
+        self.dtoa
+    }
+
+    /// `__ryu_pow5(i, inv) -> (low, high)`.
+    fn ryu_pow5(self) -> u32 {
+        self.dtoa + 1
+    }
+
+    /// `__ryu_mul_shift(m, low, high, j) -> i64`.
+    fn mul_shift(self) -> u32 {
+        self.dtoa + 2
+    }
+
+    /// `__ryu_mp5(value, p) -> i32`.
+    fn multiple_of_pow5(self) -> u32 {
+        self.dtoa + 3
+    }
+
+    /// `__ryu_d2d(bits) -> (digits, exp10)`.
+    fn ryu_d2d(self) -> u32 {
+        self.dtoa + 4
+    }
+
+    /// `__scratch_str(ptr, len) -> i32`.
+    fn scratch_str(self) -> u32 {
+        self.dtoa + 5
+    }
+
+    /// `__num_to_str(bits) -> i32`.
+    fn num_to_str(self) -> u32 {
+        self.dtoa + 6
+    }
+
+    /// `__dec_expand(bits) -> (ptr, count, point)`.
+    fn dec_expand(self) -> u32 {
+        self.dtoa + 7
+    }
+
+    /// `__num_format(bits, mode, f) -> i32`.
+    fn num_format(self) -> u32 {
+        self.dtoa + 8
+    }
+
+    /// `__num_radix(bits, radix) -> i32`.
+    fn num_radix(self) -> u32 {
+        self.dtoa + 9
+    }
+
+    /// `__prim_str(v) -> i32`.
+    fn prim_str(self) -> u32 {
+        self.dtoa + 10
+    }
+
+    /// `__msg_str(v) -> i32`.
+    fn msg_str(self) -> u32 {
+        self.dtoa + 11
     }
 
     /// `__to_primitive(v, hint) -> i64` (see [`convert::emit_to_primitive`]):
@@ -1200,8 +1275,8 @@ impl Helpers<'_> {
         self.to_primitive() + 15
     }
 
-    /// `__promise_self_error() -> i64` (see [`builtins::emit_promise_self_error`]),
-    /// exported under [`PROMISE_SELF_ERROR_EXPORT_NAME`].
+    /// The self-resolution `TypeError` constructor `() -> i64` (see
+    /// [`builtins::emit_promise_self_error`]).
     fn promise_self_error(self) -> u32 {
         self.to_primitive() + 16
     }
@@ -1260,8 +1335,8 @@ impl Helpers<'_> {
         self.settle_resolve_slot + 2 + builtin.index()
     }
 
-    /// `__new_array(len) -> i32`: the exported array constructor, right after
-    /// `__new_string`.
+    /// `__new_array(len) -> i32`: the array constructor, right after
+    /// `new_string`.
     fn new_array(self) -> u32 {
         self.new_string + 1
     }
@@ -1374,24 +1449,35 @@ struct FnLayout {
     blocks: i32,
     /// Base address of the realm image.
     realm: i32,
+    /// Base address of the Unicode table segment ([`unicode::data`]).
+    unicode: i32,
 }
 
 mod array;
+mod builder;
 mod builtins;
 mod convert;
+mod dtoa;
 mod expr;
 mod function;
 mod generator;
 mod json_parse;
+mod libm;
 mod numeric;
 mod object;
+mod promise_engine;
 mod props;
 mod realm;
+mod render;
+mod roots;
 mod runtime;
 mod sections;
 mod stmt;
+mod strtod;
 #[cfg(test)]
 mod tests;
+mod unicode;
+mod unicode_data;
 mod value;
 
 #[allow(clippy::wildcard_imports)]
@@ -1423,17 +1509,18 @@ use stmt::*;
 #[allow(clippy::wildcard_imports)]
 use value::*;
 
-/// Emit a complete WebAssembly module for `program`.
-///
-/// The returned bytes are a self-contained module exporting a single function
-/// `main` with signature `() -> i64`. It declares one `i64` local per program
-/// variable, executes each statement in order, and leaves the value of the last
-/// expression statement on the stack as the result. Values of any earlier
-/// expression statements are dropped. A program with no expression statement
-/// (only declarations) has no value, so the `undefined` jsval is pushed as the
-/// result to keep the `() -> i64` signature total.
+/// Options of a compilation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompileOptions {
+    /// Render the completion value to fd 1 after the final drain.
+    pub print_completion: bool,
+}
+
+/// Emit a complete WebAssembly command module for `program`: exports
+/// `_start` and `memory`, imports the four WASI functions. See the module
+/// documentation.
 #[allow(clippy::too_many_lines)]
-pub fn emit(program: &IrProgram) -> Vec<u8> {
+pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     let mut module = Module::new();
 
     // Collect every distinct string literal and assign each a compile-time byte
@@ -1449,83 +1536,42 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     let info_count = fn_count + 2 + builtin_count();
     let blocks = strings_end + abi::FN_INFO_ENTRY_SIZE.cast_signed() * info_count;
     let realm = blocks + abi::FUNC_BLOCK_SIZE.cast_signed() * fn_count;
+    let intern_base = realm + realm::image_size();
+    let intern = intern_table(&offsets, intern_base);
+    // The raw Unicode tables end the static region; blocks stay 8-aligned.
+    let unicode_base = intern_base + 4 * intern.cap;
     let layout = FnLayout {
         info: strings_end,
         blocks,
         realm,
+        unicode: unicode_base,
     };
-    let intern_base = realm + realm::image_size();
-    let intern = intern_table(&offsets, intern_base);
-    let heap_ptr_init = intern_base + 4 * intern.cap;
+    let heap_ptr_init = (unicode_base + unicode::data_size() + BLOCK_ALIGN - 1) & -BLOCK_ALIGN;
 
     // Type/function sections and the resolved helper indices (see
     // [`build_type_and_function_sections`]).
     // Per-function exception-unwinding state, reset at each function body.
     // Owned here so it outlives every `emit_main`/`emit_function` call below.
     let unwind = RefCell::new(Unwind::default());
-    let (
-        types,
-        functions,
-        helpers,
-        print_type,
-        convert_type,
-        method_type,
-        promise_type,
-        then_type,
-        now_type,
-        parse_int_type,
-    ) = build_type_and_function_sections(program, &unwind, layout);
+    let (mut types, mut functions, helpers, import_types) =
+        build_type_and_function_sections(program, &unwind, layout);
+    libm::register(&mut types, &mut functions);
+    promise_engine::register(&mut types, &mut functions);
     module.section(&types);
 
-    // Import section: the host `print` function backing `console.log` (index 0),
-    // the host `__convert` function backing the conversions (index 1), and the
-    // host `__method` function backing the array/string methods (index 2).
+    // Import section: exactly the four WASI functions (indices 0..=3).
     // Imports occupy the lowest function indices, so every defined
-    // function/element/export index is shifted by IMPORT_FUNC_COUNT (accounted for
-    // in `build_type_and_function_sections` and below). This follows the type
-    // section and precedes the function section (wasm section order); the order of
-    // the imports here must match their assigned indices in `Helpers`.
+    // function/element/export index is shifted by IMPORT_FUNC_COUNT.
     let mut imports = ImportSection::new();
-    imports.import(
-        PRINT_IMPORT_MODULE,
-        PRINT_IMPORT_NAME,
-        EntityType::Function(print_type),
-    );
-    imports.import(
-        CONVERT_IMPORT_MODULE,
-        CONVERT_IMPORT_NAME,
-        EntityType::Function(convert_type),
-    );
-    imports.import(
-        METHOD_IMPORT_MODULE,
-        METHOD_IMPORT_NAME,
-        EntityType::Function(method_type),
-    );
-    // The host promise imports (indices 3/4): `__promise(op, a, b) -> i64`
-    // and `__then(p, on_f, on_r) -> i64`, backing the host promise engine.
-    imports.import(
-        PROMISE_IMPORT_MODULE,
-        PROMISE_IMPORT_NAME,
-        EntityType::Function(promise_type),
-    );
-    imports.import(
-        THEN_IMPORT_MODULE,
-        THEN_IMPORT_NAME,
-        EntityType::Function(then_type),
-    );
-    // The host wall-clock import (backing `Date`, index 5): `__now() -> f64`,
-    // milliseconds since the Unix epoch, backing `Date.now()` / `new Date()`.
-    imports.import(
-        NOW_IMPORT_MODULE,
-        NOW_IMPORT_NAME,
-        EntityType::Function(now_type),
-    );
-    // The host `parseInt` import (index 6): `__parse_int(s, radix) -> i64`.
-    imports.import(
-        PARSE_INT_IMPORT_MODULE,
-        PARSE_INT_IMPORT_NAME,
-        EntityType::Function(parse_int_type),
-    );
+    let names = [
+        (abi::WASI_MODULE, abi::WASI_FD_WRITE_NAME),
+        (abi::WASI_MODULE, abi::WASI_CLOCK_TIME_GET_NAME),
+        (abi::WASI_MODULE, abi::WASI_RANDOM_GET_NAME),
+        (abi::WASI_MODULE, abi::WASI_PROC_EXIT_NAME),
+    ];
+    for ((module_name, name), ty) in names.into_iter().zip(import_types) {
+        imports.import(module_name, name, EntityType::Function(ty));
+    }
     module.section(&imports);
 
     module.section(&functions);
@@ -1562,50 +1608,10 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // exception-unwinding globals (see [`build_globals`]).
     module.section(&build_globals(heap_ptr_init, &intern, program.module_cells));
 
-    // Export section: `main` as function index IMPORT_FUNC_COUNT (the first
-    // DEFINED function, after the imports), memory index 0 as "memory" (function
-    // imports do not shift the single memory's index).
+    // Export section: exactly `_start` and memory index 0 as "memory".
     let mut exports = ExportSection::new();
-    exports.export(EXPORT_NAME, ExportKind::Func, IMPORT_FUNC_COUNT);
+    exports.export(abi::START_EXPORT_NAME, ExportKind::Func, helpers.start());
     exports.export(MEMORY_EXPORT_NAME, ExportKind::Memory, 0);
-    // The bump-allocator heap pointer global is exported so the run stage can
-    // detect the out-of-memory sentinel.
-    exports.export(HEAP_PTR_EXPORT_NAME, ExportKind::Global, HEAP_PTR_GLOBAL);
-    // The exception-unwinding globals are exported so the run stage can
-    // detect and render an uncaught exception after `main` returns.
-    exports.export(
-        EXC_PENDING_EXPORT_NAME,
-        ExportKind::Global,
-        EXC_PENDING_GLOBAL,
-    );
-    exports.export(EXC_VALUE_EXPORT_NAME, ExportKind::Global, EXC_VALUE_GLOBAL);
-    // The `__invoke1` callback trampoline is exported so the host promise
-    // engine can run a `.then`/`.catch`/`.finally` reaction's guest callback
-    // re-entrantly. It is the LAST defined function (appended after every helper).
-    exports.export(INVOKE_EXPORT_NAME, ExportKind::Func, helpers.invoke1);
-    // The `__async_step` trampoline is exported so the host async engine
-    // can drive an `async function` body's state machine one suspend at a time.
-    exports.export(ASYNC_STEP_EXPORT_NAME, ExportKind::Func, helpers.async_step);
-    // The allocator and the guest constructors: the hosts allocate every
-    // string/array/promise block through these, never by hand.
-    exports.export(ALLOC_EXPORT_NAME, ExportKind::Func, helpers.alloc);
-    exports.export(NEW_STRING_EXPORT_NAME, ExportKind::Func, helpers.new_string);
-    exports.export(
-        NEW_ARRAY_EXPORT_NAME,
-        ExportKind::Func,
-        helpers.new_string + 1,
-    );
-    exports.export(
-        NEW_PROMISE_EXPORT_NAME,
-        ExportKind::Func,
-        helpers.new_string + 2,
-    );
-    // The self-resolution `TypeError` the hosts reject `resolve(p)`-with-`p` with.
-    exports.export(
-        PROMISE_SELF_ERROR_EXPORT_NAME,
-        ExportKind::Func,
-        helpers.promise_self_error(),
-    );
     module.section(&exports);
 
     // Element section: an active segment filling the funcref table at offset
@@ -1633,151 +1639,189 @@ pub fn emit(program: &IrProgram) -> Vec<u8> {
     // Code section: `main` first, then each user function's body, then the
     // helpers last (mirroring the function-index order above).
     let mut code = CodeSection::new();
-    code.function(&emit_main(program, &offsets, helpers));
+    let leaves = roots::leaf_set(helpers);
+    code.function(&emit_main(program, &offsets, helpers, &leaves));
     for func in &program.functions {
         // A generator state machine emits a `switch (gen.state)` dispatch
         // over its segments rather than a straight-line body.
         if func.machine.is_some() {
-            code.function(&generator::emit_generator_sm(func, &offsets, helpers));
+            code.function(&generator::emit_generator_sm(
+                func, &offsets, helpers, &leaves,
+            ));
         } else {
-            code.function(&emit_function(func, &offsets, helpers));
+            code.function(&emit_function(func, &offsets, helpers, &leaves));
         }
     }
-    code.function(&emit_alloc());
-    code.function(&emit_concat(helpers.alloc));
-    code.function(&emit_str_eq());
-    code.function(&emit_str_cmp());
-    code.function(&emit_str_index(helpers.alloc));
-    code.function(&emit_str_hash());
-    code.function(&emit_intern_slot(helpers));
-    code.function(&emit_intern_find(helpers));
-    code.function(&emit_intern(helpers));
-    code.function(&emit_index_value());
-    code.function(&emit_index_string(helpers));
-    code.function(&emit_str_exotic_index(helpers));
-    code.function(&emit_to_key(&offsets, helpers));
-    code.function(&emit_prop_find(helpers));
-    code.function(&emit_define(helpers));
-    code.function(&emit_fn_materialize(&offsets, helpers));
-    code.function(&emit_get(&offsets, helpers));
-    code.function(&emit_set(helpers));
-    code.function(&emit_has(&offsets, helpers));
-    code.function(&emit_delete(&offsets, helpers));
-    code.function(&emit_own_keys(helpers));
-    code.function(&emit_for_in_keys(helpers));
-    code.function(&emit_copy_data(helpers));
-    code.function(&emit_array_reserve(helpers.alloc));
+    code.function(&emit_alloc(&leaves));
+    code.function(&emit_concat(helpers.alloc, &leaves));
+    code.function(&emit_str_eq(&leaves));
+    code.function(&emit_str_cmp(&leaves));
+    code.function(&emit_str_index(helpers.alloc, &leaves));
+    code.function(&emit_str_hash(&leaves));
+    code.function(&emit_intern_slot(helpers, &leaves));
+    code.function(&emit_intern_find(helpers, &leaves));
+    code.function(&emit_intern(helpers, &leaves));
+    code.function(&emit_index_value(&leaves));
+    code.function(&emit_index_string(helpers, &leaves));
+    code.function(&emit_str_exotic_index(helpers, &leaves));
+    code.function(&emit_to_key(&offsets, helpers, &leaves));
+    code.function(&emit_prop_find(helpers, &leaves));
+    code.function(&emit_define(helpers, &leaves));
+    code.function(&emit_fn_materialize(&offsets, helpers, &leaves));
+    code.function(&emit_get(&offsets, helpers, &leaves));
+    code.function(&emit_set(helpers, &leaves));
+    code.function(&emit_has(&offsets, helpers, &leaves));
+    code.function(&emit_delete(&offsets, helpers, &leaves));
+    code.function(&emit_own_keys(helpers, &leaves));
+    code.function(&emit_for_in_keys(helpers, &leaves));
+    code.function(&emit_copy_data(helpers, &leaves));
+    code.function(&emit_array_reserve(helpers.alloc, &leaves));
     code.function(&emit_array_push(
         helpers.array_reserve(),
         helpers.sparse_define(),
+        &leaves,
     ));
     code.function(&emit_array_concat(
         helpers.array_reserve(),
         helpers.sparse_get(),
         helpers.proto_elem(),
+        &leaves,
     ));
-    code.function(&emit_array_set(&offsets, helpers, false));
-    code.function(&emit_array_set_length(&offsets, helpers));
-    code.function(&emit_sparse_get(helpers));
-    code.function(&emit_sparse_set(helpers, false));
-    code.function(&emit_protos_indexless());
-    code.function(&emit_proto_elem(helpers));
-    code.function(&emit_proto_set(helpers));
-    code.function(&emit_array_set(&offsets, helpers, true));
-    code.function(&emit_sparse_set(helpers, true));
-    code.function(&emit_json_escape(helpers.alloc));
+    code.function(&emit_array_set(&offsets, helpers, false, &leaves));
+    code.function(&emit_array_set_length(&offsets, helpers, &leaves));
+    code.function(&emit_sparse_get(helpers, &leaves));
+    code.function(&emit_sparse_set(helpers, false, &leaves));
+    code.function(&emit_protos_indexless(&leaves));
+    code.function(&emit_proto_elem(helpers, &leaves));
+    code.function(&emit_proto_set(helpers, &leaves));
+    code.function(&emit_array_set(&offsets, helpers, true, &leaves));
+    code.function(&emit_sparse_set(helpers, true, &leaves));
+    code.function(&emit_json_escape(helpers.alloc, &leaves));
     code.function(&emit_json_str(
-        helpers.convert,
+        helpers.num_to_str(),
         helpers.json_escape,
         JsonTokens::resolve(&offsets),
+        &leaves,
     ));
-    code.function(&emit_same_value_zero(helpers.str_eq));
-    code.function(&emit_map_find(helpers.same_value_zero));
-    code.function(&emit_map_set(helpers.map_find, helpers.array_push));
-    code.function(&emit_map_get(helpers.map_find));
-    code.function(&emit_map_has(helpers.map_find));
-    code.function(&emit_map_delete(helpers.map_find));
+    code.function(&emit_same_value_zero(helpers.str_eq, &leaves));
+    code.function(&builtins::emit_array_search(helpers, &leaves));
+    code.function(&emit_map_find(helpers.same_value_zero, &leaves));
+    code.function(&emit_map_set(helpers.map_find, helpers.array_push, &leaves));
+    code.function(&emit_map_get(helpers.map_find, &leaves));
+    code.function(&emit_map_has(helpers.map_find, &leaves));
+    code.function(&emit_map_delete(helpers.map_find, &leaves));
     // `__loose_eq` (loose `==`) and `__str_to_array` (string spread) follow the
     // Map/Set helpers.
-    code.function(&emit_loose_eq(helpers));
+    code.function(&emit_loose_eq(helpers, &leaves));
     code.function(&emit_str_to_array(
         helpers.new_array(),
         helpers.str_index,
         helpers.alloc,
+        &leaves,
     ));
     // The in-wasm `JSON.parse` family, in the order their indices were assigned.
-    code.function(&emit_json_ws());
-    code.function(&emit_json_throw(&offsets, helpers));
-    code.function(&emit_json_string(helpers.alloc, helpers));
-    code.function(&emit_json_number(helpers.alloc, helpers.convert, helpers));
-    code.function(&emit_json_value(helpers));
-    code.function(&emit_json_array(helpers));
-    code.function(&emit_json_object(helpers.alloc, helpers));
-    code.function(&emit_json_parse(helpers));
+    code.function(&emit_json_ws(&leaves));
+    code.function(&emit_json_throw(&offsets, helpers, &leaves));
+    code.function(&emit_json_string(helpers.alloc, helpers, &leaves));
+    code.function(&emit_json_number(helpers, &leaves));
+    code.function(&emit_json_value(helpers, &leaves));
+    code.function(&emit_json_array(helpers, &leaves));
+    code.function(&emit_json_object(helpers.alloc, helpers, &leaves));
+    code.function(&emit_json_parse(helpers, &leaves));
     // `__gen_to_array` — the generator-spread drain — precedes the
     // trampoline so every later index stays stable.
-    code.function(&generator::emit_gen_to_array(helpers));
-    code.function(&emit_nullish_throw(&offsets, helpers));
-    code.function(&emit_prop_throw(&offsets, helpers));
+    code.function(&generator::emit_gen_to_array(helpers, &leaves));
+    code.function(&emit_nullish_throw(&offsets, helpers, &leaves));
+    code.function(&emit_prop_throw(&offsets, helpers, &leaves));
     // The `__invoke1` callback trampoline is appended after every helper so
     // every helper index stays stable; the `__async_step` trampoline
     // follows it, then the two `new Promise` settler functions.
-    code.function(&emit_box_f64_helper());
-    code.function(&emit_to_number_helper(&offsets, helpers));
-    code.function(&emit_invoke1(helpers));
-    code.function(&generator::emit_async_step(helpers));
-    code.function(&emit_settler(PROMISE_OP_SETTLE_FULFILL, helpers));
-    code.function(&emit_settler(PROMISE_OP_SETTLE_REJECT, helpers));
-    code.function(&emit_new_string(helpers.alloc));
+    code.function(&emit_box_f64_helper(&leaves));
+    code.function(&emit_to_number_helper(&offsets, helpers, &leaves));
+    for helper in dtoa::emit_helpers(&offsets, helpers, &leaves) {
+        code.function(&helper);
+    }
+    code.function(&strtod::emit_num_unit(&leaves));
+    code.function(&strtod::emit_str_ws(&leaves));
+    code.function(&strtod::emit_dec_parse(helpers, &leaves));
+    code.function(&strtod::emit_dec_slow(helpers, &leaves));
+    code.function(&strtod::emit_dec_round(&leaves));
+    code.function(&strtod::emit_dec_left(&leaves));
+    code.function(&strtod::emit_dec_right(&leaves));
+    code.function(&strtod::emit_digit_span(helpers, &leaves));
+    code.function(&strtod::emit_radix_pow2(helpers, &leaves));
+    code.function(&strtod::emit_radix_fold(helpers, &leaves));
+    code.function(&strtod::emit_string_to_number(helpers, &leaves));
+    code.function(&strtod::emit_to_number_prim(helpers, &leaves));
+    code.function(&strtod::emit_parse_float(helpers, &leaves));
+    code.function(&strtod::emit_parse_int(helpers, &leaves));
+    code.function(&numeric::emit_now(&leaves));
+    code.function(&numeric::emit_random(&leaves));
+    code.function(&emit_invoke1(helpers, &leaves));
+    code.function(&generator::emit_async_step(helpers, &leaves));
+    code.function(&emit_settler(abi::PROMISE_FULFILLED, helpers, &leaves));
+    code.function(&emit_settler(abi::PROMISE_REJECTED, helpers, &leaves));
+    code.function(&emit_new_string(helpers.alloc, &leaves));
     code.function(&emit_new_array(
         helpers.alloc,
         intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Array), helpers),
-    ));
-    code.function(&emit_new_promise(
-        helpers.alloc,
-        intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Promise), helpers),
+        &leaves,
     ));
     // The realm: `__has_own`, then the builtin bodies.
-    code.function(&emit_has_own(&offsets, helpers));
+    code.function(&emit_has_own(&offsets, helpers, &leaves));
     for builtin in Builtin::ALL {
-        code.function(&builtins::emit_builtin(builtin, &offsets, helpers));
+        code.function(&builtins::emit_builtin(builtin, &offsets, helpers, &leaves));
     }
     // The conversion helpers follow the builtin bodies.
-    code.function(&emit_to_primitive(&offsets, helpers));
-    code.function(&convert::emit_to_string(&offsets, helpers));
-    code.function(&emit_add_helper(helpers));
-    code.function(&emit_compare(helpers));
-    code.function(&emit_array_join(&offsets, helpers));
-    code.function(&builtins::emit_to_object(&offsets, helpers));
-    code.function(&builtins::emit_json_rep(&offsets, helpers));
-    code.function(&builtins::emit_json_indent(helpers));
-    code.function(&builtins::emit_json_revive(helpers));
-    code.function(&emit_define_own(&offsets, helpers));
-    code.function(&emit_to_desc(&offsets, helpers));
-    code.function(&emit_own_desc(&offsets, helpers));
-    code.function(&emit_set_integrity(helpers));
-    code.function(&emit_test_integrity());
-    code.function(&emit_own_enum(&offsets, helpers));
-    code.function(&emit_set_proto(helpers));
-    code.function(&builtins::emit_promise_self_error(&offsets, helpers));
-    code.function(&emit_symbol_get(helpers));
-    code.function(&emit_super_get(&offsets, helpers));
-    code.function(&emit_super_set(&offsets, helpers));
-    code.function(&emit_private_find(helpers));
-    code.function(&emit_private_add(helpers));
-    code.function(&emit_private_get(helpers));
-    code.function(&emit_private_set(helpers));
-    code.function(&emit_private_brand(helpers));
-    code.function(&emit_private_in(&offsets, helpers));
+    code.function(&emit_to_primitive(&offsets, helpers, &leaves));
+    code.function(&convert::emit_to_string(&offsets, helpers, &leaves));
+    code.function(&emit_add_helper(helpers, &leaves));
+    code.function(&emit_compare(helpers, &leaves));
+    code.function(&emit_array_join(&offsets, helpers, &leaves));
+    code.function(&builtins::emit_to_object(&offsets, helpers, &leaves));
+    code.function(&builtins::emit_json_rep(&offsets, helpers, &leaves));
+    code.function(&builtins::emit_json_indent(helpers, &leaves));
+    code.function(&builtins::emit_json_revive(helpers, &leaves));
+    code.function(&emit_define_own(&offsets, helpers, &leaves));
+    code.function(&emit_to_desc(&offsets, helpers, &leaves));
+    code.function(&emit_own_desc(&offsets, helpers, &leaves));
+    code.function(&emit_set_integrity(helpers, &leaves));
+    code.function(&emit_test_integrity(&leaves));
+    code.function(&emit_own_enum(&offsets, helpers, &leaves));
+    code.function(&emit_set_proto(helpers, &leaves));
+    code.function(&builtins::emit_promise_self_error(
+        &offsets, helpers, &leaves,
+    ));
+    code.function(&emit_symbol_get(helpers, &leaves));
+    code.function(&emit_super_get(&offsets, helpers, &leaves));
+    code.function(&emit_super_set(&offsets, helpers, &leaves));
+    code.function(&emit_private_find(helpers, &leaves));
+    code.function(&emit_private_add(helpers, &leaves));
+    code.function(&emit_private_get(helpers, &leaves));
+    code.function(&emit_private_set(helpers, &leaves));
+    code.function(&emit_private_brand(helpers, &leaves));
+    code.function(&emit_private_in(&offsets, helpers, &leaves));
+    for helper in render::emit_helpers(&offsets, helpers, &leaves) {
+        code.function(&helper);
+    }
+    code.function(&emit_start(&offsets, helpers, options, &leaves));
+    // The families after `_start`, in index order: Unicode, libm, then the
+    // promise engine.
+    for helper in unicode::emit_helpers(helpers, &leaves) {
+        code.function(&helper);
+    }
+    for helper in libm::emit_helpers(helpers, &leaves) {
+        code.function(&helper);
+    }
+    for helper in promise_engine::emit_helpers(&offsets, helpers, &leaves) {
+        code.function(&helper);
+    }
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.
-    module.section(&emit_data_section(
-        &offsets,
-        &intern,
-        &program.functions,
-        layout,
-    ));
+    let mut data = emit_data_section(&offsets, &intern, &program.functions, layout);
+    libm::emit_data(&mut data);
+    module.section(&data);
 
     module.finish()
 }

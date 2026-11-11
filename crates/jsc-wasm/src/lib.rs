@@ -13,7 +13,19 @@
 use wasm_bindgen::JsError;
 use wasm_bindgen::prelude::wasm_bindgen;
 
+use jsc_core::emit::CompileOptions;
 use jsc_core::error::CompileError;
+
+#[wasm_bindgen]
+extern "C" {
+    /// The options object of [`compile`].
+    #[wasm_bindgen(typescript_type = "{ printCompletion?: boolean }")]
+    pub type JsCompileOptions;
+
+    /// `options.printCompletion`.
+    #[wasm_bindgen(method, getter, js_name = printCompletion)]
+    fn print_completion(this: &JsCompileOptions) -> Option<bool>;
+}
 
 /// Compile JavaScript `src` to the bytes of a WebAssembly module.
 ///
@@ -22,18 +34,24 @@ use jsc_core::error::CompileError;
 /// codegen failure is surfaced as a `JsError` (a JS `Error`); when the
 /// underlying [`CompileError`] carries a source span, the message is the
 /// rustc/swc-style caret block the CLI prints, so the browser can show exactly
-/// where compilation failed.
+/// where compilation failed. With `printCompletion`, the module renders its
+/// completion value to fd 1 after the final drain.
 #[wasm_bindgen]
-pub fn compile(src: &str) -> Result<Vec<u8>, JsError> {
-    compile_inner(src).map_err(|err| JsError::new(&render_error(&err, src)))
+pub fn compile(src: &str, options: Option<JsCompileOptions>) -> Result<Vec<u8>, JsError> {
+    let options = CompileOptions {
+        print_completion: options
+            .and_then(|options| options.print_completion())
+            .unwrap_or(false),
+    };
+    compile_inner(src, options).map_err(|err| JsError::new(&render_error(&err, src)))
 }
 
 /// The pipeline itself: parse, lower, emit. Kept separate so [`compile`] only
 /// concerns itself with turning the error into a `JsError`.
-fn compile_inner(src: &str) -> anyhow::Result<Vec<u8>> {
+fn compile_inner(src: &str, options: CompileOptions) -> anyhow::Result<Vec<u8>> {
     let program = jsc_core::frontend::parse(src, jsc_core::frontend::Dialect::Js)?;
     let ir = jsc_core::codegen::lower(&program)?;
-    Ok(jsc_core::emit::emit(&ir))
+    Ok(jsc_core::emit::emit(&ir, options))
 }
 
 /// Render a pipeline error into a diagnostic string. A spanned [`CompileError`]

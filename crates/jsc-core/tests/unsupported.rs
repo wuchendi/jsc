@@ -1,7 +1,7 @@
 //! Integration tests: out-of-scope constructs that must fail with a clear error, not a wrong value.
 
 mod common;
-use common::assert_uncaught;
+use common::{assert_uncaught, eval_text};
 
 // ---------------------------------------------------------------------------
 // An unknown / not-yet-implemented method is a run-time `TypeError` from the
@@ -49,41 +49,30 @@ fn unknown_object_method_throws_at_runtime() {
 
 #[test]
 fn method_added_after_literal_is_callable() {
-    use jsc_core::run::{Value, compile_and_run};
     // A method added to an object after its literal is an ordinary property, so
     // calling it works (dot and computed forms, arrow and method values).
+    assert_eq!(eval_text("let o = {}; o.f = () => 1; o.f()"), "1",);
     assert_eq!(
-        compile_and_run("let o = {}; o.f = () => 1; o.f()").expect("added method must run"),
-        Value::Number(1.0),
-    );
-    assert_eq!(
-        compile_and_run("const o = { a: 2 }; o[\"g\"] = function () { return this.a }; o.g()")
-            .expect("added method must run"),
-        Value::Number(2.0),
+        eval_text("const o = { a: 2 }; o[\"g\"] = function () { return this.a }; o.g()"),
+        "2",
     );
 }
 
 #[test]
 fn keeps_dynamic_shape_receivers_at_runtime() {
-    use jsc_core::run::{Value, compile_and_run};
     // Soundness: a receiver whose shape is NOT statically fixed must keep runtime
     // dispatch — the static-shape guard must never reject a valid program. A `let`
     // reassigned to a different object holds an unknown shape at the call site.
     assert_eq!(
-        compile_and_run("let o = { f() { return 1 } }; o = { bar() { return 2 } }; o.bar()")
-            .expect("reassigned receiver must keep runtime dispatch"),
-        Value::Number(2.0),
+        eval_text("let o = { f() { return 1 } }; o = { bar() { return 2 } }; o.bar()"),
+        "2",
     );
     // Calling a method that IS in the known shape stays valid.
-    assert_eq!(
-        compile_and_run("let o = { f() { return 7 } }; o.f()").expect("known method must run"),
-        Value::Number(7.0),
-    );
+    assert_eq!(eval_text("let o = { f() { return 7 } }; o.f()"), "7",);
     // A class instance receiver has no object-literal shape => runtime dispatch.
     assert_eq!(
-        compile_and_run("class P { m() { return 9 } } let p = new P(); p.m()")
-            .expect("class instance method must run"),
-        Value::Number(9.0),
+        eval_text("class P { m() { return 9 } } let p = new P(); p.m()"),
+        "9",
     );
 }
 
@@ -132,30 +121,27 @@ fn dynamic_shape_unknown_method_throws_typeerror() {
     // The thrown value is a real branded TypeError object, so
     // `try`/`catch` can observe its identity and read its fields.
     assert_eq!(
-        jsc_core::run::compile_and_run(
+        eval_text(
             "class A { f() { return 1 } } let a = new A(); let caught = false; \
              try { a.bar() } catch (e) { caught = e instanceof TypeError } caught"
-        )
-        .expect("the guard's TypeError must be catchable"),
-        jsc_core::run::Value::Bool(true),
+        ),
+        "true",
     );
     // It is also `instanceof Error`, and its `.message` is the bare reason (the
     // `TypeError:` prefix belongs to `.stack` / the uncaught render).
     assert_eq!(
-        jsc_core::run::compile_and_run(
+        eval_text(
             "class A { f() { return 1 } } let a = new A(); let caught = false; \
              try { a.bar() } catch (e) { caught = e instanceof Error } caught"
-        )
-        .expect("the guard's TypeError must be an Error"),
-        jsc_core::run::Value::Bool(true),
+        ),
+        "true",
     );
     assert_eq!(
-        jsc_core::run::compile_and_run(
+        eval_text(
             "class A { f() { return 1 } } let a = new A(); let m = 0; \
              try { a.bar() } catch (e) { m = e.message } m"
-        )
-        .expect("the guard's TypeError message must be readable"),
-        jsc_core::run::Value::Str("a.bar is not a function".to_owned()),
+        ),
+        "a.bar is not a function",
     );
 }
 

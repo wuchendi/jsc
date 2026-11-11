@@ -22,17 +22,12 @@ macro_rules! wasm {
 /// `memory.size * 64 KiB`. On
 /// overflow the cold path grows by `max(needed, current)` pages (at least
 /// doubling), falling back to exactly the needed pages. When even that fails
-/// (the module's memory `maximum` is reached) it stores the sticky
-/// [`abi::HEAP_PTR_OOM`] sentinel in `__heap_ptr` and traps; the run stage maps
-/// the sentinel to `Uncaught RangeError: out of memory`. The sentinel also makes
-/// every later allocation fail. The `i32` param is local 0; extra locals hold the
+/// (the module's memory `maximum` is reached) it writes the static
+/// [`abi::OOM_LINE`] to fd 2 through its static iovec, allocating nothing, and
+/// calls `proc_exit(1)`. The `i32` param is local 0; extra locals hold the
 /// old pointer (i32), the end offset (i64), and the needed page count (i32).
-pub(super) fn emit_alloc() -> Function {
-    let mut function = Function::new(vec![
-        (1, ValType::I32),
-        (1, ValType::I64),
-        (1, ValType::I32),
-    ]);
+pub(super) fn emit_alloc(leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I64, RAW_I32]);
     let (size, old, end, need) = (0, 1, 2, 3);
     // old = __heap_ptr; end = u64(old) + ((u64(size) + 7) & !7).
     function.instruction(&Instruction::GlobalGet(HEAP_PTR_GLOBAL));
@@ -80,10 +75,12 @@ pub(super) fn emit_alloc() -> Function {
     function.instruction(&Instruction::I32Const(-1));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
-    // Out of memory: store the sticky sentinel and trap.
-    function.instruction(&Instruction::I32Const(abi::HEAP_PTR_OOM));
-    function.instruction(&Instruction::GlobalSet(HEAP_PTR_GLOBAL));
-    function.instruction(&Instruction::Unreachable);
+    // Out of memory: the static line on fd 2, then `proc_exit(1)`.
+    wasm!(function;
+        I32Const(2), I32Const(abi::OOM_IOVEC.cast_signed()), I32Const(1),
+        I32Const(abi::WASI_NWRITTEN.cast_signed()), Call(FD_WRITE_IMPORT), Drop,
+        I32Const(1), Call(PROC_EXIT_IMPORT), Unreachable,
+    );
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
@@ -100,12 +97,12 @@ pub(super) fn emit_alloc() -> Function {
     }));
     function.instruction(&Instruction::LocalGet(old));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit `__alloc(size)` for a block of kind `type_byte`, store the type byte,
 /// and leave the base in local `base`.
-fn emit_new_block(function: &mut Function, alloc: u32, base: u32, type_byte: i32) {
+fn emit_new_block(function: &mut impl Sink, alloc: u32, base: u32, type_byte: i32) {
     function.instruction(&Instruction::Call(alloc));
     function.instruction(&Instruction::LocalTee(base));
     function.instruction(&Instruction::I32Const(type_byte));
@@ -116,12 +113,12 @@ fn emit_new_block(function: &mut Function, alloc: u32, base: u32, type_byte: i32
     }));
 }
 
-/// Emit the exported `__new_string(len: i32, two_byte: i32) -> i32`
-/// constructor: a [`TYPE_STRING`] block of `len` code units — Latin-1 bytes,
-/// or UTF-16LE units with `STR_FLAG_TWO_BYTE` when `two_byte` (`0`/`1`) —
-/// whose data the host fills. Locals 0/1 are the params; local 2 the base.
-pub(super) fn emit_new_string(alloc: u32) -> Function {
-    let mut function = Function::new(vec![(1, ValType::I32)]);
+/// Emit the `new_string(len: i32, two_byte: i32) -> i32` constructor: a
+/// [`TYPE_STRING`] block of `len` code units — Latin-1 bytes, or UTF-16LE units
+/// with `STR_FLAG_TWO_BYTE` when `two_byte` (`0`/`1`) — whose data the caller
+/// fills. Locals 0/1 are the params; local 2 the base.
+pub(super) fn emit_new_string(alloc: u32, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[RAW_I32, RAW_I32], &[ROOT_BASE]);
     let (len, two_byte, base) = (0, 1, 2);
     emit_alloc_str(
         &mut function,
@@ -131,7 +128,7 @@ pub(super) fn emit_new_string(alloc: u32) -> Function {
         base,
     );
     wasm!(function; LocalGet(base), End);
-    function
+    finish_builder(function)
 }
 
 /// The `STR_FLAG_TWO_BYTE` bit of a string block's flags byte.
@@ -161,11 +158,11 @@ const DATA: u64 = abi::STR_DATA_OFFSET as u64;
 /// `s = __alloc(STR_DATA_OFFSET + (len << w))` as a [`TYPE_STRING`] block of
 /// `len` code units (pushed by `len`), `TWO_BYTE` when `w` (pushes `0`/`1`),
 /// leaving the base in i32 local `s`.
-pub(super) fn emit_alloc_str(
-    function: &mut Function,
+pub(super) fn emit_alloc_str<S: Sink>(
+    function: &mut S,
     alloc: u32,
-    len: impl Fn(&mut Function),
-    w: impl Fn(&mut Function),
+    len: impl Fn(&mut S),
+    w: impl Fn(&mut S),
     s: u32,
 ) {
     len(function);
@@ -179,7 +176,7 @@ pub(super) fn emit_alloc_str(
 }
 
 /// Push `1` when the string block in i32 local `s` is `TWO_BYTE`, else `0`.
-pub(super) fn emit_str_two_byte(function: &mut Function, s: u32) {
+pub(super) fn emit_str_two_byte(function: &mut impl Sink, s: u32) {
     wasm!(function;
         LocalGet(s), I32Load8U(mem8(u64::from(abi::HEADER_FLAGS_OFFSET))),
         I32Const(TWO_BYTE), I32And, I32Const(0), I32Ne,
@@ -188,7 +185,7 @@ pub(super) fn emit_str_two_byte(function: &mut Function, s: u32) {
 
 /// Push code unit `i` (i32 local) of the string block in i32 local `s`, read
 /// at the width in i32 local `w` (`0` one-byte, `1` two-byte).
-pub(super) fn emit_str_unit(function: &mut Function, s: u32, i: u32, w: u32) {
+pub(super) fn emit_str_unit(function: &mut impl Sink, s: u32, i: u32, w: u32) {
     wasm!(function;
         LocalGet(w),
         If(BlockType::Result(ValType::I32)),
@@ -203,7 +200,7 @@ pub(super) fn emit_str_unit(function: &mut Function, s: u32, i: u32, w: u32) {
 /// against the length in i32 local `len`) of the two-byte string block in
 /// i32 local `s` are a lead (`D800–DBFF`) and a trail (`DC00–DFFF`)
 /// surrogate, else `0`.
-pub(super) fn emit_surrogate_pair_at(function: &mut Function, s: u32, i: u32, len: u32) {
+pub(super) fn emit_surrogate_pair_at(function: &mut impl Sink, s: u32, i: u32, len: u32) {
     wasm!(function;
         LocalGet(i), I32Const(1), I32Add, LocalGet(len), I32LtU,
         If(BlockType::Result(ValType::I32)),
@@ -217,7 +214,7 @@ pub(super) fn emit_surrogate_pair_at(function: &mut Function, s: u32, i: u32, le
 
 /// `dst` = a fresh two-unit, two-byte string of units `i` and `i + 1` (i32
 /// local `i`) of the two-byte string block in i32 local `s`.
-pub(super) fn emit_str_pair(function: &mut Function, alloc: u32, s: u32, i: u32, dst: u32) {
+pub(super) fn emit_str_pair(function: &mut impl Sink, alloc: u32, s: u32, i: u32, dst: u32) {
     emit_alloc_str(
         function,
         alloc,
@@ -235,12 +232,12 @@ pub(super) fn emit_str_pair(function: &mut Function, alloc: u32, s: u32, i: u32,
 
 /// Store the code unit pushed by `unit` as unit `i` (i32 local) of the string
 /// block in i32 local `s` of the width in i32 local `w`.
-pub(super) fn emit_store_unit(
-    function: &mut Function,
+pub(super) fn emit_store_unit<S: Sink>(
+    function: &mut S,
     s: u32,
     i: u32,
     w: u32,
-    unit: impl Fn(&mut Function),
+    unit: impl Fn(&mut S),
 ) {
     wasm!(function;
         LocalGet(w),
@@ -255,7 +252,7 @@ pub(super) fn emit_store_unit(
 
 /// [`emit_str_narrow`] the string block in i32 local `s` when the i32 local
 /// `w` (its width) is set.
-pub(super) fn emit_str_canonical(function: &mut Function, w: u32, s: u32, i: u32, n: u32) {
+pub(super) fn emit_str_canonical(function: &mut impl Sink, w: u32, s: u32, i: u32, n: u32) {
     wasm!(function; LocalGet(w), If(BlockType::Empty));
     emit_str_narrow(function, s, i, n);
     wasm!(function; End);
@@ -264,7 +261,7 @@ pub(super) fn emit_str_canonical(function: &mut Function, w: u32, s: u32, i: u32
 /// Narrow the `TWO_BYTE` string block in i32 local `s` in place to one-byte
 /// when every code unit is `<= 0xFF` (the canonical form); `i` and `n` are
 /// i32 scratch.
-pub(super) fn emit_str_narrow(function: &mut Function, s: u32, i: u32, n: u32) {
+pub(super) fn emit_str_narrow(function: &mut impl Sink, s: u32, i: u32, n: u32) {
     let flags = mem8(u64::from(abi::HEADER_FLAGS_OFFSET));
     wasm!(function;
         LocalGet(s), I32Load(mem32(STR_LEN_OFFSET)), LocalSet(n),
@@ -303,12 +300,12 @@ fn mem32(offset: u64) -> MemArg {
 }
 
 /// Replace the string block base on the stack with its u32 `len`.
-pub(super) fn emit_load_str_len(function: &mut Function) {
+pub(super) fn emit_load_str_len(function: &mut impl Sink) {
     function.instruction(&Instruction::I32Load(mem32(STR_LEN_OFFSET)));
 }
 
 /// Replace the string block base on the stack with the address of its data.
-pub(super) fn emit_str_data(function: &mut Function) {
+pub(super) fn emit_str_data(function: &mut impl Sink) {
     function.instruction(&Instruction::I32Const(STR_DATA_OFFSET));
     function.instruction(&Instruction::I32Add);
 }
@@ -324,7 +321,7 @@ fn mem64(offset: u64) -> MemArg {
 
 /// Emit `store = __alloc(8 + 8 * cap)` as a [`TYPE_ELEMS`] block with its
 /// `cap` written, leaving the base in local `store`.
-fn emit_new_elems(function: &mut Function, alloc: u32, cap: u32, store: u32) {
+fn emit_new_elems(function: &mut impl Sink, alloc: u32, cap: u32, store: u32) {
     function.instruction(&Instruction::LocalGet(cap));
     function.instruction(&Instruction::I32Const(3));
     function.instruction(&Instruction::I32Shl);
@@ -336,13 +333,13 @@ fn emit_new_elems(function: &mut Function, alloc: u32, cap: u32, store: u32) {
     function.instruction(&Instruction::I32Store(mem32(ELEMS_CAP_OFFSET)));
 }
 
-/// Emit the exported `__new_array(len: i32) -> i32` constructor: a
+/// Emit the `__new_array(len: i32) -> i32` constructor: a
 /// [`TYPE_ARRAY`] handle (`proto` = `%Array.prototype%`, the jsval `proto`)
 /// with `len` set and, when `len > 0`, a `cap = len`
 /// [`TYPE_ELEMS`] store whose every element is `undefined`. Local 0 is `len`;
 /// locals 1/2/3 the handle base, the store base, and the element cursor.
-pub(super) fn emit_new_array(alloc: u32, proto: i64) -> Function {
-    let mut function = Function::new(vec![(3, ValType::I32)]);
+pub(super) fn emit_new_array(alloc: u32, proto: i64, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[RAW_I32], &[ROOT_BASE, ROOT_BASE, RAW_I32]);
     let (len, base, store, at) = (0, 1, 2, 3);
     function.instruction(&Instruction::I32Const(ARRAY_BLOCK_SIZE));
     function.instruction(&Instruction::Call(alloc));
@@ -386,53 +383,24 @@ pub(super) fn emit_new_array(alloc: u32, proto: i64) -> Function {
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::End);
-    function
-}
-
-/// Emit the exported `__new_promise() -> i32` constructor: a pending
-/// [`abi::TYPE_PROMISE`] block with prototype `proto` (`%Promise.prototype%`),
-/// `state = PENDING`, and
-/// `value = undefined`. Local 0 is the base.
-pub(super) fn emit_new_promise(alloc: u32, proto: i64) -> Function {
-    let mut function = Function::new(vec![(1, ValType::I32)]);
-    let base = 0;
-    function.instruction(&Instruction::I32Const(PROMISE_BLOCK_SIZE));
-    function.instruction(&Instruction::Call(alloc));
-    function.instruction(&Instruction::LocalSet(base));
-    emit_object_prefix(&mut function, base, i32::from(abi::TYPE_PROMISE), proto);
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Const(abi::PROMISE_PENDING));
-    function.instruction(&Instruction::I32Store(MemArg {
-        offset: PROMISE_STATE_OFFSET,
-        align: 2,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I64Store(MemArg {
-        offset: PROMISE_VALUE_OFFSET,
-        align: 3,
-        memory_index: 0,
-    }));
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__invoke1(fn: i64, arg: i64) -> i64` callback trampoline.
 ///
-/// The host promise engine calls this exported function re-entrantly to run a
-/// `.then`/`.catch`/`.finally` reaction's guest callback `fn` with the settled
-/// value `arg`. It mirrors [`super::emit_call_indirect`]'s env-last ABI: push the
+/// The guest promise engine's `__run_job` calls this internal trampoline to
+/// run a `.then`/`.catch`/`.finally` reaction's guest callback `fn` with the
+/// settled value `arg`; nothing outside the guest calls it. It mirrors
+/// [`super::emit_call_indirect`]'s env-last ABI: push the
 /// single real argument into slot `a0` (padding the remaining `K-1` positional
 /// slots with `undefined`), reset `this`, push the callee's own environment, the
 /// argument count (`1`), and the funcref-table index, then `call_indirect`. The
-/// callback's result is left on the stack; a throw inside it sets `__exc_pending`
-/// (which the host checks after the call), so no propagation is emitted here.
+/// callback's result is left on the stack; a throw inside it sets `$exc_pending`
+/// (which the caller checks after the call), so no propagation is emitted here.
 /// The two `i64` params occupy locals 0/1; one extra `i32` local holds the
 /// callee block base.
-pub(super) fn emit_invoke1(helpers: Helpers<'_>) -> Function {
-    let mut function = Function::new(vec![(1, ValType::I32)]);
+pub(super) fn emit_invoke1(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[ROOT_JS, ROOT_JS], &[RAW_I32]);
     let (callee, arg, base) = (0, 1, 2);
     // base = i32.wrap(callee).
     function.instruction(&Instruction::LocalGet(callee));
@@ -470,38 +438,65 @@ pub(super) fn emit_invoke1(helpers: Helpers<'_>) -> Function {
         table_index: 0,
     });
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
-/// Emit a `new Promise` settler function: the `resolve` (`op` =
-/// `PROMISE_OP_SETTLE_FULFILL`) or `reject` (`PROMISE_OP_SETTLE_REJECT`) half of
-/// an executor's callback pair.
+/// Emit a resolving function: the `resolve` (`state` = `PROMISE_FULFILLED`)
+/// or `reject` (`PROMISE_REJECTED`) half of a `CreateResolvingFunctions`
+/// pair (a `new Promise` executor's, a thenable job's).
 ///
 /// It shares the uniform function ABI `(a0..a_{K-1}, env, argc) -> i64` and is
-/// called through the funcref table like any function value, with the TARGET
-/// PROMISE carried in its `env` slot (local `K`) — `new Promise` builds the
-/// function value that way instead of a closure environment. The settler reads
-/// the bound promise from `env` and its first argument (`a0`, or `undefined` when
-/// the ABI has no positional slot) as the settlement value, calls
-/// `__promise(op, promise, value)` to drive the host settle logic, and returns
-/// `undefined`. `K = helpers.max_args`; no extra locals are declared.
-pub(super) fn emit_settler(op: i32, helpers: Helpers<'_>) -> Function {
-    let mut function = Function::new(vec![]);
+/// called through the funcref table like any function value; its `env` slot
+/// (local `K`) holds the pair's shared `TYPE_ENV` block from
+/// `__promise_resolving`: `[promise, alreadyResolved]`. Once `alreadyResolved`
+/// is set it does nothing; else it sets it and calls
+/// `__promise_settle(promise, state, a0)` (`a0` is `undefined` when the ABI has
+/// no positional slot), which resolves per the spec. It returns `undefined`.
+/// `K = helpers.max_args`; no extra locals are declared.
+pub(super) fn emit_settler(state: i32, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let k = helpers.max_args;
-    // __promise(op, env /* the bound promise */, value): push op, then P, then v.
-    function.instruction(&Instruction::I32Const(op));
-    function.instruction(&Instruction::LocalGet(k)); // env slot = the bound promise
+    let mut function = FnBuilder::new(leaves);
+    for _ in 0..=k {
+        function.param(ROOT_JS); // a0..a_{K-1}, env
+    }
+    function.param(RAW_I64); // argc
+    let done = MemArg {
+        offset: u64::from(abi::RESOLVING_DONE_OFFSET),
+        align: 3,
+        memory_index: 0,
+    };
+    // `alreadyResolved`: a second call of either function is a no-op.
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(done));
+    function.instruction(&Instruction::I64Const(TRUE_BITS));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Const(TRUE_BITS));
+    function.instruction(&Instruction::I64Store(done));
+    function.instruction(&Instruction::LocalGet(k));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(MemArg {
+        offset: u64::from(abi::RESOLVING_PROMISE_OFFSET),
+        align: 3,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(state));
     if k >= 1 {
-        function.instruction(&Instruction::LocalGet(0)); // a0 = the settlement value
+        function.instruction(&Instruction::LocalGet(0)); // a0 = the resolution
     } else {
         function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     }
-    function.instruction(&Instruction::Call(helpers.promise));
-    function.instruction(&Instruction::Drop);
-    // A settler returns `undefined` (its call result is ignored anyway).
+    function.instruction(&Instruction::Call(helpers.promise_settle()));
+    // A resolving function returns `undefined`.
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__concat(a: i32, b: i32) -> i32` string concatenator.
@@ -513,8 +508,12 @@ pub(super) fn emit_settler(op: i32, helpers: Helpers<'_>) -> Function {
 /// widening unit loop for a one-byte operand of a two-byte result. Params
 /// occupy locals 0/1; extra `i32` locals hold `lenA`, `lenB`, the result
 /// width, `dst`, and the loop index.
-pub(super) fn emit_concat(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(5, ValType::I32)]);
+pub(super) fn emit_concat(alloc_index: u32, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(
+        leaves,
+        &[ROOT_BASE, ROOT_BASE],
+        &[RAW_I32, RAW_I32, RAW_I32, ROOT_BASE, RAW_I32],
+    );
     let (a, b, len_a, len_b, w, dst, i) = (0, 1, 2, 3, 4, 5, 6);
     wasm!(function; LocalGet(a));
     emit_load_str_len(&mut function);
@@ -527,6 +526,7 @@ pub(super) fn emit_concat(alloc_index: u32) -> Function {
     emit_str_two_byte(&mut function, a);
     emit_str_two_byte(&mut function, b);
     wasm!(function; I32Or, LocalSet(w));
+    function.frame_begin();
     emit_alloc_str(
         &mut function,
         alloc_index,
@@ -535,7 +535,7 @@ pub(super) fn emit_concat(alloc_index: u32) -> Function {
         dst,
     );
     // Copy `len` units of `src` to unit offset `at` (pushed) of `dst`.
-    let copy = |f: &mut Function, src: u32, len: u32, at: &dyn Fn(&mut Function)| {
+    let copy = |f: &mut FnBuilder<'_>, src: u32, len: u32, at: &dyn Fn(&mut FnBuilder<'_>)| {
         wasm!(f; LocalGet(w));
         emit_str_two_byte(f, src);
         wasm!(f; I32Eq, If(BlockType::Empty), LocalGet(dst));
@@ -566,7 +566,7 @@ pub(super) fn emit_concat(alloc_index: u32) -> Function {
     copy(&mut function, a, len_a, &|f| wasm!(f; I32Const(0)));
     copy(&mut function, b, len_b, &|f| wasm!(f; LocalGet(len_a)));
     wasm!(function; LocalGet(dst), End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__str_eq(a: i32, b: i32) -> i32` content string comparator.
@@ -577,8 +577,8 @@ pub(super) fn emit_concat(alloc_index: u32) -> Function {
 /// `len << two_byte` data bytes are compared 8 at a time with `i64.load`,
 /// then the tail byte by byte. Params occupy locals 0/1; extra `i32` locals
 /// hold the data byte count and the byte offset.
-pub(super) fn emit_str_eq() -> Function {
-    let mut function = Function::new(vec![(2, ValType::I32)]);
+pub(super) fn emit_str_eq(leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[ROOT_BASE, ROOT_BASE], &[RAW_I32, RAW_I32]);
     let (a, b, n, p) = (0, 1, 2, 3);
     let flags = mem8(u64::from(abi::HEADER_FLAGS_OFFSET));
     wasm!(function;
@@ -615,7 +615,7 @@ pub(super) fn emit_str_eq() -> Function {
         I32Const(1),
         End,
     );
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__str_cmp(a: i32, b: i32) -> i32` code-unit order comparator.
@@ -627,8 +627,14 @@ pub(super) fn emit_str_eq() -> Function {
 /// side's units are read at its own width. Params occupy locals 0/1; extra
 /// `i32` locals hold `lenA`, `lenB`, `min`, the loop index, the two current
 /// units, and the two widths.
-pub(super) fn emit_str_cmp() -> Function {
-    let mut function = Function::new(vec![(8, ValType::I32)]);
+pub(super) fn emit_str_cmp(leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(
+        leaves,
+        &[ROOT_BASE, ROOT_BASE],
+        &[
+            RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
+        ],
+    );
     let (a, b, len_a, len_b, min, i) = (0, 1, 2, 3, 4, 5);
     let (unit_a, unit_b, w_a, w_b) = (6, 7, 8, 9);
     wasm!(function;
@@ -642,7 +648,7 @@ pub(super) fn emit_str_cmp() -> Function {
     emit_str_two_byte(&mut function, b);
     wasm!(function; LocalSet(w_b));
     // Compare the shared prefix, returning on the first differing pair.
-    let prefix = |f: &mut Function, load: &dyn Fn(&mut Function, u32, u32)| {
+    let prefix = |f: &mut FnBuilder<'_>, load: &dyn Fn(&mut FnBuilder<'_>, u32, u32)| {
         wasm!(f;
             I32Const(0), LocalSet(i),
             Block(BlockType::Empty), Loop(BlockType::Empty),
@@ -675,7 +681,7 @@ pub(super) fn emit_str_cmp() -> Function {
         I32Sub,
         End,
     );
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__str_index(ptr: i32, i: i32) -> i32` one-unit string builder.
@@ -685,8 +691,12 @@ pub(super) fn emit_str_cmp() -> Function {
 /// fresh one-unit string in canonical form: one-byte when the unit is
 /// `<= 0xFF`, else two-byte. The two `i32` parameters occupy locals 0/1;
 /// extra `i32` locals hold `dst`, the unit, and the width.
-pub(super) fn emit_str_index(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(3, ValType::I32)]);
+pub(super) fn emit_str_index(alloc_index: u32, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(
+        leaves,
+        &[ROOT_BASE, RAW_I32],
+        &[ROOT_BASE, RAW_I32, RAW_I32],
+    );
     let (ptr, i, dst, unit, w) = (0, 1, 2, 3, 4);
     emit_str_two_byte(&mut function, ptr);
     wasm!(function; LocalSet(w));
@@ -702,7 +712,7 @@ pub(super) fn emit_str_index(alloc_index: u32) -> Function {
     wasm!(function; I32Const(0), LocalSet(i));
     emit_store_unit(&mut function, dst, i, w, |f| wasm!(f; LocalGet(unit)));
     wasm!(function; LocalGet(dst), End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__array_reserve(base: i32, need: i32)` store grower.
@@ -713,8 +723,12 @@ pub(super) fn emit_str_index(alloc_index: u32) -> Function {
 /// into it, and repoints the handle's `elems`; the handle never moves. Locals
 /// 0/1 are the params; extra `i32` locals hold the old store, `cap`, and the
 /// new store.
-pub(super) fn emit_array_reserve(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(3, ValType::I32)]);
+pub(super) fn emit_array_reserve(alloc_index: u32, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(
+        leaves,
+        &[ROOT_BASE, RAW_I32],
+        &[RAW_I32, RAW_I32, ROOT_BASE],
+    );
     let (base, need, old, cap, store) = (0, 1, 2, 3, 4);
 
     // old = base.elems; cap = old ? old.cap : 0.
@@ -734,6 +748,7 @@ pub(super) fn emit_array_reserve(alloc_index: u32) -> Function {
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::Return);
     function.instruction(&Instruction::End);
+    function.frame_begin();
 
     // cap = max(4, 2 * cap); cap = max(cap, need).
     function.instruction(&Instruction::LocalGet(cap));
@@ -778,38 +793,63 @@ pub(super) fn emit_array_reserve(alloc_index: u32) -> Function {
     function.instruction(&Instruction::LocalGet(store));
     function.instruction(&Instruction::I32Store(mem32(ARRAY_ELEMS_OFFSET)));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__array_push(base: i32, value: i64) -> i32` in-place appender:
 /// `__array_reserve(base, len + 1)`, store `value` at slot `len` of the
 /// element store, bump `len`, and return the (unchanged) handle base; a
 /// `SPARSE` array appends through `__sparse_set` (function `sparse_set`). The
-/// two params occupy locals 0/1; an extra `i32` local holds `len`.
-pub(super) fn emit_array_push(reserve_index: u32, sparse_set: u32) -> Function {
-    let mut function = Function::new(vec![(1, ValType::I32)]);
-    let (base, value, len) = (0, 1, 2);
+/// two params occupy locals 0/1; extra `i32` locals hold `len` and the store.
+/// The frame is pushed only on the `SPARSE` or growth path.
+pub(super) fn emit_array_push(reserve_index: u32, sparse_set: u32, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[ROOT_BASE, ROOT_JS], &[RAW_I32, RAW_I32]);
+    let (base, value, len, elems) = (0, 1, 2, 3);
 
+    // len = base.len; elems = base.elems.
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::LocalSet(len));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
+    function.instruction(&Instruction::LocalSet(elems));
+
+    // Only a SPARSE array or a store without room needs a frame.
+    emit_is_sparse(&mut function, base);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::LocalGet(elems));
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::I32Ne);
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(len));
+    function.instruction(&Instruction::LocalGet(elems));
+    function.instruction(&Instruction::I32Load(mem32(ELEMS_CAP_OFFSET)));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.frame_begin();
     // SPARSE: __sparse_set(base, len, value); return base.
     emit_is_sparse(&mut function, base);
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::LocalGet(value));
     function.instruction(&Instruction::Call(sparse_set));
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::Return);
     function.instruction(&Instruction::End);
-
-    // len = base.len; __array_reserve(base, len + 1).
+    // __array_reserve(base, len + 1).
     function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::LocalGet(base));
-    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
-    function.instruction(&Instruction::LocalTee(len));
+    function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::Call(reserve_index));
+    function.frame_end();
+    function.instruction(&Instruction::End);
 
     // base.elems[len] = value.
     function.instruction(&Instruction::LocalGet(base));
@@ -829,7 +869,7 @@ pub(super) fn emit_array_push(reserve_index: u32, sparse_set: u32) -> Function {
     function.instruction(&Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)));
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__array_concat(dst: i32, src: i32) -> i32` in-place joiner:
@@ -845,14 +885,19 @@ pub(super) fn emit_array_push(reserve_index: u32, sparse_set: u32) -> Function {
 /// exception pending. The two params occupy locals 0/1; extra `i32` locals
 /// hold `dlen`, `slen`, the two element cursors and the index `k`, an `i64`
 /// local the element.
-pub(super) fn emit_array_concat(reserve_index: u32, sparse_get: u32, proto_elem: u32) -> Function {
-    let mut function = Function::new(vec![
-        (4, ValType::I32),
-        (1, ValType::I64),
-        (1, ValType::I32),
-    ]);
+pub(super) fn emit_array_concat(
+    reserve_index: u32,
+    sparse_get: u32,
+    proto_elem: u32,
+    leaves: &LeafSet,
+) -> Function {
+    let mut function = helper_builder(
+        leaves,
+        &[ROOT_BASE, ROOT_BASE],
+        &[RAW_I32, RAW_I32, RAW_I32, RAW_I32, ROOT_JS, RAW_I32],
+    );
     let (dst, src, dlen, slen, to, from, elem, k) = (0, 1, 2, 3, 4, 5, 6, 7);
-    let ret_dst = |function: &mut Function| {
+    let ret_dst = |function: &mut FnBuilder<'_>| {
         function.instruction(&Instruction::LocalGet(dst));
         function.instruction(&Instruction::Return);
     };
@@ -941,7 +986,7 @@ pub(super) fn emit_array_concat(reserve_index: u32, sparse_get: u32, proto_elem:
     );
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// The by-index half of [`emit_array_concat`] over its locals `(dst, src,
@@ -949,7 +994,7 @@ pub(super) fn emit_array_concat(reserve_index: u32, sparse_get: u32, proto_elem:
 /// element via `__sparse_get`, a hole (or an index past a length a getter
 /// shrank) through `__proto_elem`; a throwing getter returns `dst`.
 fn emit_concat_by_index(
-    function: &mut Function,
+    function: &mut impl Sink,
     (dst, src, slen, elem, k): (u32, u32, u32, u32, u32),
     array_push: u32,
     sparse_get: u32,
@@ -1019,15 +1064,21 @@ fn emit_concat_by_index(
 /// write cursor `o`, the current unit `b`, the two-char escape char `esc`
 /// (`0` when the unit has none), and the width `w`.
 #[allow(clippy::too_many_lines)]
-pub(super) fn emit_json_escape(alloc_index: u32) -> Function {
-    let mut function = Function::new(vec![(7, ValType::I32)]);
+pub(super) fn emit_json_escape(alloc_index: u32, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(
+        leaves,
+        &[ROOT_BASE],
+        &[
+            RAW_I32, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
+        ],
+    );
     let (str_ptr, len, dst, i, o, b, esc, w) = (0, 1, 2, 3, 4, 5, 6, 7);
     // Append the unit pushed by `unit` at `o`; o += 1.
-    let put = |f: &mut Function, unit: &dyn Fn(&mut Function)| {
+    let put = |f: &mut _, unit: &dyn Fn(&mut FnBuilder<'_>)| {
         emit_store_unit(f, dst, o, w, unit);
         wasm!(f; LocalGet(o), I32Const(1), I32Add, LocalSet(o));
     };
-    let put_const = |f: &mut Function, c: u8| put(f, &|f| wasm!(f; I32Const(i32::from(c))));
+    let put_const = |f: &mut _, c: u8| put(f, &|f| wasm!(f; I32Const(i32::from(c))));
 
     wasm!(function; LocalGet(str_ptr));
     emit_load_str_len(&mut function);
@@ -1132,23 +1183,27 @@ pub(super) fn emit_json_escape(alloc_index: u32) -> Function {
     wasm!(function; LocalGet(dst), LocalGet(o), I32Store(mem32(STR_LEN_OFFSET)));
     emit_str_canonical(&mut function, w, dst, i, b);
     wasm!(function; LocalGet(dst), End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__json_str(v: i64) -> str_base: i32` primitive serializer of
 /// `JSON.stringify` (`__json_rep` serializes arrays and objects). Returns the
 /// base offset of a heap string holding `v`'s JSON form:
 ///
-/// - number: `__convert(v, TO_STRING)` when finite (reusing the EXISTING host
-///   import — no new import), else the token `"null"` (JSON renders NaN/Infinity
-///   as null);
+/// - number: `__num_to_str(v)` when finite (`num_to_str_index`), else the token
+///   `"null"` (JSON renders NaN/Infinity as null);
 /// - `true`/`false`/`null`: the matching keyword token; `undefined`: `"null"`;
 /// - string: `__json_escape` (`escape_index`);
 /// - any other heap kind: `"null"`.
 ///
 /// Param `v` occupies local 0; one `i32` local holds the string accumulator.
-pub(super) fn emit_json_str(convert_index: u32, escape_index: u32, tokens: JsonTokens) -> Function {
-    let mut function = Function::new(vec![(1, ValType::I32)]);
+pub(super) fn emit_json_str(
+    num_to_str_index: u32,
+    escape_index: u32,
+    tokens: JsonTokens,
+    leaves: &LeafSet,
+) -> Function {
+    let mut function = helper_builder(leaves, &[ROOT_JS], &[ROOT_BASE]);
     let v = 0;
     let acc = 1;
 
@@ -1196,7 +1251,7 @@ pub(super) fn emit_json_str(convert_index: u32, escape_index: u32, tokens: JsonT
     function.instruction(&Instruction::I32Const(tokens.null));
     function.instruction(&Instruction::LocalSet(acc));
     function.instruction(&Instruction::Else);
-    // number: finite (x - x == 0) ? __convert(v, TO_STRING) : "null".
+    // number: finite (x - x == 0) ? __num_to_str(v) : "null".
     function.instruction(&Instruction::LocalGet(v));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::LocalGet(v));
@@ -1206,9 +1261,7 @@ pub(super) fn emit_json_str(convert_index: u32, escape_index: u32, tokens: JsonT
     function.instruction(&Instruction::F64Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_STRING));
-    function.instruction(&Instruction::Call(convert_index));
-    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::Call(num_to_str_index));
     function.instruction(&Instruction::LocalSet(acc));
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(tokens.null));
@@ -1222,7 +1275,7 @@ pub(super) fn emit_json_str(convert_index: u32, escape_index: u32, tokens: JsonT
 
     function.instruction(&Instruction::LocalGet(acc));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__same_value_zero(a: i64, b: i64) -> i32` Map/Set key-equality
@@ -1237,8 +1290,8 @@ pub(super) fn emit_json_str(convert_index: u32, escape_index: u32, tokens: JsonT
 /// differ in tag, distinct heap objects/arrays are reference-unequal). The string
 /// path is guarded by an `if` so `__str_eq` never runs on a non-pointer. The two
 /// `i64` params occupy locals 0/1; no extra locals.
-pub(super) fn emit_same_value_zero(str_eq_index: u32) -> Function {
-    let mut function = Function::new(vec![]);
+pub(super) fn emit_same_value_zero(str_eq_index: u32, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[ROOT_JS, ROOT_JS], &[]);
     let (a, b) = (0, 1);
     // both strings ? __str_eq : (f64_eq | identity bits).
     emit_is_string(&mut function, a);
@@ -1262,7 +1315,7 @@ pub(super) fn emit_same_value_zero(str_eq_index: u32) -> Function {
     function.instruction(&Instruction::I32Or);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__loose_eq(a: i64, b: i64) -> i32` loose-equality (`==`) helper.
@@ -1272,7 +1325,7 @@ pub(super) fn emit_same_value_zero(str_eq_index: u32) -> Function {
 /// `false`→`0`). Then: if either operand is `null`/`undefined`, the result is
 /// `1` iff BOTH are (nullish values equal each other and nothing else); two
 /// numbers compare as `f64`; two strings by byte content (via `__str_eq`); a
-/// number and a string coerce the string via the `__convert` `ToNumber` import
+/// number and a string coerce the string with `__to_number_prim`
 /// and compare as `f64`; an object against a (non-nullish) primitive is
 /// replaced by its `ToPrimitive` (hint default, `__to_primitive`) and compared
 /// again (a user `valueOf`/`toString` throw leaves it pending and yields `0`;
@@ -1281,9 +1334,9 @@ pub(super) fn emit_same_value_zero(str_eq_index: u32) -> Function {
 /// the same object is equal; a symbol equals only itself, never a number or
 /// string, without coercion). The two `i64` params occupy locals 0/1; they are
 /// mutated in place, so no extra locals are needed.
-pub(super) fn emit_loose_eq(helpers: Helpers<'_>) -> Function {
-    let (str_eq_index, convert_index) = (helpers.str_eq, helpers.convert);
-    let mut function = Function::new(vec![]);
+pub(super) fn emit_loose_eq(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let str_eq_index = helpers.str_eq;
+    let mut function = helper_builder(leaves, &[ROOT_JS, ROOT_JS], &[]);
     let (a, b) = (0, 1);
     let one_bits = 1.0f64.to_bits().cast_signed();
     let zero_bits = 0.0f64.to_bits().cast_signed();
@@ -1350,8 +1403,7 @@ pub(super) fn emit_loose_eq(helpers: Helpers<'_>) -> Function {
     function.instruction(&Instruction::LocalGet(a));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
-    function.instruction(&Instruction::Call(convert_index));
+    function.instruction(&Instruction::Call(helpers.to_number_prim()));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::F64Eq);
     function.instruction(&Instruction::Else);
@@ -1362,8 +1414,7 @@ pub(super) fn emit_loose_eq(helpers: Helpers<'_>) -> Function {
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     function.instruction(&Instruction::LocalGet(a));
-    function.instruction(&Instruction::I32Const(CONVERT_OP_TO_NUMBER));
-    function.instruction(&Instruction::Call(convert_index));
+    function.instruction(&Instruction::Call(helpers.to_number_prim()));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::LocalGet(b));
     function.instruction(&Instruction::F64ReinterpretI64);
@@ -1383,14 +1434,14 @@ pub(super) fn emit_loose_eq(helpers: Helpers<'_>) -> Function {
     function.instruction(&Instruction::End);
     // Close the function body.
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// The object-vs-primitive arm of [`emit_loose_eq`]: an object against a
 /// non-nullish primitive is replaced by its `ToPrimitive` (hint default) and
 /// `__loose_eq` returns the comparison of the result (`0` when a user
 /// `valueOf`/`toString` threw).
-fn emit_loose_eq_to_primitive(function: &mut Function, helpers: Helpers<'_>) {
+fn emit_loose_eq_to_primitive(function: &mut impl Sink, helpers: Helpers<'_>) {
     let (a, b) = (0, 1);
     for (obj, prim) in [(a, b), (b, a)] {
         emit_is_object(function, obj);
@@ -1426,8 +1477,15 @@ pub(super) fn emit_str_to_array(
     new_array_index: u32,
     str_index_index: u32,
     alloc_index: u32,
+    leaves: &LeafSet,
 ) -> Function {
-    let mut function = Function::new(vec![(8, ValType::I32)]);
+    let mut function = helper_builder(
+        leaves,
+        &[ROOT_JS],
+        &[
+            ROOT_BASE, RAW_I32, ROOT_BASE, RAW_I32, ROOT_BASE, RAW_I32, RAW_I32, ROOT_BASE,
+        ],
+    );
     let (s, ptr, len, arr, i, store, k, w, dst) = (0, 1, 2, 3, 4, 5, 6, 7, 8);
     // ptr = wrap(s); len = its code-unit length; arr = __new_array(len);
     // store = arr.elems.
@@ -1468,7 +1526,7 @@ pub(super) fn emit_str_to_array(
         LocalGet(arr), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
         End,
     );
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__map_find(handle: i32, key: i64) -> i32` Map/Set lookup.
@@ -1482,8 +1540,12 @@ pub(super) fn emit_str_to_array(
 /// returned address. Params occupy locals 0/1; four extra `i32` locals hold the
 /// backing element store, its length, the loop index, and the current slot
 /// address.
-pub(super) fn emit_map_find(svz_index: u32) -> Function {
-    let mut function = Function::new(vec![(4, ValType::I32)]);
+pub(super) fn emit_map_find(svz_index: u32, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(
+        leaves,
+        &[ROOT_BASE, ROOT_JS],
+        &[RAW_I32, RAW_I32, RAW_I32, RAW_I32],
+    );
     let (handle, key, store, len, i, slot) = (0, 1, 2, 3, 4, 5);
     let entries_slot = MemArg {
         offset: MAP_ENTRIES_OFFSET,
@@ -1551,7 +1613,7 @@ pub(super) fn emit_map_find(svz_index: u32) -> Function {
     // No key matched.
     function.instruction(&Instruction::I32Const(-1));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__map_set(handle: i32, key: i64, val: i64)` Map/Set insert-or-update.
@@ -1562,8 +1624,16 @@ pub(super) fn emit_map_find(svz_index: u32) -> Function {
 /// before is not found, so re-adding it appends). `set.add` reuses
 /// this with `val = undefined`. Params occupy locals 0/1/2; two extra `i32`
 /// locals hold the found address and the backing array base.
-pub(super) fn emit_map_set(map_find_index: u32, array_push_index: u32) -> Function {
-    let mut function = Function::new(vec![(2, ValType::I32)]);
+pub(super) fn emit_map_set(
+    map_find_index: u32,
+    array_push_index: u32,
+    leaves: &LeafSet,
+) -> Function {
+    let mut function = helper_builder(
+        leaves,
+        &[ROOT_BASE, ROOT_JS, ROOT_JS],
+        &[RAW_I32, ROOT_BASE],
+    );
     let (handle, key, val, addr, arr) = (0, 1, 2, 3, 4);
     let entries_slot = MemArg {
         offset: MAP_ENTRIES_OFFSET,
@@ -1618,15 +1688,15 @@ pub(super) fn emit_map_set(map_find_index: u32, array_push_index: u32) -> Functi
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::I32Store(size_slot));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__map_get(handle: i32, key: i64) -> i64` Map value reader: the
 /// value stored 8 bytes past the key slot `__map_find` (at `map_find_index`)
 /// resolves, or the `undefined` bits on a miss. Params occupy locals 0/1; one extra
 /// `i32` local holds the found address.
-pub(super) fn emit_map_get(map_find_index: u32) -> Function {
-    let mut function = Function::new(vec![(1, ValType::I32)]);
+pub(super) fn emit_map_get(map_find_index: u32, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[ROOT_BASE, ROOT_JS], &[RAW_I32]);
     let (handle, key, addr) = (0, 1, 2);
     let val_at = MemArg {
         offset: 8,
@@ -1646,21 +1716,21 @@ pub(super) fn emit_map_get(map_find_index: u32) -> Function {
     function.instruction(&Instruction::I64Load(val_at));
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__map_has(handle: i32, key: i64) -> i32` Map/Set membership probe:
 /// `1` iff `__map_find` (at `map_find_index`) hits, else `0`. Params occupy
 /// locals 0/1; no extra locals.
-pub(super) fn emit_map_has(map_find_index: u32) -> Function {
-    let mut function = Function::new(vec![]);
+pub(super) fn emit_map_has(map_find_index: u32, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[ROOT_BASE, ROOT_JS], &[]);
     function.instruction(&Instruction::LocalGet(0));
     function.instruction(&Instruction::LocalGet(1));
     function.instruction(&Instruction::Call(map_find_index));
     function.instruction(&Instruction::I32Const(-1));
     function.instruction(&Instruction::I32Ne);
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }
 
 /// Emit the `__map_delete(handle: i32, key: i64) -> i32` Map/Set remover.
@@ -1672,8 +1742,8 @@ pub(super) fn emit_map_has(map_find_index: u32) -> Function {
 /// continues at the next one. The handle's u32 `size` header (the live count)
 /// drops by 1; returns `1`. Params occupy locals 0/1; one extra `i32` local
 /// holds the found address.
-pub(super) fn emit_map_delete(map_find_index: u32) -> Function {
-    let mut function = Function::new(vec![(1, ValType::I32)]);
+pub(super) fn emit_map_delete(map_find_index: u32, leaves: &LeafSet) -> Function {
+    let mut function = helper_builder(leaves, &[ROOT_BASE, ROOT_JS], &[RAW_I32]);
     let (handle, key, addr) = (0, 1, 2);
     let size_slot = MemArg {
         offset: MAP_SIZE_OFFSET,
@@ -1715,5 +1785,5 @@ pub(super) fn emit_map_delete(map_find_index: u32) -> Function {
 
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::End);
-    function
+    finish_builder(function)
 }

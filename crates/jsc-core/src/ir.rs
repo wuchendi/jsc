@@ -216,7 +216,7 @@ pub enum ConvertOp {
     ToNumber,
     /// `Boolean(x)` — JS truthiness (a boolean jsval). Lowered to inline wasm.
     ToBoolean,
-    /// `parseInt(s, radix)` — the host `__parse_int` over `ToString(s)` and the
+    /// `parseInt(s, radix)` — the guest `__parse_int` over `ToString(s)` and the
     /// radix (`undefined` when omitted).
     ParseInt,
     /// `parseFloat(s)` — the leading decimal float of `ToString(s)`, parsed on
@@ -225,8 +225,8 @@ pub enum ConvertOp {
 }
 
 /// The inline fast path of an `Array.prototype` search/join method on an
-/// array receiver (DESIGN.md §6.4), run host-side through the `__method`
-/// import (`join`: the guest `__array_join`).
+/// array receiver (DESIGN.md §6.4), run by the guest `__array_search`
+/// (`join`: `__array_join`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodOp {
     /// `arr.indexOf(x)` — first index where element `=== x`, else `-1`.
@@ -1787,10 +1787,9 @@ pub enum IrNode {
     /// names, not real bindings: they are recognized syntactically at codegen
     /// (only when nothing of the same name shadows them) and take exactly one
     /// argument (`parseInt` also an optional radix). `Boolean` lowers to inline
-    /// JS-truthiness wasm; `parseInt` calls the host `__parse_int` import; the
-    /// other three delegate to the host `__convert` import, which reuses the run
-    /// stage's `format_value`/parse helpers (so `String(42) == "42"`, matching
-    /// `format_number`).
+    /// JS-truthiness wasm; `parseInt` calls the guest `__parse_int`; the
+    /// other three run the guest conversions (`__to_string`, `__to_number`,
+    /// `__parse_float`).
     ConvertCall {
         /// Which conversion this call performs.
         op: ConvertOp,
@@ -2068,15 +2067,15 @@ pub enum IrNode {
     /// runtime helper (`__json_str`): numbers/booleans/`null` render literally
     /// (non-finite numbers as `"null"`), strings are quoted + escaped, arrays and
     /// objects recurse (own enumerable keys in own-key order; `undefined`/function values are omitted as object values
-    /// and become `"null"` as array elements). Number formatting reuses the
-    /// existing `__convert` host import (no NEW host import). See [`IrNode::JsonParse`]
+    /// and become `"null"` as array elements). Numbers go through the guest
+    /// number formatter. See [`IrNode::JsonParse`]
     /// for the inverse.
     JsonStringify {
         /// The single value argument, evaluated once and serialized.
         arg: Box<IrNode>,
     },
     /// A `JSON.parse(text)` call. `arg` is
-    /// coerced to a string (via the `__convert` `ToString` import) and handed to
+    /// coerced to a string (via the guest `__to_string`) and handed to
     /// the in-wasm recursive-descent parser `__json_parse`, which materializes a
     /// guest value tree — including OBJECTS with runtime-unknown keys, each
     /// member interned and defined through `__define`. Malformed
@@ -2112,16 +2111,15 @@ pub enum IrNode {
         args: Vec<IrNode>,
     },
     /// `Promise.resolve(v)`: build a promise already fulfilled with `v`
-    /// (or return `v` unchanged when it is itself a promise). Lowers to the host
-    /// `__promise` import with [`crate::abi::PROMISE_OP_RESOLVE`].
+    /// (or return `v` unchanged when it is itself a promise). Lowers to the
+    /// guest promise engine's `__promise_resolve`.
     PromiseResolve(Box<IrNode>),
     /// `Promise.reject(v)`: build a promise already rejected with reason
-    /// `v`. Lowers to the host `__promise` import with
-    /// [`crate::abi::PROMISE_OP_REJECT`].
+    /// `v`. Lowers to the guest promise engine's `__promise_reject`.
     PromiseReject(Box<IrNode>),
     /// `p.then(onF, onR)` / `p.catch(onR)`: register the reactions on `p`
     /// and yield the chained result promise. A missing handler is `undefined`
-    /// (passthrough). Lowers to the host `__then` import.
+    /// (passthrough). Lowers to the guest promise engine's `__promise_then`.
     PromiseThen {
         /// The receiver promise expression.
         promise: Box<IrNode>,
@@ -2130,46 +2128,47 @@ pub enum IrNode {
         /// The rejection handler (`undefined` when absent).
         on_rejected: Box<IrNode>,
     },
-    /// `p.finally(fn)`: run `fn` on settlement and pass `p`'s original
-    /// settlement through to the chained result promise. Lowers to the host
-    /// `__promise` import with [`crate::abi::PROMISE_OP_FINALLY`].
+    /// `p.finally(fn)` on a `%Promise%` instance: `p.then(thenFinally,
+    /// catchFinally)` with the spec's closures over `fn` (a non-callable `fn`
+    /// is passed as both). Lowers to the guest promise engine's
+    /// `__promise_finally`.
     PromiseFinally {
         /// The receiver promise expression.
         promise: Box<IrNode>,
         /// The finalizer callback, run for its side effect on settlement.
         on_finally: Box<IrNode>,
     },
-    /// Top-level `await p`: drive the host microtask queue until `p`
-    /// settles, then yield its fulfillment value (or unwind its rejection through
-    /// the exception globals). Lowers to the host `__promise` import with
-    /// [`crate::abi::PROMISE_OP_AWAIT`]. Only reachable at the top level — an
-    /// `await` inside a function body is a parse error (async functions stay
-    /// unsupported).
+    /// Top-level `await v`: `PromiseResolve(%Promise%, v)`, mark that promise
+    /// handled, drain the guest microtask queue, then yield its fulfillment
+    /// value (or unwind its rejection through the exception globals). Lowers to the guest promise engine's
+    /// `__promise_await`. Only reachable at the top level (an `await` in an
+    /// async body is a `yield` of its state machine).
     Await(Box<IrNode>),
-    /// `new Promise(executor)`: allocate a fresh pending promise `P`
-    /// (stashed in `p_local`), build `resolve`/`reject` FUNCTION values bound to
-    /// `P` (via the settler funcref slots), call `executor(resolve, reject)`
-    /// synchronously — a throwing executor rejects `P` — and yield `P`. The
-    /// `resolve`/`reject` values carry `P` in their env slot, so calling one
-    /// drives the host settle logic on `P` (no lexical capture needed).
+    /// `new Promise(executor)`: allocate a fresh pending promise `P` and its
+    /// resolving `env` `[P, alreadyResolved]` (stashed in `p_local`), build
+    /// `resolve`/`reject` FUNCTION values over that `env` (via the settler
+    /// funcref slots), call `executor(resolve, reject)` synchronously — a
+    /// throwing executor calls `reject` — and yield `P`. Only the first call
+    /// of either function runs `__promise_settle` on `P`.
     PromiseCtor {
         /// The executor expression (a function value taking `(resolve, reject)`).
         executor: Box<IrNode>,
-        /// A dedicated local (not scratch) holding `P` across the executor call.
+        /// A dedicated local (not scratch) holding the resolving `env` across
+        /// the executor call.
         p_local: u32,
     },
     /// Spawn an `async function` body: the operand is a
     /// [`IrNode::MakeGenerator`] building the handle for the body compiled as a
-    /// generator state machine (`await` == `yield`). Lowers to the host
-    /// `__promise` import with [`crate::abi::PROMISE_OP_ASYNC_SPAWN`], which
-    /// allocates the result promise, drives the first step, and returns the
-    /// promise. Emitted as the whole body of the wrapper function the `async`
+    /// generator state machine (`await` == `yield`). Lowers to the guest
+    /// engine's `__async_spawn`, which allocates the result promise, drives
+    /// the body to its first `await`, and returns the promise; each `await`
+    /// resumes from the microtask queue. Emitted as the whole body of the wrapper function the `async`
     /// name binds to (`return AsyncSpawn(MakeGenerator{..})`).
     AsyncSpawn(Box<IrNode>),
     /// `new Date()` / `new Date(value)`. Allocates a fresh `TYPE_DATE`
     /// block whose f64 payload is `TimeClip` of the timestamp in milliseconds
     /// since the Unix epoch, and yields the handle heap jsval. `arg` is `None`
-    /// for the no-argument form (the host clock, the `__now` import); otherwise
+    /// for the no-argument form (the WASI clock, the guest `__now`); otherwise
     /// it is the single constructor argument: a Date's time value is taken
     /// directly, anything else goes through `ToPrimitive`, then a string is
     /// parsed as by `Date.parse` and any other primitive goes through
@@ -2179,7 +2178,7 @@ pub enum IrNode {
         arg: Option<Box<IrNode>>,
     },
     /// `Date.now()`: the host wall-clock time in milliseconds since the
-    /// Unix epoch, as a plain number jsval. Lowers to the host `__now` import.
+    /// Unix epoch, as a plain number jsval. Lowers to the guest `__now`.
     DateNow,
     /// A static `obj.size` read (DESIGN.md §6.4): a
     /// `TYPE_MAP`/`TYPE_SET` receiver passing its [`ProtoKind::Collection`]

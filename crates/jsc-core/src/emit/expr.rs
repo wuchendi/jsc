@@ -1,13 +1,39 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// Emit `node`, then root its value (an operand held on the stack across
+/// later code). The temp lives until the enclosing [`emit_node`] returns.
+pub(super) fn emit_operand(
+    node: &IrNode,
+    function: &mut impl Sink,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    emit_node(node, function, scratch, strings, helpers);
+    function.root_node(node);
+}
+
 /// Recursively emit the instructions for `node` into `function`.
+pub(super) fn emit_node(
+    node: &IrNode,
+    function: &mut impl Sink,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let mark = function.temp_mark();
+    emit_node_inner(node, function, scratch, strings, helpers);
+    function.release_temps(mark);
+}
+
+/// The [`emit_node`] dispatch.
 // The central per-IR-variant dispatch: one match arm per `IrNode`, so it grows
 // with the node set rather than with any single case's complexity.
 #[allow(clippy::too_many_lines)]
-pub(super) fn emit_node(
+fn emit_node_inner(
     node: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -53,6 +79,7 @@ pub(super) fn emit_node(
         }
         IrNode::Assign { local, value } => {
             emit_node(value, function, scratch, strings, helpers);
+            function.note_def(*local, value);
             // `local.tee` stores the value and leaves a copy on the stack so an
             // assignment can be used as an expression.
             function.instruction(&Instruction::LocalTee(*local));
@@ -62,6 +89,7 @@ pub(super) fn emit_node(
             // K padded args, then a trailing `undefined` env (a top-level function
             // never captures) and the argument count, then a plain `call`. The
             // callee leaves its boxed jsval result.
+            let mark = function.temp_mark();
             emit_call_args(args, function, scratch, strings, helpers);
             // A plain call binds `this = undefined`: reset the carrier after
             // every argument is evaluated, so a method call in an argument does not
@@ -69,8 +97,9 @@ pub(super) fn emit_node(
             emit_reset_this(function);
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
             emit_argc(call_argc(args.len(), helpers), function);
-            // `func` is codegen's index (main = 0, user functions 1..=n); the host
-            // import shifts every defined function up by IMPORT_FUNC_COUNT.
+            // `func` is codegen's index (main = 0, user functions 1..=n); the WASI
+            // imports shift every defined function up by IMPORT_FUNC_COUNT.
+            function.release_temps(mark);
             function.instruction(&Instruction::Call(*func + IMPORT_FUNC_COUNT));
             // A user function can throw; unwind if it left an exception in flight.
             emit_propagate_if_pending(function, helpers);
@@ -229,6 +258,7 @@ pub(super) fn emit_node(
         IrNode::PrivEnvStore { env, slot, value } => {
             emit_node(env, function, scratch, strings, helpers);
             emit_penv_elems(function);
+            function.root_temp(TempClass::Base);
             emit_node(value, function, scratch, strings, helpers);
             function.instruction(&Instruction::I64Store(penv_slot(*slot)));
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
@@ -240,9 +270,10 @@ pub(super) fn emit_node(
             attrs,
             name,
         } => {
-            emit_node(obj, function, scratch, strings, helpers);
+            emit_operand(obj, function, scratch, strings, helpers);
             emit_node(key, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32WrapI64);
+            function.root_temp(TempClass::Base);
             emit_node(value, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32Const(attrs.cast_signed()));
             function.instruction(&Instruction::I32Const(static_str(strings, name)));
@@ -251,7 +282,7 @@ pub(super) fn emit_node(
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
         IrNode::PrivateGet { obj, key, name } => {
-            emit_node(obj, function, scratch, strings, helpers);
+            emit_operand(obj, function, scratch, strings, helpers);
             emit_node(key, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32WrapI64);
             function.instruction(&Instruction::I32Const(static_str(strings, name)));
@@ -264,9 +295,10 @@ pub(super) fn emit_node(
             value,
             name,
         } => {
-            emit_node(obj, function, scratch, strings, helpers);
+            emit_operand(obj, function, scratch, strings, helpers);
             emit_node(key, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32WrapI64);
+            function.root_temp(TempClass::Base);
             emit_node(value, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32Const(static_str(strings, name)));
             function.instruction(&Instruction::Call(helpers.private_set()));
@@ -279,12 +311,13 @@ pub(super) fn emit_node(
             name,
             write,
         } => {
-            emit_node(obj, function, scratch, strings, helpers);
+            emit_operand(obj, function, scratch, strings, helpers);
             if let Some(value) = value {
-                emit_node(value, function, scratch, strings, helpers);
+                emit_operand(value, function, scratch, strings, helpers);
             } else {
                 function.instruction(&Instruction::LocalTee(scratch));
                 function.instruction(&Instruction::LocalGet(scratch));
+                function.root_temp(TempClass::Jsval);
             }
             emit_node(brand, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32Const(static_str(strings, name)));
@@ -312,7 +345,7 @@ pub(super) fn emit_node(
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
         }
         IrNode::PrivateIn { obj, brand, name } => {
-            emit_node(obj, function, scratch, strings, helpers);
+            emit_operand(obj, function, scratch, strings, helpers);
             emit_node(brand, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32Const(static_str(strings, name)));
             function.instruction(&Instruction::Call(helpers.private_in()));
@@ -321,6 +354,7 @@ pub(super) fn emit_node(
         IrNode::SetProto { obj, proto } => {
             emit_node(obj, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32WrapI64);
+            function.root_temp(TempClass::Base);
             emit_node(proto, function, scratch, strings, helpers);
             function.instruction(&Instruction::I64Store(MemArg {
                 offset: u64::from(abi::OBJ_PROTO_OFFSET),
@@ -656,86 +690,59 @@ pub(super) fn emit_node(
         IrNode::IncDec { local, inc, prefix } => {
             emit_inc_dec(*local, *inc, *prefix, function, helpers);
         }
-        // The promise-creation primitives: push the `__promise` op flag,
-        // the value operand, and an unused `b` slot, then call the host import. It
-        // returns the fresh (or, for `resolve` of a promise, adopted) promise jsval.
+        // The promise primitives call the guest promise engine.
         IrNode::PromiseResolve(value) => {
             emit_promise_resolve(value, function, scratch, strings, helpers);
         }
         IrNode::PromiseReject(value) => {
-            emit_promise_call(
-                PROMISE_OP_REJECT,
-                value,
-                &IrNode::Undefined,
-                function,
-                scratch,
-                strings,
-                helpers,
-            );
+            emit_node(value, function, scratch, strings, helpers);
+            function.instruction(&Instruction::Call(helpers.promise_reject()));
         }
-        // `p.finally(fn)`: the finalizer rides in the `b` slot; the host runs it on
-        // settlement and passes the original settlement through.
+        // `p.finally(fn)`: `p.then(thenFinally, catchFinally)` over `fn`.
         IrNode::PromiseFinally {
             promise,
             on_finally,
         } => {
-            emit_promise_call(
-                PROMISE_OP_FINALLY,
-                promise,
-                on_finally,
-                function,
-                scratch,
-                strings,
-                helpers,
-            );
+            emit_operand(promise, function, scratch, strings, helpers);
+            emit_node(on_finally, function, scratch, strings, helpers);
+            function.instruction(&Instruction::Call(helpers.promise_finally()));
         }
-        // `await p`: drive the microtask queue until `p` settles. A rejection is
-        // surfaced through the exception globals, so unwind if it left one pending.
+        // Top-level `await v`: `PromiseResolve(%Promise%, v)`, mark it handled,
+        // drain the microtask queue, and yield the fulfillment value; a
+        // rejection (or a throw of `PromiseResolve`) is left in flight, so
+        // unwind if one is pending.
         IrNode::Await(promise) => {
-            emit_promise_call(
-                PROMISE_OP_AWAIT,
-                promise,
-                &IrNode::Undefined,
-                function,
-                scratch,
-                strings,
-                helpers,
-            );
+            emit_node(promise, function, scratch, strings, helpers);
+            function.instruction(&Instruction::Call(helpers.promise_await()));
             emit_propagate_if_pending(function, helpers);
         }
-        // `p.then(onF, onR)` / `p.catch(onR)`: register reactions on `p` and yield
-        // the chained result promise (the host `__then` import).
+        // `p.then(onF, onR)` / `p.catch(onR)`: register a reaction on `p` and
+        // yield the derived promise.
         IrNode::PromiseThen {
             promise,
             on_fulfilled,
             on_rejected,
         } => {
-            emit_node(promise, function, scratch, strings, helpers);
-            emit_node(on_fulfilled, function, scratch, strings, helpers);
+            emit_operand(promise, function, scratch, strings, helpers);
+            emit_operand(on_fulfilled, function, scratch, strings, helpers);
             emit_node(on_rejected, function, scratch, strings, helpers);
-            function.instruction(&Instruction::Call(helpers.then));
+            function.instruction(&Instruction::Call(helpers.promise_then()));
         }
         // `new Promise(executor)`: build the promise + resolve/reject settlers, run
-        // the executor synchronously (a throw rejects the promise), and yield it.
+        // the executor synchronously (a throw calls `reject`), and yield the promise.
         IrNode::PromiseCtor { executor, p_local } => {
             emit_promise_ctor(executor, *p_local, function, scratch, strings, helpers);
         }
         // Spawn an `async function` body: build the generator (the inner
-        // `MakeGenerator`) and hand it to the host async engine, which allocates
-        // the result promise, drives the first step, and returns the promise.
+        // `MakeGenerator`) and hand it to `__async_spawn`, which allocates the
+        // result promise, drives the body to its first `await`, and returns
+        // the promise.
         IrNode::AsyncSpawn(make_generator) => {
-            emit_promise_call(
-                PROMISE_OP_ASYNC_SPAWN,
-                make_generator,
-                &IrNode::Undefined,
-                function,
-                scratch,
-                strings,
-                helpers,
-            );
+            emit_node(make_generator, function, scratch, strings, helpers);
+            function.instruction(&Instruction::Call(helpers.async_spawn()));
         }
         // The `Date` builtins: allocate/read a `TYPE_DATE` block's f64
-        // millisecond payload. `DateNew`/`DateNow` seed from `arg` or the host clock;
+        // millisecond payload. `DateNew`/`DateNow` seed from `arg` or the WASI clock;
         // `DateField` computes a field from a Date receiver's payload.
         IrNode::DateNew { arg } => {
             emit_date_new_node(arg.as_deref(), function, scratch, strings, helpers);
@@ -807,7 +814,7 @@ pub(super) fn emit_node(
 /// then the callee index if indirect.
 pub(super) fn emit_call_args(
     args: &[IrNode],
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -818,6 +825,8 @@ pub(super) fn emit_call_args(
         // JS ignores extra arguments; drop any beyond the fixed K slots.
         if i >= k {
             function.instruction(&Instruction::Drop);
+        } else {
+            function.root_node(arg);
         }
     }
     // Missing arguments are `undefined`.
@@ -831,7 +840,7 @@ pub(super) fn emit_call_args(
 /// right before the `call`/`call_indirect`, after every argument has been
 /// evaluated, so a nested method call in an argument does not leak its receiver.
 /// The push+`global.set` pair is stack-neutral.
-pub(super) fn emit_reset_this(function: &mut Function) {
+pub(super) fn emit_reset_this(function: &mut impl Sink) {
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
 }
@@ -848,7 +857,7 @@ pub(super) fn emit_reset_this(function: &mut Function) {
 /// index.
 pub(super) fn emit_method_call_user(
     node: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -920,7 +929,7 @@ fn emit_bound_call(
     (callee_val, this_local): (u32, u32),
     argc: usize,
     text: CalleeErrorText<'_>,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -971,7 +980,7 @@ fn emit_bound_call(
 /// resolves to a non-function (e.g. a missing method).
 pub(super) fn emit_this_call(
     node: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1051,9 +1060,9 @@ pub(super) fn emit_this_call(
 /// arguments are evaluated once into their scratch locals; the fast path runs
 /// when the value is the intrinsic with its dirty bit clear (a watched
 /// namespace), or when the member read from it is still the builtin method.
-pub(super) fn emit_namespace_guard(
+pub(super) fn emit_namespace_guard<S: Sink>(
     node: &IrNode,
-    function: &mut Function,
+    function: &mut S,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1074,7 +1083,7 @@ pub(super) fn emit_namespace_guard(
     };
     // `obj.key` into `member_local` (JS reads the callee before the
     // arguments).
-    let read = |function: &mut Function| {
+    let read = |function: &mut S| {
         emit_index_node(
             &IrNode::Local(*obj_local),
             &IrNode::Str(key.as_str().into()),
@@ -1086,7 +1095,7 @@ pub(super) fn emit_namespace_guard(
         );
         function.instruction(&Instruction::LocalTee(*member_local));
     };
-    let emit_args = |function: &mut Function| {
+    let emit_args = |function: &mut S| {
         for (arg, &local) in args.iter().zip(arg_locals) {
             emit_node(arg, function, scratch, strings, helpers);
             function.instruction(&Instruction::LocalSet(local));
@@ -1103,7 +1112,7 @@ pub(super) fn emit_namespace_guard(
         return;
     };
     // `obj.key === %builtin%`: the member read, compared with the constant.
-    let read_compare = |function: &mut Function| {
+    let read_compare = |function: &mut S| {
         read(function);
         function.instruction(&Instruction::I64Const(realm::method_bits(builtin, helpers)));
         function.instruction(&Instruction::I64Eq);
@@ -1170,7 +1179,7 @@ fn proto_kind_cases(kind: ProtoKind) -> &'static [(i32, Intrinsic)] {
 /// the family's prototype and, unless
 /// `sealed`, whose dirty bit is clear. `tmp` is a free i32 local.
 pub(super) fn emit_proto_kind_test(
-    function: &mut Function,
+    function: &mut impl Sink,
     local: u32,
     kind: ProtoKind,
     sealed: bool,
@@ -1248,7 +1257,7 @@ pub(super) fn emit_proto_kind_test(
 /// function's `prototype`) whose `proto` is `%GeneratorPrototype%`, so
 /// `next` resolves to the builtin either way.
 fn emit_generator_kind_test(
-    function: &mut Function,
+    function: &mut impl Sink,
     local: u32,
     sealed: bool,
     tmp: u32,
@@ -1331,12 +1340,12 @@ fn emit_generator_kind_test(
 /// `argc`, through the out-of-line generic method call — or, when `key` is a
 /// `String.prototype` builtin, straight into that builtin for a string
 /// receiver while `%String.prototype%` is clean (the `call_indirect` slot is a
-/// `select`); when the arguments already have the types the builtin coerces
-/// to, that string receiver runs the builtin's host op inline instead.
+/// `select`); `localeCompare` of a string literal runs `__str_cmp` inline on
+/// that string receiver instead.
 #[allow(clippy::too_many_lines)]
-pub(super) fn emit_proto_guard(
+pub(super) fn emit_proto_guard<S: Sink>(
     node: &IrNode,
-    function: &mut Function,
+    function: &mut S,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1360,12 +1369,12 @@ pub(super) fn emit_proto_guard(
         function.instruction(&Instruction::LocalSet(scratch));
         scratch
     };
-    let string_guard = |function: &mut Function| {
+    let string_guard = |function: &mut S| {
         emit_string_receiver_test(function, local, *sealed);
     };
     // With an early callee read: whether it found the fast path `slot`'s
     // builtin (its marker, see [`early_marker`]).
-    let found = |function: &mut Function, slot: usize| {
+    let found = |function: &mut S, slot: usize| {
         if let Some(callee) = callee {
             emit_node(callee, function, scratch, strings, helpers);
             function.instruction(&Instruction::I64Const(early_marker(slot)));
@@ -1374,58 +1383,27 @@ pub(super) fn emit_proto_guard(
     };
     let string = realm::method_of(realm::prototype_of(BuiltinCtor::String), key);
     let mut opened = 0;
-    // Arguments already of the types the builtin coerces to: on a string
-    // receiver the builtin is exactly its host op, inline.
-    let inline_string = match string {
-        Some(Builtin::StringMethod(op)) => builtins::inline_host_op(op, args),
-        _ => None,
-    };
-    if let Some((flag, may_fail)) = inline_string {
-        // A host op that may refuse its input (DESIGN.md §13) runs inside a
-        // block: its result leaves the block unless it is the
-        // `METHOD_RANGE_ERROR` sentinel, which falls through to the builtin
-        // call below (the builtin throws).
-        if may_fail {
-            function.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
-            enter_frame(helpers);
-        }
+    // A string-literal argument needs no coercion: on a string receiver
+    // `localeCompare` is exactly `__str_cmp`, inline.
+    let inline_string =
+        matches!(string, Some(Builtin::StringMethod(op)) if builtins::inline_str_cmp(op, args));
+    if inline_string {
         // A primitive keeps its kind: the early read decides.
         if callee.is_some() {
             found(function, STRING_SLOT);
         } else {
             string_guard(function);
         }
-        let block = if may_fail {
-            BlockType::Empty
-        } else {
-            BlockType::Result(ValType::I64)
-        };
-        function.instruction(&Instruction::If(block));
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
         enter_frame(helpers);
         function.instruction(&Instruction::LocalGet(local));
-        function.instruction(&Instruction::I32Const(flag));
-        for slot in 0..2 {
-            match args.get(slot) {
-                Some(arg) => emit_node(arg, function, scratch, strings, helpers),
-                None => {
-                    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-                }
-            }
-        }
-        function.instruction(&Instruction::Call(helpers.method));
-        if may_fail {
-            let result = scratch + 1;
-            function.instruction(&Instruction::LocalTee(result));
-            function.instruction(&Instruction::LocalGet(result));
-            builtins::emit_is_method_refusal(function);
-            function.instruction(&Instruction::I32Eqz);
-            function.instruction(&Instruction::BrIf(1));
-            function.instruction(&Instruction::Drop);
-            leave_frame(helpers);
-            function.instruction(&Instruction::End);
-        } else {
-            function.instruction(&Instruction::Else);
-        }
+        function.instruction(&Instruction::I32WrapI64);
+        emit_operand(&args[0], function, scratch, strings, helpers);
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::Call(helpers.str_cmp));
+        function.instruction(&Instruction::F64ConvertI32S);
+        function.instruction(&Instruction::I64ReinterpretF64);
+        function.instruction(&Instruction::Else);
         opened += 1;
     }
     for (slot, (kind, path)) in fast.iter().enumerate() {
@@ -1433,7 +1411,7 @@ pub(super) fn emit_proto_guard(
         // read decides; only a path reading own properties (an array's
         // elements, a promise's `constructor`) tests the receiver again.
         if callee.is_none() || props_sensitive(*kind) {
-            emit_proto_kind_test(function, local, *kind, *sealed, scratch + 3, helpers);
+            emit_proto_kind_test(function, local, *kind, *sealed, scratch + KIND_TMP, helpers);
             if callee.is_some() {
                 found(function, slot);
                 function.instruction(&Instruction::I32And);
@@ -1449,7 +1427,7 @@ pub(super) fn emit_proto_guard(
             function.instruction(&Instruction::I32And);
         }
         if matches!(path, IrNode::ArrayPush { .. }) {
-            emit_push_room_test(function, scratch + 3);
+            emit_push_room_test(function, scratch + KIND_TMP);
         }
         function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
         enter_frame(helpers);
@@ -1510,7 +1488,7 @@ pub(super) fn emit_proto_guard(
     function.instruction(&Instruction::I64Const(env));
     emit_argc(call_argc(args.len(), helpers), function);
     match string {
-        Some(builtin) if inline_string.is_none() => {
+        Some(builtin) if !inline_string => {
             let slot = |b: Builtin| Instruction::I32Const(helpers.builtin_slot(b).cast_signed());
             function.instruction(&slot(builtin));
             function.instruction(&slot(generic));
@@ -1535,7 +1513,7 @@ pub(super) fn emit_proto_guard(
 /// Push `1` when the jsval in `local` is a string while (unless `sealed`)
 /// `%String.prototype%`'s dirty bit is clear: the heap tag in the top 16
 /// bits, then the kind byte.
-fn emit_string_receiver_test(function: &mut Function, local: u32, sealed: bool) {
+fn emit_string_receiver_test(function: &mut impl Sink, local: u32, sealed: bool) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::I64Const(48));
     function.instruction(&Instruction::I64ShrU);
@@ -1611,9 +1589,9 @@ fn kind_method(kind: ProtoKind, key: &str) -> Option<Builtin> {
 /// [`early_marker`] of a string receiver or of the first fast path whose test
 /// the receiver passes (its builtin, with no lookup), else the generic
 /// `[[Get]]` of `key`.
-pub(super) fn emit_proto_method(
+pub(super) fn emit_proto_method<S: Sink>(
     node: &IrNode,
-    function: &mut Function,
+    function: &mut S,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1635,7 +1613,7 @@ pub(super) fn emit_proto_method(
         scratch
     };
     let mut opened = 0;
-    let mut open = |function: &mut Function, slot: usize| {
+    let mut open = |function: &mut S, slot: usize| {
         function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
         enter_frame(helpers);
         function.instruction(&Instruction::I64Const(early_marker(slot)));
@@ -1647,7 +1625,7 @@ pub(super) fn emit_proto_method(
         open(function, STRING_SLOT);
     }
     for (slot, &kind) in kinds.iter().enumerate().take(STRING_SLOT) {
-        emit_proto_kind_test(function, local, kind, *sealed, scratch + 3, helpers);
+        emit_proto_kind_test(function, local, kind, *sealed, scratch + KIND_TMP, helpers);
         open(function, slot);
     }
     emit_index_node(
@@ -1669,7 +1647,7 @@ pub(super) fn emit_proto_method(
 /// the array base in i32 local `base`: an array that long takes the builtin
 /// `push`, which sets the non-index key and throws the `RangeError` on
 /// `length`.
-fn emit_push_room_test(function: &mut Function, base: u32) {
+fn emit_push_room_test(function: &mut impl Sink, base: u32) {
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(array_len_slot()));
@@ -1702,9 +1680,9 @@ const _: () = assert!(abi::ARRAY_FLAG_DICTIONARY == 0x20);
 /// `__new_target` are set, and the callee runs with the construct marker
 /// `argc = -(n + 1)`. An object return value replaces `this`.
 #[allow(clippy::too_many_lines)]
-pub(super) fn emit_construct(
+pub(super) fn emit_construct<S: Sink>(
     node: &IrNode,
-    function: &mut Function,
+    function: &mut S,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1724,7 +1702,7 @@ pub(super) fn emit_construct(
     };
     let (f, this) = (*callee_local, *this_local);
     // `new.target`: the callee itself, or the derived class for `super(..)`.
-    let emit_new_target = |function: &mut Function| match new_target {
+    let emit_new_target = |function: &mut S| match new_target {
         Some(new_target) => emit_node(new_target, function, scratch, strings, helpers),
         None => {
             function.instruction(&Instruction::LocalGet(f));
@@ -1838,7 +1816,7 @@ fn emit_class_heritage(
     value: &IrNode,
     parent: u32,
     proto: u32,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1883,7 +1861,7 @@ fn emit_class_heritage(
 
 /// Push the jsval in `local` when it is an object-family heap value (any heap
 /// kind but a string or a symbol), else the i64 pushed by `alt`.
-fn emit_select_object(function: &mut Function, local: u32, alt: &Instruction<'_>) {
+fn emit_select_object(function: &mut impl Sink, local: u32, alt: &Instruction<'_>) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(alt);
     emit_is_object(function, local);
@@ -1892,7 +1870,7 @@ fn emit_select_object(function: &mut Function, local: u32, alt: &Instruction<'_>
 
 /// Push `1` if the jsval in `local` is an object (a heap value other than a
 /// string or a symbol), else `0`.
-pub(super) fn emit_is_object(function: &mut Function, local: u32) {
+pub(super) fn emit_is_object(function: &mut impl Sink, local: u32) {
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
@@ -1917,7 +1895,7 @@ fn static_str(strings: &StrOffsets, text: &JsStr) -> i32 {
 /// description `desc` (the fresh block in the i32 scratch `+3`).
 fn emit_private_name(
     desc: &JsStr,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1952,7 +1930,7 @@ fn emit_private_name(
 }
 
 /// Replace the `%penv` array jsval on the stack with its element store base.
-fn emit_penv_elems(function: &mut Function) {
+fn emit_penv_elems(function: &mut impl Sink) {
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I32Load(MemArg {
         offset: u64::from(abi::ARRAY_ELEMS_OFFSET),
@@ -1972,7 +1950,7 @@ fn penv_slot(slot: u32) -> MemArg {
 
 /// Push nonzero if the jsval in `local` is a constructor: a function value
 /// whose header carries `FUNC_FLAG_CONSTRUCTOR`, else `0`.
-pub(super) fn emit_is_constructor(function: &mut Function, local: u32) {
+pub(super) fn emit_is_constructor(function: &mut impl Sink, local: u32) {
     emit_is_function(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     function.instruction(&Instruction::LocalGet(local));
@@ -1993,7 +1971,7 @@ pub(super) fn emit_is_constructor(function: &mut Function, local: u32) {
 
 /// Box the i32 condition on the stack as a boolean jsval (the i32 scratch
 /// `+21` carries it past the two constants).
-fn emit_box_bool(function: &mut Function, scratch: u32) {
+fn emit_box_bool(function: &mut impl Sink, scratch: u32) {
     function.instruction(&Instruction::LocalSet(scratch + 21));
     function.instruction(&Instruction::I64Const(TRUE_BITS));
     function.instruction(&Instruction::I64Const(FALSE_BITS));
@@ -2003,7 +1981,7 @@ fn emit_box_bool(function: &mut Function, scratch: u32) {
 
 /// Push `1` if the `argc` local holds the construct marker: a negative number,
 /// i.e. its sign bit is set (a plain count is `+0` or positive).
-pub(super) fn emit_is_construct_call(function: &mut Function, argc: u32) {
+pub(super) fn emit_is_construct_call(function: &mut impl Sink, argc: u32) {
     function.instruction(&Instruction::LocalGet(argc));
     function.instruction(&Instruction::I64Const(0));
     function.instruction(&Instruction::I64LtS);
@@ -2011,7 +1989,7 @@ pub(super) fn emit_is_construct_call(function: &mut Function, argc: u32) {
 
 /// Push the construct marker `argc = -(count + 1)` as a NUMBER jsval for a
 /// `new` / `super(..)` call passing `count` arguments.
-pub(super) fn emit_construct_argc(count: usize, function: &mut Function) {
+pub(super) fn emit_construct_argc(count: usize, function: &mut impl Sink) {
     // See `emit_argc`: the count is tiny, so the conversion is exact.
     #[allow(clippy::cast_precision_loss)]
     let bits = (-(count as f64) - 1.0).to_bits().cast_signed();
@@ -2020,7 +1998,7 @@ pub(super) fn emit_construct_argc(count: usize, function: &mut Function) {
 
 /// Push the construct marker `argc = -(len + 1)` for a spread `new` /
 /// `super(...)` whose argument count is the i32 in `len`.
-fn emit_spread_construct_argc(len: u32, function: &mut Function) {
+fn emit_spread_construct_argc(len: u32, function: &mut impl Sink) {
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::F64ConvertI32U);
     function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
@@ -2040,7 +2018,7 @@ pub(super) fn call_argc(count: usize, helpers: Helpers<'_>) -> usize {
 /// actual source argument `count` as a NUMBER jsval (its `f64` bit pattern),
 /// letting a callee's rest parameter collect exactly the real arguments. Pushed
 /// after the env slot, before the funcref index for an indirect call.
-pub(super) fn emit_argc(count: usize, function: &mut Function) {
+pub(super) fn emit_argc(count: usize, function: &mut impl Sink) {
     // A call's argument count is tiny (bounded by `K`), so the `usize -> f64`
     // conversion is always exact — well within `f64`'s 52-bit mantissa.
     #[allow(clippy::cast_precision_loss)]
@@ -2064,7 +2042,7 @@ pub(super) fn emit_func_value(
     table_index: u32,
     captures: &[IrNode],
     kind: FnKind,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2130,7 +2108,7 @@ pub(super) fn emit_func_value(
 /// or `EnvLoad`), so `dst` is not clobbered while they are evaluated.
 pub(super) fn emit_env_block(
     captures: &[IrNode],
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2182,7 +2160,7 @@ pub(super) fn emit_env_block(
 /// type byte, the value at `+HEADER_SIZE`, then rebox the base as a heap jsval.
 pub(super) fn emit_cell_new(
     value: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2226,7 +2204,7 @@ pub(super) fn emit_cell_new(
 /// memory. The operand is stashed in the general i64 scratch slot (`+0`).
 pub(super) fn emit_str_len(
     operand: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2288,7 +2266,7 @@ pub(super) fn emit_str_len(
 
 /// Load a boxed cell's value: given a cell heap jsval on the stack, wrap it to a
 /// base offset and load the jsval stored at `+HEADER_SIZE`.
-pub(super) fn emit_cell_load(function: &mut Function) {
+pub(super) fn emit_cell_load(function: &mut impl Sink) {
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I64Load(MemArg {
         offset: HEADER_SIZE as u64,
@@ -2301,7 +2279,7 @@ pub(super) fn emit_cell_load(function: &mut Function) {
 /// environment jsval is the closure's last wasm parameter (local
 /// `helpers.max_args` under the env-last ABI); its cell pointers begin at
 /// `+HEADER_SIZE+4`.
-pub(super) fn emit_env_load(slot: u32, function: &mut Function, helpers: Helpers<'_>) {
+pub(super) fn emit_env_load(slot: u32, function: &mut impl Sink, helpers: Helpers<'_>) {
     function.instruction(&Instruction::LocalGet(helpers.max_args));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::I64Load(MemArg {
@@ -2317,7 +2295,7 @@ pub(super) fn emit_env_load(slot: u32, function: &mut Function, helpers: Helpers
 pub(super) fn emit_cell_set(
     cell: &IrNode,
     value: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2326,6 +2304,7 @@ pub(super) fn emit_cell_set(
     // base = wrap(cell).
     emit_node(cell, function, scratch, strings, helpers);
     function.instruction(&Instruction::I32WrapI64);
+    function.root_temp(TempClass::Base);
     // value on top, saved into `tmp` (tee leaves it on the stack).
     emit_node(value, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalTee(tmp));
@@ -2339,125 +2318,56 @@ pub(super) fn emit_cell_set(
     function.instruction(&Instruction::LocalGet(tmp));
 }
 
-/// Emit a call through a function **value** (`IrNode::CallIndirect`), leaving the
-/// callee's boxed jsval result on the stack. Under the env-last ABI it pushes
-/// the `K` padded args, then evaluates the callee once (stashing its block base
-/// in an i32 scratch), pushes the callee's **own environment** as the trailing
-/// `env` argument, then the funcref-table index, and `call_indirect`s.
-///
-/// The callee is evaluated **after** the arguments and its base then read twice
-/// (env, then index) with no intervening evaluation, so a nested indirect call
-/// in an argument cannot clobber the stashed base.
-/// Emit a call to the host `__promise(op, a, b) -> i64` import: push the
-/// `op` flag, then evaluate `a` and `b` into the two jsval slots, then `call`.
-/// Used by `Promise.resolve`/`reject` (`b` unused), `await` (`b` unused), and
-/// `p.finally` (`a` = the promise, `b` = the finalizer).
-pub(super) fn emit_promise_call(
-    op: i32,
-    a: &IrNode,
-    b: &IrNode,
-    function: &mut Function,
-    scratch: u32,
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-) {
-    function.instruction(&Instruction::I32Const(op));
-    emit_node(a, function, scratch, strings, helpers);
-    emit_node(b, function, scratch, strings, helpers);
-    function.instruction(&Instruction::Call(helpers.promise));
-}
-
-/// Emit `Promise.resolve(value)` of the inline `%Promise%` namespace: the
-/// host op, except for a promise, whose `constructor` decides the result
-/// (`PromiseResolve(%Promise%, v)`): the `Promise.resolve` builtin with
-/// `this = %Promise%`.
+/// Emit `Promise.resolve(value)` of the inline `%Promise%` namespace:
+/// `PromiseResolve(%Promise%, v)` through `__promise_resolve` (a throw of the
+/// `constructor` read propagates).
 fn emit_promise_resolve(
     value: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (v, args) = (scratch, scratch + 3);
     emit_node(value, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(v));
-    emit_is_pointer(function, v);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, v);
-    function.instruction(&Instruction::I32Const(i32::from(abi::TYPE_PROMISE)));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    enter_frame(helpers);
-    for slot in 0..helpers.max_args {
-        if slot == 0 {
-            function.instruction(&Instruction::LocalGet(v));
-        } else {
-            function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        }
-    }
-    if helpers.max_args == 0 {
-        // No positional slot: the argument rides in the spread array.
-        function.instruction(&Instruction::I32Const(1));
-        function.instruction(&Instruction::Call(helpers.new_array()));
-        function.instruction(&Instruction::LocalTee(args));
-        emit_array_elems(function);
-        function.instruction(&Instruction::LocalGet(v));
-        function.instruction(&Instruction::I64Store(elem_slot(0)));
-        function.instruction(&Instruction::LocalGet(args));
-        function.instruction(&Instruction::I64ExtendI32U);
-        function.instruction(&Instruction::I64Const(HEAP_BITS));
-        function.instruction(&Instruction::I64Or);
-        function.instruction(&Instruction::GlobalSet(SPREAD_ARGS_GLOBAL));
-    }
-    let promise = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Promise), helpers);
-    function.instruction(&Instruction::I64Const(promise));
-    function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
-    function.instruction(&Instruction::I64Const(0));
-    emit_argc(1, function);
-    let resolve = Builtin::PromiseStatic(realm::PromiseStaticOp::Resolve);
-    function.instruction(&Instruction::Call(helpers.builtin(resolve)));
+    function.instruction(&Instruction::Call(helpers.promise_resolve()));
     emit_propagate_if_pending(function, helpers);
-    function.instruction(&Instruction::Else);
-    function.instruction(&Instruction::I32Const(PROMISE_OP_RESOLVE));
-    function.instruction(&Instruction::LocalGet(v));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::Call(helpers.promise));
-    leave_frame(helpers);
-    function.instruction(&Instruction::End);
 }
 
 /// Emit `new Promise(executor)`, leaving the fresh promise's jsval on the
 /// stack.
 ///
-/// Steps: (1) `P = __promise(NEW)`, stashed in the dedicated `p_local`; (2) build
-/// `resolve`/`reject` FUNCTION values pointing at the settler funcref slots with
-/// `P` in their env slot; (3) call `executor(resolve, reject)` synchronously
-/// through `call_indirect` (env-last ABI), padding the two settlers to the fixed
-/// `K` positional slots (under `K < 2` publishing them as the spread argument
-/// array, which carries the overflow); (4) if the executor left `$exc_pending` set (it
-/// threw), reject `P` with the thrown value and clear the flag — a throwing
-/// executor rejects the promise rather than propagating; (5) push `P`.
+/// Steps: (1) `P = __promise_new(%Promise.prototype%)` and its resolving
+/// functions' shared env `[P, alreadyResolved]` (`__promise_resolving`),
+/// stashed in the dedicated `p_local`; (2) build `resolve`/`reject` FUNCTION
+/// values pointing at the settler funcref slots with that env; (3) call
+/// `executor(resolve, reject)` synchronously through `call_indirect` (env-last
+/// ABI), padding the two settlers to the fixed `K` positional slots (under
+/// `K < 2` publishing them as the spread argument array, which carries the
+/// overflow); (4) if the executor left `$exc_pending` set (it threw), clear the
+/// flag and call `reject` with the thrown value — a no-op once `resolve` /
+/// `reject` ran, else `P` rejects rather than the throw propagating; (5) push
+/// `P` (env slot 0).
 ///
 /// `p_local` is a real frame local (not scratch), so building the settlers and
-/// evaluating the executor cannot clobber the stashed promise.
+/// evaluating the executor cannot clobber the stashed env.
 pub(super) fn emit_promise_ctor(
     executor: &IrNode,
     p_local: u32,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     let exec_base = scratch + 7;
 
-    // P = __promise(NEW, undefined, undefined); stash it in p_local.
-    function.instruction(&Instruction::I32Const(PROMISE_OP_NEW));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::Call(helpers.promise));
+    // P = __promise_new(%Promise.prototype%); stash its resolving env in p_local.
+    let proto = intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Promise), helpers);
+    function.instruction(&Instruction::I64Const(proto));
+    function.instruction(&Instruction::Call(helpers.promise_new()));
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(HEAP_BITS));
+    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::Call(helpers.promise_resolving()));
     function.instruction(&Instruction::LocalSet(p_local));
 
     // Push the K padded positional args: resolve (a0), reject (a1), then undefined
@@ -2537,35 +2447,69 @@ pub(super) fn emit_promise_ctor(
     // The executor's return value is ignored.
     function.instruction(&Instruction::Drop);
 
-    // If the executor threw, its exception is caught HERE and turned into a
-    // rejection of P (not propagated): reject P with `$exc_value`, then clear the
-    // pending flag so execution continues normally with P (now rejected).
+    emit_executor_throw(p_local, function, scratch, helpers);
+
+    // The `new Promise` expression yields P.
+    function.instruction(&Instruction::LocalGet(p_local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(MemArg {
+        offset: u64::from(abi::RESOLVING_PROMISE_OFFSET),
+        align: 3,
+        memory_index: 0,
+    }));
+}
+
+/// A `new Promise` executor that threw has its exception caught HERE (not
+/// propagated): clear the pending flag, then `reject(thrown)` through the
+/// resolving env in `p_local` — a no-op once `alreadyResolved`.
+fn emit_executor_throw(p_local: u32, function: &mut impl Sink, scratch: u32, helpers: Helpers<'_>) {
+    let done = MemArg {
+        offset: u64::from(abi::RESOLVING_DONE_OFFSET),
+        align: 3,
+        memory_index: 0,
+    };
+    let promise_slot = MemArg {
+        offset: u64::from(abi::RESOLVING_PROMISE_OFFSET),
+        align: 3,
+        memory_index: 0,
+    };
     function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::I32Const(PROMISE_OP_SETTLE_REJECT));
-    function.instruction(&Instruction::LocalGet(p_local));
     function.instruction(&Instruction::GlobalGet(EXC_VALUE_GLOBAL));
-    function.instruction(&Instruction::Call(helpers.promise));
-    function.instruction(&Instruction::Drop);
+    function.instruction(&Instruction::LocalSet(scratch));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::I64Const(0));
     function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
-    function.instruction(&Instruction::End);
-
-    // The `new Promise` expression yields P.
     function.instruction(&Instruction::LocalGet(p_local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(done));
+    function.instruction(&Instruction::I64Const(TRUE_BITS));
+    function.instruction(&Instruction::I64Ne);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(p_local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Const(TRUE_BITS));
+    function.instruction(&Instruction::I64Store(done));
+    function.instruction(&Instruction::LocalGet(p_local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(promise_slot));
+    function.instruction(&Instruction::I32Const(abi::PROMISE_REJECTED));
+    function.instruction(&Instruction::LocalGet(scratch));
+    function.instruction(&Instruction::Call(helpers.promise_settle()));
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
 }
 
-/// Emit a `new Promise` settler FUNCTION value, leaving its heap jsval on
-/// the stack: a `TYPE_FUNCTION` block whose funcref-table index is the settler
-/// slot `table_index` and whose ENV slot holds the bound promise (read from
-/// `p_local`) rather than a closure environment. Mirrors [`emit_func_value`] but
-/// stores `p_local` in the env slot directly.
+/// Emit an internal FUNCTION value, leaving its heap jsval on the stack: a
+/// `TYPE_FUNCTION` block whose funcref-table index is `table_index` (a
+/// resolving function, a builtin closure) and whose ENV slot holds the jsval
+/// read from `p_local` (the resolving env, the closure's captured value).
+/// Mirrors [`emit_func_value`] but stores `p_local` in the env slot directly.
 pub(super) fn emit_settler_value(
     table_index: u32,
     p_local: u32,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     helpers: Helpers<'_>,
 ) {
@@ -2591,7 +2535,7 @@ pub(super) fn emit_settler_value(
         align: 2,
         memory_index: 0,
     }));
-    // Write the bound promise into the env slot at dst + FUNC_ENV_OFFSET.
+    // Write the env jsval into the env slot at dst + FUNC_ENV_OFFSET.
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::LocalGet(p_local));
@@ -2610,7 +2554,7 @@ pub(super) fn emit_call_indirect(
     callee: &IrNode,
     args: &[IrNode],
     not_callable: &CalleeError,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2669,7 +2613,7 @@ pub(super) fn emit_call_indirect(
 /// callable guards and the builtins; the transfer leaves the stack
 /// polymorphic, so any discarded operands need no cleanup.
 pub(super) fn emit_throw_not_a_function(
-    function: &mut Function,
+    function: &mut impl Sink,
     text: CalleeErrorText<'_>,
     scratch: u32,
     strings: &StrOffsets,
@@ -2688,7 +2632,7 @@ pub(super) fn emit_throw_not_a_function(
 /// (the stack is polymorphic afterwards).
 pub(super) fn emit_throw_error(
     error: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2713,7 +2657,7 @@ fn reference_error(global: &GlobalRef) -> IrNode {
 
 /// Push `HasProperty(global object, key of global)` as an i32.
 fn emit_global_has(
-    function: &mut Function,
+    function: &mut impl Sink,
     global: &GlobalRef,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2731,7 +2675,7 @@ fn emit_global_has(
 fn emit_global_get(
     global: &GlobalRef,
     typeof_operand: bool,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2770,7 +2714,7 @@ fn emit_global_get(
 fn emit_global_set(
     global: &GlobalRef,
     value: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2806,10 +2750,10 @@ fn emit_global_set(
 /// declaration's unconditionally (a rejected redefinition propagates), a
 /// `var`'s with `undefined` only when it is not already an own property;
 /// yields `undefined`.
-fn emit_global_declare(
+fn emit_global_declare<S: Sink>(
     name: &str,
     value: Option<&IrNode>,
-    function: &mut Function,
+    function: &mut S,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2817,7 +2761,7 @@ fn emit_global_declare(
     let global = intrinsic_bits(Intrinsic::Global, helpers);
     let key = static_key(strings, name);
     let attrs = (abi::ATTR_WRITABLE | abi::ATTR_ENUMERABLE).cast_signed();
-    let define = |function: &mut Function| {
+    let define = |function: &mut S| {
         function.instruction(&Instruction::I64Const(global));
         function.instruction(&Instruction::I32WrapI64);
         function.instruction(&Instruction::I32Const(key));
@@ -2850,7 +2794,7 @@ fn emit_global_declare(
 /// slots, so `local` may itself be a scratch slot the caller re-reads afterwards
 /// — that read only runs when nothing was thrown.
 pub(super) fn emit_callable_guard(
-    function: &mut Function,
+    function: &mut impl Sink,
     text: CalleeErrorText<'_>,
     local: u32,
     scratch: u32,
@@ -2884,7 +2828,7 @@ pub(super) fn is_static_function(callee: &IrNode) -> bool {
 pub(super) fn emit_call_spread(
     target: &SpreadCallee,
     args: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -2980,7 +2924,7 @@ fn emit_spread_args_setup(
     args: &IrNode,
     base: u32,
     len: u32,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -3000,7 +2944,7 @@ fn emit_spread_args_setup(
 pub(super) fn emit_spread_arg_slots(
     base: u32,
     len: u32,
-    function: &mut Function,
+    function: &mut impl Sink,
     helpers: Helpers<'_>,
 ) {
     for i in 0..helpers.max_args {
@@ -3022,7 +2966,7 @@ pub(super) fn emit_spread_arg_slots(
 /// `$__spread_args` right before the call, after every argument and the callee
 /// were evaluated, so a callee gathering its arguments reads the ones beyond
 /// `K` from it (only when its argument count exceeds `K`). Stack-neutral.
-pub(super) fn emit_publish_spread_args(base: u32, function: &mut Function) {
+pub(super) fn emit_publish_spread_args(base: u32, function: &mut impl Sink) {
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(HEAP_BITS));
@@ -3033,57 +2977,53 @@ pub(super) fn emit_publish_spread_args(base: u32, function: &mut Function) {
 /// Push a spread call's dynamic argument count `len` as a NUMBER jsval (its
 /// `f64` bit pattern), so a callee's rest parameter collects exactly the
 /// real spread arguments.
-pub(super) fn emit_spread_argc(len: u32, function: &mut Function) {
+pub(super) fn emit_spread_argc(len: u32, function: &mut impl Sink) {
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::F64ConvertI32U);
     function.instruction(&Instruction::I64ReinterpretF64);
 }
 
+/// End a `console.log` line: the newline, then one `fd_write` of the buffer.
+fn emit_end_line(function: &mut impl Sink, helpers: Helpers<'_>) {
+    function.instruction(&Instruction::I32Const(0x0A));
+    function.instruction(&Instruction::Call(helpers.out_byte()));
+    function.instruction(&Instruction::I32Const(1));
+    function.instruction(&Instruction::Call(helpers.out_flush()));
+}
+
 /// Emit a `console.log(a0, .., a_{n-1})` expression, leaving the
 /// `undefined` jsval (its expression value) on the stack.
 ///
-/// Each argument is evaluated left-to-right and passed to the host `print`
-/// import as `print(jsval_bits, flag)`: every argument but the last uses
-/// `PRINT_FLAG_SEP` (value + a single space) and the last uses `PRINT_FLAG_END`
-/// (value + newline). A zero-argument call emits one `print(undefined,
-/// PRINT_FLAG_NEWLINE)` so the line is just a newline. The host formats the
-/// jsval (reusing `format_value`) and reads linear memory for pointer jsvals.
+/// Each argument is evaluated left-to-right and appended to the output buffer
+/// by the guest renderer, separated by a single space; the line is written
+/// with one `fd_write` after the last argument (for no arguments, just a
+/// newline).
 pub(super) fn emit_console_log(
     args: &[IrNode],
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    if args.is_empty() {
-        // `console.log()` prints just a newline; the jsval operand is ignored, so
-        // a dummy `undefined` satisfies the import's `(i64, i32)` signature.
-        function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-        function.instruction(&Instruction::I32Const(PRINT_FLAG_NEWLINE));
-        function.instruction(&Instruction::Call(helpers.print));
-    } else {
-        let last = args.len() - 1;
-        for (i, arg) in args.iter().enumerate() {
-            emit_node(arg, function, scratch, strings, helpers);
-            let flag = if i == last {
-                PRINT_FLAG_END
-            } else {
-                PRINT_FLAG_SEP
-            };
-            function.instruction(&Instruction::I32Const(flag));
-            function.instruction(&Instruction::Call(helpers.print));
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            function.instruction(&Instruction::I32Const(0x20));
+            function.instruction(&Instruction::Call(helpers.out_byte()));
         }
+        emit_node(arg, function, scratch, strings, helpers);
+        function.instruction(&Instruction::Call(helpers.render_top()));
     }
+    emit_end_line(function, helpers);
     // `console.log(..)` evaluates to `undefined`.
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
 }
 
-/// Emit a `console.log(...)` spread call: build the argument array, then print
-/// each element (a hole as `undefined`) like [`emit_console_log`] prints its
-/// arguments — a bare newline for none — and push `undefined`.
+/// Emit a `console.log(...)` spread call: build the argument array, then
+/// render each element (a hole as `undefined`) like [`emit_console_log`]
+/// renders its arguments — a bare newline for none — and push `undefined`.
 pub(super) fn emit_console_log_spread(
     args: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -3093,13 +3033,7 @@ pub(super) fn emit_console_log_spread(
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalTee(base));
     function.instruction(&Instruction::I32Load(array_len_slot()));
-    function.instruction(&Instruction::LocalTee(len));
-    function.instruction(&Instruction::I32Eqz);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
-    function.instruction(&Instruction::I32Const(PRINT_FLAG_NEWLINE));
-    function.instruction(&Instruction::Call(helpers.print));
-    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalSet(len));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::LocalSet(idx));
     function.instruction(&Instruction::Block(BlockType::Empty));
@@ -3108,6 +3042,12 @@ pub(super) fn emit_console_log_spread(
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::I32GeU);
     function.instruction(&Instruction::BrIf(1));
+    // Every element but the first is preceded by a space.
+    function.instruction(&Instruction::LocalGet(idx));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::I32Const(0x20));
+    function.instruction(&Instruction::Call(helpers.out_byte()));
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::LocalGet(base));
     emit_array_elems(function);
     function.instruction(&Instruction::LocalGet(idx));
@@ -3117,20 +3057,15 @@ pub(super) fn emit_console_log_spread(
     function.instruction(&Instruction::I64Load(elem_slot(0)));
     function.instruction(&Instruction::LocalSet(elem));
     emit_elem_read(function, elem);
-    // The last element ends the line; every other one is followed by a space.
-    function.instruction(&Instruction::I32Const(PRINT_FLAG_END));
-    function.instruction(&Instruction::I32Const(PRINT_FLAG_SEP));
+    function.instruction(&Instruction::Call(helpers.render_top()));
     function.instruction(&Instruction::LocalGet(idx));
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalTee(idx));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Select);
-    function.instruction(&Instruction::Call(helpers.print));
+    function.instruction(&Instruction::LocalSet(idx));
     function.instruction(&Instruction::Br(0));
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
+    emit_end_line(function, helpers);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
 }
 
@@ -3157,7 +3092,7 @@ pub(super) fn emit_console_log_spread(
 ///   maps to index 0 ("number").
 pub(super) fn emit_typeof_node(
     operand: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -3244,11 +3179,11 @@ pub(super) fn emit_typeof_node(
 /// stack: stash it in `local`, redefine its own `name` (configurable only) as
 /// `prefix` + the key in `key` (a string key itself; a symbol `"[desc]"`, or
 /// `""` when its description is `undefined`), and push the function again.
-fn emit_set_function_name(
+fn emit_set_function_name<S: Sink>(
     key: u32,
     prefix: &str,
     local: u32,
-    function: &mut Function,
+    function: &mut S,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
@@ -3257,7 +3192,7 @@ fn emit_set_function_name(
         align: 3,
         memory_index: 0,
     };
-    let text = |function: &mut Function, text: &str| {
+    let text = |function: &mut S, text: &str| {
         function.instruction(&Instruction::I32Const(static_key(strings, text)));
     };
     function.instruction(&Instruction::LocalTee(local));

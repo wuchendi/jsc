@@ -4,7 +4,7 @@ use super::*;
 /// Load the element-store base of the array handle whose `i32` base is on the
 /// stack (its `elems` slot); element `i` is then the jsval at
 /// `store + ELEMS_DATA_OFFSET + 8*i`.
-pub(super) fn emit_array_elems(function: &mut Function) {
+pub(super) fn emit_array_elems(function: &mut impl Sink) {
     function.instruction(&Instruction::I32Load(MemArg {
         offset: ARRAY_ELEMS_OFFSET,
         align: 2,
@@ -28,7 +28,7 @@ pub(super) fn elem_slot(k: u64) -> MemArg {
 /// read resolves a hole through the prototype chain first
 /// ([`emit_hole_lookup`]); this alone serves the slots that are not elements of a
 /// user-visible array (a spread argument list) and what follows that lookup.
-pub(super) fn emit_elem_read(function: &mut Function, elem: u32) {
+pub(super) fn emit_elem_read(function: &mut impl Sink, elem: u32) {
     function.instruction(&Instruction::LocalGet(elem));
     function.instruction(&Instruction::LocalGet(elem));
     function.instruction(&Instruction::I64Const(HOLE_BITS));
@@ -43,7 +43,7 @@ pub(super) fn emit_elem_read(function: &mut Function, elem: u32) {
 /// inherited through the prototype chain (still [`HOLE_BITS`] when absent).
 /// An inherited getter may throw: the exception propagates.
 pub(super) fn emit_hole_lookup(
-    function: &mut Function,
+    function: &mut impl Sink,
     elem: u32,
     arr: u32,
     idx: u32,
@@ -67,7 +67,7 @@ pub(super) fn emit_hole_lookup(
 
 /// Push i32 nonzero when the array handle whose i32 base is in local `arr` is
 /// `SPARSE` (its header `flags` bit), else `0`.
-pub(super) fn emit_is_sparse(function: &mut Function, arr: u32) {
+pub(super) fn emit_is_sparse(function: &mut impl Sink, arr: u32) {
     function.instruction(&Instruction::LocalGet(arr));
     function.instruction(&Instruction::I32Load8U(MemArg {
         offset: u64::from(abi::HEADER_FLAGS_OFFSET),
@@ -83,7 +83,7 @@ pub(super) fn emit_is_sparse(function: &mut Function, arr: u32) {
 /// slot of a dense array, `__sparse_get` (function index `sparse_get`) of a
 /// `SPARSE` one. The store base is reloaded per access, since a callback may
 /// grow the array (replacing its store).
-pub(super) fn emit_elem_load(function: &mut Function, arr: u32, idx: u32, sparse_get: u32) {
+pub(super) fn emit_elem_load(function: &mut impl Sink, arr: u32, idx: u32, sparse_get: u32) {
     emit_is_sparse(function, arr);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     function.instruction(&Instruction::LocalGet(arr));
@@ -121,7 +121,7 @@ pub(super) fn array_len_slot() -> MemArg {
 /// scratch locals, without disturbing this store's base sitting beneath it.
 pub(super) fn emit_array_node(
     elems: &[IrNode],
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -160,12 +160,15 @@ pub(super) fn emit_array_node(
             memory_index: 0,
         }));
         // Each element jsval at store + 8 + 8*k, left-to-right.
+        let mark = function.temp_mark();
+        function.root_temp(TempClass::Base);
         for (k, elem) in elems.iter().enumerate() {
             function.instruction(&Instruction::LocalTee(dst));
             function.instruction(&Instruction::LocalGet(dst));
             emit_node(elem, function, scratch, strings, helpers);
             function.instruction(&Instruction::I64Store(elem_slot(k as u64)));
         }
+        function.release_temps(mark);
         // The handle: object prefix, `len = n`, `elems = store`.
         function.instruction(&Instruction::LocalSet(store));
         function.instruction(&Instruction::I32Const(ARRAY_BLOCK_SIZE));
@@ -220,7 +223,7 @@ pub(super) fn emit_array_node(
 /// [`List`]: SpreadElem::List
 pub(super) fn emit_array_spread(
     parts: &[SpreadElem],
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -252,7 +255,7 @@ pub(super) fn emit_array_spread(
                 let value = scratch + 22;
                 emit_node(source, function, scratch, strings, helpers);
                 function.instruction(&Instruction::LocalSet(value));
-                builtins::emit_iter_classify(function, value, false, scratch + 3, helpers);
+                builtins::emit_iter_classify(function, value, false, scratch + KIND_TMP, helpers);
                 function.instruction(&Instruction::LocalSet(scratch + 26));
                 emit_spread_list(value, scratch + 26, function, helpers);
                 function.instruction(&Instruction::I32WrapI64);
@@ -275,8 +278,8 @@ pub(super) fn emit_array_spread(
 /// by its record state in i64 `state` ([`builtins::emit_iter_classify`]):
 /// the array itself, a string's characters, a generator's drained values,
 /// else [`ProtocolOp::ToList`]'s list. A throw propagates.
-fn emit_spread_list(value: u32, state: u32, function: &mut Function, helpers: Helpers<'_>) {
-    let state_is = |function: &mut Function, kind: f64| {
+fn emit_spread_list<S: Sink>(value: u32, state: u32, function: &mut S, helpers: Helpers<'_>) {
+    let state_is = |function: &mut S, kind: f64| {
         function.instruction(&Instruction::LocalGet(state));
         function.instruction(&Instruction::I64Const(kind.to_bits().cast_signed()));
         function.instruction(&Instruction::I64Eq);
@@ -321,7 +324,7 @@ fn emit_spread_list(value: u32, state: u32, function: &mut Function, helpers: He
 pub(super) fn emit_array_push_node(
     local: u32,
     value: &IrNode,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -343,14 +346,14 @@ pub(super) fn emit_array_push_node(
 /// `__array_set_length`, which drops it from the property table).
 pub(super) fn emit_array_pop_node(
     local: u32,
-    function: &mut Function,
+    function: &mut impl Sink,
     scratch: u32,
     helpers: Helpers<'_>,
 ) {
     // Transient scratch locals: the handle base and the new length (i32), and
     // the removed element (i64).
     let base = scratch + 3;
-    let new_len = scratch + 7;
+    let new_len = scratch + 9;
     let removed = scratch + 4;
 
     // base = wrap(array_handle).
@@ -397,7 +400,7 @@ pub(super) fn emit_array_pop_node(
 /// stack via [`emit_elem_load`]. `arr`/`idx` are the array-handle-base /
 /// loop-index i32 scratch locals of an [`emit_array_hof`] loop.
 pub(super) fn emit_hof_load_elem(
-    function: &mut Function,
+    function: &mut impl Sink,
     arr: u32,
     idx: u32,
     helpers: Helpers<'_>,
@@ -407,7 +410,7 @@ pub(super) fn emit_hof_load_elem(
 
 /// Push the loop index `idx` (an i32 scratch local) as a number jsval — its
 /// `f64` bit pattern in the i64 carrier.
-fn emit_hof_index(function: &mut Function, idx: u32) {
+fn emit_hof_index(function: &mut impl Sink, idx: u32) {
     function.instruction(&Instruction::LocalGet(idx));
     function.instruction(&Instruction::F64ConvertI32U);
     function.instruction(&Instruction::I64ReinterpretF64);
@@ -422,7 +425,7 @@ fn emit_hof_index(function: &mut Function, idx: u32) {
 /// number `pushed`, at most `helpers.max_args`. Leaves the callback's boxed
 /// jsval result.
 fn emit_hof_invoke(
-    function: &mut Function,
+    function: &mut impl Sink,
     helpers: Helpers<'_>,
     cb: u32,
     this: Option<u32>,
@@ -496,14 +499,14 @@ enum HofArgc {
 /// callee (a funcref slot past the user functions and the settlers) can, so
 /// any other callback keeps `spill = 0` and receives the `K` positional
 /// arguments alone, as if passed directly.
-fn emit_hof_spill_seed(
-    function: &mut Function,
+fn emit_hof_spill_seed<S: Sink>(
+    function: &mut S,
     helpers: Helpers<'_>,
     cb: u32,
     spill: u32,
     all: u32,
 ) {
-    let alloc = |function: &mut Function| {
+    let alloc = |function: &mut S| {
         function.instruction(&Instruction::I32Const(all.cast_signed()));
         function.instruction(&Instruction::Call(helpers.new_array()));
         function.instruction(&Instruction::I64ExtendI32U);
@@ -562,13 +565,13 @@ pub(super) const REDUCE_EMPTY: CalleeErrorText<'static> = [
 /// completes and frees those locals first — the loop body itself only reads
 /// memory and `call_indirect`s, never re-entering an inner HOF at this frame.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(super) fn emit_array_hof(
+pub(super) fn emit_array_hof<S: Sink>(
     op: ArrayHofOp,
     array: &IrNode,
     callback: &IrNode,
     init: Option<&IrNode>,
     this_arg: Option<&IrNode>,
-    function: &mut Function,
+    function: &mut S,
     scratch: u32,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -653,7 +656,7 @@ pub(super) fn emit_array_hof(
         ArrayHofOp::ForEach => {}
     }
     // Push the callback's argument `j` of `(element, index, array)`.
-    let callback_arg = |function: &mut Function, j: u32| match j {
+    let callback_arg = |function: &mut S, j: u32| match j {
         0 => {
             function.instruction(&Instruction::LocalGet(elem));
         }
@@ -668,7 +671,7 @@ pub(super) fn emit_array_hof(
     // Push the positional arguments (`reduce`'s accumulator is pushed by the
     // caller), refill and publish the spread argument array when spilled,
     // and invoke.
-    let call = |function: &mut Function, before: u32| {
+    let call = |function: &mut S, before: u32| {
         let n = all.min(helpers.max_args);
         for j in before..n {
             callback_arg(function, j - before);

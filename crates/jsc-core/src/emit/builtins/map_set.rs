@@ -193,7 +193,7 @@ fn adder_not_callable(local: u32, set: bool) -> IrNode {
 /// Read `this` into `this` and throw `builtin`'s receiver `TypeError` unless
 /// it is a `Map` (or, for `set`, a `Set`) handle.
 fn this_collection(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     this: u32,
     builtin: Builtin,
@@ -216,7 +216,7 @@ fn this_collection(
 
 /// Push the slot count (two per entry, tombstones included) of the backing
 /// array of the handle in `handle`.
-pub(super) fn entries_len(function: &mut Function, handle: u32) {
+pub(super) fn entries_len(function: &mut impl Sink, handle: u32) {
     wasm!(function;
         LocalGet(handle), I32WrapI64,
         I64Load(MemArg { offset: MAP_ENTRIES_OFFSET, align: 3, memory_index: 0 }), I32WrapI64,
@@ -227,7 +227,7 @@ pub(super) fn entries_len(function: &mut Function, handle: u32) {
 /// Load the key and value of the backing slot pair at i32 index `i` of the
 /// handle in `handle` into `key` / `value` (`at` an i32 temp).
 pub(super) fn load_entry(
-    function: &mut Function,
+    function: &mut impl Sink,
     handle: u32,
     i: u32,
     at: u32,
@@ -250,7 +250,7 @@ pub(super) fn load_entry(
 /// tombstones (a `HOLE` key, DESIGN.md §5.2), stopping at the
 /// next live entry or the end (`at`, `key`, `value` temps).
 pub(super) fn skip_tombstones(
-    function: &mut Function,
+    function: &mut impl Sink,
     handle: u32,
     i: u32,
     at: u32,
@@ -273,7 +273,7 @@ pub(super) fn skip_tombstones(
 pub(super) fn emit_op(
     set: bool,
     op: MapOp,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -296,7 +296,7 @@ pub(super) fn emit_op(
 /// The `size` getter.
 pub(super) fn emit_size(
     set: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -315,7 +315,7 @@ pub(super) fn emit_size(
 /// deletion never shifts the walk.
 pub(super) fn emit_for_each(
     set: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -383,7 +383,7 @@ pub(super) fn emit_for_each(
 /// `__map_set` when i32 `builtin_adder` is set, else a call (a throw left
 /// pending).
 fn call_adder(
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     map: u32,
     adder: u32,
@@ -429,7 +429,7 @@ fn call_adder(
 /// the iterator itself does not.
 pub(super) fn emit_ctor(
     set: bool,
-    function: &mut Function,
+    function: &mut FnBuilder<'_>,
     frame: Frame,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
