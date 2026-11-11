@@ -2398,8 +2398,8 @@ Errors are printed to stderr.
   | `968dd97` | 19243 | 30014 | 47665 |
   | `eee36ef` | 19378 | 30014 | 47665 |
 
-  The current metric is its last row: **28037 / 32889 eligible tests pass
-  (≈ 85.2 %)**; `baseline.txt` holds the same 28037 paths. The drop in
+  The current metric is its last row: **28219 / 32889 eligible tests pass
+  (≈ 85.8 %)**; `baseline.txt` holds the same 28219 paths. The drop in
   rate at `d0f5e6a` is the 3180 newly eligible `async` tests (84 pass); at
   `15be3e0` the 3620 tests including `propertyHelper.js` became eligible
   (1413 pass).
