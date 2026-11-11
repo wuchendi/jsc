@@ -13,6 +13,7 @@ fn emit(program: &IrProgram) -> Vec<u8> {
         program,
         CompileOptions {
             print_completion: true,
+            gc_stress: false,
         },
     )
 }
@@ -476,17 +477,21 @@ fn string_literal_emits_data_segment_below_the_heap() {
 fn no_literals_starts_heap_after_the_intern_table() {
     // With no string literals, the static strings (the always-interned
     // "length", the realm's and the builtins' strings), the `__fn_info` table
-    // (the two settlers and the builtins), the realm image, the intern table
-    // and the Unicode tables precede the heap, which starts at the next page
+    // (the two settlers and the builtins), the realm image, the intern table,
+    // the Unicode tables and the collector's static root list (the realm's
+    // object-family blocks) precede the heap, which starts at the next page
     // boundary.
     let program = expr_program(IrNode::Num(42.0));
     let bytes = emit(&program);
     validate(&bytes);
     let (offsets, strings_end) = collect_strings(&program);
     let info = abi::FN_INFO_ENTRY_SIZE.cast_signed() * (2 + builtin_count());
-    let intern_base = strings_end + info + realm::image_size();
+    let realm_base = strings_end + info;
+    let intern_base = realm_base + realm::image_size();
     let cap = intern_table(&offsets, intern_base).cap;
-    let end = intern_base + 4 * cap + crate::emit::unicode::data_size();
+    let roots = (intern_base + 4 * cap + crate::emit::unicode::data_size() + 3) & -4;
+    let roots_len = i32::try_from(realm::static_objects(realm_base).len()).expect("count");
+    let end = roots + 4 + 4 * roots_len;
     let page = abi::GC_PAGE_SIZE.cast_signed();
     assert_eq!(data_layout(&bytes).1, Some((end + page - 1) / page * page));
 }
@@ -519,8 +524,8 @@ fn gc_size_class_table() {
     assert_eq!(decoded, want, "static class table");
 }
 
-/// The page table, the free-list heads, the current pages and the class
-/// table sit in the fixed static area, below every string block and the
+/// The page table, the free-list heads, the current pages, the class
+/// table and the static mark stack sit in the fixed static area, below every string block and the
 /// heap, and every block size class keeps bases 8-aligned.
 #[test]
 fn gc_static_layout() {
@@ -538,8 +543,12 @@ fn gc_static_layout() {
         abi::GC_CUR_PAGES + 4 * abi::GC_CLASS_COUNT
     );
     assert_eq!(
-        abi::STATIC_AREA_END,
+        abi::GC_MARK_STACK,
         abi::GC_CLASS_SIZES + 4 * abi::GC_CLASS_COUNT
+    );
+    assert_eq!(
+        abi::STATIC_AREA_END,
+        abi::GC_MARK_STACK + abi::GC_MARK_STACK_SIZE
     );
     assert_eq!(abi::STATIC_AREA_END % abi::BLOCK_ALIGN, 0);
     for class in 1..=abi::GC_CLASS_COUNT {

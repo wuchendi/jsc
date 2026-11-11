@@ -18,15 +18,16 @@ macro_rules! wasm {
 /// ([`abi::gc_size_class`], computed here as `(size + 15) >> 4` or
 /// `40 - clz(size - 1)`). A larger one takes a large span of
 /// `k = ceil((size + 16) / 64 KiB)` pages: the budget step, then
-/// `__gc_take_pages(k)`; the head page is coded
-/// [`abi::GC_PAGE_LARGE_HEAD`], its pre-header records `k` and links the span
-/// onto `$__gc_large`, and the block starts after the pre-header. A span
-/// beyond the memory cap or pages memory cannot supply end in the static
-/// [`abi::OOM_LINE`] on fd 2 and `proc_exit(1)`. Locals: `size`, the page
-/// count `k`, the span `page`.
+/// `__gc_take_pages(k)` (failing that, one collection and a retry); the head
+/// page is coded [`abi::GC_PAGE_LARGE_HEAD`], its pre-header records `k` and
+/// links the span onto `$__gc_large`, and the block starts after the
+/// pre-header. A span beyond the memory cap or pages memory cannot supply
+/// end in the static [`abi::OOM_LINE`] on fd 2 and `proc_exit(1)`. Locals:
+/// `size`, the page count `k`, the span `page`, the collect-before-OOM flag
+/// `tried`.
 pub(super) fn emit_alloc(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut function = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I32]);
-    let (size, k, page) = (0, 1, 2);
+    let mut function = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I32, RAW_I32]);
+    let (size, k, page, tried) = (0, 1, 2, 3);
     let max_pages = i32::try_from(abi::MEMORY_MAX_PAGES).unwrap_or(i32::MAX);
     let header = abi::GC_LARGE_HEADER_SIZE.cast_signed();
     wasm!(function;
@@ -45,12 +46,15 @@ pub(super) fn emit_alloc(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     wasm!(function; End);
     gc::emit_gc_budget(
         &mut function,
+        helpers,
         |f| wasm!(f; LocalGet(k), I32Const(16), I32Shl),
     );
     wasm!(function;
+        Loop(BlockType::Empty),
         LocalGet(k), Call(helpers.gc_take_pages()), LocalTee(page), I32Eqz,
         If(BlockType::Empty),
     );
+    gc::emit_collect_retry(&mut function, helpers, tried, 1);
     gc::emit_oom_exit(&mut function);
     wasm!(function;
         End,
@@ -60,7 +64,9 @@ pub(super) fn emit_alloc(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         LocalGet(page), GlobalGet(GC_LARGE_GLOBAL),
         I32Store(mem32(u64::from(abi::GC_LARGE_NEXT_OFFSET))),
         LocalGet(page), GlobalSet(GC_LARGE_GLOBAL),
-        LocalGet(page), I32Const(header), I32Add, End,
+        LocalGet(page), I32Const(header), I32Add, Return,
+        End,
+        Unreachable, End,
     );
     finish_builder(function)
 }

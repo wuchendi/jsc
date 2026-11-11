@@ -3151,6 +3151,19 @@ pub(super) fn image_size() -> i32 {
     (symbols_offset(&registry()) + abi::SYMBOL_BLOCK_SIZE * symbols).cast_signed()
 }
 
+/// The addresses of the image's object-family blocks at `base`, for the
+/// collector's static root list (design/runtime-memory.md §5.4): every
+/// intrinsic (the `Symbol.for` registry included), then every builtin
+/// method block. The accessor and symbol blocks are immutable and left out.
+pub(super) fn static_objects(base: i32) -> Vec<u32> {
+    let registry = registry();
+    let base = base.cast_unsigned();
+    intrinsics()
+        .map(|intrinsic| base + intrinsic_offset(&registry, intrinsic))
+        .chain(methods(&registry).map(|builtin| base + method_offset(&registry, builtin)))
+        .collect()
+}
+
 /// The heap-pointer jsval of `intrinsic` in the image at `base`.
 pub(super) fn intrinsic_addr_bits(base: i32, intrinsic: Intrinsic) -> i64 {
     let addr = base.cast_unsigned() + intrinsic_offset(&registry(), intrinsic);

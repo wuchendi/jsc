@@ -487,7 +487,7 @@ fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
 pub(super) fn build_globals(
     heap_start: i32,
     intern: &InternTable,
-    module_cells: u32,
+    gc: gc::GcLayout,
 ) -> GlobalSection {
     let mut globals = GlobalSection::new();
     let mut_i32 = |init| {
@@ -589,15 +589,23 @@ pub(super) fn build_globals(
         let (ty, init) = mut_i32(0);
         globals.global(ty, &init);
     }
-    // The collector: `$__gc_debt` (the initial budget), `$__gc_live`,
-    // `$__gc_epoch` (1), `$__gc_busy`, `$__gc_free_pages`, `$__gc_large`.
-    for init in [abi::GC_MIN_BUDGET.cast_signed(), 0, 1, 0, 0, 0] {
+    // The collector: `$__gc_debt` (the initial budget, `0` under
+    // `gc_stress`), `$__gc_live`, `$__gc_epoch` (1), `$__gc_busy`,
+    // `$__gc_free_pages`, `$__gc_large`, then the mark stack's `$__gc_stack`,
+    // `$__gc_stack_top`, `$__gc_stack_end` and `$__gc_overflow` (set by each
+    // collection).
+    let budget = if gc.stress {
+        0
+    } else {
+        abi::GC_MIN_BUDGET.cast_signed()
+    };
+    for init in [budget, 0, 1, 0, 0, 0, 0, 0, 0, 0] {
         let (ty, init) = mut_i32(init);
         globals.global(ty, &init);
     }
     // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in
     // `main`'s prologue before any user code runs.
-    for _ in 0..module_cells {
+    for _ in 0..gc.module_cells {
         let (ty, init) = mut_i64();
         globals.global(ty, &init);
     }

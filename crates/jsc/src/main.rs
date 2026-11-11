@@ -107,7 +107,10 @@ fn run(eval: Option<String>, print: Option<String>, file: Option<String>) -> Res
             )));
         }
     };
-    let options = CompileOptions { print_completion };
+    let options = CompileOptions {
+        print_completion,
+        gc_stress: false,
+    };
     let wasm = compile(&src, dialect, &label, options)?;
     let outcome = jsc_core::run::run(&wasm, Sinks::Inherit, None).map_err(Failure::Runtime)?;
     Ok(u8::try_from(outcome.code).unwrap_or(1))

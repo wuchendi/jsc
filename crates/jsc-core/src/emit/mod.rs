@@ -205,12 +205,22 @@ const GC_FREE_PAGES_GLOBAL: u32 = 34;
 /// The head of the large-span list (`$__gc_large`, raw `i32` page address,
 /// init 0 = none).
 const GC_LARGE_GLOBAL: u32 = 35;
+/// The mark stack's base (`$__gc_stack`, i32): [`abi::GC_MARK_STACK`] at the
+/// start of every collection, or pages from the pool once it outgrew it.
+const GC_STACK_GLOBAL: u32 = 36;
+/// The mark stack's first free entry (`$__gc_stack_top`, i32).
+const GC_STACK_TOP_GLOBAL: u32 = 37;
+/// The mark stack's end (`$__gc_stack_end`, i32).
+const GC_STACK_END_GLOBAL: u32 = 38;
+/// Set when a mark-stack push found no room (`$__gc_overflow`, i32): the
+/// marking pass is repeated with a rescan of every marked block.
+const GC_OVERFLOW_GLOBAL: u32 = 39;
 
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
 /// the renderer, RNG, promise-engine and collector globals and set in `main`'s
 /// prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 36;
+const MODULE_CELL_GLOBAL_BASE: u32 = 40;
 
 /// An array hole (see [`abi::HOLE`]): the element-slot bit pattern of a
 /// missing element. Every element read maps it to `undefined`.
@@ -1451,6 +1461,18 @@ fn decl_func_base(table_index: u32, helpers: Helpers<'_>) -> i32 {
         + abi::FUNC_BLOCK_SIZE.cast_signed() * table_index.cast_signed()
 }
 
+/// The static root list's addresses (design/runtime-memory.md §5.4): the
+/// `fn_count` static declaration blocks from `blocks`, then the realm image's
+/// intrinsic and builtin-method blocks ([`realm::static_objects`], the
+/// `Symbol.for` registry among them).
+fn static_roots(blocks: i32, fn_count: i32, realm: i32) -> Vec<u32> {
+    let size = abi::FUNC_BLOCK_SIZE.cast_signed();
+    (0..fn_count)
+        .map(|i| (blocks + size * i).cast_unsigned())
+        .chain(realm::static_objects(realm))
+        .collect()
+}
+
 /// The number of builtin bodies (funcref-table slots after the settlers).
 fn builtin_count() -> i32 {
     i32::try_from(Builtin::ALL.len()).unwrap_or(0)
@@ -1535,6 +1557,10 @@ use value::*;
 pub struct CompileOptions {
     /// Render the completion value to fd 1 after the final drain.
     pub print_completion: bool,
+    /// Test only (not exposed by the CLI): an allocation budget of `0`, so
+    /// every allocation runs a full collection (design/runtime-memory.md
+    /// §5.6, Q20).
+    pub gc_stress: bool,
 }
 
 /// Emit a complete WebAssembly command module for `program`: exports
@@ -1558,15 +1584,24 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     let realm = blocks + abi::FUNC_BLOCK_SIZE.cast_signed() * fn_count;
     let intern_base = realm + realm::image_size();
     let intern = intern_table(&offsets, intern_base);
-    // The raw Unicode tables end the static region; blocks stay 8-aligned.
+    // The raw Unicode tables and the collector's static root list end the
+    // static region; blocks stay 8-aligned.
     let unicode_base = intern_base + 4 * intern.cap;
+    let roots_base = (unicode_base + unicode::data_size() + 3) & -4;
+    let static_roots = static_roots(blocks, fn_count, realm);
     let layout = FnLayout {
         info: strings_end,
         blocks,
         realm,
         unicode: unicode_base,
     };
-    let heap_start = gc::heap_start(unicode_base + unicode::data_size());
+    let heap_start = gc::heap_start(roots_base + gc::root_list_size(static_roots.len()));
+    let gc_layout = gc::GcLayout {
+        heap_start,
+        roots: roots_base,
+        module_cells: program.module_cells,
+        stress: options.gc_stress,
+    };
 
     // Type/function sections and the resolved helper indices (see
     // [`build_type_and_function_sections`]).
@@ -1627,7 +1662,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
 
     // Global section: the page frontier plus the exception-unwinding globals
     // (see [`build_globals`]).
-    module.section(&build_globals(heap_start, &intern, program.module_cells));
+    module.section(&build_globals(heap_start, &intern, gc_layout));
 
     // Export section: exactly `_start` and memory index 0 as "memory".
     let mut exports = ExportSection::new();
@@ -1837,13 +1872,18 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     for helper in promise_engine::emit_helpers(&offsets, helpers, &leaves) {
         code.function(&helper);
     }
-    for helper in gc::emit_helpers(helpers, &leaves) {
+    for helper in gc::emit_helpers(helpers, &leaves, gc_layout) {
         code.function(&helper);
     }
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.
     let mut data = emit_data_section(&offsets, &intern, &program.functions, layout);
+    data.active(
+        0,
+        &ConstExpr::i32_const(roots_base),
+        gc::root_list(&static_roots),
+    );
     libm::emit_data(&mut data);
     module.section(&data);
 

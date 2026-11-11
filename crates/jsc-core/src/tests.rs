@@ -15,6 +15,7 @@ fn compile_and_run_evaluates_numeric_expression() {
         &ir,
         CompileOptions {
             print_completion: true,
+            gc_stress: false,
         },
     );
     let capture = Capture::new();

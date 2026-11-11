@@ -832,7 +832,7 @@ pub(crate) const DEC_POW5_LEN: u32 = 1440;
 pub(crate) const DEC_POWERS: u32 = DEC_POW5 + DEC_POW5_LEN;
 
 /// The first address after the fixed static area, where the string blocks begin.
-pub(crate) const STATIC_AREA_END: u32 = GC_CLASS_SIZES + 4 * GC_CLASS_COUNT;
+pub(crate) const STATIC_AREA_END: u32 = GC_MARK_STACK + GC_MARK_STACK_SIZE;
 
 /// The size of a GC page: one 64 KiB wasm page. The heap starts at the first
 /// page boundary after the static region (design/runtime-memory.md §5.1).
@@ -883,6 +883,15 @@ pub(crate) const GC_CUR_PAGES: u32 = GC_FREE_HEADS + 4 * GC_CLASS_COUNT;
 /// segment) after the current pages: class `c`'s slot size at
 /// `GC_CLASS_SIZES + 4 * (c - 1)`.
 pub(crate) const GC_CLASS_SIZES: u32 = GC_CUR_PAGES + 4 * GC_CLASS_COUNT;
+
+/// Address of the collector's static mark stack (`u32` block bases) after the
+/// class size table: every collection starts on it, so marking always makes
+/// progress even when no page is left; a deeper stack moves to pages from the
+/// pool (design/runtime-memory.md §5.4).
+pub(crate) const GC_MARK_STACK: u32 = GC_CLASS_SIZES + 4 * GC_CLASS_COUNT;
+
+/// The byte size of [`GC_MARK_STACK`] (1024 entries).
+pub(crate) const GC_MARK_STACK_SIZE: u32 = 4096;
 
 /// The byte size of a small page's header; slots start right after it.
 pub(crate) const GC_PAGE_HEADER_SIZE: u32 = 16;

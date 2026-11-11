@@ -472,6 +472,9 @@ pub(super) fn emit_str_hash(leaves: &LeafSet) -> Function {
 
 /// `__intern_slot(s: i32) -> i32`: the address of the intern-table slot that
 /// holds the string with `s`'s content, or of the empty slot where it belongs.
+/// The table is weak (design/runtime-memory.md §5.6): a collection turns the
+/// slot of an unreachable heap string into the tombstone `1`, which the probe
+/// passes over and an insertion never reuses.
 pub(super) fn emit_intern_slot(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_BASE], &[RAW_I32, RAW_I32, RAW_I32, RAW_I32]);
     let (s, mask, i, a, c) = (0, 1, 2, 3, 4);
@@ -482,8 +485,12 @@ pub(super) fn emit_intern_slot(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
         GlobalGet(INTERN_BASE_GLOBAL), LocalGet(i), I32Const(2), I32Shl, I32Add, LocalTee(a),
         I32Load(m32(0)), LocalTee(c), I32Eqz,
         If(BlockType::Empty), LocalGet(a), Return, End,
+        // A tombstone (`1`, a collected string) is probed past.
+        LocalGet(c), I32Const(1), I32Ne,
+        If(BlockType::Empty),
         LocalGet(c), LocalGet(s), Call(helpers.str_eq),
         If(BlockType::Empty), LocalGet(a), Return, End,
+        End,
         LocalGet(i), I32Const(1), I32Add, LocalGet(mask), I32And, LocalSet(i),
         Br(0),
         End,
@@ -504,7 +511,8 @@ pub(super) fn emit_intern_find(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
 /// `__intern(s: i32) -> i32`: the interned block with `s`'s content, inserting
 /// `s` itself (flagged `INTERNED`, plus `ARRAY_INDEX` for a canonical index
 /// spelling) on a miss. The table doubles, rehashing into a fresh heap copy,
-/// once more than half its slots are used.
+/// once more than half its slots are used (tombstones included); the copy
+/// keeps only the strings, and `$__intern_count` restarts from them.
 pub(super) fn emit_intern(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(
         leaves,
@@ -541,12 +549,17 @@ pub(super) fn emit_intern(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         LocalGet(a), LocalGet(cap), I32Const(3), I32Shl, I32Store(m32(u64::from(HEADER_SIZE.cast_unsigned()))),
         LocalGet(a), I32Const(HEADER_SIZE + 4), I32Add, GlobalSet(INTERN_BASE_GLOBAL),
         LocalGet(cap), I32Const(1), I32Shl, GlobalSet(INTERN_CAP_GLOBAL),
+        // Only the strings move (slots `> 1`); the count restarts without
+        // the tombstones.
         I32Const(0), LocalSet(i),
+        I32Const(0), GlobalSet(INTERN_COUNT_GLOBAL),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(cap), I32GeU, BrIf(1),
         LocalGet(old), LocalGet(i), I32Const(2), I32Shl, I32Add, I32Load(m32(0)), LocalTee(c),
+        I32Const(1), I32GtU,
         If(BlockType::Empty),
         LocalGet(c), Call(helpers.intern_slot), LocalGet(c), I32Store(m32(0)),
+        GlobalGet(INTERN_COUNT_GLOBAL), I32Const(1), I32Add, GlobalSet(INTERN_COUNT_GLOBAL),
         End,
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),
