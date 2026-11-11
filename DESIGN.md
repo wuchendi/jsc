@@ -2374,7 +2374,11 @@ Errors are printed to stderr.
   fail / compile-error / timeout, with negative tests matched on parse versus
   runtime phase and the uncaught error name (builtin errors render as
   `Uncaught TypeError: …`, a failed assertion as `Uncaught Test262Error { … }`).
-  A non-negative `async` test that exits 0 passes only if stdout has a line
+  An `Uncaught (in promise) …` report (exit 1) is host rejection tracking,
+  not an uncaught exception of the script, so it counts as normal completion
+  (INTERPRETING.md's pass rule): a non-negative test passes, a runtime
+  negative test fails. A non-negative `async` test that completes normally
+  passes only if stdout has a line
   exactly `Test262:AsyncTestComplete` and none starting
   `Test262:AsyncTestFailure`; otherwise it fails with that failure line (or
   `missing Test262:AsyncTestComplete`) as the detail in

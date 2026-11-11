@@ -15,11 +15,20 @@
 //! x }` and so reports the name `Test262Error`. `$DONOTEVALUATE()` throws a
 //! string (`Uncaught Test262: This statement ...`), which never matches.
 //!
+//! # Unhandled rejections
+//!
+//! jsc reports a promise rejected without a handler after the final drain as
+//! `Uncaught (in promise) ...` on stderr and exits 1. That report is host
+//! behaviour (`HostPromiseRejectionTracker`), not an uncaught exception of
+//! the script, so INTERPRETING.md's pass rule ("the test completes without
+//! an uncaught exception") counts it as normal completion: a non-negative test
+//! passes, a `phase: runtime` negative test fails.
+//!
 //! # Async tests
 //!
-//! A non-negative `flag:async` test that exits 0 is judged by the `$DONE`
-//! report on stdout ([`classify_async`]); every other async result follows
-//! the rules above.
+//! A non-negative `flag:async` test that completes normally (exit 0, or only
+//! an unhandled-rejection report) is judged by the `$DONE` report on stdout
+//! ([`classify_async`]); every other async result follows the rules above.
 
 use crate::frontmatter::Negative;
 
@@ -59,6 +68,9 @@ impl Outcome {
     }
 }
 
+/// Start of jsc's report of a promise rejected without a handler.
+const UNHANDLED: &str = "Uncaught (in promise) ";
+
 enum Verdict {
     Ok,
     CompileError,
@@ -74,6 +86,7 @@ fn verdict(status: Status, stderr: &str) -> Verdict {
         Status::Exited(code) if code == 2 || stderr.trim_start().starts_with("error:") => {
             Verdict::CompileError
         }
+        Status::Exited(1) if stderr.trim_start().starts_with(UNHANDLED) => Verdict::Ok,
         Status::Exited(1) if stderr.contains("Uncaught") => Verdict::Uncaught,
         Status::Signaled | Status::Exited(_) => Verdict::Other,
     }
@@ -131,7 +144,7 @@ pub fn classify_async(
     stderr: &str,
     negative: Option<&Negative>,
 ) -> (Outcome, Option<String>) {
-    if negative.is_some() || status != Status::Exited(0) {
+    if negative.is_some() || !matches!(verdict(status, stderr), Verdict::Ok) {
         return (classify(status, stderr, negative), None);
     }
     if let Some(line) = stdout.lines().find(|l| l.starts_with(ASYNC_FAILURE)) {
@@ -295,6 +308,47 @@ mod tests {
         assert_eq!(
             classify_async(Status::Exited(1), done, UNCAUGHT, None),
             (Outcome::Fail, None)
+        );
+    }
+
+    #[test]
+    fn unhandled_rejection_is_normal_completion() {
+        let report = "Uncaught (in promise) TypeError: object.constructor is not an object\n";
+        assert_eq!(classify(Status::Exited(1), report, None), Outcome::Pass);
+        assert_eq!(
+            classify(
+                Status::Exited(1),
+                report,
+                Some(&neg("runtime", "TypeError"))
+            ),
+            Outcome::Fail
+        );
+        assert_eq!(
+            classify(
+                Status::Exited(1),
+                report,
+                Some(&neg("parse", "SyntaxError"))
+            ),
+            Outcome::Fail
+        );
+        // A script exception is still an exception, even inside a promise job's
+        // output further down.
+        assert_eq!(
+            classify(
+                Status::Exited(1),
+                "Uncaught Test262Error { message: x }\n",
+                None
+            ),
+            Outcome::Fail
+        );
+        let done = "Test262:AsyncTestComplete\n";
+        assert_eq!(
+            classify_async(Status::Exited(1), done, report, None),
+            (Outcome::Pass, None)
+        );
+        assert_eq!(
+            classify_async(Status::Exited(1), "", report, None),
+            (Outcome::Fail, Some(MISSING_COMPLETE.to_owned()))
         );
     }
 
