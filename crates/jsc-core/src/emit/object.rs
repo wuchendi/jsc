@@ -1452,7 +1452,8 @@ fn emit_date_iso(bits: u32, function: &mut impl Sink, scratch: u32, helpers: Hel
     let tmp = scratch + 24;
     let abs_year = scratch + 25;
     let bptr = scratch + 3;
-    let at = scratch + 8;
+    // An integer (the year shift, then the write cursor): the raw `+9`.
+    let at = scratch + 9;
     emit_days_tod(function, bits, days, tod, scratch + 25, scratch + 28);
     emit_date_civil(
         function,
@@ -2014,9 +2015,10 @@ pub(super) fn emit_map_op<S: Sink>(
 /// tombstoned in place (`HOLE` key, `undefined` value;
 /// DESIGN.md §5.2). The backing keeps its length, so a live
 /// iterator continues at its index and sees the entries added after the
-/// `clear`. Uses the i32 scratch locals `scratch + 8` / `+ 9`.
+/// `clear`. Uses the raw i32 scratch locals `scratch + 9` / `+ 10`: `at` is
+/// an interior address (never rooted; no safepoint runs in the loop).
 fn emit_map_clear(handle: u32, function: &mut impl Sink, scratch: u32) {
-    let (at, end) = (scratch + 8, scratch + 9);
+    let (at, end) = (scratch + 10, scratch + 9);
     let slot = |offset| MemArg {
         offset,
         align: 3,
@@ -2992,7 +2994,7 @@ fn emit_raise_type_error(
         IrNode::Local(stack),
     );
     emit_node(&error, function, scratch, strings, helpers);
-    function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
+    emit_set_exc_value(function, helpers);
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::I32Const(0));

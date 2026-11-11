@@ -11,8 +11,12 @@ macro_rules! wasm {
 }
 
 /// Emit the generic `__alloc(size: i32) -> i32` for a variable `size > 0`
-/// (every caller requests at least a header): a zeroed block whose base is
-/// [`BLOCK_ALIGN`]-aligned (design/runtime-memory.md §5.6).
+/// (every caller requests at least a header), or, when `fixed`,
+/// `__alloc_fixed(size)`, the entry of callers that write the whole block
+/// unconditionally (the constant-size sites above [`abi::GC_SMALL_MAX`],
+/// [`gc::emit_alloc_const`]; the render buffers; `__new_array`'s stores up to
+/// the reserve): a zeroed block whose base is [`BLOCK_ALIGN`]-aligned
+/// (design/runtime-memory.md §5.6).
 ///
 /// A size up to [`abi::GC_SMALL_MAX`] goes to `__alloc_small` with its class
 /// ([`abi::gc_size_class`], computed here as `(size + 15) >> 4` or
@@ -21,11 +25,15 @@ macro_rules! wasm {
 /// `__gc_take_pages(k)` (failing that, one collection and a retry); the head
 /// page is coded [`abi::GC_PAGE_LARGE_HEAD`], its pre-header records `k` and
 /// links the span onto `$__gc_large`, and the block starts after the
-/// pre-header. A span beyond the memory cap or pages memory cannot supply
-/// end in the static [`abi::OOM_LINE`] on fd 2 and `proc_exit(1)`. Locals:
+/// pre-header. When memory cannot supply the span (§5.8) `__alloc` throws
+/// `%OutOfMemoryError%` and returns `0`, which every variable-size caller
+/// checks; `__alloc_fixed`, whose callers write the block unconditionally,
+/// takes the span from the out-of-memory reserve like a small request
+/// ([`gc::emit_oom_reserve`]), and exits when the reserve cannot cover it.
+/// Locals:
 /// `size`, the page count `k`, the span `page`, the collect-before-OOM flag
 /// `tried`.
-pub(super) fn emit_alloc(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+pub(super) fn emit_alloc(helpers: Helpers<'_>, leaves: &LeafSet, fixed: bool) -> Function {
     let mut function = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I32, RAW_I32]);
     let (size, k, page, tried) = (0, 1, 2, 3);
     let max_pages = i32::try_from(abi::MEMORY_MAX_PAGES).unwrap_or(i32::MAX);
@@ -39,11 +47,15 @@ pub(super) fn emit_alloc(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         Call(helpers.alloc_small()), Return,
         End,
         LocalGet(size), I64ExtendI32U, I64Const(i64::from(abi::GC_LARGE_HEADER_SIZE) + 0xFFFF),
-        I64Add, I64Const(16), I64ShrU, I32WrapI64, LocalTee(k), I32Const(max_pages), I32GtU,
-        If(BlockType::Empty),
+        I64Add, I64Const(16), I64ShrU, I32WrapI64, LocalTee(k),
     );
-    gc::emit_oom_exit(&mut function);
-    wasm!(function; End);
+    if fixed {
+        wasm!(function; Drop);
+    } else {
+        wasm!(function; I32Const(max_pages), I32GtU, If(BlockType::Empty));
+        gc::emit_oom_large(&mut function, helpers);
+        wasm!(function; End);
+    }
     gc::emit_gc_budget(
         &mut function,
         helpers,
@@ -55,7 +67,11 @@ pub(super) fn emit_alloc(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         If(BlockType::Empty),
     );
     gc::emit_collect_retry(&mut function, helpers, tried, 1);
-    gc::emit_oom_exit(&mut function);
+    if fixed {
+        gc::emit_oom_reserve(&mut function, helpers, 1, Some(k));
+    } else {
+        gc::emit_oom_large(&mut function, helpers);
+    }
     wasm!(function;
         End,
         LocalGet(page), I32Const(16), I32ShrU, I32Const(i32::from(abi::GC_PAGE_LARGE_HEAD)),
@@ -71,23 +87,13 @@ pub(super) fn emit_alloc(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     finish_builder(function)
 }
 
-/// Emit `__alloc(size)` for a block of kind `type_byte`, store the type byte,
-/// and leave the base in local `base`.
-fn emit_new_block(function: &mut impl Sink, alloc: u32, base: u32, type_byte: i32) {
-    function.instruction(&Instruction::Call(alloc));
-    function.instruction(&Instruction::LocalTee(base));
-    function.instruction(&Instruction::I32Const(type_byte));
-    function.instruction(&Instruction::I32Store8(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }));
-}
-
 /// Emit the `new_string(len: i32, two_byte: i32) -> i32` constructor: a
 /// [`TYPE_STRING`] block of `len` code units — Latin-1 bytes, or UTF-16LE units
 /// with `STR_FLAG_TWO_BYTE` when `two_byte` (`0`/`1`) — whose data the caller
-/// fills. Locals 0/1 are the params; local 2 the base.
+/// fills, or `0` with the `RangeError` pending when a block above
+/// [`abi::GC_SMALL_MAX`] cannot be had (design/runtime-memory.md §5.8; only
+/// `__json_indent` asks for that much, and checks). Locals 0/1 are the
+/// params; local 2 the base.
 pub(super) fn emit_new_string(alloc: u32, leaves: &LeafSet) -> Function {
     let mut function = helper_builder(leaves, &[RAW_I32, RAW_I32], &[ROOT_BASE]);
     let (len, two_byte, base) = (0, 1, 2);
@@ -97,6 +103,7 @@ pub(super) fn emit_new_string(alloc: u32, leaves: &LeafSet) -> Function {
         |f| wasm!(f; LocalGet(len)),
         |f| wasm!(f; LocalGet(two_byte)),
         base,
+        &[Instruction::I32Const(0), Instruction::Return],
     );
     wasm!(function; LocalGet(base), End);
     finish_builder(function)
@@ -126,24 +133,56 @@ fn mem16(offset: u64) -> MemArg {
 /// The string data offset as a [`MemArg`] offset.
 const DATA: u64 = abi::STR_DATA_OFFSET as u64;
 
+/// The out-of-memory exit of a helper returning an `i32` string base: the
+/// static empty string [`abi::OOM_EMPTY_STR`] (design/runtime-memory.md §5.8).
+pub(super) const OOM_RETURN_EMPTY_STR: [Instruction<'static>; 2] = [
+    Instruction::I32Const(abi::OOM_EMPTY_STR.cast_signed()),
+    Instruction::Return,
+];
+
+/// The out-of-memory exit of a builtin (or a helper returning a jsval):
+/// `undefined`, with the `RangeError` pending for the caller's check.
+pub(super) const OOM_RETURN_UNDEFINED: [Instruction<'static>; 2] =
+    [Instruction::I64Const(UNDEFINED_BITS), Instruction::Return];
+
 /// `s = __alloc(STR_DATA_OFFSET + (len << w))` as a [`TYPE_STRING`] block of
 /// `len` code units (pushed by `len`), `TWO_BYTE` when `w` (pushes `0`/`1`),
-/// leaving the base in i32 local `s`.
+/// leaving the base in i32 local `s`. A failed allocation (out of memory,
+/// design/runtime-memory.md §5.8: only a request above
+/// [`abi::GC_SMALL_MAX`] returns `0`) runs `oom`, which must leave the
+/// function with a valid dummy result; `oom` is empty exactly when `len` is
+/// small enough that the allocation cannot fail.
 pub(super) fn emit_alloc_str<S: Sink>(
     function: &mut S,
     alloc: u32,
     len: impl Fn(&mut S),
     w: impl Fn(&mut S),
     s: u32,
+    oom: &[Instruction<'_>],
 ) {
     len(function);
     w(function);
-    wasm!(function; I32Shl, I32Const(STR_DATA_OFFSET), I32Add, Call(alloc), LocalTee(s));
-    wasm!(function; I32Const((TWO_BYTE << 16) | TYPE_STRING), I32Const(TYPE_STRING));
+    wasm!(function; I32Shl, I32Const(STR_DATA_OFFSET), I32Add, Call(alloc), LocalSet(s));
+    emit_oom_check(function, s, oom);
+    wasm!(function; LocalGet(s), I32Const((TWO_BYTE << 16) | TYPE_STRING), I32Const(TYPE_STRING));
     w(function);
     wasm!(function; Select, I32Store(mem32(0)), LocalGet(s));
     len(function);
     wasm!(function; I32Store(mem32(STR_LEN_OFFSET)));
+}
+
+/// Run `oom` when the block base in i32 local `base` is `0` (a failed
+/// variable-size allocation, design/runtime-memory.md §5.8); nothing when
+/// `oom` is empty.
+pub(super) fn emit_oom_check(function: &mut impl Sink, base: u32, oom: &[Instruction<'_>]) {
+    if oom.is_empty() {
+        return;
+    }
+    wasm!(function; LocalGet(base), I32Eqz, If(BlockType::Empty));
+    for instruction in oom {
+        function.instruction(instruction);
+    }
+    wasm!(function; End);
 }
 
 /// Push `1` when the string block in i32 local `s` is `TWO_BYTE`, else `0`.
@@ -192,6 +231,7 @@ pub(super) fn emit_str_pair(function: &mut impl Sink, alloc: u32, s: u32, i: u32
         |f| wasm!(f; I32Const(2)),
         |f| wasm!(f; I32Const(1)),
         dst,
+        &[],
     );
     wasm!(function;
         LocalGet(dst),
@@ -290,15 +330,34 @@ fn mem64(offset: u64) -> MemArg {
     }
 }
 
-/// Emit `store = __alloc(8 + 8 * cap)` as a [`TYPE_ELEMS`] block with its
-/// `cap` written, leaving the base in local `store`.
-fn emit_new_elems(function: &mut impl Sink, alloc: u32, cap: u32, store: u32) {
+/// The largest element store `__new_array` takes from `__alloc_fixed`, which
+/// cannot fail (the out-of-memory reserve covers it, design/runtime-memory.md
+/// §5.8), so a constant-length array is always whole.
+const RESERVE_ELEMS: u32 =
+    ((abi::GC_RESERVE_PAGES << 16) - abi::GC_LARGE_HEADER_SIZE - abi::ELEMS_DATA_OFFSET) / 8;
+
+/// Emit `store = alloc(8 + 8 * cap)` as a [`TYPE_ELEMS`] block with its
+/// `cap` written, leaving the base in local `store`: `alloc` turns the pushed
+/// size into a base. A `0` base (out of memory, §5.8) runs `oom` instead,
+/// which must leave the function.
+fn emit_new_elems<S: Sink>(
+    function: &mut S,
+    alloc: impl FnOnce(&mut S),
+    cap: u32,
+    store: u32,
+    oom: &[Instruction<'_>],
+) {
     function.instruction(&Instruction::LocalGet(cap));
     function.instruction(&Instruction::I32Const(3));
     function.instruction(&Instruction::I32Shl);
     function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
     function.instruction(&Instruction::I32Add);
-    emit_new_block(function, alloc, store, TYPE_ELEMS);
+    alloc(function);
+    function.instruction(&Instruction::LocalSet(store));
+    emit_oom_check(function, store, oom);
+    function.instruction(&Instruction::LocalGet(store));
+    function.instruction(&Instruction::I32Const(TYPE_ELEMS));
+    function.instruction(&Instruction::I32Store8(mem8(0)));
     function.instruction(&Instruction::LocalGet(store));
     function.instruction(&Instruction::LocalGet(cap));
     function.instruction(&Instruction::I32Store(mem32(ELEMS_CAP_OFFSET)));
@@ -307,7 +366,12 @@ fn emit_new_elems(function: &mut impl Sink, alloc: u32, cap: u32, store: u32) {
 /// Emit the `__new_array(len: i32) -> i32` constructor: a
 /// [`TYPE_ARRAY`] handle (`proto` = `%Array.prototype%`, the jsval `proto`)
 /// with `len` set and, when `len > 0`, a `cap = len`
-/// [`TYPE_ELEMS`] store whose every element is `undefined`. Local 0 is `len`;
+/// [`TYPE_ELEMS`] store whose every element is `undefined`. A store of at
+/// most [`RESERVE_ELEMS`] slots comes from `__alloc_fixed` and is always
+/// there; a larger one may fail (out of memory, design/runtime-memory.md
+/// §5.8), leaving an empty array with the `RangeError` pending, so a caller
+/// passing a run-time `len` checks `$exc_pending` before writing elements.
+/// Local 0 is `len`;
 /// locals 1/2/3 the handle base, the store base, and the element cursor.
 pub(super) fn emit_new_array(helpers: Helpers<'_>, proto: i64, leaves: &LeafSet) -> Function {
     let mut function = helper_builder(leaves, &[RAW_I32], &[ROOT_BASE, ROOT_BASE, RAW_I32]);
@@ -323,7 +387,32 @@ pub(super) fn emit_new_array(helpers: Helpers<'_>, proto: i64, leaves: &LeafSet)
     function.instruction(&Instruction::I32Store(mem32(ARRAY_ELEMS_OFFSET)));
     function.instruction(&Instruction::LocalGet(len));
     function.instruction(&Instruction::If(BlockType::Empty));
-    emit_new_elems(&mut function, helpers.alloc, len, store);
+    // Out of memory leaves a valid empty array: `len` back to 0, no store.
+    let oom = [
+        Instruction::LocalGet(base),
+        Instruction::I32Const(0),
+        Instruction::I32Store(mem32(ARRAY_LEN_OFFSET)),
+        Instruction::LocalGet(base),
+        Instruction::Return,
+    ];
+    let reserve_elems = RESERVE_ELEMS.cast_signed();
+    emit_new_elems(
+        &mut function,
+        |f| {
+            wasm!(f;
+                LocalSet(at),
+                LocalGet(len), I32Const(reserve_elems), I32LeU,
+                If(BlockType::Result(ValType::I32)),
+                LocalGet(at), Call(helpers.alloc_fixed()),
+                Else,
+                LocalGet(at), Call(helpers.alloc),
+                End,
+            );
+        },
+        len,
+        store,
+        &oom,
+    );
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::LocalGet(store));
     function.instruction(&Instruction::I32Store(mem32(ARRAY_ELEMS_OFFSET)));
@@ -503,6 +592,7 @@ pub(super) fn emit_concat(alloc_index: u32, leaves: &LeafSet) -> Function {
         |f| wasm!(f; LocalGet(len_a), LocalGet(len_b), I32Add),
         |f| wasm!(f; LocalGet(w)),
         dst,
+        &OOM_RETURN_EMPTY_STR,
     );
     // Copy `len` units of `src` to unit offset `at` (pushed) of `dst`.
     let copy = |f: &mut FnBuilder<'_>, src: u32, len: u32, at: &dyn Fn(&mut FnBuilder<'_>)| {
@@ -678,6 +768,7 @@ pub(super) fn emit_str_index(alloc_index: u32, leaves: &LeafSet) -> Function {
         |f| wasm!(f; I32Const(1)),
         |f| wasm!(f; LocalGet(w)),
         dst,
+        &[],
     );
     wasm!(function; I32Const(0), LocalSet(i));
     emit_store_unit(&mut function, dst, i, w, |f| wasm!(f; LocalGet(unit)));
@@ -737,7 +828,14 @@ pub(super) fn emit_array_reserve(alloc_index: u32, leaves: &LeafSet) -> Function
     function.instruction(&Instruction::I32GtU);
     function.instruction(&Instruction::Select);
     function.instruction(&Instruction::LocalSet(cap));
-    emit_new_elems(&mut function, alloc_index, cap, store);
+    // Out of memory: no growth (the caller checks `$exc_pending`).
+    emit_new_elems(
+        &mut function,
+        |f| wasm!(f; Call(alloc_index)),
+        cap,
+        store,
+        &[Instruction::Return],
+    );
 
     // if old: memory.copy(store + 8, old + 8, 8 * len).
     function.instruction(&Instruction::LocalGet(old));
@@ -818,6 +916,12 @@ pub(super) fn emit_array_push(reserve_index: u32, sparse_set: u32, leaves: &Leaf
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::Call(reserve_index));
+    // Out of memory: the array stays as it was (design/runtime-memory.md §5.8).
+    function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    function.instruction(&Instruction::LocalGet(base));
+    function.instruction(&Instruction::Return);
+    function.instruction(&Instruction::End);
     function.frame_end();
     function.instruction(&Instruction::End);
 
@@ -893,6 +997,11 @@ pub(super) fn emit_array_concat(
     function.instruction(&Instruction::LocalGet(slen));
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::Call(reserve_index));
+    // Out of memory: `dst` stays as it was (design/runtime-memory.md §5.8).
+    function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+    function.instruction(&Instruction::If(BlockType::Empty));
+    ret_dst(&mut function);
+    function.instruction(&Instruction::End);
     // to = dst.elems + 8 * dlen; from = src.elems; then the slot copies (the
     // slot MemArg adds ELEMS_DATA_OFFSET).
     function.instruction(&Instruction::LocalGet(dst));
@@ -1061,6 +1170,7 @@ pub(super) fn emit_json_escape(alloc_index: u32, leaves: &LeafSet) -> Function {
         |f| wasm!(f; LocalGet(len), I32Const(6), I32Mul, I32Const(2), I32Add),
         |f| wasm!(f; LocalGet(w)),
         dst,
+        &OOM_RETURN_EMPTY_STR,
     );
     // Opening quote; `i`/`o` start at 0.
     put_const(&mut function, b'"');
@@ -1462,8 +1572,13 @@ pub(super) fn emit_str_to_array(
     wasm!(function; LocalGet(s), I32WrapI64, LocalTee(ptr));
     emit_load_str_len(&mut function);
     wasm!(function;
-        LocalTee(len), Call(new_array_index), LocalTee(arr),
-        I32Load(mem32(ARRAY_ELEMS_OFFSET)), LocalSet(store),
+        LocalTee(len), Call(new_array_index), LocalSet(arr),
+        // Out of memory: the empty array, with the `RangeError` pending.
+        GlobalGet(EXC_PENDING_GLOBAL),
+        If(BlockType::Empty),
+        LocalGet(arr), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Return,
+        End,
+        LocalGet(arr), I32Load(mem32(ARRAY_ELEMS_OFFSET)), LocalSet(store),
     );
     emit_str_two_byte(&mut function, ptr);
     wasm!(function;

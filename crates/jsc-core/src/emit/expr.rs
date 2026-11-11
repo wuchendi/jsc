@@ -784,7 +784,7 @@ fn emit_node_inner(
             // Evaluate the operand, stash it in `$exc_value`, raise `$exc_pending`,
             // then unwind to the enclosing handler (the function boundary when none is active).
             emit_node(value, function, scratch, strings, helpers);
-            function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
+            emit_set_exc_value(function, helpers);
             function.instruction(&Instruction::I32Const(1));
             function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
             // A throw is an abrupt completion that REPLACES any pending
@@ -2623,6 +2623,23 @@ pub(super) fn emit_throw_not_a_function(
     );
 }
 
+/// Store the thrown value on the stack into `$exc_value` — unless building it
+/// ran out of memory (design/runtime-memory.md §5.8): a pending
+/// `%OutOfMemoryError%` stays the exception, so no error assembled from an
+/// out-of-memory dummy (an empty message) is ever thrown.
+pub(super) fn emit_set_exc_value(function: &mut impl Sink, helpers: Helpers<'_>) {
+    let oom = intrinsic_bits(Intrinsic::OutOfMemoryError, helpers);
+    function.instruction(&Instruction::I64Const(oom));
+    function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+    function.instruction(&Instruction::GlobalGet(EXC_VALUE_GLOBAL));
+    function.instruction(&Instruction::I64Const(oom));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::Select);
+    function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
+}
+
 /// Throw the error object `error` builds and unwind to the nearest handler
 /// (the stack is polymorphic afterwards).
 pub(super) fn emit_throw_error(
@@ -2633,7 +2650,7 @@ pub(super) fn emit_throw_error(
     helpers: Helpers<'_>,
 ) {
     emit_node(error, function, scratch, strings, helpers);
-    function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
+    emit_set_exc_value(function, helpers);
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::I32Const(0));
@@ -2778,6 +2795,8 @@ fn emit_global_declare<S: Sink>(
         function.instruction(&Instruction::I32Const(attrs));
         function.instruction(&Instruction::Call(helpers.define));
         function.instruction(&Instruction::End);
+        // The global table may have failed to grow (out of memory).
+        emit_propagate_if_pending(function, helpers);
     }
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
 }
@@ -3000,6 +3019,9 @@ pub(super) fn emit_console_log(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    // An allocation that ran out of memory earlier (a valid block from the
+    // reserve, design/runtime-memory.md §5.8) throws before any output.
+    emit_propagate_if_pending(function, helpers);
     for (i, arg) in args.iter().enumerate() {
         if i > 0 {
             function.instruction(&Instruction::I32Const(0x20));
@@ -3009,6 +3031,8 @@ pub(super) fn emit_console_log(
         function.instruction(&Instruction::Call(helpers.render_top()));
     }
     emit_end_line(function, helpers);
+    // The render buffers may have taken the out-of-memory reserve.
+    emit_propagate_if_pending(function, helpers);
     // `console.log(..)` evaluates to `undefined`.
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
 }
@@ -3025,6 +3049,7 @@ pub(super) fn emit_console_log_spread(
 ) {
     let (base, len, idx, elem) = (scratch + 8, scratch + 9, scratch + 10, scratch + 13);
     emit_node(args, function, scratch, strings, helpers);
+    emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalTee(base));
     function.instruction(&Instruction::I32Load(array_len_slot()));
@@ -3227,5 +3252,8 @@ fn emit_set_function_name<S: Sink>(
     function.instruction(&Instruction::I64Or);
     function.instruction(&Instruction::I32Const(abi::ATTR_CONFIGURABLE.cast_signed()));
     function.instruction(&Instruction::Call(helpers.define));
+    // Out of memory in `__concat` or the table growth (§5.8): no function
+    // with a dummy `name` escapes.
+    emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::LocalGet(local));
 }

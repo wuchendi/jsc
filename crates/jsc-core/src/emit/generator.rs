@@ -734,6 +734,9 @@ pub(super) fn emit_gen_to_array(helpers: Helpers<'_>, leaves: &LeafSet) -> Funct
     function.instruction(&Instruction::LocalGet(val));
     function.instruction(&Instruction::Call(helpers.array_push));
     function.instruction(&Instruction::Drop);
+    // Out of memory in the push: stop, the `RangeError` pending.
+    function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+    function.instruction(&Instruction::BrIf(1)); // -> $exit
     function.instruction(&Instruction::Br(0)); // -> $L
     function.instruction(&Instruction::End); // $L
     function.instruction(&Instruction::End); // $exit

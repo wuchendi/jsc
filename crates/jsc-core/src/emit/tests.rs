@@ -13,7 +13,7 @@ fn emit(program: &IrProgram) -> Vec<u8> {
         program,
         CompileOptions {
             print_completion: true,
-            gc_stress: false,
+            gc_stress: crate::emit::gc_stress_from_env(),
         },
     )
 }

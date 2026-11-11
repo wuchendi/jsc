@@ -1045,6 +1045,9 @@ pub(super) fn emit_slice(
         If(BlockType::Empty),
         LocalGet(fin), LocalGet(k), F64Sub, I32TruncSatF64U, LocalTee(n),
         Call(helpers.new_array()), LocalSet(dst),
+    );
+    return_if_pending(function);
+    wasm!(function;
         LocalGet(n), If(BlockType::Empty), LocalGet(dst),
     );
     data(function);
@@ -3506,6 +3509,9 @@ pub(super) fn emit_sort(
     wasm!(function;
         LocalGet(src), I32Load(array_len_slot()), LocalTee(pairs), Call(helpers.new_array()),
         LocalSet(dst),
+    );
+    return_if_pending(function);
+    wasm!(function;
         LocalGet(pairs), I32Const(1), I32ShrU, LocalSet(pairs),
         I64Const(UNDEFINED_BITS), LocalSet(this_arg),
     );

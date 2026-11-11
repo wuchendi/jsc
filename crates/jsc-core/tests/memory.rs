@@ -109,16 +109,6 @@ fn out_of_memory_has_no_backtrace() {
     assert_eq!(done.stderr, "Uncaught RangeError: out of memory\n");
 }
 
-/// An out-of-memory inside `try` is not catchable (the heap is exhausted, so
-/// the program terminates with the out-of-memory error instead).
-#[test]
-fn out_of_memory_inside_try_terminates() {
-    assert_uncaught(
-        &format!("try {{ {HUGE} }} catch (e) {{ 0 }} 1"),
-        "RangeError: out of memory",
-    );
-}
-
 /// A program whose guest strings fill ~448 MiB of the 512 MiB cap, so the next
 /// 64 MiB allocation by a builtin (`s.slice(1)`) runs out of memory. Shared
 /// verbatim with `packages/jsc/tests/run.test.ts`.

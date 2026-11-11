@@ -226,7 +226,7 @@ pub(super) fn emit_json_throw(
         strings,
         helpers,
     );
-    function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
+    emit_set_exc_value(&mut function, helpers);
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::I32Const(0));
@@ -274,6 +274,7 @@ pub(super) fn emit_json_string(
             f.instruction(&Instruction::I32Const(1));
         },
         str_base,
+        &OOM_RETURN_UNDEFINED,
     );
 
     function.instruction(&Instruction::Block(BlockType::Empty));
