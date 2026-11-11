@@ -239,15 +239,16 @@ pub(super) fn emit_array_spread(
                 // base = __array_push(base, value).
                 emit_node(value, function, scratch, strings, helpers);
                 function.instruction(&Instruction::Call(helpers.array_push));
+                emit_propagate_if_pending(function, helpers);
             }
             SpreadElem::List(list) => {
                 // base = __array_concat(base, list).
                 emit_node(list, function, scratch, strings, helpers);
                 function.instruction(&Instruction::I32WrapI64);
                 function.instruction(&Instruction::Call(helpers.array_concat));
-                if helpers.has_accessors {
-                    emit_propagate_if_pending(function, helpers);
-                }
+                // A getter inherited by a hole may have thrown, or the store
+                // failed to grow (out of memory).
+                emit_propagate_if_pending(function, helpers);
             }
             SpreadElem::Spread(source) => {
                 // base = __array_concat(base, IterableToList(source)); `base`
@@ -260,10 +261,9 @@ pub(super) fn emit_array_spread(
                 emit_spread_list(value, scratch + 26, function, helpers);
                 function.instruction(&Instruction::I32WrapI64);
                 function.instruction(&Instruction::Call(helpers.array_concat));
-                // A getter inherited by a hole may have thrown.
-                if helpers.has_accessors {
-                    emit_propagate_if_pending(function, helpers);
-                }
+                // A getter inherited by a hole may have thrown, or the store
+                // failed to grow (out of memory).
+                emit_propagate_if_pending(function, helpers);
             }
         }
     }
@@ -333,6 +333,7 @@ pub(super) fn emit_array_push_node(
     function.instruction(&Instruction::I32WrapI64);
     emit_node(value, function, scratch, strings, helpers);
     function.instruction(&Instruction::Call(helpers.array_push));
+    emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::I32Load(array_len_slot()));
     function.instruction(&Instruction::F64ConvertI32U);
     function.instruction(&Instruction::I64ReinterpretF64);
@@ -646,6 +647,7 @@ pub(super) fn emit_array_hof<S: Sink>(
             function.instruction(&Instruction::LocalGet(len));
             function.instruction(&Instruction::Call(helpers.new_array()));
             function.instruction(&Instruction::LocalSet(res));
+            emit_propagate_if_pending(function, helpers);
         }
         ArrayHofOp::Filter => {
             // res = a fresh empty array (grown in place per truthy element by
@@ -778,6 +780,7 @@ pub(super) fn emit_array_hof<S: Sink>(
             function.instruction(&Instruction::Call(helpers.array_push));
             function.instruction(&Instruction::Drop);
             function.instruction(&Instruction::End);
+            emit_propagate_if_pending(function, helpers);
         }
         ArrayHofOp::Reduce => {
             // acc = callback(acc, ..), or the first present element seeds it.

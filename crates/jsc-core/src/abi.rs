@@ -808,13 +808,21 @@ pub(crate) const OOM_IOVEC: u32 = WASI_SCRATCH + 40;
 /// Address of the [`OOM_LINE`] bytes, right after its iovec.
 pub(crate) const OOM_LINE_ADDR: u32 = OOM_IOVEC + 8;
 
-/// The line `__alloc` writes to fd 2 before `proc_exit(1)`.
+/// The line `__alloc` writes to fd 2 before `proc_exit(1)` when an
+/// out-of-memory finds the reserve already spent (design/runtime-memory.md
+/// §5.8).
 pub(crate) const OOM_LINE: &str = "Uncaught RangeError: out of memory\n";
+
+/// Address of 8 zero bytes after the [`OOM_LINE`] bytes, read as an empty
+/// one-byte [`TYPE_STRING`] block: the dummy result a string-building helper
+/// returns when its variable-size allocation fails (out of memory,
+/// design/runtime-memory.md §5.8) while the `RangeError` is pending.
+pub(crate) const OOM_EMPTY_STR: u32 = OOM_LINE_ADDR + 40;
 
 /// Address of the static decimal-conversion scratch, 784 bytes: the
 /// `num_digits`, `decimal_point` and `truncated` words, the end index of the
 /// last parsed literal, then the 768-digit buffer.
-pub(crate) const DEC_SCRATCH: u32 = OOM_LINE_ADDR + 40;
+pub(crate) const DEC_SCRATCH: u32 = OOM_EMPTY_STR + 8;
 
 /// Address of the 23 exact `f64` powers of ten (`10^0..=10^22`).
 pub(crate) const DEC_POW10: u32 = DEC_SCRATCH + 784;
@@ -928,6 +936,12 @@ pub(crate) const GC_FREE_NEXT_OFFSET: u32 = 4;
 /// The minimum allocation budget between collections, in bytes (4 MiB, Q13):
 /// after a collection `$__gc_debt = max(GC_MIN_BUDGET, $__gc_live)`.
 pub(crate) const GC_MIN_BUDGET: u32 = 4 << 20;
+
+/// The out-of-memory reserve in pages (`GC_RESERVE` = 256 KiB,
+/// design/runtime-memory.md §5.8): held out of the page pool so the first
+/// out-of-memory can still hand small requests a block while its
+/// `RangeError` unwinds.
+pub(crate) const GC_RESERVE_PAGES: u32 = 4;
 
 /// The small size class of a `size`-byte request (`1..=GC_CLASS_COUNT`), or
 /// `0` for a large request (`size > GC_SMALL_MAX`): `size <= 256` gives

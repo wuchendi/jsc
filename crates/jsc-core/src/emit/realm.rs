@@ -76,6 +76,11 @@ pub(super) enum Intrinsic {
     /// `%IteratorHelperPrototype%`: the `next` / `return` of the helper
     /// objects the lazy `Iterator.prototype` methods create (DESIGN.md §7.9).
     IteratorHelperPrototype,
+    /// `%OutOfMemoryError%` (design/runtime-memory.md §5.8): the one
+    /// preallocated `RangeError` every out-of-memory condition throws, a
+    /// `CLASS_ERROR` object with the own non-enumerable `message` and
+    /// `stack`; not reachable from the global object.
+    OutOfMemoryError,
 }
 
 /// A builtin iterator family: the receivers of one iterator prototype's
@@ -256,6 +261,7 @@ impl Intrinsic {
                 Some(Self::AsyncIteratorPrototype)
             }
             Self::ErrorPrototype(_) => Some(Self::ErrorPrototype(ErrorKind::Error)),
+            Self::OutOfMemoryError => Some(Self::ErrorPrototype(ErrorKind::RangeError)),
             // The native error constructors inherit from `Error`.
             Self::Ctor(BuiltinCtor::Error(kind)) if kind != ErrorKind::Error => {
                 Some(Self::Ctor(BuiltinCtor::Error(ErrorKind::Error)))
@@ -327,6 +333,8 @@ impl Intrinsic {
     fn class(self) -> u8 {
         if self == Self::Global {
             abi::CLASS_GLOBAL
+        } else if self == Self::OutOfMemoryError {
+            abi::CLASS_ERROR
         } else {
             abi::CLASS_ORDINARY
         }
@@ -392,6 +400,7 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
             Intrinsic::ArrayUnscopables,
             Intrinsic::WrapForValidIteratorPrototype,
             Intrinsic::IteratorHelperPrototype,
+            Intrinsic::OutOfMemoryError,
         ])
 }
 
@@ -2662,6 +2671,13 @@ pub(super) fn registry() -> Vec<Entry> {
                 Value::Method(Builtin::ErrorToString),
             ));
         }
+    }
+    for (key, value) in [
+        ("message", "out of memory"),
+        ("stack", "RangeError: out of memory"),
+    ] {
+        let oom = Intrinsic::OutOfMemoryError;
+        entries.push(entry(oom, key, METHOD_ATTRS, Value::Str(value)));
     }
     for (key, value) in MATH_CONSTANTS {
         entries.push(entry(Intrinsic::Math, key, CONST_ATTRS, Value::Num(value)));

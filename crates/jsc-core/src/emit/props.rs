@@ -512,7 +512,9 @@ pub(super) fn emit_intern_find(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
 /// `s` itself (flagged `INTERNED`, plus `ARRAY_INDEX` for a canonical index
 /// spelling) on a miss. The table doubles, rehashing into a fresh heap copy,
 /// once more than half its slots are used (tombstones included); the copy
-/// keeps only the strings, and `$__intern_count` restarts from them.
+/// keeps only the strings, and `$__intern_count` restarts from them. When the
+/// copy cannot be had (out of memory, design/runtime-memory.md §5.8) the
+/// table stays as it is, with the `RangeError` pending.
 pub(super) fn emit_intern(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(
         leaves,
@@ -543,7 +545,9 @@ pub(super) fn emit_intern(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         // The new table is a `TYPE_RAW` block; `$__intern_base` is its data.
         LocalGet(cap), I32Const(3), I32Shl, I32Const(HEADER_SIZE + 4), I32Add,
         Call(helpers.alloc), LocalTee(a),
-        I32Const(0), LocalGet(cap), I32Const(3), I32Shl, I32Const(HEADER_SIZE + 4), I32Add,
+        // Out of memory (design/runtime-memory.md §5.8): no growth.
+        I32Eqz, If(BlockType::Empty), LocalGet(s), Return, End,
+        LocalGet(a), I32Const(0), LocalGet(cap), I32Const(3), I32Shl, I32Const(HEADER_SIZE + 4), I32Add,
         MemoryFill(0),
         LocalGet(a), I32Const(i32::from(abi::TYPE_RAW)), I32Store8(m8(0)),
         LocalGet(a), LocalGet(cap), I32Const(3), I32Shl, I32Store(m32(u64::from(HEADER_SIZE.cast_unsigned()))),
@@ -831,7 +835,9 @@ const DEFINE_LOCALS: [LocalClass; 7] = [
 /// starts at capacity 4; a full one is rebuilt with capacity `max(4, 2 *
 /// live)` (the same capacity when tombstones free half), keeping the live
 /// entries in order (and the table's watch flag and bit), and `o`'s `props`
-/// slot is rewritten. A watched table sets its dirty bit when the program
+/// slot is rewritten; when the new table cannot be had (out of memory,
+/// design/runtime-memory.md §5.8) nothing changes and the `RangeError` is
+/// left pending. A watched table sets its dirty bit when the program
 /// tracks them.
 pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(
@@ -879,7 +885,7 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         I32Const(4), LocalGet(n), I32Const(4), I32GtU, Select,
         LocalGet(n), LocalGet(cap), I32LeU, Select, LocalSet(cap),
         LocalGet(cap), I32Const(4), I32Shl, I32Const(P_HEADER), I32Add, Call(helpers.alloc), LocalTee(q),
-        LocalGet(p), I32Load(m32(0)), I32Store(m32(0)),
+        I32Eqz, If(BlockType::Empty), Return, End, LocalGet(q), LocalGet(p), I32Load(m32(0)), I32Store(m32(0)),
         LocalGet(q), LocalGet(cap), I32Store(m32(P_CAP)),
         // Copy the live entries in slot order.
         LocalGet(p), I32Const(P_HEADER), I32Add, LocalTee(src),
@@ -1824,6 +1830,8 @@ pub(super) fn emit_array_set(
         LocalGet(o), LocalGet(i), LocalGet(v), Call(sparse_store), Return,
         End,
         LocalGet(o), LocalGet(i), I32Const(1), I32Add, Call(helpers.array_reserve()),
+        // Out of memory: no store (design/runtime-memory.md §5.8).
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
         // Fill len..i with holes, then store element i.
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(len), LocalGet(i), I32GeU, BrIf(1),
@@ -2273,8 +2281,8 @@ pub(super) fn emit_array_set_length(
         IrNode::Str(ARRAY_LENGTH_STACK.into()),
     );
     emit_node(&error, &mut f, scratch, strings, helpers);
+    emit_set_exc_value(&mut f, helpers);
     wasm!(f;
-        GlobalSet(EXC_VALUE_GLOBAL),
         I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
         I32Const(0), GlobalSet(CF_KIND_GLOBAL),
         Return,
@@ -2357,6 +2365,7 @@ pub(super) fn emit_array_set_length(
         I32LtU,
         If(BlockType::Empty),
         LocalGet(o), LocalGet(n), Call(helpers.array_reserve()),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
         LocalGet(len), LocalSet(j),
     );
     emit_fill_holes(&mut f, o, j, n);

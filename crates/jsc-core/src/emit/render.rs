@@ -270,7 +270,9 @@ pub(super) fn emit_helpers(
     helpers: Helpers<'_>,
     leaves: &LeafSet,
 ) -> Vec<Function> {
-    let alloc = helpers.alloc;
+    // The renderer writes every byte it reserved, so its buffers come from
+    // `__alloc_fixed`, which never returns `0` (design/runtime-memory.md §5.8).
+    let alloc = helpers.alloc_fixed();
     vec![
         emit_reserve(OUT_BUF_GLOBAL, OUT_CAP_GLOBAL, alloc, leaves),
         emit_reserve(PATH_BUF_GLOBAL, PATH_CAP_GLOBAL, alloc, leaves),
@@ -305,7 +307,10 @@ fn lit(f: &mut impl Sink, strings: &StrOffsets, helpers: Helpers<'_>, text: &str
 
 /// `reserve(need: i32)`: grow the `TYPE_RAW` block in `base`/`cap` to at least
 /// `need` data bytes, keeping its contents. `max(need, 2 * cap, 64)` bytes when
-/// it grows. The old block stays rooted through its global across the alloc.
+/// it grows. The old block stays rooted through its global across the alloc,
+/// which is `__alloc_fixed`: out of memory leaves the `RangeError` pending
+/// for the `console.log` call site, the buffer whole (from the reserve), or
+/// exits when the reserve cannot cover it.
 fn emit_reserve(base: u32, cap: u32, alloc: u32, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[RAW_I32], &[ROOT_BASE, RAW_I32]);
     let (need, block, size) = (0, 1, 2);

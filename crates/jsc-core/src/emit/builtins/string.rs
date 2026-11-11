@@ -553,6 +553,7 @@ fn emit_case_map(
         |f| wasm!(f; LocalGet(s.n)),
         |f| wasm!(f; I32Const(0)),
         dst,
+        &OOM_RETURN_UNDEFINED,
     );
     wasm!(function; I32Const(0), LocalSet(i));
     count_loop(function, i, s.n, |function| {
@@ -1111,6 +1112,7 @@ fn emit_substring(
         |f| wasm!(f; LocalGet(n)),
         |f| wasm!(f; LocalGet(src.w)),
         dst,
+        &OOM_RETURN_UNDEFINED,
     );
     wasm!(function; LocalGet(dst), I32Const(abi::STR_DATA_OFFSET.cast_signed()), I32Add);
     src.addr(function, from);
@@ -1500,6 +1502,7 @@ fn emit_repeat(
         |f| wasm!(f; LocalGet(total)),
         |f| wasm!(f; LocalGet(s.w)),
         dst,
+        &OOM_RETURN_UNDEFINED,
     );
     emit_copy_units(function, d, |f| wasm!(f; I32Const(0)), s, s.n, done);
     wasm!(function;
@@ -1577,6 +1580,7 @@ fn emit_pad(
         |f| wasm!(f; LocalGet(total)),
         |f| wasm!(f; LocalGet(width)),
         dst,
+        &OOM_RETURN_UNDEFINED,
     );
     let (fill_at, recv_at) = if op == StringOp::PadStart {
         (None, Some(fill))
@@ -1820,6 +1824,7 @@ fn emit_well_formed(
             |f| wasm!(f; LocalGet(s.n)),
             |f| wasm!(f; I32Const(1)),
             dst,
+            &OOM_RETURN_UNDEFINED,
         );
         emit_copy_units(function, d, |f| wasm!(f; I32Const(0)), s, s.n, i);
         emit_lone_surrogates(function, d, i, c, |f| {
@@ -2037,6 +2042,7 @@ pub(super) fn emit_from_char_code(
         |f| wasm!(f; LocalGet(argc), I32Const(i32::from(code_point)), I32Shl),
         |f| wasm!(f; I32Const(1)),
         dst,
+        &OOM_RETURN_UNDEFINED,
     );
     count_loop(function, idx, argc, |function| {
         arg_at(function, frame, idx, spread, value);

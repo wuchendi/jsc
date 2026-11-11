@@ -16,27 +16,30 @@
 //!
 //! `__gc_collect` is a precise, non-moving, stop-the-world mark-sweep run
 //! from the allocation budget step ([`emit_gc_budget`]) and once before an
-//! out-of-memory exit. It bumps the epoch, marks from the roots
+//! allocation gives up (out of memory, §5.8: [`emit_oom_reserve`] /
+//! [`emit_oom_large`]). It bumps the epoch, marks from the roots
 //! ([`emit_collect`]) through the mark stack (`__gc_visit` / `__gc_trace` /
 //! `__gc_drain`), tombstones the unmarked heap strings of the weak intern
 //! table, and sweeps. `__gc_sweep` frees every unmarked slot
 //! (`gc != $__gc_epoch`) onto rebuilt class lists, returns empty pages and
-//! unmarked large spans to the pool and recomputes `$__gc_live`. No
-//! collector helper allocates or runs user code, and a collection never
-//! nests (`$__gc_busy`).
+//! unmarked large spans to the pool and recomputes `$__gc_live`; then it
+//! takes back the out-of-memory reserve ([`abi::GC_RESERVE_PAGES`] pages,
+//! `$__gc_reserve`) if an out-of-memory released it. No collector helper
+//! allocates or runs user code, and a collection never nests (`$__gc_busy`).
 
 use wasm_encoder::{
     BlockType, Function, FunctionSection, Instruction, MemArg, TypeSection, ValType,
 };
 
 use super::{
-    CF_VALUE_GLOBAL, EXC_VALUE_GLOBAL, FD_WRITE_IMPORT, GC_BUSY_GLOBAL, GC_DEBT_GLOBAL,
-    GC_EPOCH_GLOBAL, GC_FREE_PAGES_GLOBAL, GC_LARGE_GLOBAL, GC_LIVE_GLOBAL, GC_OVERFLOW_GLOBAL,
-    GC_STACK_END_GLOBAL, GC_STACK_GLOBAL, GC_STACK_TOP_GLOBAL, HEAP_BASE, HEAP_PTR_GLOBAL, Helpers,
-    INTERN_BASE_GLOBAL, INTERN_CAP_GLOBAL, JOB_HEAD_GLOBAL, JOB_TAIL_GLOBAL, LeafSet,
-    MODULE_CELL_GLOBAL_BASE, NEW_TARGET_GLOBAL, OUT_BUF_GLOBAL, PATH_BUF_GLOBAL, PROC_EXIT_IMPORT,
-    RAW_I32, RAW_I64, REFS_BUF_GLOBAL, REJECTED_HEAD_GLOBAL, SP_GLOBAL, SPREAD_ARGS_GLOBAL, Sink,
-    THIS_GLOBAL, abi, finish_builder, helper_builder, promise_engine,
+    CF_VALUE_GLOBAL, EXC_PENDING_GLOBAL, EXC_VALUE_GLOBAL, FD_WRITE_IMPORT, GC_BUSY_GLOBAL,
+    GC_DEBT_GLOBAL, GC_EPOCH_GLOBAL, GC_FREE_PAGES_GLOBAL, GC_LARGE_GLOBAL, GC_LIVE_GLOBAL,
+    GC_OVERFLOW_GLOBAL, GC_RESERVE_GLOBAL, GC_STACK_END_GLOBAL, GC_STACK_GLOBAL,
+    GC_STACK_TOP_GLOBAL, HEAP_BASE, HEAP_PTR_GLOBAL, Helpers, INTERN_BASE_GLOBAL,
+    INTERN_CAP_GLOBAL, JOB_HEAD_GLOBAL, JOB_TAIL_GLOBAL, LeafSet, MODULE_CELL_GLOBAL_BASE,
+    NEW_TARGET_GLOBAL, OUT_BUF_GLOBAL, PATH_BUF_GLOBAL, PROC_EXIT_IMPORT, RAW_I32, RAW_I64,
+    REFS_BUF_GLOBAL, REJECTED_HEAD_GLOBAL, SP_GLOBAL, SPREAD_ARGS_GLOBAL, Sink, THIS_GLOBAL, abi,
+    finish_builder, helper_builder, promise_engine, realm,
 };
 
 /// Emit each listed instruction in order: `wasm!(function; LocalGet(0), ..)`.
@@ -67,7 +70,7 @@ pub(super) struct GcLayout {
 
 /// The `(params, results)` of the allocator and collector helpers, in
 /// function-index order.
-pub(super) const TYPES: [(&[ValType], &[ValType]); 8] = [
+pub(super) const TYPES: [(&[ValType], &[ValType]); 9] = [
     (&[I32], &[I32]),   // __alloc_small(class) -> base
     (&[I32], &[I32]),   // __gc_take_pages(k) -> base | 0
     (&[I32, I32], &[]), // __gc_release_pages(base, k)
@@ -76,6 +79,7 @@ pub(super) const TYPES: [(&[ValType], &[ValType]); 8] = [
     (&[I32], &[]),      // __gc_visit(ref)
     (&[I32], &[]),      // __gc_trace(block)
     (&[], &[]),         // __gc_drain()
+    (&[I32], &[I32]),   // __alloc_fixed(size) -> base
 ];
 
 /// Append the allocator helpers' types and function entries (after the
@@ -129,11 +133,19 @@ impl Helpers<'_> {
     fn gc_drain(self) -> u32 {
         self.gc_base() + 7
     }
+    /// `__alloc_fixed(size: i32) -> i32`: `__alloc` for callers that write
+    /// the whole block unconditionally (constant-size sites above
+    /// [`abi::GC_SMALL_MAX`], the render buffers, `__new_array`'s stores up
+    /// to the reserve); never `0`. See [`super::emit_alloc`].
+    pub(super) fn alloc_fixed(self) -> u32 {
+        self.gc_base() + 8
+    }
 }
 
 /// The helper call graph of the allocator and collector, for the leaf
 /// analysis: the page helpers and every collector helper never reach
-/// `__alloc` (`__alloc_small` is an allocation and stays a safepoint).
+/// `__alloc` (`__alloc_small` and `__alloc_fixed` are allocations and stay
+/// safepoints).
 pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
     vec![
         (helpers.gc_take_pages(), vec![]),
@@ -142,6 +154,7 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         (
             helpers.gc_collect(),
             vec![
+                helpers.gc_take_pages(),
                 helpers.gc_visit(),
                 helpers.gc_trace(),
                 helpers.gc_drain(),
@@ -169,6 +182,7 @@ pub(super) fn emit_helpers(helpers: Helpers<'_>, leaves: &LeafSet, gc: GcLayout)
         emit_visit(helpers, leaves, gc),
         emit_trace(helpers, leaves),
         emit_drain(helpers, leaves),
+        super::emit_alloc(helpers, leaves, true),
     ]
 }
 
@@ -205,10 +219,11 @@ pub(super) fn class_sizes() -> Vec<u8> {
 
 /// Push the base of a fresh zeroed block of the compile-time `size`: the
 /// per-class entry `__alloc_small(class)` for a small size, else
-/// `__alloc(size)`.
+/// `__alloc_fixed(size)`. Neither returns `0`: out of memory hands a block
+/// from the reserve (§5.8).
 pub(super) fn emit_alloc_const(function: &mut impl Sink, helpers: Helpers<'_>, size: i32) {
     match abi::gc_size_class(size.cast_unsigned()) {
-        0 => wasm!(function; I32Const(size), Call(helpers.alloc)),
+        0 => wasm!(function; I32Const(size), Call(helpers.alloc_fixed())),
         class => wasm!(function; I32Const(class.cast_signed()), Call(helpers.alloc_small())),
     }
 }
@@ -233,7 +248,7 @@ pub(super) fn emit_gc_budget<S: Sink>(
 /// Emit the collect-before-OOM step (§5.6 step 4) after a failed page take:
 /// unless this request already collected (local `tried`) or a collection is
 /// running, collect and branch to the retry loop `depth` labels out (counted
-/// from the code that follows); else fall through to the out-of-memory exit.
+/// from the code that follows); else fall through to the out-of-memory step.
 pub(super) fn emit_collect_retry(
     function: &mut impl Sink,
     helpers: Helpers<'_>,
@@ -248,9 +263,59 @@ pub(super) fn emit_collect_retry(
     );
 }
 
-/// Emit the out-of-memory exit: the static [`abi::OOM_LINE`] on fd 2 through
-/// its static iovec (allocating nothing), then `proc_exit(1)`.
-pub(super) fn emit_oom_exit(function: &mut impl Sink) {
+/// Emit: throw `%OutOfMemoryError%` (design/runtime-memory.md §5.8) — set
+/// `$exc_value` to the static error and `$exc_pending`, so the caller's next
+/// exception check unwinds to the nearest `catch`.
+fn emit_oom_pending(function: &mut impl Sink, helpers: Helpers<'_>) {
+    let error = realm::intrinsic_bits(realm::Intrinsic::OutOfMemoryError, helpers);
+    wasm!(function;
+        I64Const(error), GlobalSet(EXC_VALUE_GLOBAL), I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
+    );
+}
+
+/// Emit the out-of-memory step of a request that must not fail (§5.8): a
+/// small one (`<= GC_SMALL_MAX`), or a constant-size large one of `k` pages
+/// (the local `k`, at most the reserve), after the collect-before-OOM retry
+/// failed. While the reserve is held, release its pages to the pool, throw
+/// `%OutOfMemoryError%` and branch to the retry loop `depth` labels out (it
+/// now succeeds, handing the caller a zeroed block whose fields it can write
+/// before its exception check unwinds); with the reserve spent, or a
+/// request larger than it, the fatal exit.
+pub(super) fn emit_oom_reserve(
+    function: &mut impl Sink,
+    helpers: Helpers<'_>,
+    depth: u32,
+    k: Option<u32>,
+) {
+    wasm!(function; GlobalGet(GC_RESERVE_GLOBAL), I32Const(0), I32Ne);
+    if let Some(k) = k {
+        wasm!(function;
+            LocalGet(k), I32Const(abi::GC_RESERVE_PAGES.cast_signed()), I32LeU, I32And,
+        );
+    }
+    wasm!(function;
+        If(BlockType::Empty),
+        GlobalGet(GC_RESERVE_GLOBAL), I32Const(abi::GC_RESERVE_PAGES.cast_signed()),
+        Call(helpers.gc_release_pages()),
+        I32Const(0), GlobalSet(GC_RESERVE_GLOBAL),
+    );
+    emit_oom_pending(function, helpers);
+    wasm!(function; Br(depth + 1), End);
+    emit_oom_exit(function);
+}
+
+/// Emit the out-of-memory step of a large request (`> GC_SMALL_MAX`, §5.8):
+/// throw `%OutOfMemoryError%` and return `0`. Every caller that can ask for
+/// a large block checks for `0` and leaves a valid dummy behind instead.
+pub(super) fn emit_oom_large(function: &mut impl Sink, helpers: Helpers<'_>) {
+    emit_oom_pending(function, helpers);
+    wasm!(function; I32Const(0), Return);
+}
+
+/// Emit the fatal out-of-memory exit, taken only once the reserve is spent
+/// (§5.8): the static [`abi::OOM_LINE`] on fd 2 through its static iovec
+/// (allocating nothing), then `proc_exit(1)`.
+fn emit_oom_exit(function: &mut impl Sink) {
     wasm!(function;
         I32Const(2), I32Const(abi::OOM_IOVEC.cast_signed()), I32Const(1),
         I32Const(abi::WASI_NWRITTEN.cast_signed()), Call(FD_WRITE_IMPORT), Drop,
@@ -294,7 +359,7 @@ const PAGE_HEADER: i32 = abi::GC_PAGE_HEADER_SIZE.cast_signed();
 /// collect-before-OOM flag `tried`). The order of §5.6: budget, class free
 /// list (zeroing the slot), current page bump, a fresh page (zero) from
 /// `__gc_take_pages`, else one collection and a retry, else the
-/// out-of-memory exit.
+/// out-of-memory step ([`emit_oom_reserve`]).
 fn emit_alloc_small(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[RAW_I32], &[RAW_I32; 6]);
     let (class, ci, size, head, page, bump, tried) = (0, 1, 2, 3, 4, 5, 6);
@@ -329,7 +394,7 @@ fn emit_alloc_small(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         If(BlockType::Empty),
     );
     emit_collect_retry(&mut f, helpers, tried, 1);
-    emit_oom_exit(&mut f);
+    emit_oom_reserve(&mut f, helpers, 1, None);
     wasm!(f;
         End,
         LocalGet(page), I32Const(PAGE_SHIFT), I32ShrU, LocalGet(class),
@@ -551,7 +616,8 @@ const MARK_STACK_END: i32 = (abi::GC_MARK_STACK + abi::GC_MARK_STACK_SIZE).cast_
 /// Emit `__gc_collect()` (§5.6 "Collection order", without the M3 weak
 /// steps): set `$__gc_busy`, advance `$__gc_epoch` (`1..=255`), mark, then
 /// release a paged mark stack, tombstone the intern table's unmarked heap
-/// strings (slot value `1`), `__gc_sweep`, and renew the budget to
+/// strings (slot value `1`), `__gc_sweep`, take the out-of-memory reserve
+/// when it is not held (§5.8), and renew the budget to
 /// `max(GC_MIN_BUDGET, $__gc_live)` (`0` under `gc_stress`).
 ///
 /// Marking is a sequence of passes. Each pass visits the roots (§5.4: the
@@ -570,7 +636,6 @@ fn emit_collect(helpers: Helpers<'_>, leaves: &LeafSet, gc: GcLayout) -> Functio
     let mut f = helper_builder(leaves, &[], &[RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I64]);
     let (p, end, first, c, v) = (0, 1, 2, 3, 4);
     let hs = gc.heap_start;
-    let min = abi::GC_MIN_BUDGET.cast_signed();
     let gc_byte = abi::HEADER_GC_OFFSET;
     let ss_end = abi::SHADOW_STACK_SIZE.cast_signed();
     wasm!(f;
@@ -663,7 +728,24 @@ fn emit_collect(helpers: Helpers<'_>, leaves: &LeafSet, gc: GcLayout) -> Functio
         End, End,
         Call(helpers.gc_sweep()),
     );
-    if gc.stress {
+    emit_renew(&mut f, helpers, gc.stress);
+    wasm!(f; I32Const(0), GlobalSet(GC_BUSY_GLOBAL), End);
+    finish_builder(f)
+}
+
+/// Emit the end of [`emit_collect`] after the sweep: take back the
+/// out-of-memory reserve (§5.8) when an out-of-memory spent it, and renew
+/// the budget to `max(GC_MIN_BUDGET, $__gc_live)` (`0` under `stress`).
+fn emit_renew(f: &mut impl Sink, helpers: Helpers<'_>, stress: bool) {
+    let min = abi::GC_MIN_BUDGET.cast_signed();
+    wasm!(f;
+        GlobalGet(GC_RESERVE_GLOBAL), I32Eqz,
+        If(BlockType::Empty),
+        I32Const(abi::GC_RESERVE_PAGES.cast_signed()), Call(helpers.gc_take_pages()),
+        GlobalSet(GC_RESERVE_GLOBAL),
+        End,
+    );
+    if stress {
         wasm!(f; I32Const(0), GlobalSet(GC_DEBT_GLOBAL));
     } else {
         wasm!(f;
@@ -671,8 +753,6 @@ fn emit_collect(helpers: Helpers<'_>, leaves: &LeafSet, gc: GcLayout) -> Functio
             I32GtS, Select, GlobalSet(GC_DEBT_GLOBAL),
         );
     }
-    wasm!(f; I32Const(0), GlobalSet(GC_BUSY_GLOBAL), End);
-    finish_builder(f)
 }
 
 /// Emit the overflow rescan of [`emit_collect`]: `__gc_trace` (then

@@ -666,6 +666,7 @@ pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>, leaves: &LeafSet) 
         wasm!(f; End, End, End, Br(0), End, End);
         if !write {
             wasm!(f; LocalGet(o), LocalGet(w), Call(helpers.new_string), LocalSet(dst));
+            emit_oom_check(&mut f, dst, &OOM_RETURN_EMPTY_STR);
         }
     }
     emit_str_canonical(&mut f, w, dst, i, g);
