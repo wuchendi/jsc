@@ -587,8 +587,8 @@ and `value` in place.
 - **Insertion order** is slot order. **Delete** writes `key = 0` and value
   `undefined` and decrements `live`; later slots keep their index.
 - **Growth** (`__define`): a missing table starts at capacity 4; a full one is
-  rebuilt at `max(4, 2·live)` (the same capacity when tombstones free half),
-  copying live entries in order and keeping the watch flag and bit, and the
+  rebuilt at `max(4, 2·live)` (the same capacity when tombstones free half,
+  unless it is `0`: an empty static realm table), copying live entries in order and keeping the watch flag and bit, and the
   owner's `props` slot is rewritten. The owner handle never moves. Literals and
   class instances reserve their static key count up front. A static realm
   table that overflows is rebuilt on the heap the same way.

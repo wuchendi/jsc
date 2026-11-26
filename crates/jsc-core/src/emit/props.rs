@@ -833,7 +833,7 @@ const DEFINE_LOCALS: [LocalClass; 7] = [
 /// not extensible` (both left pending, nothing changed) unless `key` is a
 /// private name. A missing table
 /// starts at capacity 4; a full one is rebuilt with capacity `max(4, 2 *
-/// live)` (the same capacity when tombstones free half), keeping the live
+/// live)` (the same nonzero capacity when tombstones free half), keeping the live
 /// entries in order (and the table's watch flag and bit), and `o`'s `props`
 /// slot is rewritten; when the new table cannot be had (out of memory,
 /// design/runtime-memory.md §5.8) nothing changes and the `RangeError` is
@@ -879,11 +879,11 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         Else,
         LocalGet(p), I32Load(m32(P_COUNT)), LocalGet(p), I32Load(m32(P_CAP)), LocalTee(cap), I32Eq,
         If(BlockType::Empty),
-        // cap' = 2 * live <= cap ? cap : max(4, 2 * live)
+        // cap' = (2 * live <= cap) > (cap == 0) ? cap : max(4, 2 * live)
         LocalGet(cap),
         LocalGet(p), I32Load(m32(P_LIVE)), I32Const(1), I32Shl, LocalTee(n),
         I32Const(4), LocalGet(n), I32Const(4), I32GtU, Select,
-        LocalGet(n), LocalGet(cap), I32LeU, Select, LocalSet(cap),
+        LocalGet(n), LocalGet(cap), I32LeU, LocalGet(cap), I32Eqz, I32GtU, Select, LocalSet(cap),
         LocalGet(cap), I32Const(4), I32Shl, I32Const(P_HEADER), I32Add, Call(helpers.alloc), LocalTee(q),
         I32Eqz, If(BlockType::Empty), Return, End, LocalGet(q), LocalGet(p), I32Load(m32(0)), I32Store(m32(0)),
         LocalGet(q), LocalGet(cap), I32Store(m32(P_CAP)),
