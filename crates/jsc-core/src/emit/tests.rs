@@ -105,6 +105,14 @@ fn thrown(bytes: &[u8]) -> (u64, Vec<u8>) {
     (done.thrown, done.memory)
 }
 
+/// The `[type, flags, class]` header bytes of the block at `base`, leaving out
+/// the `gc` byte: it is the mark epoch (design/runtime-memory.md §5.2), so any
+/// block that survived a collection (every block under `JSC_GC_STRESS=1`)
+/// carries a non-zero epoch there.
+fn header(memory: &[u8], base: usize) -> [u8; 3] {
+    [memory[base], memory[base + 2], memory[base + 3]]
+}
+
 /// Wrap a single expression into a one-statement program.
 fn expr_program(node: IrNode) -> IrProgram {
     IrProgram {
@@ -751,8 +759,8 @@ fn heap_blocks_write_the_type_byte_header() {
     // Every heap block begins with its TYPE BYTE at the base offset. Run
     // a literal, take the low 32 bits of the returned jsval as the block base,
     // and assert the byte there is the expected kind (0 string / 1 array / 2
-    // object) followed by the `gc`/`flags`/`class` bytes: zero, except a static
-    // string's `flags`, which carry `INTERNED`.
+    // object) and the `flags`/`class` bytes are zero, except a static string's
+    // `flags`, which carry `INTERNED` ([`header`] skips the `gc` epoch byte).
     for (src, expected_type, flags) in [
         ("\"hi\"", 0u8, crate::abi::STR_FLAG_INTERNED),
         ("[7, 8]", 1u8, 0),
@@ -764,10 +772,9 @@ fn heap_blocks_write_the_type_byte_header() {
         // A heap jsval carries tag 0b101 and the block base in its low 32 bits.
         assert_eq!((bits >> 48) & 0b111, 0b101, "{src} should be a heap jsval");
         let base = (bits & 0xFFFF_FFFF) as usize;
-        assert_eq!(memory[base], expected_type, "type byte for {src}");
         assert_eq!(
-            &memory[base + 1..base + 4],
-            &[0, flags, 0],
+            header(&memory, base),
+            [expected_type, flags, 0],
             "header bytes for {src}"
         );
     }
@@ -907,8 +914,9 @@ fn static_string_blobs_are_8_aligned() {
 fn every_block_is_8_aligned_with_zero_header_bytes() {
     // Guest-allocated (concat, array, object, function, Map, Date, generator)
     // and builtin-allocated (String(n), string/array methods, promises) blocks
-    // all start 8-aligned with header bytes 1..3 (`gc`, `flags`, `class`) zero,
-    // except a fresh arrow's `flags`, which is `LAZY`.
+    // all start 8-aligned with header bytes 2..3 (`flags`, `class`) zero,
+    // except a fresh arrow's `flags`, which is `LAZY`. Byte 1 (`gc`) is the
+    // mark epoch, non-zero after a collection (design/runtime-memory.md §5.2).
     for src in [
         "'x' + 1",
         "let n = 3; [1, n]",
@@ -934,7 +942,6 @@ fn every_block_is_8_aligned_with_zero_header_bytes() {
         let base = (bits & 0xFFFF_FFFF) as usize;
         assert_eq!(base % 8, 0, "{src}: block base {base} is not 8-aligned");
         for (name, offset) in [
-            ("gc", crate::abi::HEADER_GC_OFFSET),
             ("flags", crate::abi::HEADER_FLAGS_OFFSET),
             ("class", crate::abi::HEADER_CLASS_OFFSET),
         ] {
@@ -976,7 +983,7 @@ fn runtime_strings_and_promises_are_aligned_and_zeroed() {
     )));
     let s = base_of(bits);
     assert_eq!(s % 8, 0);
-    assert_eq!(&mem[s..s + 4], &[TYPE_STRING, 0, 0, 0]);
+    assert_eq!(header(&mem, s), [TYPE_STRING, 0, 0]);
     assert_eq!(u32_at(&mem, s + 4), 3);
     // A two-byte concatenation sets the flag; its 3 units take 6 data bytes.
     let (bits, mem) = thrown(&emit_throwing(lower_js(
@@ -984,7 +991,7 @@ fn runtime_strings_and_promises_are_aligned_and_zeroed() {
     )));
     let t = base_of(bits);
     assert_eq!(t % 8, 0);
-    assert_eq!(&mem[t..t + 4], &[TYPE_STRING, 0, STR_FLAG_TWO_BYTE, 0]);
+    assert_eq!(header(&mem, t), [TYPE_STRING, STR_FLAG_TWO_BYTE, 0]);
     assert_eq!(u32_at(&mem, t + 4), 3);
 
     // Two pending promises: the 40-byte runtime-memory.md §3.4 layout, `seq`
@@ -998,7 +1005,7 @@ fn runtime_strings_and_promises_are_aligned_and_zeroed() {
     let (p, q) = (base_of(u64_at(&mem, data)), base_of(u64_at(&mem, data + 8)));
     for at in [p, q] {
         assert_eq!(at % 8, 0);
-        assert_eq!(&mem[at..at + 4], &[TYPE_PROMISE, 0, 0, 0]);
+        assert_eq!(header(&mem, at), [TYPE_PROMISE, 0, 0]);
         assert_eq!(u32_at(&mem, at + 4), 0, "props");
         // `proto` = `%Promise.prototype%`.
         assert_eq!(
@@ -1042,8 +1049,8 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         );
         let at = usize::try_from(bits & 0xFFFF_FFFF).expect("base");
         assert_eq!(
-            &mem[at..at + 4],
-            &[TYPE_FUNCTION, 0, 0, 0],
+            header(mem, at),
+            [TYPE_FUNCTION, 0, 0],
             "%Function.prototype%"
         );
     };
@@ -1055,7 +1062,7 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         let base = u32::try_from(bits & 0xFFFF_FFFF).expect("base");
         assert_eq!(base % 8, 0, "{src}: 8-aligned");
         let at = base as usize;
-        assert_eq!(&memory[at..at + 4], &[kind, 0, flags, 0], "{src}: header");
+        assert_eq!(header(&memory, at), [kind, flags, 0], "{src}: header");
         assert_eq!(u32_at(&memory, base + OBJ_PROPS_OFFSET), 0, "{src}: props");
         let proto = u64_at(&memory, base + OBJ_PROTO_OFFSET);
         if kind == TYPE_FUNCTION {
@@ -1447,8 +1454,9 @@ fn leaf_set_matches_the_call_graph() {
 }
 
 /// `__array_push` touches `$__sp` only on its sparse-or-growth path: the
-/// prologue, the sparse `return`, and the region end, all after the two
-/// fast-path tests.
+/// prologue, the sparse `return`, the out-of-memory `return` after
+/// `__array_reserve` (design/runtime-memory.md §5.8), and the region end, all
+/// after the two fast-path tests.
 #[test]
 fn array_push_frame_is_shrink_wrapped() {
     use wasmparser::{Operator, Parser, Payload};
@@ -1495,7 +1503,7 @@ fn array_push_frame_is_shrink_wrapped() {
                 _ => {}
             }
         }
-        assert_eq!(sp_writes, 3);
+        assert_eq!(sp_writes, 4);
         assert_eq!(ifs_before_frame, Some(2));
     });
 }
