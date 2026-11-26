@@ -347,8 +347,9 @@ fn sum_precise_uses_raw_accumulator() {
 /// `TYPE_ENV`, the environment-block type byte (`abi.rs`).
 const TYPE_ENV: i32 = 4;
 
-/// The `Array.fromAsync` state block: 10 slots behind the 8-byte header.
-const FA_SIZE: i32 = 88;
+/// The `Array.fromAsync` state block: 10 slots behind the 8-byte header, 88
+/// bytes, allocated as `__alloc_small` size class 6 (the 96-byte slots).
+const FA_CLASS: i32 = 6;
 const FA_SLOTS: i32 = 10;
 
 /// `Array.fromAsync` keeps its state in a `TYPE_ENV` block and passes the
@@ -359,21 +360,26 @@ fn from_async_state_block_is_headered_env() {
     let bodies = bodies("Array.fromAsync([1])");
     let entry = bodies
         .iter()
-        .find_map(|ops| {
-            let at = ops.windows(2).position(|w| {
-                matches!(w[0], Operator::I32Const { value } if value == FA_SIZE)
-                    && matches!(w[1], Operator::Call { .. })
-            })?;
-            let header = &ops[at..(at + 24).min(ops.len())];
-            let typed = header.windows(2).any(|w| {
-                matches!(w[0], Operator::I32Const { value } if value == TYPE_ENV)
-                    && matches!(w[1], Operator::I32Store8 { memarg } if memarg.offset == 0)
-            });
-            let counted = header.windows(2).any(|w| {
-                matches!(w[0], Operator::I32Const { value } if value == FA_SLOTS)
-                    && matches!(w[1], Operator::I32Store { memarg } if memarg.offset == 4)
-            });
-            (typed && counted).then_some(ops)
+        .find(|ops| {
+            // Any `i32.const 6; call` may be a class-6 allocation: the state
+            // block is the one whose header writes follow.
+            ops.windows(2).enumerate().any(|(at, w)| {
+                if !(matches!(w[0], Operator::I32Const { value } if value == FA_CLASS)
+                    && matches!(w[1], Operator::Call { .. }))
+                {
+                    return false;
+                }
+                let header = &ops[at..(at + 24).min(ops.len())];
+                let typed = header.windows(2).any(|w| {
+                    matches!(w[0], Operator::I32Const { value } if value == TYPE_ENV)
+                        && matches!(w[1], Operator::I32Store8 { memarg } if memarg.offset == 0)
+                });
+                let counted = header.windows(2).any(|w| {
+                    matches!(w[0], Operator::I32Const { value } if value == FA_SLOTS)
+                        && matches!(w[1], Operator::I32Store { memarg } if memarg.offset == 4)
+                });
+                typed && counted
+            })
         })
         .expect("no TYPE_ENV fromAsync state block is written");
     // Into a local: a base local's own write-through ends in an `i64.store`.
