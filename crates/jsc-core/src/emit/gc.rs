@@ -63,9 +63,21 @@ pub(super) struct GcLayout {
     pub(super) roots: i32,
     /// The number of module-cell globals.
     pub(super) module_cells: u32,
-    /// The test-only `gc_stress` option: budget `0`, so every allocation
-    /// collects.
-    pub(super) stress: bool,
+    /// The test-only `gc_stress` interval ([`super::CompileOptions`]): `0`
+    /// off; otherwise the budget counts allocations, not bytes, and is `0`
+    /// (collect at the next allocation) for the first
+    /// [`super::GC_STRESS_PREFIX`] collections, then `stress - 1`.
+    pub(super) stress: u32,
+}
+
+impl GcLayout {
+    /// The collection counter of a `gc_stress` interval above `1`
+    /// (`$__gc_stress_count`, i32, init 0, saturating at
+    /// [`super::GC_STRESS_PREFIX`]), the global after the module cells;
+    /// emitted only then.
+    pub(super) fn stress_count_global(self) -> Option<u32> {
+        (self.stress > 1).then_some(MODULE_CELL_GLOBAL_BASE + self.module_cells)
+    }
 }
 
 /// The `(params, results)` of the allocator and collector helpers, in
@@ -174,7 +186,7 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
 /// Every allocator and collector helper body, in [`TYPES`] order.
 pub(super) fn emit_helpers(helpers: Helpers<'_>, leaves: &LeafSet, gc: GcLayout) -> Vec<Function> {
     vec![
-        emit_alloc_small(helpers, leaves),
+        emit_alloc_small(helpers, leaves, gc.stress),
         emit_take_pages(leaves),
         emit_release_pages(leaves),
         emit_sweep(helpers, leaves),
@@ -182,7 +194,7 @@ pub(super) fn emit_helpers(helpers: Helpers<'_>, leaves: &LeafSet, gc: GcLayout)
         emit_visit(helpers, leaves, gc),
         emit_trace(helpers, leaves),
         emit_drain(helpers, leaves),
-        super::emit_alloc(helpers, leaves, true),
+        super::emit_alloc(helpers, leaves, gc.stress, true),
     ]
 }
 
@@ -229,15 +241,21 @@ pub(super) fn emit_alloc_const(function: &mut impl Sink, helpers: Helpers<'_>, s
 }
 
 /// Emit the allocation budget step (§5.6 "When to collect", step 1):
-/// `$__gc_debt -= bytes` (pushed by `bytes`); when the debt goes negative
-/// outside a collection, `__gc_collect` runs and renews the budget.
+/// `$__gc_debt -= bytes` (pushed by `bytes`), or `-= 1` under `gc_stress`
+/// (`stress != 0`, the budget counts allocations); when the debt goes
+/// negative outside a collection, `__gc_collect` runs and renews the budget.
 pub(super) fn emit_gc_budget<S: Sink>(
     function: &mut S,
     helpers: Helpers<'_>,
+    stress: u32,
     bytes: impl FnOnce(&mut S),
 ) {
     wasm!(function; GlobalGet(GC_DEBT_GLOBAL));
-    bytes(function);
+    if stress == 0 {
+        bytes(function);
+    } else {
+        wasm!(function; I32Const(1));
+    }
     wasm!(function;
         I32Sub, GlobalSet(GC_DEBT_GLOBAL),
         GlobalGet(GC_DEBT_GLOBAL), I32Const(0), I32LtS, GlobalGet(GC_BUSY_GLOBAL), I32Eqz, I32And,
@@ -360,14 +378,14 @@ const PAGE_HEADER: i32 = abi::GC_PAGE_HEADER_SIZE.cast_signed();
 /// list (zeroing the slot), current page bump, a fresh page (zero) from
 /// `__gc_take_pages`, else one collection and a retry, else the
 /// out-of-memory step ([`emit_oom_reserve`]).
-fn emit_alloc_small(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+fn emit_alloc_small(helpers: Helpers<'_>, leaves: &LeafSet, stress: u32) -> Function {
     let mut f = helper_builder(leaves, &[RAW_I32], &[RAW_I32; 6]);
     let (class, ci, size, head, page, bump, tried) = (0, 1, 2, 3, 4, 5, 6);
     wasm!(f;
         LocalGet(class), I32Const(2), I32Shl, LocalTee(ci),
         I32Load(class_entry(abi::GC_CLASS_SIZES)), LocalSet(size),
     );
-    emit_gc_budget(&mut f, helpers, |f| wasm!(f; LocalGet(size)));
+    emit_gc_budget(&mut f, helpers, stress, |f| wasm!(f; LocalGet(size)));
     wasm!(f;
         Loop(BlockType::Empty),
         // Pop the class free list and zero the whole slot.
@@ -618,7 +636,8 @@ const MARK_STACK_END: i32 = (abi::GC_MARK_STACK + abi::GC_MARK_STACK_SIZE).cast_
 /// release a paged mark stack, tombstone the intern table's unmarked heap
 /// strings (slot value `1`), `__gc_sweep`, take the out-of-memory reserve
 /// when it is not held (§5.8), and renew the budget to
-/// `max(GC_MIN_BUDGET, $__gc_live)` (`0` under `gc_stress`).
+/// `max(GC_MIN_BUDGET, $__gc_live)` (under `gc_stress`, an allocation
+/// count: see [`emit_renew`]).
 ///
 /// Marking is a sequence of passes. Each pass visits the roots (§5.4: the
 /// shadow stack `[$__sp + 8, SS_SIZE)` as jsvals; `$exc_value`, `$cf_value`,
@@ -728,15 +747,19 @@ fn emit_collect(helpers: Helpers<'_>, leaves: &LeafSet, gc: GcLayout) -> Functio
         End, End,
         Call(helpers.gc_sweep()),
     );
-    emit_renew(&mut f, helpers, gc.stress);
+    emit_renew(&mut f, helpers, gc);
     wasm!(f; I32Const(0), GlobalSet(GC_BUSY_GLOBAL), End);
     finish_builder(f)
 }
 
 /// Emit the end of [`emit_collect`] after the sweep: take back the
 /// out-of-memory reserve (§5.8) when an out-of-memory spent it, and renew
-/// the budget to `max(GC_MIN_BUDGET, $__gc_live)` (`0` under `stress`).
-fn emit_renew(f: &mut impl Sink, helpers: Helpers<'_>, stress: bool) {
+/// the budget to `max(GC_MIN_BUDGET, $__gc_live)`. Under `gc_stress` the
+/// budget is an allocation count: `0` (the next allocation collects) at
+/// interval `1` and for the first [`super::GC_STRESS_PREFIX`] collections
+/// (counted in `$__gc_stress_count`) at an interval `N > 1`, then `N - 1`
+/// (every `N`th allocation collects).
+fn emit_renew(f: &mut impl Sink, helpers: Helpers<'_>, gc: GcLayout) {
     let min = abi::GC_MIN_BUDGET.cast_signed();
     wasm!(f;
         GlobalGet(GC_RESERVE_GLOBAL), I32Eqz,
@@ -745,7 +768,19 @@ fn emit_renew(f: &mut impl Sink, helpers: Helpers<'_>, stress: bool) {
         GlobalSet(GC_RESERVE_GLOBAL),
         End,
     );
-    if stress {
+    if let Some(count) = gc.stress_count_global() {
+        let prefix = super::GC_STRESS_PREFIX.cast_signed();
+        let interval = i32::try_from(gc.stress - 1).unwrap_or(i32::MAX);
+        wasm!(f;
+            GlobalGet(count), I32Const(prefix), I32LtU,
+            If(BlockType::Empty),
+            GlobalGet(count), I32Const(1), I32Add, GlobalSet(count),
+            I32Const(0), GlobalSet(GC_DEBT_GLOBAL),
+            Else,
+            I32Const(interval), GlobalSet(GC_DEBT_GLOBAL),
+            End,
+        );
+    } else if gc.stress == 1 {
         wasm!(f; I32Const(0), GlobalSet(GC_DEBT_GLOBAL));
     } else {
         wasm!(f;

@@ -1562,18 +1562,31 @@ use value::*;
 pub struct CompileOptions {
     /// Render the completion value to fd 1 after the final drain.
     pub print_completion: bool,
-    /// Test only (not exposed by the CLI): an allocation budget of `0`, so
-    /// every allocation runs a full collection (design/runtime-memory.md
-    /// §5.6, Q20).
-    pub gc_stress: bool,
+    /// Test only (not exposed by the CLI; design/runtime-memory.md §5.6,
+    /// Q20): the collection interval in allocations. `0` is off (the byte
+    /// budget alone decides); `1` runs a full collection at every
+    /// allocation; `N > 1` collects at every allocation for the first
+    /// [`GC_STRESS_PREFIX`] collections of a run, then at every `N`th
+    /// allocation.
+    pub gc_stress: u32,
 }
 
-/// Whether `JSC_GC_STRESS=1` is set: the in-crate test helpers then emit
-/// every program with `gc_stress` (the CI `gc-stress` job,
-/// design/runtime-memory.md §7.1 `gc_stress_run_suite`).
+/// The number of collections a `gc_stress` run with an interval `N > 1`
+/// runs at every allocation before it switches to every `N`th allocation
+/// (see [`CompileOptions::gc_stress`]): most programs finish inside it, so
+/// they are checked exactly as under `gc_stress = 1`.
+pub const GC_STRESS_PREFIX: u32 = 100_000;
+
+/// The `gc_stress` interval of `JSC_GC_STRESS` (`0` when unset): the
+/// in-crate test helpers emit every program with it (the CI `gc-stress`
+/// job, design/runtime-memory.md §7.1 `gc_stress_run_suite`).
 #[cfg(test)]
-pub(crate) fn gc_stress_from_env() -> bool {
-    std::env::var("JSC_GC_STRESS").is_ok_and(|value| value == "1")
+pub(crate) fn gc_stress_from_env() -> u32 {
+    std::env::var("JSC_GC_STRESS").map_or(0, |value| {
+        value
+            .parse()
+            .expect("JSC_GC_STRESS is an allocation interval")
+    })
 }
 
 /// Emit a complete WebAssembly command module for `program`: exports
@@ -1721,7 +1734,7 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
             code.function(&emit_function(func, &offsets, helpers, &leaves));
         }
     }
-    code.function(&emit_alloc(helpers, &leaves, false));
+    code.function(&emit_alloc(helpers, &leaves, options.gc_stress, false));
     code.function(&emit_concat(helpers.alloc, &leaves));
     code.function(&emit_str_eq(&leaves));
     code.function(&emit_str_cmp(&leaves));

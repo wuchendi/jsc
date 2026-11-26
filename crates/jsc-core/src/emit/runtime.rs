@@ -33,7 +33,12 @@ macro_rules! wasm {
 /// Locals:
 /// `size`, the page count `k`, the span `page`, the collect-before-OOM flag
 /// `tried`.
-pub(super) fn emit_alloc(helpers: Helpers<'_>, leaves: &LeafSet, fixed: bool) -> Function {
+pub(super) fn emit_alloc(
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+    stress: u32,
+    fixed: bool,
+) -> Function {
     let mut function = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I32, RAW_I32]);
     let (size, k, page, tried) = (0, 1, 2, 3);
     let max_pages = i32::try_from(abi::MEMORY_MAX_PAGES).unwrap_or(i32::MAX);
@@ -59,6 +64,7 @@ pub(super) fn emit_alloc(helpers: Helpers<'_>, leaves: &LeafSet, fixed: bool) ->
     gc::emit_gc_budget(
         &mut function,
         helpers,
+        stress,
         |f| wasm!(f; LocalGet(k), I32Const(16), I32Shl),
     );
     wasm!(function;

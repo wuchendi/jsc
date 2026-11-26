@@ -346,6 +346,7 @@ None is exported.
 | 39 | `$__gc_overflow` | `i32` | set when a mark-stack push found no room (§5.7) |
 | 40 | `$__gc_reserve` | `i32` | the out-of-memory reserve's first page, `0` while spent (§5.6) |
 | 41+ | module cells | `i64` | one cell pointer per module binding (`41 + slot`, §7.1), then one per tagged-template site (§7.4) |
+| after the cells | `$__gc_stress_count` | `i32` | test-only `gc_stress` interval above `1`: collections run so far, saturating at `GC_STRESS_PREFIX` (§5.6); absent otherwise |
 
 **Exports.** Exactly `_start: () -> ()` and `memory` (§6.8).
 
@@ -818,9 +819,16 @@ unconditionally — the constant-size sites above 2048 bytes
 element stores of up to 32 765 slots — and never returns `0`: a span that
 fits the reserve comes from it like a small request.
 
-**`gc_stress`** (`CompileOptions::gc_stress`, test only; the CLI does not
-expose it): the budget is `0` from the start and after every collection, so
-every allocation collects.
+**`gc_stress`** (`CompileOptions::gc_stress: u32`, test only; the CLI does
+not expose it) is a collection interval in allocations: under any nonzero
+value the budget step subtracts `1` per allocation instead of the bytes, and
+the budget starts at `0`. At `1` every renewal sets it to `0`, so every
+allocation collects. At `N > 1` the first `GC_STRESS_PREFIX` (100 000)
+collections, counted in `$__gc_stress_count` (an i32 global after the module
+cells, emitted only then), renew it to `0`, so a run collects at every
+allocation until then and at every `N`th allocation afterwards. At `0` (every
+non-test build) none of this is emitted: the budget counts bytes and the
+module has no extra global.
 
 **`__gc_take_pages(k) -> base | 0`** never calls `__alloc`: with at least `k`
 pages in the pool (`$__gc_free_pages`) it takes the first run of `k` free
@@ -2610,12 +2618,14 @@ test262 checkout is absent, as in this job). Dev and test builds use
 (`Cargo.toml`), because every test compiles and runs JS programs through swc,
 the emitter and wasmtime.
 
-**Job `gc-stress`** (matrix of 4): `JSC_GC_STRESS=1 cargo nextest run -p
-jsc-core --partition count:N/4`, the jsc-core suite once more with every
-program compiled with `gc_stress` (the shared test helpers read the variable;
-design/runtime-memory.md §7.1 `gc_stress_run_suite`), excluding the opcount
-binary, the `memory` binary (heap-cap and million-allocation tests) and the
-two churn tests of `tests/gc.rs`; collection must not change any output.
+**Job `gc-stress`** (matrix of 4, 60-minute timeout): `JSC_GC_STRESS=61
+cargo nextest run -p jsc-core --partition count:N/4`, the jsc-core suite once
+more with every program compiled with the `gc_stress` interval 61 (§5.6:
+every allocation collects for the first 100 000 collections, then every 61st;
+the shared test helpers read the variable; the `gc_*` canaries always use
+interval 1; design/runtime-memory.md §7.1 `gc_stress_run_suite`), excluding
+the opcount binary and the `memory` binary (heap-cap and million-allocation
+tests); collection must not change any output.
 
 **Job `test262`** (baseline regression gate, 90-minute timeout): fetch test262
 (cached on the hash of `scripts/test262-fetch.sh`), `cargo build --release -p
