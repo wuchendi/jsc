@@ -1646,3 +1646,41 @@ fn gc_page_helpers_are_leaves() {
     assert!(!leaves.is_leaf(helpers.alloc));
     validate(&emit(&program));
 }
+
+/// A `gc_stress` interval `N > 1` (runtime-memory.md §5.6): every allocation
+/// collects for the first [`super::GC_STRESS_PREFIX`] collections, then every
+/// `N`th. Off, every allocation and an interval are three distinct modules
+/// (the interval adds `$__gc_stress_count`), and a run that crosses the
+/// prefix (about two allocations per iteration) computes what the default
+/// build does.
+#[test]
+fn gc_stress_interval_after_prefix() {
+    let src = "let keep = []; let sum = 0; \
+               for (let i = 0; i < 60000; i++) { \
+                 const o = { i: i, s: 'k' + i }; \
+                 if (i % 100 === 0) keep.push(o); \
+                 sum += o.s.length; \
+               } \
+               sum + keep.length + keep[599].i + keep[599].s.length";
+    let program = crate::codegen::lower(
+        &crate::frontend::parse(src, crate::frontend::Dialect::Js).expect("parse"),
+    )
+    .expect("lower");
+    let module = |gc_stress| {
+        super::emit(
+            &program,
+            CompileOptions {
+                print_completion: true,
+                gc_stress,
+            },
+        )
+    };
+    let (off, every, interval) = (module(0), module(1), module(7));
+    assert_ne!(off, every);
+    assert_ne!(every, interval);
+    assert_ne!(off, interval);
+    validate(&interval);
+    let expected = completion(&off);
+    assert_eq!(expected, "409396");
+    assert_eq!(completion(&interval), expected);
+}
