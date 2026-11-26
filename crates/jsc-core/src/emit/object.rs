@@ -385,7 +385,12 @@ pub(super) fn emit_object_has_node(
     helpers: Helpers<'_>,
 ) {
     emit_key_lookup(key, function, scratch, strings, helpers);
+    // A converted key (an interned index string) is only weakly held by the
+    // intern table while `obj` evaluates.
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Base);
     emit_node(obj, function, scratch, strings, helpers);
+    function.release_temps(mark);
     function.instruction(&Instruction::Call(helpers.has));
     emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::I64ExtendI32U);
@@ -851,10 +856,14 @@ pub(super) fn emit_json_stringify_node(
         HEAP_BITS | i64::from(static_key(strings, "")),
     ));
     function.instruction(&Instruction::LocalGet(scratch));
+    // The value rides the stack across the cycle-stack allocation.
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Jsval);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::Call(helpers.new_array()));
+    function.release_temps(mark);
     function.instruction(&Instruction::Call(helpers.json_rep()));
     emit_propagate_if_pending(function, helpers);
 }
