@@ -846,12 +846,34 @@ pub(crate) const STATIC_AREA_END: u32 = GC_MARK_STACK + GC_MARK_STACK_SIZE;
 /// page boundary after the static region (design/runtime-memory.md §5.1).
 pub(crate) const GC_PAGE_SIZE: u32 = 1 << 16;
 
-/// Address of the GC page table, right after the Ryu tables: one byte per
-/// wasm page ([`GC_PAGE_TABLE_SIZE`] bytes), indexed by `address >> 16`. A
-/// code is `0` (not heap: the shadow stack, the static region and pages above
-/// the frontier), a small-page class `1..=`[`GC_CLASS_COUNT`],
+/// Rounds `x` up to a multiple of `align` (a power of two).
+pub(crate) const fn align_up(x: u32, align: u32) -> u32 {
+    (x + align - 1) & !(align - 1)
+}
+
+/// The byte size of the allocator's static state, from [`GC_PAGE_TABLE`] to
+/// [`STATIC_AREA_END`]: the page table, the three `u32[GC_CLASS_COUNT]`
+/// arrays and the mark stack.
+const GC_STATIC_SIZE: u32 = GC_PAGE_TABLE_SIZE + 3 * 4 * GC_CLASS_COUNT + GC_MARK_STACK_SIZE;
+
+/// Address of the GC page table, after the Ryu tables: one byte per wasm page
+/// ([`GC_PAGE_TABLE_SIZE`] bytes), indexed by `address >> 16`. A code is `0`
+/// (not heap: the shadow stack, the static region and pages above the
+/// frontier), a small-page class `1..=`[`GC_CLASS_COUNT`],
 /// [`GC_PAGE_LARGE_HEAD`], [`GC_PAGE_LARGE_TAIL`] or [`GC_PAGE_FREE`].
-pub(crate) const GC_PAGE_TABLE: u32 = RYU_TABLES_ADDR + RYU_TABLES_SIZE;
+///
+/// The three `u32[GC_CLASS_COUNT]` arrays are 228 bytes (≡ 4 mod 8), so the
+/// area's end is rounded up to [`BLOCK_ALIGN`] and the padding sits before
+/// the page table: [`GC_MARK_STACK`], [`STATIC_AREA_END`] and every static
+/// block after it (the `Math` block, the string blobs) stay 8-aligned.
+pub(crate) const GC_PAGE_TABLE: u32 = align_up(
+    RYU_TABLES_ADDR + RYU_TABLES_SIZE + GC_STATIC_SIZE,
+    BLOCK_ALIGN,
+) - GC_STATIC_SIZE;
+
+const _: () = assert!(STATIC_AREA_END - GC_PAGE_TABLE == GC_STATIC_SIZE);
+const _: () = assert!(GC_MARK_STACK.is_multiple_of(BLOCK_ALIGN));
+const _: () = assert!(STATIC_AREA_END.is_multiple_of(BLOCK_ALIGN));
 
 /// The byte size of [`GC_PAGE_TABLE`]: one entry per page up to
 /// [`MEMORY_MAX_PAGES`] (8 KiB).
