@@ -127,6 +127,25 @@ fn gc_promise_reactions_survive() {
     );
 }
 
+/// Both resolving functions of `new Promise` survive the allocations between
+/// their creation and the executor call (the executor closure itself), and
+/// stay callable after the executor returned.
+#[test]
+fn gc_promise_executor_settlers_survive() {
+    same_under_stress(
+        "let res, rej;
+         const p = new Promise((a, b) => { res = a; rej = b; });
+         const q = new Promise((a, b) => { const junk = [{ k: 'x' + 1 }]; b('no' + junk.length); });
+         let junk = [];
+         for (let i = 0; i < 20; i++) junk.push({ i: 'j' + i });
+         p.then(v => console.log('p', v));
+         q.catch(e => console.log('q', e));
+         res('ok' + 1);
+         rej('late');",
+        "q no1\np ok1\n",
+    );
+}
+
 /// Heap values stored on static blocks (a realm intrinsic's static table
 /// written in place or rebuilt on the heap, a materialized builtin method, a
 /// top-level declaration, the `Symbol.for` registry) are reached through the
