@@ -1651,17 +1651,17 @@ fn gc_page_helpers_are_leaves() {
 /// collects for the first [`super::GC_STRESS_PREFIX`] collections, then every
 /// `N`th. Off, every allocation and an interval are three distinct modules
 /// (the interval adds `$__gc_stress_count`), and a run that crosses the
-/// prefix (about two allocations per iteration) computes what the default
+/// prefix (at least two allocations per iteration, 40 000 in all) computes what the default
 /// build does.
 #[test]
 fn gc_stress_interval_after_prefix() {
     let src = "let keep = []; let sum = 0; \
-               for (let i = 0; i < 60000; i++) { \
+               for (let i = 0; i < 20000; i++) { \
                  const o = { i: i, s: 'k' + i }; \
                  if (i % 100 === 0) keep.push(o); \
                  sum += o.s.length; \
                } \
-               sum + keep.length + keep[599].i + keep[599].s.length";
+               sum + keep.length + keep[199].i + keep[199].s.length";
     let program = crate::codegen::lower(
         &crate::frontend::parse(src, crate::frontend::Dialect::Js).expect("parse"),
     )
@@ -1681,6 +1681,6 @@ fn gc_stress_interval_after_prefix() {
     assert_ne!(off, interval);
     validate(&interval);
     let expected = completion(&off);
-    assert_eq!(expected, "409396");
+    assert_eq!(expected, "128996");
     assert_eq!(completion(&interval), expected);
 }

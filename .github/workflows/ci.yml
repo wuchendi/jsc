@@ -90,23 +90,24 @@ jobs:
         run: cargo nextest run --workspace --no-fail-fast --partition count:${{ matrix.part }}/4
 
   # design/runtime-memory.md §7.1 `gc_stress_run_suite`: the jsc-core run-test
-  # suite once more with JSC_GC_STRESS=61, which makes the shared test helpers
-  # compile every program with the `gc_stress` interval 61: a full collection
-  # at every allocation for the first 100 000 collections of a run
-  # (GC_STRESS_PREFIX; almost every test ends inside it and is checked
-  # exactly), then at every 61st allocation. A collection per allocation
-  # costs O(allocations x live set): the 100 000-link promise chains of
-  # promises::long_then_chain_no_stack_growth (~5e5 and ~8e5 allocations,
-  # live sets growing to ~4e5 and ~8e5 blocks) took hours that way; past the
-  # prefix they cost 61x less. A missed root at a site run many times is
-  # still hit after the prefix; 61 is prime, so a loop body whose allocation
-  # count is not a multiple of 61 cannot alias every collection onto the
-  # same site. The gc_* canaries (common::assert_same_under_gc_stress) always
-  # use interval 1. Collection must not change any output. Excluded:
+  # suite once more with JSC_GC_STRESS=127, which makes the shared test
+  # helpers compile every program with the `gc_stress` interval 127: a full
+  # collection at every allocation for the first 30 000 collections of a run
+  # (GC_STRESS_PREFIX; nearly every test program ends inside it and is
+  # checked exactly as with JSC_GC_STRESS=1), then at every 127th allocation.
+  # A collection per allocation costs O(allocations x live set): the two
+  # 100 000-link promise chains of promises::long_then_chain_no_stack_growth
+  # (live sets growing with every allocation) took 5832 s that way; under
+  # this setting the prefix costs ~(30k / total allocations)^2 of that and
+  # the tail ~1/127 (~46 s). A missed root at a site run many times is still
+  # hit after the prefix; 127 is prime, so a loop body whose allocation count
+  # is not a multiple of 127 cannot alias every collection onto the same
+  # site. The gc_* canaries (common::assert_same_under_gc_stress) always use
+  # interval 1. Collection must not change any output. Excluded:
   # - binary(opcount): fuel assertions and the opcount snapshot measure the
   #   default build (they compile without the shared helpers).
   # - binary(memory): heap-cap and out-of-memory tests that fill up to the
-  #   512 MiB cap with a live set (100 000 collections each tracing up to
+  #   512 MiB cap with a live set (30 000 collections each tracing up to
   #   ~0.5 GiB), plus the million-allocation growth tests.
   gc-stress:
     name: gc-stress (nextest ${{ matrix.part }}/4)
@@ -117,7 +118,7 @@ jobs:
       matrix:
         part: [1, 2, 3, 4]
     env:
-      JSC_GC_STRESS: "61"
+      JSC_GC_STRESS: "127"
     steps:
       - uses: actions/checkout@v7
 

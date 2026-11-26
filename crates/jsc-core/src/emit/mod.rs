@@ -1575,7 +1575,7 @@ pub struct CompileOptions {
 /// runs at every allocation before it switches to every `N`th allocation
 /// (see [`CompileOptions::gc_stress`]): most programs finish inside it, so
 /// they are checked exactly as under `gc_stress = 1`.
-pub const GC_STRESS_PREFIX: u32 = 100_000;
+pub const GC_STRESS_PREFIX: u32 = 30_000;
 
 /// The `gc_stress` interval of `JSC_GC_STRESS` (`0` when unset): the
 /// in-crate test helpers emit every program with it (the CI `gc-stress`

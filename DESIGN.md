@@ -823,7 +823,7 @@ fits the reserve comes from it like a small request.
 not expose it) is a collection interval in allocations: under any nonzero
 value the budget step subtracts `1` per allocation instead of the bytes, and
 the budget starts at `0`. At `1` every renewal sets it to `0`, so every
-allocation collects. At `N > 1` the first `GC_STRESS_PREFIX` (100 000)
+allocation collects. At `N > 1` the first `GC_STRESS_PREFIX` (30 000)
 collections, counted in `$__gc_stress_count` (an i32 global after the module
 cells, emitted only then), renew it to `0`, so a run collects at every
 allocation until then and at every `N`th allocation afterwards. At `0` (every
@@ -2625,10 +2625,10 @@ test262 checkout is absent, as in this job). Dev and test builds use
 (`Cargo.toml`), because every test compiles and runs JS programs through swc,
 the emitter and wasmtime.
 
-**Job `gc-stress`** (matrix of 4, 60-minute timeout): `JSC_GC_STRESS=61
+**Job `gc-stress`** (matrix of 4, 60-minute timeout): `JSC_GC_STRESS=127
 cargo nextest run -p jsc-core --partition count:N/4`, the jsc-core suite once
-more with every program compiled with the `gc_stress` interval 61 (§5.6:
-every allocation collects for the first 100 000 collections, then every 61st;
+more with every program compiled with the `gc_stress` interval 127 (§5.6:
+every allocation collects for the first 30 000 collections, then every 127th;
 the shared test helpers read the variable; the `gc_*` canaries always use
 interval 1; design/runtime-memory.md §7.1 `gc_stress_run_suite`), excluding
 the opcount binary and the `memory` binary (heap-cap and million-allocation
