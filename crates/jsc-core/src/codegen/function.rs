@@ -122,10 +122,12 @@ pub(super) struct Params<'p> {
 
 /// One declared parameter still to bind.
 enum ParamBind<'p> {
-    /// An identifier parameter: its local and binding id, its default, and —
-    /// for a cell whose TDZ a closure may observe — the temp local holding
-    /// the incoming argument while the cell holds the hole.
+    /// An identifier parameter: its name, local and binding id, its default
+    /// (an anonymous definition takes the name), and — for a cell whose TDZ a
+    /// closure may observe — the temp local holding the incoming argument
+    /// while the cell holds the hole.
     Ident {
+        name: JsStr,
         local: u32,
         id: u32,
         default: Option<&'p Expr>,
@@ -297,6 +299,7 @@ impl LowerCtx<'_> {
                 boxed_params.push(local);
             }
             params.binds.push(ParamBind::Ident {
+                name: JsStr::from(ident.id.sym.as_ref()),
                 local,
                 id,
                 default,
@@ -412,6 +415,7 @@ impl LowerCtx<'_> {
         for bind in binds {
             match bind {
                 ParamBind::Ident {
+                    name,
                     local,
                     id,
                     default,
@@ -421,7 +425,7 @@ impl LowerCtx<'_> {
                         // A TDZ cell: default the argument temp, then
                         // initialize the cell from it.
                         if let Some(default) = default {
-                            self.lower_default_guard(arg, false, default, body)?;
+                            self.lower_default_guard(arg, false, default, Some(&name), body)?;
                         }
                         body.push(IrStmt::Expr(IrNode::CellSet {
                             cell: Box::new(IrNode::Local(local)),
@@ -429,7 +433,7 @@ impl LowerCtx<'_> {
                         }));
                     } else if let Some(default) = default {
                         let cell = self.is_cell(local);
-                        self.lower_default_guard(local, cell, default, body)?;
+                        self.lower_default_guard(local, cell, default, Some(&name), body)?;
                     }
                     self.param_bound(id);
                 }
@@ -444,7 +448,7 @@ impl LowerCtx<'_> {
                 // patterns, holes, defaults, and rest).
                 ParamBind::Pattern { temp, pat, default } => {
                     if let Some(default) = default {
-                        self.lower_default_guard(temp, false, default, body)?;
+                        self.lower_default_guard(temp, false, default, None, body)?;
                     }
                     self.lower_binding_pattern(pat, IrNode::Local(temp), true, body)?;
                 }
@@ -595,12 +599,14 @@ impl LowerCtx<'_> {
 
     /// Emit a default-parameter guard: `if (param === undefined) param =
     /// <default>`, evaluated per call only on the undefined path. A `cell`
-    /// param reads/writes through its boxed cell.
+    /// param reads/writes through its boxed cell. An identifier parameter's
+    /// `name` names an anonymous default (`NamedEvaluation`).
     fn lower_default_guard(
         &mut self,
         local: u32,
         cell: bool,
         default: &Expr,
+        name: Option<&JsStr>,
         body: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
         let read = if cell {
@@ -608,7 +614,10 @@ impl LowerCtx<'_> {
         } else {
             IrNode::Local(local)
         };
-        let default_value = self.lower_expr(default)?;
+        let default_value = match name {
+            Some(name) => self.lower_named_expr(default, name)?,
+            None => self.lower_expr(default)?,
+        };
         let write = if cell {
             IrNode::CellSet {
                 cell: Box::new(IrNode::Local(local)),

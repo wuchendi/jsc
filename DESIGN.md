@@ -1659,7 +1659,14 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   thrown its `TypeError`, so a key's `toString` never runs then); a
   short-circuited `&&=` / `||=` / `??=` skips both the right-hand side and
   the store, so no setter runs. An anonymous function assigned by `=` or a logical assignment to an
-  unparenthesized identifier is named after it. An invalid target (`f() = 1`,
+  unparenthesized identifier is named after it. The same `NamedEvaluation`
+  names an anonymous function, arrow, generator, async function or class
+  (also parenthesized, a cover form such as `x = (function () {})`) used as
+  a declaration initializer, an object-literal value, or a default in a
+  binding pattern, an assignment pattern or a parameter, after the target
+  identifier; a member or nested-pattern target names nothing, a named
+  definition keeps its own name, and a class with an own static `name`
+  member keeps that member. An invalid target (`f() = 1`,
   `1 = 2`, `a + b = c`, `(a, b) = c`, `a?.b = 1`) is an early `SyntaxError`
   (`Invalid left-hand side in assignment`).
 - **Conditional** `c ? a : b`, optional chaining `a?.b`, `a?.[k]`, `a?.()`,

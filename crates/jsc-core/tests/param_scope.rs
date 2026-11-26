@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{assert_output, assert_rejected};
+use common::{assert_output, assert_rejected, assert_string};
 
 /// The JS helper every test uses: run `f`, printing its result or the name
 /// of what it threw.
@@ -205,4 +205,47 @@ fn let_redeclaring_a_parameter_is_an_early_error() {
     assert_rejected("const f = (a = 1) => { const a = 2; };");
     assert_rejected("function* g([a]){ let a; }");
     assert_rejected("async function f(a){ class a {} }");
+}
+
+// --- NamedEvaluation of parameter defaults -------------------------------------------
+
+#[test]
+fn parameter_default_is_named_by_its_identifier() {
+    assert_string("function f(a = function () {}) { return a.name; } f()", "a");
+    assert_string("(function (b = () => 1) { return b.name; })()", "b");
+    assert_string("((c = class {}) => c.name)()", "c");
+    assert_string("({ m(d = function* () {}) { return d.name; } }).m()", "d");
+    assert_string(
+        "class K { constructor(e = () => 1) { this.n = e.name; } m(f = class {}) { return f.name; } } \
+         new K().n + ',' + new K().m()",
+        "e,f",
+    );
+    assert_string(
+        "function* g(h = async () => 1) { yield h.name; } g().next().value",
+        "h",
+    );
+    assert_string(
+        "let n; async function f(i = function () {}) { n = i.name; } f(); n",
+        "i",
+    );
+    // A parameter read by a closure (a cell) is named too.
+    assert_string("function f(j = () => j) { return j().name; } f()", "j");
+    // Pattern parameters name their identifier defaults.
+    assert_string(
+        "function f([k = () => 1], { l = class {} }) { return k.name + l.name; } f([], {})",
+        "kl",
+    );
+}
+
+#[test]
+fn parameter_default_that_is_not_anonymous_keeps_its_name() {
+    assert_string(
+        "function f(a = function own() {}) { return a.name; } f()",
+        "own",
+    );
+    assert_string("function f(a = (0, () => 1)) { return a.name; } f()", "");
+    assert_string(
+        "function f(a = (function () {})) { return a.name; } f()",
+        "a",
+    );
 }
