@@ -378,7 +378,7 @@ start is laid out by the compiler, in this order:
 | `8 … 47` | WASI scratch area (`abi::WASI_SCRATCH`): one iovec, `nwritten`, the clock result and the random seed buffer |
 | `48 … 95` | the iovec (`abi::OOM_IOVEC`) and bytes of the static out-of-memory line (§5.6) |
 | `96 … 103` | 8 zero bytes read as an empty one-byte string (`abi::OOM_EMPTY_STR`), the dummy result of a failed string allocation (§5.6) |
-| `104 …` `abi::GC_PAGE_TABLE` | the number-conversion scratch and tables: `abi::DEC_SCRATCH`, the decimal parser tables, `abi::NUM_SCRATCH_ADDR`, `abi::RYU_TABLES_ADDR` |
+| `104 …` `abi::GC_PAGE_TABLE` | the number-conversion scratch and tables: `abi::DEC_SCRATCH`, the decimal parser tables, `abi::NUM_SCRATCH_ADDR`, `abi::RYU_TABLES_ADDR`, then 4 padding bytes: the allocator area's end is rounded up to `abi::BLOCK_ALIGN` with the pad placed before it, so `abi::GC_MARK_STACK`, `abi::STATIC_AREA_END` and every block after it are 8-aligned (const-asserted in `abi.rs`) |
 | `abi::GC_PAGE_TABLE …` `abi::STATIC_AREA_END` | the allocator's static state (§5.6): the page table (one byte per page, 8 KiB), the per-class free-list heads and current pages (`u32[19]` each, zero), the class size table (`u32[19]`), the collector's static mark stack (`abi::GC_MARK_STACK`, 4 KiB, §5.7) |
 | `abi::STATIC_AREA_END …` `abi::STATIC_AREA_END + libm::STATIC_SIZE` | the `Math` block (`emit/libm.rs`): the constant tables of `rem_pio2_large` and `atan`, then the working arrays of `rem_pio2_large` |
 | from `HEAP_BASE = abi::STATIC_AREA_END + libm::STATIC_SIZE` | every distinct string literal and static key, one `TYPE_STRING` block each, 8-byte aligned, `flags = INTERNED` (plus `ARRAY_INDEX` for a canonical index spelling) |
@@ -587,8 +587,8 @@ and `value` in place.
 - **Insertion order** is slot order. **Delete** writes `key = 0` and value
   `undefined` and decrements `live`; later slots keep their index.
 - **Growth** (`__define`): a missing table starts at capacity 4; a full one is
-  rebuilt at `max(4, 2·live)` (the same capacity when tombstones free half),
-  copying live entries in order and keeping the watch flag and bit, and the
+  rebuilt at `max(4, 2·live)` (the same capacity when tombstones free half,
+  unless it is `0`: an empty static realm table), copying live entries in order and keeping the watch flag and bit, and the
   owner's `props` slot is rewritten. The owner handle never moves. Literals and
   class instances reserve their static key count up front. A static realm
   table that overflows is rebuilt on the heap the same way.

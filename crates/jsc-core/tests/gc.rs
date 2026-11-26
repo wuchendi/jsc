@@ -127,6 +127,25 @@ fn gc_promise_reactions_survive() {
     );
 }
 
+/// Both resolving functions of `new Promise` survive the allocations between
+/// their creation and the executor call (the executor closure itself), and
+/// stay callable after the executor returned.
+#[test]
+fn gc_promise_executor_settlers_survive() {
+    same_under_stress(
+        "let res, rej;
+         const p = new Promise((a, b) => { res = a; rej = b; });
+         const q = new Promise((a, b) => { const junk = [{ k: 'x' + 1 }]; b('no' + junk.length); });
+         let junk = [];
+         for (let i = 0; i < 20; i++) junk.push({ i: 'j' + i });
+         p.then(v => console.log('p', v));
+         q.catch(e => console.log('q', e));
+         res('ok' + 1);
+         rej('late');",
+        "q no1\np ok1\n",
+    );
+}
+
 /// Heap values stored on static blocks (a realm intrinsic's static table
 /// written in place or rebuilt on the heap, a materialized builtin method, a
 /// top-level declaration, the `Symbol.for` registry) are reached through the
@@ -363,5 +382,104 @@ fn gc_stress_elision_emit_pow() {
     elision(
         "console.log(num(2) ** num(10), num(3) ** num(2) ** num(2), num(4) ** num(0.5));",
         "1024 81 2\n",
+    );
+}
+
+/// A spread array literal's fresh handle rides the operand stack while each
+/// part runs (a generator drain, an array, a string, a pushed item): it is
+/// rooted for the whole build, so no part's allocation frees it.
+#[test]
+fn gc_spread_array_literal_base_survives() {
+    same_under_stress(
+        "function* g() { yield 'a' + 1; yield 'b' + 2; }
+         const a = [0, ...g(), ...[3, 'c' + 4], 'd' + 5, ...'xy'];
+         console.log(JSON.stringify(a), [...g()].join());
+         function add(x, y) { return x + y; }
+         console.log(add(...g()));",
+        "[0,\"a1\",\"b2\",3,\"c4\",\"d5\",\"x\",\"y\"] a1,b2\na1b2\n",
+    );
+}
+
+/// An object-literal accessor block is built while its getter and setter
+/// closures allocate: its base is rooted across both builds.
+#[test]
+fn gc_accessor_literal_survives() {
+    same_under_stress(
+        "const o = { v: 'a', get x() { return this.v + '!' }, set x(n) { this.v = n + '?' } };
+         o.x = 'b' + 1;
+         console.log(o.x, o.v);",
+        "b1?! b1?\n",
+    );
+}
+
+/// A spread call's callee is held on the operand stack while the argument
+/// array is built; an unnamed closure is reachable only from there.
+#[test]
+fn gc_spread_call_callee_survives() {
+    same_under_stress(
+        "console.log(((a, b) => a + b)(...['p' + 1, 'q' + 2]));",
+        "p1q2\n",
+    );
+}
+
+/// A `finally` sets the in-flight exception aside on the operand stack; a
+/// throw caught inside the body replaces `$exc_value`, so the stash alone
+/// keeps the original error alive until it is restored.
+#[test]
+fn gc_finally_stashed_exception_survives() {
+    same_under_stress(
+        "function f() {
+           try { throw new Error('e' + 1); }
+           finally { try { throw 'x' + 2; } catch (_) {} const junk = []; for (let i = 0; i < 20; i++) junk.push({ i: 'j' + i }); }
+         }
+         try { f(); } catch (e) { console.log(e.message); }",
+        "e1\n",
+    );
+}
+
+/// `JSON.stringify(x)` holds the freshly computed value on the operand stack
+/// while it allocates the cycle stack: a value reachable only from there
+/// survives (no "circular structure" from a reused block, no `{}` from a
+/// freed one).
+#[test]
+fn gc_json_stringify_operand_survives() {
+    same_under_stress(
+        "function mk() { return [7, 'x' + 1, { k: 'v' + 2 }]; }
+         console.log(JSON.stringify(mk()), JSON.stringify(Array.of(1, 'y' + 3)));",
+        "[7,\"x1\",{\"k\":\"v2\"}] [1,\"y3\"]\n",
+    );
+}
+
+/// `k in obj` converts a computed key to an interned index string, which the
+/// weak intern table alone does not keep alive while `obj` evaluates.
+#[test]
+fn gc_in_computed_key_survives() {
+    same_under_stress(
+        "let n = 3; console.log(n in new String('a\u{e9}\u{1F600}'), (n - 1) in ['p' + 1, 'q' + 2, 'r' + 3]);",
+        "true true\n",
+    );
+}
+
+/// `Math.sumPrecise` keeps its exact accumulator (a `TYPE_RAW` block) alive
+/// across every iterator step.
+#[test]
+fn gc_sum_precise_accumulator_survives() {
+    same_under_stress(
+        "function* g() { yield -0.1; yield 'x' + 1 ? -0.2 : 0; yield 1e300; yield -1e300; }
+         console.log(Math.sumPrecise(g()), Math.sumPrecise([0.1, 0.2, 0.3]));",
+        "-0.30000000000000004 0.6\n",
+    );
+}
+
+/// The first `Symbol.for` registration grows the empty static registry table
+/// onto the heap with room for the entry.
+#[test]
+fn gc_symbol_registry_first_entry_survives() {
+    same_under_stress(
+        "const a = Symbol.for('r' + 1);
+         let junk = []; for (let i = 0; i < 20; i++) junk.push({ i: 'j' + i });
+         const b = Symbol.for('s' + 2);
+         console.log(Symbol.for('r1') === a, Symbol.for('s2') === b, Symbol.keyFor(a));",
+        "true true r1\n",
     );
 }

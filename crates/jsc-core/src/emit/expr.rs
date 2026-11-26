@@ -2371,10 +2371,15 @@ pub(super) fn emit_promise_ctor(
     // in the spread argument array published after the executor is evaluated
     // (as a builtin call does), so a callee reading argument 1 past `K` (the
     // `GetCapabilitiesExecutor`, `arguments`) still sees `reject`.
+    // The settlers wait on the operand stack across the second settler's
+    // allocation and the executor's evaluation: root each as a temp until the
+    // call (the callee roots its own parameters).
     let k = helpers.max_args as usize;
+    let mark = function.temp_mark();
     if k >= 2 {
         for slot in [helpers.settle_resolve_slot, helpers.settle_reject_slot] {
             emit_settler_value(slot, p_local, function, scratch, helpers);
+            function.root_temp(TempClass::Jsval);
         }
         for _ in 2..k {
             function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
@@ -2436,6 +2441,7 @@ pub(super) fn emit_promise_ctor(
         align: 2,
         memory_index: 0,
     }));
+    function.release_temps(mark);
     function.instruction(&Instruction::CallIndirect {
         type_index: helpers.fn_type,
         table_index: 0,
@@ -2877,9 +2883,9 @@ pub(super) fn emit_call_spread(
                 _ => EXPRESSION_NOT_A_FUNCTION,
             };
             // The callee is evaluated first (JS order) and kept on the operand
-            // stack while the argument array is built (a call nested in the
-            // arguments reuses the scratch locals), then stashed.
-            emit_node(callee, function, scratch, strings, helpers);
+            // stack, rooted, while the argument array is built (a call nested in
+            // the arguments reuses the scratch locals), then stashed.
+            emit_operand(callee, function, scratch, strings, helpers);
             emit_spread_args_setup(args, base, len, function, scratch, strings, helpers);
             // IsCallable (DF4), checked after the arguments (spec order).
             if !is_static_function(callee) {

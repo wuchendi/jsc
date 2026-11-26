@@ -267,7 +267,7 @@ fn emit_object_rebox(function: &mut impl Sink) {
 /// closure values (which reuse the `+3` allocation scratch for their OWN blocks)
 /// cannot corrupt the accessor block base. A `MakeAccessor` only ever appears as an
 /// object-literal or class-prototype entry value, so the two closure builds are
-/// the only nested emits and this stack discipline suffices.
+/// the only nested emits. They allocate, so the stacked base is rooted as a temp.
 pub(super) fn emit_make_accessor_node(
     getter: &IrNode,
     setter: &IrNode,
@@ -300,6 +300,8 @@ pub(super) fn emit_make_accessor_node(
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(TYPE_ACCESSOR));
     function.instruction(&Instruction::I32Store8(type_byte));
+    // Root the base on the stack: each closure build below allocates.
+    function.root_temp(TempClass::Base);
 
     // Getter jsval slot. Re-`tee` dst from the stack, push a copy for the store
     // address, evaluate the getter (may clobber the `dst` LOCAL via its own alloc —
@@ -383,7 +385,12 @@ pub(super) fn emit_object_has_node(
     helpers: Helpers<'_>,
 ) {
     emit_key_lookup(key, function, scratch, strings, helpers);
+    // A converted key (an interned index string) is only weakly held by the
+    // intern table while `obj` evaluates.
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Base);
     emit_node(obj, function, scratch, strings, helpers);
+    function.release_temps(mark);
     function.instruction(&Instruction::Call(helpers.has));
     emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::I64ExtendI32U);
@@ -849,10 +856,14 @@ pub(super) fn emit_json_stringify_node(
         HEAP_BITS | i64::from(static_key(strings, "")),
     ));
     function.instruction(&Instruction::LocalGet(scratch));
+    // The value rides the stack across the cycle-stack allocation.
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Jsval);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::Call(helpers.new_array()));
+    function.release_temps(mark);
     function.instruction(&Instruction::Call(helpers.json_rep()));
     emit_propagate_if_pending(function, helpers);
 }

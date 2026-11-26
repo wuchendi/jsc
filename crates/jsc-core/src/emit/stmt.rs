@@ -414,8 +414,12 @@ pub(super) fn emit_try(
     // stack-neutral; an abrupt exit from it discards the stash) so the body
     // runs with `$exc_pending` clear: every call-site check inside it sees
     // only a throw of its own.
+    // The stashed value is rooted: the body may allocate and overwrite
+    // `$exc_value`.
     function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::GlobalGet(EXC_VALUE_GLOBAL));
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Jsval);
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
     emit_stmts(
@@ -427,6 +431,7 @@ pub(super) fn emit_try(
         break_label,
         continue_label,
     );
+    function.release_temps(mark);
     // Restore the stashed exception unless the body threw its own (which
     // supersedes it): value = pending ? current : stashed; pending |= stashed.
     function.instruction(&Instruction::GlobalGet(EXC_VALUE_GLOBAL));
