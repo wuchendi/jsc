@@ -109,7 +109,7 @@ fn run(eval: Option<String>, print: Option<String>, file: Option<String>) -> Res
     };
     let options = CompileOptions {
         print_completion,
-        gc_stress: false,
+        gc_stress: 0,
     };
     let wasm = compile(&src, dialect, &label, options)?;
     let outcome = jsc_core::run::run(&wasm, Sinks::Inherit, None).map_err(Failure::Runtime)?;

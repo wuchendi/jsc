@@ -201,9 +201,9 @@ fn gc_map_iterator_survives() {
 }
 
 /// design/runtime-memory.md §7.1 `gc_stress_run_suite`: the whole run-test
-/// suite under `gc_stress` is the CI `gc-stress` job, where `JSC_GC_STRESS=1`
+/// suite under `gc_stress` is the CI `gc-stress` job, where `JSC_GC_STRESS=N`
 /// makes the shared helpers (`common::compile` / `common::exec`, and the
-/// in-crate ones) build every program with a collection at each allocation.
+/// in-crate ones) build every program with the collection interval `N`.
 /// This anchor checks that plumbing: the stressed module differs from the
 /// plain one, the helpers pick the one the environment asks for, and both
 /// compute the same.
@@ -215,15 +215,14 @@ fn gc_stress_run_suite() {
         print_completion: false,
         gc_stress,
     };
-    let plain = common::compile_with(src, options(false)).expect("compiles");
-    let stressed = common::compile_with(src, options(true)).expect("compiles");
+    let plain = common::compile_with(src, options(0)).expect("compiles");
+    let stressed = common::compile_with(src, options(1)).expect("compiles");
     assert_ne!(plain, stressed, "gc_stress changes the module");
-    let expected = if common::gc_stress_from_env() {
-        stressed
-    } else {
-        plain
-    };
-    assert_eq!(common::compile(src, false).expect("compiles"), expected);
+    let expected = common::compile_with(src, options(common::gc_stress_from_env()));
+    assert_eq!(
+        common::compile(src, false).expect("compiles"),
+        expected.expect("compiles")
+    );
     same_under_stress(src, "100 v99\n");
 }
 
