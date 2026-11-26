@@ -620,6 +620,8 @@ impl LowerCtx<'_> {
 
     pub(super) fn lower_named_expr(&mut self, expr: &Expr, name: &JsStr) -> anyhow::Result<IrNode> {
         match expr {
+            // A parenthesized (cover) definition is still anonymous.
+            Expr::Paren(p) => self.lower_named_expr(&p.expr, name),
             Expr::Arrow(arrow) => self.lower_arrow(arrow, name),
             Expr::Fn(fn_expr) if fn_expr.ident.is_none() => self.lower_fn_expr(fn_expr, name),
             Expr::Class(class_expr) if class_expr.ident.is_none() => {
@@ -2428,6 +2430,7 @@ impl LowerCtx<'_> {
         key: u32,
     ) -> anyhow::Result<IrNode> {
         match expr {
+            Expr::Paren(p) => self.lower_computed_named_expr(&p.expr, key),
             Expr::Class(class_expr) if class_expr.ident.is_none() => {
                 self.lower_class(&class_expr.class, &JsStr::default(), false, Some(key))
             }
@@ -3235,15 +3238,24 @@ fn seq_then(mut seq: Vec<IrNode>, last: IrNode) -> IrNode {
 
 /// Whether `expr` is an anonymous function definition named by the property
 /// it initializes (`IsAnonymousFunctionDefinition`): an arrow or a function
-/// expression without its own name.
+/// expression without its own name, possibly parenthesized (a cover form).
 fn is_anonymous_function(expr: &Expr) -> bool {
-    matches!(expr, Expr::Arrow(_)) || matches!(expr, Expr::Fn(f) if f.ident.is_none())
+    match expr {
+        Expr::Paren(p) => is_anonymous_function(&p.expr),
+        Expr::Arrow(_) => true,
+        Expr::Fn(f) => f.ident.is_none(),
+        _ => false,
+    }
 }
 
 /// Whether `expr` is an anonymous function or class definition
 /// (`IsAnonymousFunctionDefinition`), named by the key it is defined under.
 pub(super) fn is_anonymous_definition(expr: &Expr) -> bool {
-    is_anonymous_function(expr) || matches!(expr, Expr::Class(c) if c.ident.is_none())
+    match expr {
+        Expr::Paren(p) => is_anonymous_definition(&p.expr),
+        Expr::Class(c) => c.ident.is_none(),
+        _ => is_anonymous_function(expr),
+    }
 }
 
 /// The compile-time name of a static property key (`""` for a computed key,

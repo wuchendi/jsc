@@ -306,3 +306,42 @@ fn accessor_halves_split_by_a_spread_or_computed_entry() {
         "functionfunctiontrue",
     );
 }
+
+// --- NamedEvaluation of binding-pattern defaults ----------------------------------
+
+#[test]
+fn binding_pattern_default_is_named_by_its_identifier() {
+    for kw in ["let", "const", "var"] {
+        assert_string(
+            &format!(
+                "{kw} [a = function () {{}}, b = () => 1, c = function* () {{}}, \
+                 d = async function () {{}}, e = class {{}}] = []; \
+                 [a.name, b.name, c.name, d.name, e.name].join()"
+            ),
+            "a,b,c,d,e",
+        );
+        assert_string(
+            &format!(
+                "{kw} {{ a = function () {{}}, b = () => 1, k: c = class {{}}, \
+                 m: d = async () => 1 }} = {{}}; [a.name, b.name, c.name, d.name].join()"
+            ),
+            "a,b,c,d",
+        );
+    }
+    // A cover (parenthesized) default is still anonymous.
+    assert_string("let [cover = (function () {})] = []; cover.name", "cover");
+    assert_string("let { cover = (() => 1) } = {}; cover.name", "cover");
+}
+
+#[test]
+fn binding_pattern_default_that_is_not_anonymous_keeps_its_name() {
+    assert_string("let [g = function own() {}] = []; g.name", "own");
+    assert_string("let { g = class Own {} } = {}; g.name", "Own");
+    assert_string("let [x = (0, function () {})] = []; x.name", "");
+    assert_string(
+        "let { x = class { static name() {} } } = {}; typeof x.name",
+        "function",
+    );
+    // A nested pattern target is not an identifier: nothing is named.
+    assert_string("let [[y] = [function () {}]] = []; y.name", "");
+}

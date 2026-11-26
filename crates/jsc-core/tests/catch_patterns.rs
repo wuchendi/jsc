@@ -164,3 +164,15 @@ fn a_catch_pattern_works_in_an_async_function() {
         "awaited\n",
     );
 }
+
+#[test]
+fn catch_pattern_default_is_named_by_its_identifier() {
+    assert_string(
+        "let r; try { throw {}; } catch ({ x = () => 1, k: y = class {} }) { r = x.name + y.name; } r",
+        "xy",
+    );
+    assert_string(
+        "let r; try { throw []; } catch ([z = function () {}]) { r = z.name; } r",
+        "z",
+    );
+}

@@ -165,3 +165,35 @@ fn private_member_targets() {
         "TypeError",
     );
 }
+
+// --- NamedEvaluation of assignment-pattern defaults --------------------------------
+
+#[test]
+fn assignment_pattern_default_is_named_by_its_identifier() {
+    assert_string(
+        "let a, b, c; [a = function () {}, b = () => 1, c = class {}] = []; \
+         [a.name, b.name, c.name].join()",
+        "a,b,c",
+    );
+    assert_string(
+        "let a, b; ({ a = function* () {} } = {}); ({ k: b = async function () {} } = {}); \
+         a.name + ',' + b.name",
+        "a,b",
+    );
+    assert_string(
+        "let cover; [cover = (function () {})] = []; cover.name",
+        "cover",
+    );
+}
+
+#[test]
+fn assignment_pattern_default_on_a_member_or_named_is_not_renamed() {
+    assert_string("let o = {}; [o.p = function () {}] = []; o.p.name", "");
+    assert_string("let o = {}; ({ k: o.q = () => 1 } = {}); o.q.name", "");
+    assert_string("let g; [g = function own() {}] = []; g.name", "own");
+    assert_string("let x; ({ x = (0, function () {}) } = {}); x.name", "");
+    assert_string(
+        "let x; [x = class { static name() {} }] = []; typeof x.name",
+        "function",
+    );
+}

@@ -367,3 +367,19 @@ fn for_in_over_a_primitive_enumerates_only_string_indices() {
         "[\"0\",\"1\"]",
     );
 }
+
+#[test]
+fn for_of_head_pattern_default_is_named_by_its_identifier() {
+    assert_string(
+        "let r = ''; for (const [y = function () {}] of [[]]) r += y.name; r",
+        "y",
+    );
+    assert_string(
+        "let r = ''; for (let { z = class {} } of [{}]) r += z.name; r",
+        "z",
+    );
+    assert_string(
+        "let r = '', w, o = {}; for ([w = () => 1, o.p = () => 1] of [[]]) r += w.name + '|' + o.p.name; r",
+        "w|",
+    );
+}
