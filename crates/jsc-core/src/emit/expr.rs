@@ -2883,9 +2883,9 @@ pub(super) fn emit_call_spread(
                 _ => EXPRESSION_NOT_A_FUNCTION,
             };
             // The callee is evaluated first (JS order) and kept on the operand
-            // stack while the argument array is built (a call nested in the
-            // arguments reuses the scratch locals), then stashed.
-            emit_node(callee, function, scratch, strings, helpers);
+            // stack, rooted, while the argument array is built (a call nested in
+            // the arguments reuses the scratch locals), then stashed.
+            emit_operand(callee, function, scratch, strings, helpers);
             emit_spread_args_setup(args, base, len, function, scratch, strings, helpers);
             // IsCallable (DF4), checked after the arguments (spec order).
             if !is_static_function(callee) {

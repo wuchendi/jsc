@@ -267,7 +267,7 @@ fn emit_object_rebox(function: &mut impl Sink) {
 /// closure values (which reuse the `+3` allocation scratch for their OWN blocks)
 /// cannot corrupt the accessor block base. A `MakeAccessor` only ever appears as an
 /// object-literal or class-prototype entry value, so the two closure builds are
-/// the only nested emits and this stack discipline suffices.
+/// the only nested emits. They allocate, so the stacked base is rooted as a temp.
 pub(super) fn emit_make_accessor_node(
     getter: &IrNode,
     setter: &IrNode,
@@ -300,6 +300,8 @@ pub(super) fn emit_make_accessor_node(
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(TYPE_ACCESSOR));
     function.instruction(&Instruction::I32Store8(type_byte));
+    // Root the base on the stack: each closure build below allocates.
+    function.root_temp(TempClass::Base);
 
     // Getter jsval slot. Re-`tee` dst from the stack, push a copy for the store
     // address, evaluate the getter (may clobber the `dst` LOCAL via its own alloc —

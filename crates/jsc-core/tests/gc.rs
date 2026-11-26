@@ -384,3 +384,55 @@ fn gc_stress_elision_emit_pow() {
         "1024 81 2\n",
     );
 }
+
+/// A spread array literal's fresh handle rides the operand stack while each
+/// part runs (a generator drain, an array, a string, a pushed item): it is
+/// rooted for the whole build, so no part's allocation frees it.
+#[test]
+fn gc_spread_array_literal_base_survives() {
+    same_under_stress(
+        "function* g() { yield 'a' + 1; yield 'b' + 2; }
+         const a = [0, ...g(), ...[3, 'c' + 4], 'd' + 5, ...'xy'];
+         console.log(JSON.stringify(a), [...g()].join());
+         function add(x, y) { return x + y; }
+         console.log(add(...g()));",
+        "[0,\"a1\",\"b2\",3,\"c4\",\"d5\",\"x\",\"y\"] a1,b2\na1b2\n",
+    );
+}
+
+/// An object-literal accessor block is built while its getter and setter
+/// closures allocate: its base is rooted across both builds.
+#[test]
+fn gc_accessor_literal_survives() {
+    same_under_stress(
+        "const o = { v: 'a', get x() { return this.v + '!' }, set x(n) { this.v = n + '?' } };
+         o.x = 'b' + 1;
+         console.log(o.x, o.v);",
+        "b1?! b1?\n",
+    );
+}
+
+/// A spread call's callee is held on the operand stack while the argument
+/// array is built; an unnamed closure is reachable only from there.
+#[test]
+fn gc_spread_call_callee_survives() {
+    same_under_stress(
+        "console.log(((a, b) => a + b)(...['p' + 1, 'q' + 2]));",
+        "p1q2\n",
+    );
+}
+
+/// A `finally` sets the in-flight exception aside on the operand stack; a
+/// throw caught inside the body replaces `$exc_value`, so the stash alone
+/// keeps the original error alive until it is restored.
+#[test]
+fn gc_finally_stashed_exception_survives() {
+    same_under_stress(
+        "function f() {
+           try { throw new Error('e' + 1); }
+           finally { try { throw 'x' + 2; } catch (_) {} const junk = []; for (let i = 0; i < 20; i++) junk.push({ i: 'j' + i }); }
+         }
+         try { f(); } catch (e) { console.log(e.message); }",
+        "e1\n",
+    );
+}

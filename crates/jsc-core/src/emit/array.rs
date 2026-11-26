@@ -214,9 +214,12 @@ pub(super) fn emit_array_node(
 /// a clean `arguments` by index and runs the protocol otherwise (throwing
 /// `<x> is not iterable`).
 ///
-/// The handle base is kept purely on the operand stack (both runtime helpers
-/// take it as their deepest argument and return it), so a nested spread array
-/// in any part composes without a persistent local.
+/// The handle base is kept on the operand stack (both runtime helpers take it
+/// as their deepest argument and return it), so a nested spread array in any
+/// part composes without a persistent local. It is rooted as a temp for the
+/// whole build: every part may allocate (a generator drain, a protocol walk,
+/// `__array_push` growth), and the handle never moves, so the one slot keeps
+/// naming it.
 ///
 /// [`Item`]: SpreadElem::Item
 /// [`Spread`]: SpreadElem::Spread
@@ -231,6 +234,7 @@ pub(super) fn emit_array_spread(
     // base = a fresh empty array, left (i32) on the operand stack.
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::Call(helpers.new_array()));
+    function.root_temp(TempClass::Base);
 
     // Append each part; `base` stays on the stack, the source/value sits above it.
     for part in parts {
