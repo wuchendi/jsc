@@ -6,6 +6,7 @@
 //! `localeCompare` is `__str_cmp`, code-unit order.
 //! `toString` / `valueOf` are `thisStringValue`.
 
+use super::array::{CallArg, call_spilling, push_call};
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
@@ -768,59 +769,18 @@ fn emit_dispatch(
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, not_callable_text(symbol), strings, helpers);
     wasm!(function; End);
-    let args: &[u32] = if matches!(
+    let args: &[CallArg] = if matches!(
         op,
         StringOp::Replace | StringOp::ReplaceAll | StringOp::Split
     ) {
         frame.arg(function, 1);
         wasm!(function; LocalSet(a1));
-        &[s, a1]
+        &[CallArg::Val(s), CallArg::Val(a1)]
     } else {
-        &[s]
+        &[CallArg::Val(s)]
     };
-    call_with(function, frame, m, a0, args, helpers);
+    push_call(function, frame, m, a0, args, helpers);
     wasm!(function; Return, End, End);
-}
-
-/// Call the function in i64 local `callee` with `this` = i64 local `this`
-/// and the arguments `args` (i64 locals), leaving its result; arguments past
-/// `K` go in a published spread argument array.
-fn call_with(
-    function: &mut FnBuilder<'_>,
-    frame: Frame,
-    callee: u32,
-    this: u32,
-    args: &[u32],
-    helpers: Helpers<'_>,
-) {
-    for slot in 0..frame.k {
-        if let Some(&local) = args.get(slot as usize) {
-            wasm!(function; LocalGet(local));
-        } else {
-            wasm!(function; I64Const(UNDEFINED_BITS));
-        }
-    }
-    if args.len() > frame.k as usize {
-        let spread = frame.scratch() + 38;
-        let n = i32::try_from(args.len()).unwrap_or(i32::MAX);
-        wasm!(function;
-            I32Const(n), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
-            LocalSet(spread),
-        );
-        for (j, &arg) in (0u64..).zip(args) {
-            wasm!(function; LocalGet(spread), I32WrapI64);
-            emit_array_elems(function);
-            wasm!(function; LocalGet(arg), I64Store(elem_slot(j)));
-        }
-        wasm!(function; LocalGet(spread), GlobalSet(SPREAD_ARGS_GLOBAL));
-    }
-    wasm!(function; LocalGet(this), GlobalSet(THIS_GLOBAL));
-    invoke(
-        function,
-        callee,
-        |function| emit_argc(args.len(), function),
-        helpers,
-    );
 }
 
 /// Throw a `RangeError` with `text` (`[message, stack]`), followed by the
@@ -1890,22 +1850,9 @@ fn emit_replace(
     // its `ToString` result is appended.
     push_number(function, pos);
     wasm!(function; LocalSet(r));
-    let args = [search, r, s];
-    for slot in 0..frame.k {
-        if let Some(&local) = args.get(slot as usize) {
-            wasm!(function; LocalGet(local));
-        } else {
-            wasm!(function; I64Const(UNDEFINED_BITS));
-        }
-    }
-    wasm!(function; I64Const(UNDEFINED_BITS), GlobalSet(THIS_GLOBAL));
-    let count = args.len().min(frame.k as usize);
-    invoke(
-        function,
-        replacer,
-        |function| emit_argc(count, function),
-        helpers,
-    );
+    let args = [search, r, s].map(CallArg::Val);
+    let spread = frame.scratch() + 38;
+    call_spilling(function, frame.k, spread, replacer, None, &args, helpers);
     wasm!(function; LocalSet(v));
     return_if_pending(function);
     to_string(function, v, helpers);

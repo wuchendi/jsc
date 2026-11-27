@@ -418,6 +418,22 @@ interned property key.
   publishes the whole array in `$__spread_args`, so a callee that gathers its
   arguments (a rest parameter, `arguments`, a variadic builtin) reads the
   elements beyond `K` from it.
+- **Builtin calls into user code.** A builtin calling a function value with
+  more arguments than `K` (a `forEach` callback's `(value, key, map)`, a
+  replacer's `(key, value)`, a `replace` callback's `(match, position,
+  string)`, a constructor's executor under `K = 0`) never drops the surplus:
+  it fills the `K` slots, passes the real `argc`, and publishes all the
+  arguments in a fresh spread argument array, exactly like a spread call. When
+  that allocation runs out of memory the callee is not called and the
+  `RangeError` propagates. The same holds for a promise reaction or a
+  `FinalizationRegistry` cleanup callback under `K = 0` (`__invoke1` passes
+  its one argument in a one-element spread array), for an inline array
+  higher-order method whose callback may gather more than `K` arguments (the
+  shared spill array is allocated, and checked, before the first callback),
+  and for an IR call node a builtin builds with more literal arguments than
+  `K`: it is emitted as the equivalent spread call (a direct call, an indirect
+  call, a method call, a `super` call or a `new`), a compile-time choice that
+  leaves every call fitting in `K` — every source call — unchanged.
 - **`this`.** `this` rides the `$__this` global rather than a parameter. A method
   call `obj.m(args)` evaluates `obj` and the arguments, then sets
   `$__this = obj` immediately before `call_indirect`; a plain call resets it to

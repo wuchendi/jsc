@@ -1030,6 +1030,11 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
             ..
         } => {
             seed_callee_error(callee_error_text(not_callable), strs);
+            // A `super(..)` passing more arguments than `K` takes the spread
+            // `super(...args)` call, which throws the generic text.
+            if matches!(node, IrNode::ThisCall { construct: true, .. }) {
+                seed_callee_error(EXPRESSION_NOT_A_FUNCTION, strs);
+            }
             collect_node(callee, strs);
             for arg in args {
                 collect_node(arg, strs);

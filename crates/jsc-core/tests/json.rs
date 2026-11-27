@@ -188,3 +188,19 @@ fn task_repros() {
         "true Converting circular structure to JSON\n",
     );
 }
+
+/// A replacer and a reviver receive `(key, value)` also in a program whose
+/// widest call takes one argument (`K = 1`, the replacer / reviver arriving
+/// through a spread call): the value travels in the published spread
+/// argument array instead of being dropped.
+#[test]
+fn replacer_and_reviver_get_the_value_past_a_small_arity() {
+    assert_output(
+        "const keep = function () { return arguments.length === 2 ? arguments[1] : 'lost'; };
+         const a = [{ x: 1, y: [true] }, keep];
+         console.log(JSON.stringify(...a));
+         const b = ['{\"a\":1,\"b\":[2]}', keep];
+         console.log(JSON.stringify(JSON.parse(...b)));",
+        "{\"x\":1,\"y\":[true]}\n{\"a\":1,\"b\":[2]}\n",
+    );
+}

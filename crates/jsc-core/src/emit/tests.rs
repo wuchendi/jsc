@@ -1129,8 +1129,13 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     // A weak collection keeps its pairs (a WeakSet: its keys) in a flagged
     // element store whose unused and deleted slots hold `HOLE` keys
     // (`undefined` values); the collector link is clear outside a cycle.
+    // `_start` reports the throw after `main` returned, and its first output
+    // allocates the render buffer: under `gc_stress` that collects while only
+    // the thrown handle and the realm are roots. So every live key is a realm
+    // intrinsic, and the pair positions are not pinned: a collection compacts
+    // the store (the deleted pair's tombstone goes away).
     let (weak, mem) = heap(
-        "let k = {}; let w = new WeakMap(); w.set(k, 1); w.set({}, 2); w.delete(k); w",
+        "let k = {}; let w = new WeakMap(); w.set(k, 1); w.set(Object.prototype, 2); w.delete(k); w",
         TYPE_WEAKMAP,
         0,
     );
@@ -1144,11 +1149,23 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     );
     assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 8, "four pairs");
     let slot = |i: u32| u64_at(&mem, store + ELEMS_DATA_OFFSET + 8 * i);
-    assert_eq!([slot(0), slot(1)], [HOLE, UNDEFINED], "deleted pair");
-    assert_eq!(mem[(slot(2) & 0xFFFF_FFFF) as usize], TYPE_OBJECT, "key");
-    assert_eq!(slot(3), 2.0_f64.to_bits(), "value");
-    assert_eq!([slot(4), slot(5)], [HOLE, UNDEFINED], "unused pair");
-    let (weak, mem) = heap("let w = new WeakSet(); w.add(Symbol()); w", TYPE_WEAKSET, 0);
+    let (live, empty): (Vec<u32>, Vec<u32>) = (0..4).partition(|&i| slot(2 * i) != HOLE);
+    assert_eq!(live.len(), 1, "one live pair");
+    let key = slot(2 * live[0]);
+    assert_eq!(mem[(key & 0xFFFF_FFFF) as usize], TYPE_OBJECT, "key");
+    assert_eq!(slot(2 * live[0] + 1), 2.0_f64.to_bits(), "value");
+    for i in empty {
+        assert_eq!(
+            [slot(2 * i), slot(2 * i + 1)],
+            [HOLE, UNDEFINED],
+            "empty pair {i}"
+        );
+    }
+    let (weak, mem) = heap(
+        "let w = new WeakSet(); w.add(Symbol.iterator); w",
+        TYPE_WEAKSET,
+        0,
+    );
     assert_eq!(u32_at(&mem, weak + WEAK_LIVE_OFFSET), 1, "live keys");
     let store = u32_at(&mem, weak + WEAK_ENTRIES_OFFSET);
     assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 4, "four keys");
@@ -1156,16 +1173,18 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     assert_eq!(mem[(slot(0) & 0xFFFF_FFFF) as usize], TYPE_SYMBOL, "key");
     assert_eq!(slot(1), HOLE, "unused key");
 
-    // A WeakRef holds its target at @24; a FinalizationRegistry its cleanup
+    // A WeakRef holds its target at @24 (kept alive by `KeepDuringJob`: the
+    // drain does not run after a throw); a FinalizationRegistry its cleanup
     // at @24 and `(target, held, token)` cells in a flagged element store
-    // whose unused cells are all `undefined`; no job is queued and the
-    // collector links are clear outside a cycle.
+    // whose unused cells are all `undefined`; no job is queued (the target is
+    // a realm intrinsic, live at the report's collection) and the collector
+    // links are clear outside a cycle.
     let (wr, mem) = heap("let o = { a: 1 }; new WeakRef(o)", TYPE_WEAKREF, 0);
     assert_eq!(u32_at(&mem, wr + WEAK_NEXT_OFFSET), 0, "weak_next");
     let target = u64_at(&mem, wr + WEAKREF_TARGET_OFFSET);
     assert_eq!(mem[(target & 0xFFFF_FFFF) as usize], TYPE_OBJECT, "target");
     let (fr, mem) = heap(
-        "let t = {}; let fr = new FinalizationRegistry(function () {}); fr.register(t, 7); fr",
+        "let fr = new FinalizationRegistry(function () {}); fr.register(Object.prototype, 7); fr",
         TYPE_FINREG,
         0,
     );
@@ -1757,4 +1776,109 @@ fn gc_stress_interval_after_prefix() {
     let expected = completion(&off);
     assert_eq!(expected, "128996");
     assert_eq!(completion(&interval), expected);
+}
+
+/// A predicate selecting the IR call node a test rewrites.
+type NodePick<'a> = &'a dyn Fn(&IrNode) -> bool;
+
+/// The argument list of a call node that pushes `K` positional slots.
+fn call_args_mut(node: &mut IrNode) -> Option<&mut Vec<IrNode>> {
+    match node {
+        IrNode::Call { args, .. }
+        | IrNode::CallIndirect { args, .. }
+        | IrNode::MethodCallUser { args, .. }
+        | IrNode::ThisCall { args, .. }
+        | IrNode::Construct { args, .. } => Some(args),
+        _ => None,
+    }
+}
+
+/// Append `extra` to the arguments of the first one-argument call node in
+/// `node` that `pick` accepts; whether one was found.
+fn widen_node(node: &mut IrNode, pick: NodePick<'_>, extra: &[IrNode]) -> bool {
+    if pick(node)
+        && let Some(args) = call_args_mut(node)
+        && args.len() == 1
+    {
+        args.extend_from_slice(extra);
+        return true;
+    }
+    node.children_mut()
+        .into_iter()
+        .any(|child| widen_node(child, pick, extra))
+}
+
+/// [`widen_node`] over a statement list (and the bodies nested in it).
+fn widen_stmts(stmts: &mut [IrStmt], pick: NodePick<'_>, extra: &[IrNode]) -> bool {
+    stmts.iter_mut().any(|stmt| match stmt {
+        IrStmt::Decl { init: node, .. } | IrStmt::Expr(node) | IrStmt::Return(Some(node)) => {
+            widen_node(node, pick, extra)
+        }
+        IrStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            widen_node(cond, pick, extra)
+                || widen_stmts(then_body, pick, extra)
+                || widen_stmts(else_body, pick, extra)
+        }
+        _ => false,
+    })
+}
+
+/// Lower `src` (whose widest call passes one argument, so `K = 1`), append
+/// the arguments `2, 3` to the first one-argument call node `pick` accepts
+/// — the shape of an IR fragment a builtin builds — and run it. The callee
+/// gathers `...r` and completes with `r.length * 10 + r[2]`, so `33` proves
+/// every argument and the real `argc` reached it instead of the surplus
+/// being dropped.
+fn run_widened(src: &str, pick: NodePick<'_>) -> String {
+    let mut program = lower_js(src);
+    assert_eq!(program.arity, 1, "the source fixes K = 1");
+    let extra = [IrNode::Num(2.0), IrNode::Num(3.0)];
+    let found = widen_stmts(&mut program.stmts, pick, &extra)
+        || program
+            .functions
+            .iter_mut()
+            .any(|f| widen_stmts(&mut f.body, pick, &extra));
+    assert!(found, "no matching call node in {src}");
+    let bytes = emit(&program);
+    validate(&bytes);
+    completion(&bytes)
+}
+
+/// An IR call with more arguments than `K` takes the spread call form for
+/// every call node kind: direct, indirect, method, `super.m(..)` and `new`.
+#[test]
+fn ir_calls_past_k_pass_every_argument() {
+    let body = "return r.length * 10 + r[2];";
+    let cases: [(String, NodePick<'_>); 5] = [
+        (format!("function f(...r) {{ {body} }} f(1)"), &|n| {
+            matches!(n, IrNode::Call { .. })
+        }),
+        (
+            format!("let g = function (...r) {{ {body} }}; g = g; g(1)"),
+            &|n| matches!(n, IrNode::CallIndirect { .. }),
+        ),
+        (
+            format!("const o = {{ m(...r) {{ {body} }} }}; o.m(1)"),
+            &|n| matches!(n, IrNode::MethodCallUser { .. }),
+        ),
+        (
+            format!(
+                "class A {{ m(...r) {{ {body} }} }} \
+                 class B extends A {{ m() {{ return super.m(1); }} }} new B().m()"
+            ),
+            &|n| matches!(n, IrNode::ThisCall { .. }),
+        ),
+        (
+            "class C { constructor(...r) { this.v = r.length * 10 + r[2]; } } new C(1).v"
+                .to_owned(),
+            &|n| matches!(n, IrNode::Construct { spread: None, .. }),
+        ),
+    ];
+    for (src, pick) in cases {
+        assert_eq!(run_widened(&src, pick), "33", "{src}");
+    }
 }

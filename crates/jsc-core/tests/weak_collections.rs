@@ -508,8 +508,8 @@ fn weakref_finreg_constructor_without_new_throws() {
 
 /// The argument `TypeError`s: a `WeakRef` target, a registry target or a
 /// token that cannot be held weakly (primitives, registered symbols), a
-/// non-callable cleanup, and the receiver checks; the argument check runs
-/// before the `new.target` prototype read.
+/// non-callable cleanup, and the receiver checks; from a derived constructor
+/// the argument check throws out of `super(...)` before `this` is bound.
 #[test]
 fn weakref_finreg_invalid_arguments_throw() {
     assert_string(
@@ -557,15 +557,15 @@ fn weakref_finreg_invalid_arguments_throw() {
         "TypeError: Method WeakRef.prototype.deref called on incompatible receiver",
     );
     assert_string(
-        "let calls = 0;
-         let nt = function () {}.bind(null);
-         Object.defineProperty(nt, 'prototype', { get() { calls++; return WeakRef.prototype; } });
+        "let log = [];
+         class R extends WeakRef { constructor(t) { log.push('r'); super(t); log.push('r-done'); } }
+         class F extends FinalizationRegistry { constructor(c) { log.push('f'); super(c); log.push('f-done'); } }
          let r = [];
-         try { Reflect.construct(WeakRef, [1], nt); r.push('no'); } catch (e) { r.push(e instanceof TypeError); }
-         try { Reflect.construct(FinalizationRegistry, [1], nt); r.push('no'); } catch (e) { r.push(e instanceof TypeError); }
-         r.push(calls, Reflect.construct(WeakRef, [{}], nt) instanceof WeakRef, calls);
+         try { new R(1); r.push('no'); } catch (e) { r.push(e instanceof TypeError); }
+         try { new F(1); r.push('no'); } catch (e) { r.push(e instanceof TypeError); }
+         r.push(new R({}) instanceof R, log.join(' '));
          r.join()",
-        "true,true,0,true,1",
+        "true,true,true,r f r r-done",
     );
 }
 
@@ -595,4 +595,57 @@ fn finreg_cleanup_throw_is_uncaught() {
         "end\n",
         "Error: cleanup x",
     );
+}
+
+/// The `WeakMap` constructor hands each entry's value to the adder also in a
+/// program whose widest call takes one argument (`K = 1`): the value travels
+/// in the published spread array past the positional slots. 2, 4, 5 and 9
+/// entries cross the store's growth boundaries (four pairs, doubling), with
+/// string and number values; the same entries through repeated `set` calls
+/// (a `K = 2` program) agree, and so does a run under `gc_stress`.
+#[test]
+fn weakmap_ctor_two_entries_keep_values() {
+    let expected = "s0,1|s0,1,s2,3|s0,1,s2,3,s4|s0,1,s2,3,s4,5,s6,7,s8";
+    let ctor = |tail: &str| {
+        format!(
+            "function run(n) {{
+               let ks = [], e = [];
+               for (let i = 0; i < n; i++) {{
+                 let k = {{}};
+                 ks.push(k);
+                 e.push([k, i % 2 ? i : 's' + i]);
+               }}
+               let wm = new WeakMap(e);
+               let r = [];
+               for (let i = 0; i < n; i++) r.push(wm.get(ks[i]));
+               return r.join();
+             }}
+             {tail}"
+        )
+    };
+    let all = "[run(2), run(4), run(5), run(9)].join('|')";
+    assert_string(&ctor(all), expected);
+    stressed(
+        &ctor(&format!("console.log({all});")),
+        &format!("{expected}\n"),
+    );
+    assert_string(
+        "let k1 = {}, k2 = {};
+         let wm = new WeakMap([[k1, 'a'], [k2, 'b']]);
+         [wm.get(k1), wm.get(k2)].join()",
+        "a,b",
+    );
+    let by_set = "function run(n) {
+           let ks = [], wm = new WeakMap();
+           for (let i = 0; i < n; i++) {
+             let k = {};
+             ks.push(k);
+             wm.set(k, i % 2 ? i : 's' + i);
+           }
+           let r = [];
+           for (let i = 0; i < n; i++) r.push(wm.get(ks[i]));
+           return r.join();
+         }
+         [run(2), run(4), run(5), run(9)].join('|')";
+    assert_string(by_set, expected);
 }
