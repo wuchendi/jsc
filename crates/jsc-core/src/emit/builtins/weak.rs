@@ -508,6 +508,7 @@ fn emit_ctor(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, 1);
     let (map, proto, base) = (frame.x64(0), frame.y64(0), frame.base(0));
     let (ctor, kind, type_byte) = if set {
         (BuiltinCtor::WeakSet, Collection::WeakSet, abi::TYPE_WEAKSET)

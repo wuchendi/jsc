@@ -141,7 +141,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 /// The IR fragments the bodies emit, over the locals of `K = k`, for the
 /// static-string scan.
 pub(super) fn fragments(k: u32) -> Vec<IrNode> {
-    let local = Frame { k }.i64(0);
+    let local = Frame::new(k).i64(0);
     vec![
         iter_result(IrNode::Local(local), false),
         iter_result(IrNode::Undefined, true),

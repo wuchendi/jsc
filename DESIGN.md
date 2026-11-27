@@ -418,7 +418,13 @@ interned property key.
   publishes the whole array in `$__spread_args`, so a callee that gathers its
   arguments (a rest parameter, `arguments`, a variadic builtin, a builtin
   constructor's argument such as the `Promise` executor) reads the elements
-  beyond `K` from it.
+  beyond `K` from it. Every builtin body reads an argument past `K` from that
+  array (`undefined` past `argc`), never as a silent `undefined`. A nested
+  spread call publishes a fresh array, so a builtin that reads an argument
+  past `K` after user code may run (a coercion, a getter, a callback,
+  `Get(new.target, "prototype")`) first snapshots `$__spread_args` into a
+  rooted local and reads that; when every argument it reads fits in `K` it
+  emits no snapshot.
 - **Builtin calls into user code.** A builtin calling a function value with
   more arguments than `K` (a `forEach` callback's `(value, key, map)`, a
   replacer's `(key, value)`, a `replace` callback's `(match, position,
@@ -436,7 +442,7 @@ interned property key.
   shared spill array is allocated, and checked, before the first callback),
   and for an IR call node a builtin builds with more literal arguments than
   `K`: it is emitted as the equivalent spread call (a direct call, an indirect
-  call, a method call, a call on the enclosing `this`, or a `new` /
+  call, a method call, or a `new` /
   `super(..)`), a compile-time choice that leaves every call fitting in `K` —
   every source call — unchanged.
 - **`this`.** `this` rides the `$__this` global rather than a parameter. A method

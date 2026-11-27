@@ -1404,3 +1404,19 @@ fn aggregate_error_rejects_non_iterables() {
         "mTypeError",
     );
 }
+
+/// With no positional argument slot (`K = 0`) the message and options of a
+/// spread Error construct (a subclass's implicit `super(...args)` included)
+/// are read from the spread argument array, the message after
+/// `GetPrototypeFromConstructor`.
+#[test]
+fn error_arguments_past_the_argument_slots() {
+    assert_uncaught(
+        "class E extends Error {}
+         const e = new E(...['m', { cause: 1 }]), f = new Error(...['n', { cause: 2 }]);
+         const g = new TypeError(...['t']);
+         throw e.message + ' ' + e.cause + ' ' + (e instanceof E) + ' '
+           + f.message + ' ' + f.cause + ' ' + g.message;",
+        "m 1 true n 2 t",
+    );
+}

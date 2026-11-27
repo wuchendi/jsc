@@ -91,7 +91,7 @@ pub(super) fn emit_has_instance(
 
 /// The IR fragments of this family's bodies, for the static-string scan.
 pub(super) fn fragments(k: u32) -> Vec<IrNode> {
-    vec![bound_construct(Frame { k })]
+    vec![bound_construct(Frame::new(k))]
 }
 
 /// `%ThrowTypeError%`: throw the restricted-property `TypeError`.

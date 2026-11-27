@@ -112,16 +112,45 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
 struct Frame {
     /// The uniform ABI's positional arity `K`.
     k: u32,
+    /// The rooted local holding the [`Self::snapshot`] of `$__spread_args`,
+    /// which [`Self::arg`] then reads instead of the global.
+    spread: Option<u32>,
 }
 
 impl Frame {
+    /// The frame of a body under the arity `K = k`, reading arguments past
+    /// the slots from `$__spread_args` itself.
+    const fn new(k: u32) -> Self {
+        Self { k, spread: None }
+    }
+
+    /// The frame of a body that reads arguments `0..reads`, some of them
+    /// after user code may run (a coercion, a getter, a callback): when one
+    /// is past the `K` slots, `$__spread_args` is captured now into a fresh
+    /// rooted local that [`Self::arg`] (and [`Self::body`]) read, since a
+    /// nested spread call in that user code publishes another array.
+    fn snapshot(self, function: &mut FnBuilder<'_>, reads: u32) -> Self {
+        if reads <= self.k {
+            return self;
+        }
+        let spread = function.local(LocalClass::Jsval);
+        wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(spread));
+        Self {
+            spread: Some(spread),
+            ..self
+        }
+    }
+
+    /// The IR argument reader over this frame's arity and spread source.
+    fn body(self) -> ctor::Body {
+        ctor::Body::with_spread(self.k, self.spread)
+    }
+
     /// Start a builtin body under the program's arity `K`: its function
     /// builder and frame, with the unwind state reset.
     fn begin<'a>(helpers: Helpers<'_>, leaves: &'a LeafSet) -> (FnBuilder<'a>, Self) {
         helpers.unwind.borrow_mut().reset();
-        let frame = Self {
-            k: helpers.max_args,
-        };
+        let frame = Self::new(helpers.max_args);
         (Self::builder(frame.k, leaves), frame)
     }
 
@@ -159,7 +188,8 @@ impl Frame {
 
     /// Push argument `i`: slot `i`, or past the `K` slots the element of the
     /// spread argument array a call with more than `K` arguments published
-    /// (`undefined` past the argument count, or for a spread hole).
+    /// (`undefined` past the argument count, or for a spread hole), read
+    /// from the [`Self::snapshot`] when there is one.
     fn arg(self, function: &mut FnBuilder<'_>, i: u32) {
         if i < self.k {
             wasm!(function; LocalGet(i));
@@ -169,8 +199,13 @@ impl Frame {
         wasm!(function;
             LocalGet(self.argc()), F64ReinterpretI64, F64Const(Ieee64::from(f64::from(i))), F64Gt,
             If(BlockType::Result(ValType::I64)),
-            GlobalGet(SPREAD_ARGS_GLOBAL), I32WrapI64,
         );
+        if let Some(spread) = self.spread {
+            wasm!(function; LocalGet(spread));
+        } else {
+            wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL));
+        }
+        wasm!(function; I32WrapI64);
         emit_array_elems(function);
         wasm!(function; I64Load(elem_slot(u64::from(i))), LocalSet(tmp));
         emit_elem_read(function, tmp);

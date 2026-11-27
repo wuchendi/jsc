@@ -530,3 +530,17 @@ fn accessor_call_without_argument_slots_passes_the_hint() {
         "1:string 1:default",
     );
 }
+
+/// Arguments past the positional slots (`K <= 1`), snapshotted before a
+/// coercion makes a nested spread call, survive a collection at every
+/// allocation.
+#[test]
+fn arguments_past_the_slots_under_gc_stress() {
+    same_under_stress(
+        "const s = { valueOf() { Math.max(...[1, 2, 3]); return 1; } };
+         console.log(new Date(...[2020, s, 2, 3, 4, 5, 6]).toISOString() + ' '
+           + 'abcd'.slice(...[s, 3]) + ' ' + [1, 2, 3].reduce(...[function () {
+             return arguments[0] + arguments[1]; }, 'r']));",
+        "2020-02-02T03:04:05.006Z bc r123\n",
+    );
+}

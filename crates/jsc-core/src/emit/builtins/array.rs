@@ -3,6 +3,7 @@
 //! by index key) and runs the inline fast path of its call sites (DESIGN.md §6.4)
 //! for a real array receiver.
 
+use super::ctor::Body;
 #[allow(clippy::wildcard_imports)]
 use super::*;
 use crate::emit::realm::{ArrayFindOp, AsyncIterOp, FromAsyncOp, IterOp};
@@ -105,7 +106,8 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 /// The IR fragments the bodies emit, over the argument slots of `K = k`, for
 /// the static-string scan.
 pub(super) fn fragments(k: u32) -> Vec<IrNode> {
-    let o = Frame { k }.i64(0);
+    let o = Frame::new(k).i64(0);
+    let body = Body::new(k);
     let mut nodes: Vec<IrNode> = [
         ArrayHofOp::Map,
         ArrayHofOp::Filter,
@@ -113,7 +115,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
         ArrayHofOp::ForEach,
     ]
     .into_iter()
-    .map(|op| array_hof(op, k, o, Some(Box::new(arg(k, 1)))))
+    .map(|op| array_hof(op, &body, o, Some(Box::new(body.arg(1)))))
     .collect();
     nodes.extend([
         IrNode::ArrayPop { local: o },
@@ -125,23 +127,14 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
     nodes
 }
 
-/// Argument slot `i` as an IR node (`undefined` past the `K` slots).
-fn arg(k: u32, i: u32) -> IrNode {
-    if i < k {
-        IrNode::Local(i)
-    } else {
-        IrNode::Undefined
-    }
-}
-
-/// `op` over the array in local `o` with the callback in slot 0 and `extra`
-/// (the initial value of `reduce`, else `thisArg`).
-fn array_hof(op: ArrayHofOp, k: u32, o: u32, extra: Option<Box<IrNode>>) -> IrNode {
+/// `op` over the array in local `o` with the callback argument 0 of `body`
+/// and `extra` (the initial value of `reduce`, else `thisArg`).
+fn array_hof(op: ArrayHofOp, body: &Body, o: u32, extra: Option<Box<IrNode>>) -> IrNode {
     let reduce = op == ArrayHofOp::Reduce;
     IrNode::ArrayHof {
         op,
         array: Box::new(IrNode::Local(o)),
-        callback: Box::new(arg(k, 0)),
+        callback: Box::new(body.arg(0)),
         init: if reduce { extra.clone() } else { None },
         this_arg: if reduce { None } else { extra },
     }
@@ -407,6 +400,7 @@ pub(super) fn emit_hof(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, 2);
     let texts = hof_texts(op);
     let (o, callback, this_arg, value) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (acc, result) = (frame.x64(0), frame.x64(1));
@@ -423,19 +417,20 @@ pub(super) fn emit_hof(
             LocalGet(frame.argc()), F64ReinterpretI64, F64Const(Ieee64::from(2.0)), F64Ge,
         );
     };
-    let extra = || Some(Box::new(arg(frame.k, 1)));
+    let body = frame.body();
+    let extra = || Some(Box::new(body.arg(1)));
     let fast = |function: &mut FnBuilder<'_>| {
         if reduce {
             has_init(function);
             wasm!(function; If(BlockType::Result(ValType::I64)));
-            let node = array_hof(op, frame.k, o, extra());
+            let node = array_hof(op, &body, o, extra());
             emit_node(&node, function, frame.scratch(), strings, helpers);
             wasm!(function; Else);
-            let node = array_hof(op, frame.k, o, None);
+            let node = array_hof(op, &body, o, None);
             emit_node(&node, function, frame.scratch(), strings, helpers);
             wasm!(function; End);
         } else {
-            let node = array_hof(op, frame.k, o, extra());
+            let node = array_hof(op, &body, o, extra());
             emit_node(&node, function, frame.scratch(), strings, helpers);
         }
         wasm!(function; Return, End);
@@ -569,6 +564,7 @@ pub(super) fn emit_search(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, 2);
     let texts = if includes { &INCLUDES } else { &INDEX_OF };
     let (o, search, v) = (frame.i64(0), frame.i64(1), frame.i64(2));
     let key = frame.base(2);
@@ -903,6 +899,7 @@ pub(super) fn emit_join(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, 1);
     let (o, sep_v, v) = (frame.i64(0), frame.i64(1), frame.i64(2));
     let (len, k, acc, sep) = (frame.i32(0), frame.i32(1), frame.base(2), frame.base(3));
     let key = frame.base(4);
@@ -1210,7 +1207,7 @@ fn more_strings() -> impl Iterator<Item = &'static str> {
 /// The IR fragments of the statics and the non-mutating methods, over the
 /// locals of `K = k`, for the static-string scan.
 fn more_fragments(k: u32) -> Vec<IrNode> {
-    let frame = Frame { k };
+    let frame = Frame::new(k);
     let o = frame.i64(0);
     vec![
         construct(frame, o, Some(o), SPECIES_NOT_CTOR),
@@ -2391,6 +2388,7 @@ pub(super) fn emit_at(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, 1);
     let o = frame.i64(0);
     let (len, r) = (frame.yf64(0), frame.f64(0));
     this_object(function, frame, o, AT.nullish, strings, helpers);
@@ -2427,6 +2425,7 @@ pub(super) fn emit_find(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, 2);
     let texts = find_texts(op);
     let (o, pred, this_arg, v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (r, kv) = (frame.x64(0), frame.x64(1));
@@ -2507,6 +2506,7 @@ pub(super) fn emit_reduce_right(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, 2);
     let (o, callback, this_arg, value) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (acc, kv) = (frame.x64(0), frame.x64(1));
     let (key, seeded) = (frame.base(2), frame.i32(3));
@@ -2566,6 +2566,7 @@ pub(super) fn emit_last_index_of(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, 2);
     let (o, search, v) = (frame.i64(0), frame.i64(1), frame.i64(2));
     let key = frame.base(2);
     let r = frame.f64(0);
@@ -2716,6 +2717,7 @@ pub(super) fn emit_flat(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, if map { 2 } else { 1 });
     let texts = if map { &FLAT_MAP } else { &FLAT };
     let (o, cur, el, kv) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (a, mapper, zero, this_arg) = (frame.x64(0), frame.x64(1), frame.y64(1), frame.y64(4));
