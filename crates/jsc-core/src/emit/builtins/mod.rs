@@ -317,7 +317,7 @@ fn emit_builtin_body(
     helpers: Helpers<'_>,
 ) {
     match builtin {
-        Builtin::WeakOp { .. } | Builtin::Ctor(BuiltinCtor::WeakMap | BuiltinCtor::WeakSet) => {
+        Builtin::WeakOp { .. } | Builtin::WeakCell(_) => {
             weak::emit(builtin, f, frame, strings, helpers);
         }
         Builtin::FunctionPrototype => wasm!(f; I64Const(UNDEFINED_BITS)),
@@ -427,7 +427,9 @@ fn emit_global(builtin: Builtin, f: &mut FnBuilder<'_>, frame: Frame, helpers: H
     }
 }
 
-/// Emit the IR [`fragment`] body of `builtin` into `f`.
+/// Emit the IR [`fragment`] body of `builtin` into `f`; the weak
+/// constructors (`WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`)
+/// go to [`weak::emit`] instead.
 fn emit_fragment(
     builtin: Builtin,
     f: &mut FnBuilder<'_>,
@@ -435,6 +437,10 @@ fn emit_fragment(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    if weak::is_ctor(builtin) {
+        weak::emit(builtin, f, frame, strings, helpers);
+        return;
+    }
     let body = fragment(builtin, frame.k).unwrap_or(IrNode::Undefined);
     emit_node(&body, f, frame.scratch(), strings, helpers);
 }

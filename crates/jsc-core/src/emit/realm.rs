@@ -118,7 +118,7 @@ impl IterKind {
 }
 
 /// The constructors whose prototype is an [`Intrinsic::Prototype`].
-const PLAIN_PROTOTYPES: [BuiltinCtor; 11] = [
+const PLAIN_PROTOTYPES: [BuiltinCtor; 13] = [
     BuiltinCtor::Array,
     BuiltinCtor::String,
     BuiltinCtor::Number,
@@ -130,6 +130,8 @@ const PLAIN_PROTOTYPES: [BuiltinCtor; 11] = [
     BuiltinCtor::Symbol,
     BuiltinCtor::WeakMap,
     BuiltinCtor::WeakSet,
+    BuiltinCtor::WeakRef,
+    BuiltinCtor::FinalizationRegistry,
 ];
 
 /// A well-known symbol (DESIGN.md §6.4): a static
@@ -295,7 +297,9 @@ impl Intrinsic {
                 | BuiltinCtor::Promise
                 | BuiltinCtor::Date
                 | BuiltinCtor::WeakMap
-                | BuiltinCtor::WeakSet,
+                | BuiltinCtor::WeakSet
+                | BuiltinCtor::WeakRef
+                | BuiltinCtor::FinalizationRegistry,
             ) => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_SELF_ALLOC,
             Self::Ctor(_) => abi::FUNC_FLAG_CONSTRUCTOR,
             _ => 0,
@@ -592,6 +596,9 @@ pub(super) enum Builtin {
         /// The method.
         op: MapOp,
     },
+    /// A `%WeakRef.prototype%` / `%FinalizationRegistry.prototype%` method
+    /// (`emit/builtins/weak.rs`).
+    WeakCell(WeakCellOp),
     /// `Promise.prototype.then`.
     PromiseThen,
     /// `Promise.prototype.catch`.
@@ -1542,6 +1549,17 @@ impl ReflectOp {
         }
     }
 }
+/// A `%WeakRef.prototype%` or `%FinalizationRegistry.prototype%` method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WeakCellOp {
+    /// `WeakRef.prototype.deref`.
+    Deref,
+    /// `FinalizationRegistry.prototype.register`.
+    Register,
+    /// `FinalizationRegistry.prototype.unregister`.
+    Unregister,
+}
+
 /// An `Array.prototype` method that returns a changed copy of its receiver as
 /// a plain array.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1675,7 +1693,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 361] = [
+    pub(super) const ALL: [Builtin; 366] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1756,6 +1774,8 @@ impl Builtin {
         Self::Ctor(BuiltinCtor::Iterator),
         Self::Ctor(BuiltinCtor::WeakMap),
         Self::Ctor(BuiltinCtor::WeakSet),
+        Self::Ctor(BuiltinCtor::WeakRef),
+        Self::Ctor(BuiltinCtor::FinalizationRegistry),
         Self::ObjectStatic(ObjectBuiltinOp::Keys),
         Self::ObjectStatic(ObjectBuiltinOp::Values),
         Self::ObjectStatic(ObjectBuiltinOp::Entries),
@@ -2033,6 +2053,9 @@ impl Builtin {
             set: true,
             op: MapOp::Has,
         },
+        Self::WeakCell(WeakCellOp::Deref),
+        Self::WeakCell(WeakCellOp::Register),
+        Self::WeakCell(WeakCellOp::Unregister),
         Self::PromiseThen,
         Self::PromiseCatch,
         Self::PromiseFinally,
@@ -2180,6 +2203,9 @@ impl Builtin {
             Self::DateMethod(op) => op.name(),
             Self::DateBody(op) => op.name(),
             Self::CollectionOp { op, .. } | Self::WeakOp { op, .. } => op.name(),
+            Self::WeakCell(WeakCellOp::Deref) => "deref",
+            Self::WeakCell(WeakCellOp::Register) => "register",
+            Self::WeakCell(WeakCellOp::Unregister) => "unregister",
             Self::PromiseThen => "then",
             Self::PromiseCatch => "catch",
             Self::PromiseFinally => "finally",
@@ -2276,6 +2302,7 @@ impl Builtin {
             | Self::ArrayToLocaleString
             | Self::DateMethod(_)
             | Self::CollectionSize { .. }
+            | Self::WeakCell(WeakCellOp::Deref)
             | Self::ProtoGet
             | Self::CollectionOp {
                 op: MapOp::Clear, ..
@@ -2317,6 +2344,7 @@ impl Builtin {
             | Self::ArrayCopy(ArrayCopyOp::With | ArrayCopyOp::ToSpliced)
             | Self::CollectionOp { op: MapOp::Set, .. }
             | Self::WeakOp { op: MapOp::Set, .. }
+            | Self::WeakCell(WeakCellOp::Register)
             | Self::PromiseThen
             | Self::DefineAccessor { .. } => 2,
             Self::StringMethod(op) => op.length(),
@@ -2376,6 +2404,8 @@ impl Builtin {
             }
             Self::WeakOp { set: false, .. } => Some(BuiltinCtor::WeakMap),
             Self::WeakOp { set: true, .. } => Some(BuiltinCtor::WeakSet),
+            Self::WeakCell(WeakCellOp::Deref) => Some(BuiltinCtor::WeakRef),
+            Self::WeakCell(_) => Some(BuiltinCtor::FinalizationRegistry),
             Self::PromiseThen | Self::PromiseCatch | Self::PromiseFinally => {
                 Some(BuiltinCtor::Promise)
             }
@@ -2509,7 +2539,7 @@ const NUMBER_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 33] = [
+const GLOBALS: [(&str, u32, Value); 35] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -2638,6 +2668,16 @@ const GLOBALS: [(&str, u32, Value); 33] = [
         "WeakSet",
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::WeakSet)),
+    ),
+    (
+        "WeakRef",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::WeakRef)),
+    ),
+    (
+        "FinalizationRegistry",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::FinalizationRegistry)),
     ),
     ("isNaN", METHOD_ATTRS, Value::Method(Builtin::IsNaN)),
     ("isFinite", METHOD_ATTRS, Value::Method(Builtin::IsFinite)),
@@ -2943,6 +2983,11 @@ fn well_known_entries(entries: &mut Vec<Entry>) {
         (Intrinsic::Prototype(BuiltinCtor::Set), "Set"),
         (Intrinsic::Prototype(BuiltinCtor::WeakMap), "WeakMap"),
         (Intrinsic::Prototype(BuiltinCtor::WeakSet), "WeakSet"),
+        (Intrinsic::Prototype(BuiltinCtor::WeakRef), "WeakRef"),
+        (
+            Intrinsic::Prototype(BuiltinCtor::FinalizationRegistry),
+            "FinalizationRegistry",
+        ),
         (Intrinsic::Prototype(BuiltinCtor::Promise), "Promise"),
         (Intrinsic::GeneratorPrototype, "Generator"),
         (Intrinsic::AsyncGeneratorPrototype, "AsyncGenerator"),

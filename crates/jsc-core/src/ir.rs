@@ -559,11 +559,15 @@ pub enum BuiltinCtor {
     WeakMap,
     /// `WeakSet`.
     WeakSet,
+    /// `WeakRef`.
+    WeakRef,
+    /// `FinalizationRegistry`.
+    FinalizationRegistry,
 }
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 22] = [
+    pub(crate) const ALL: [BuiltinCtor; 24] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -586,6 +590,8 @@ impl BuiltinCtor {
         Self::Iterator,
         Self::WeakMap,
         Self::WeakSet,
+        Self::WeakRef,
+        Self::FinalizationRegistry,
     ];
 
     /// The constructor's global name (also its `name`).
@@ -606,6 +612,8 @@ impl BuiltinCtor {
             Self::Iterator => "Iterator",
             Self::WeakMap => "WeakMap",
             Self::WeakSet => "WeakSet",
+            Self::WeakRef => "WeakRef",
+            Self::FinalizationRegistry => "FinalizationRegistry",
         }
     }
 

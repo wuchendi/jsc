@@ -91,7 +91,7 @@ const OPEN_TRAILING: &str = " { ";
 const CLOSE_OBJECT: &str = " }";
 
 /// The static strings the renderer writes or looks properties up by.
-pub(super) const STRINGS: [&str; 58] = [
+pub(super) const STRINGS: [&str; 60] = [
     "",
     "true",
     "false",
@@ -138,6 +138,8 @@ pub(super) const STRINGS: [&str; 58] = [
     "Object [Generator]",
     "WeakMap { <items unknown> }",
     "WeakSet { <items unknown> }",
+    "WeakRef {}",
+    "FinalizationRegistry {}",
     "Uncaught ",
     "Uncaught (in promise) ",
     INVALID_DATE,
@@ -695,6 +697,8 @@ fn render_leaf(
     for (kind, text) in [
         (abi::TYPE_WEAKMAP, "WeakMap { <items unknown> }"),
         (abi::TYPE_WEAKSET, "WeakSet { <items unknown> }"),
+        (abi::TYPE_WEAKREF, "WeakRef {}"),
+        (abi::TYPE_FINREG, "FinalizationRegistry {}"),
     ] {
         is(f, i32::from(kind));
         lit(f, strings, helpers, text);

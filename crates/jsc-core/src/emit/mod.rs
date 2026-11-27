@@ -225,12 +225,31 @@ const GC_RESERVE_GLOBAL: u32 = 40;
 /// collection is linked through its `weak_next` slot, the list ending at the
 /// sentinel `1` (design/runtime-memory.md §6.2).
 const GC_WEAK_GLOBAL: u32 = 41;
+/// The head of the cycle's `WeakRef` list (`$__gc_weak_refs`, raw `i32` ref,
+/// init 1 = empty), linked like [`GC_WEAK_GLOBAL`] (design/runtime-memory.md
+/// §6.3).
+const GC_WEAK_REFS_GLOBAL: u32 = 42;
+/// The head of the cycle's `FinalizationRegistry` list (`$__gc_weak_regs`,
+/// raw `i32` ref, init 1 = empty), linked like [`GC_WEAK_GLOBAL`]
+/// (design/runtime-memory.md §6.4).
+const GC_WEAK_REGS_GLOBAL: u32 = 43;
+/// The `KeepDuringJob` set (`$__kept_objects`, raw `i32` ref to an internal
+/// array handle, init 0 = not allocated yet): `new WeakRef(t)` and a
+/// successful `deref()` push their target, and each microtask checkpoint of
+/// `__drain()` empties it (`ClearKeptObjects`, design/runtime-memory.md
+/// §6.3). A strong collector root.
+const KEPT_OBJECTS_GLOBAL: u32 = 44;
+/// The pending finalization cleanup jobs (`$__fin_jobs`, raw `i32` ref to a
+/// `FinalizationRegistry`, init 0 = none), linked through each registry's
+/// `job_next` (design/runtime-memory.md §6.4). A collector root traced as a
+/// registry list.
+const FIN_JOBS_GLOBAL: u32 = 45;
 
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
 /// the renderer, RNG, promise-engine and collector globals and set in `main`'s
 /// prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 42;
+const MODULE_CELL_GLOBAL_BASE: u32 = 46;
 
 /// An array hole (see [`abi::HOLE`]): the element-slot bit pattern of a
 /// missing element. Every element read maps it to `undefined`.
