@@ -75,10 +75,10 @@ test262 is the primary metric. `crates/jsc-test262` runs the official suite at a
 
 - `scripts/test262-fetch.sh` checks out tc39/test262 into `.tmp/test262`.
 - Tests run against the official harness files in that checkout, unmodified: `"use strict";` + `sta.js` + `assert.js` + the test's includes + the test source, compiled and run as `jsc FILE`. Includes that do not compile make their tests ineligible.
-- `tests/test262/unsupported-features.txt` lists the feature tags that make a test ineligible (Proxy, Reflect, BigInt, RegExp, typed arrays, WeakMap/WeakRef, Intl, Temporal, …). Tests flagged `module` or `noStrict` (and `raw` tests flagged `async`) are ineligible as well; other `async` tests run with the official `doneprintHandle.js` and pass on `Test262:AsyncTestComplete`.
+- `tests/test262/unsupported-features.txt` lists the feature tags that make a test ineligible (Proxy, Reflect, BigInt, RegExp, typed arrays, Intl, Temporal, …). Tests flagged `module` or `noStrict` (and `raw` tests flagged `async`) are ineligible as well; other `async` tests run with the official `doneprintHandle.js` and pass on `Test262:AsyncTestComplete`.
 - `tests/test262/baseline.txt` is the set of passing tests; `tests/test262/history.tsv` records `pass` / `eligible` / `total` per commit from a full run (`--history`).
 
-Current result (last row of `tests/test262/history.tsv`): **28219 pass / 32889 eligible (85.8%)**.
+Current result (last row of `tests/test262/history.tsv`): **29492 pass / 33051 eligible (89.2%)**.
 
 ```bash
 bash scripts/test262-fetch.sh
@@ -129,12 +129,12 @@ Details are in [DESIGN.md](DESIGN.md).
 ## Current limitations
 
 - **Strict-mode semantics only.** Sloppy-mode constructs such as `with` or assigning an undeclared variable are compile errors.
-- **No GC.** The heap is bump-allocated and never freed; the 512 MiB cap ends a run with `RangeError: out of memory`.
-- **Missing built-ins.** No `RegExp` (regex literals are rejected), `Proxy`, `Reflect`, `BigInt`, `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `eval` or the `Function` constructor; no ES modules.
+- **Memory.** A precise mark-sweep collector frees unreachable blocks; the heap is capped at 512 MiB, and exhausting it throws a catchable `RangeError: out of memory`.
+- **Missing built-ins.** No `RegExp` (regex literals are rejected), `Proxy`, `Reflect`, `BigInt`, typed arrays, `eval` or the `Function` constructor; no ES modules.
 
 ## Roadmap
 
-Garbage collection and weak collections, the remaining language features (ES modules, `RegExp`, …), performance work, and productization; see [DESIGN.md](DESIGN.md#14-roadmap).
+The remaining language features (ES modules, `RegExp`, …), performance work, and productization; see [DESIGN.md](DESIGN.md#14-roadmap).
 
 ## License
 
