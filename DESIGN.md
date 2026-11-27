@@ -416,8 +416,9 @@ interned property key.
   extra arguments are ignored, and `argc` carries the real count. A spread call
   (`f(...xs)`) fills the `K` positional slots from the flattened array and
   publishes the whole array in `$__spread_args`, so a callee that gathers its
-  arguments (a rest parameter, `arguments`, a variadic builtin) reads the
-  elements beyond `K` from it.
+  arguments (a rest parameter, `arguments`, a variadic builtin, a builtin
+  constructor's argument such as the `Promise` executor) reads the elements
+  beyond `K` from it.
 - **Builtin calls into user code.** A builtin calling a function value with
   more arguments than `K` (a `forEach` callback's `(value, key, map)`, a
   replacer's `(key, value)`, a `replace` callback's `(match, position,
