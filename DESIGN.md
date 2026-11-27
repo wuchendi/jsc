@@ -296,12 +296,12 @@ jsval, or the **construct marker** `-(n + 1)` when the callee runs under `new`
 | `5 … 4+n` | the `n` user functions |
 | then | runtime helpers in a fixed order (§6.2): `__alloc` … `__to_number` |
 | then | `__invoke1`, `__async_step`, the two `new Promise` settlers, `new_string`, `__new_array`, `__has_own` |
-| then | the builtin bodies, one per `Builtin::ALL` entry (`emit/realm.rs`, 142 entries) |
+| then | the builtin bodies, one per `Builtin::ALL` entry (`emit/realm.rs`, 366 entries) |
 | then | `__to_primitive`, `__to_string`, `__add`, `__compare`, `__array_join`, `__to_object`, `__json_rep`, `__json_indent`, `__json_revive`, and the rest of §6.2 up to the private-name helpers |
 | then | the renderer helpers (§6.2), then `_start` |
 | last | the Unicode helpers (`emit/unicode.rs`), the `Math` helpers (`emit/libm.rs`), the promise engine (`emit/promise_engine.rs`, §6.7), then the allocator helpers (`emit/gc.rs`, §5.6) |
 
-**Table.** A funcref table of exactly `n + 2 + 142` entries (min = max), filled
+**Table.** A funcref table of exactly `n + 2 + 366` entries (min = max), filled
 by one active element segment: slots `0 … n-1` are the user functions, slots
 `n` and `n + 1` the two settlers, then the builtin bodies in `Builtin::ALL`
 order. A function value's `func_idx` is a slot in this table. Every module has
@@ -345,7 +345,12 @@ None is exported.
 | 36–38 | `$__gc_stack`, `$__gc_stack_top`, `$__gc_stack_end` | `i32` | the mark stack of the running collection: base, first free entry, end (§5.7) |
 | 39 | `$__gc_overflow` | `i32` | set when a mark-stack push found no room (§5.7) |
 | 40 | `$__gc_reserve` | `i32` | the out-of-memory reserve's first page, `0` while spent (§5.6) |
-| 41+ | module cells | `i64` | one cell pointer per module binding (`41 + slot`, §7.1), then one per tagged-template site (§7.4) |
+| 41 | `$__gc_weak` | `i32` | the running collection's `WeakMap` / `WeakSet` list, linked through `weak_next`, sentinel `1` = empty (§5.7) |
+| 42 | `$__gc_weak_refs` | `i32` | the running collection's `WeakRef` list, same shape (§5.7) |
+| 43 | `$__gc_weak_regs` | `i32` | the running collection's `FinalizationRegistry` list, same shape (§5.7) |
+| 44 | `$__kept_objects` | `i32` | the `KeepDuringJob` set: raw ref to an internal array handle, `0` until the first push (§6.7) |
+| 45 | `$__fin_jobs` | `i32` | pending finalization cleanup jobs: raw ref to a registry, linked through `job_next`, `0` = none (§6.7) |
+| 46+ | module cells | `i64` | one cell pointer per module binding (`46 + slot`, §7.1), then one per tagged-template site (§7.4) |
 | after the cells | `$__gc_stress_count` | `i32` | test-only `gc_stress` interval above `1`: collections run so far, saturating at `GC_STRESS_PREFIX` (§5.6); absent otherwise |
 
 **Exports.** Exactly `_start: () -> ()` and `memory` (§6.8).
@@ -446,7 +451,8 @@ Every block base is 8-byte aligned (`BLOCK_ALIGN = 8`): heap blocks sit on
 slots at block offsets ≡ 0 (mod 8) are naturally aligned. Multi-byte fields are little-endian.
 
 The **object family** — `TYPE_ARRAY`, `TYPE_OBJECT`, `TYPE_FUNCTION`,
-`TYPE_MAP`, `TYPE_SET`, `TYPE_PROMISE`, `TYPE_GENERATOR`, `TYPE_DATE` — shares
+`TYPE_MAP`, `TYPE_SET`, `TYPE_PROMISE`, `TYPE_GENERATOR`, `TYPE_DATE`,
+`TYPE_WEAKMAP`, `TYPE_WEAKSET`, `TYPE_WEAKREF`, `TYPE_FINREG` — shares
 a 16-byte prefix (`OBJ_PREFIX_SIZE = 16`):
 
 | offset | size | field |
@@ -487,7 +493,11 @@ the array bits is ever cleared (except `JOINING`).
 | `10` `TYPE_DATE` | `Date` | prefix, `ms: f64 @16` (the `TimeClip`ped time value; local time is UTC, `LocalTZA = 0`) | 24 | `object` |
 | `11` `TYPE_ACCESSOR` | accessor pair (internal) | header, pad, `getter: i64 @8`, `setter: i64 @16` | 24 | — |
 | `12` `TYPE_PROPS` | own-property table (internal) | §5.3 | `16 + 16·cap` | — |
-| `13` `TYPE_ELEMS` | array element store (internal) | header, `cap: u32 @4`, `elem: i64 × cap @8` | `8 + 8·cap` | — |
+| `13` `TYPE_ELEMS` | array element store (internal) | header (flags: `1` `ELEMS_FLAG_WEAK`, the entry store of a weak collection or registry), `cap: u32 @4`, `elem: i64 × cap @8` | `8 + 8·cap` | — |
+| `15` `TYPE_WEAKMAP` | `WeakMap` | prefix, `weak_next: u32 @16` (collector scratch, `0` outside a collection), `entries: u32 @20` → weak `TYPE_ELEMS` of `(key, value)` pairs (`0` until the first entry), `live: u32 @24`, pad | 32 | `object` |
+| `16` `TYPE_WEAKSET` | `WeakSet` | same as `TYPE_WEAKMAP`; the store holds keys alone | 32 | `object` |
+| `17` `TYPE_WEAKREF` | `WeakRef` | prefix, `weak_next: u32 @16`, pad, `target: i64 @24` (weak; `undefined` once collected) | 32 | `object` |
+| `18` `TYPE_FINREG` | `FinalizationRegistry` | prefix, `weak_next: u32 @16`, `cells: u32 @20` → weak `TYPE_ELEMS` of `(target, held, token)` triples, `cleanup: i64 @24`, `flags: u32 @32` (`1` `FINREG_FLAG_JOB_QUEUED`), `job_next: u32 @36` (the `$__fin_jobs` link) | 40 | `object` |
 | `19` `TYPE_RAW` | internal raw buffer | header, `len: u32 @4`, `len` bytes from `@8`, no references (the grown intern table, `Math.sumPrecise` accumulator) | 8 + `len` | — |
 | `14` `TYPE_SYMBOL` | Symbol primitive | header (flags: `4` `SYMBOL_FLAG_REGISTERED`, `8` `SYMBOL_FLAG_PRIVATE` (a private name, §7.6, phase 5a); bits `1`/`2` always clear), reserved `u32 @4` = 0, `description: i64 @8` (string or `undefined`) | 16 | `symbol` |
 
@@ -530,10 +540,29 @@ Notes per kind:
   value) and `clear` tombstones every pair, so live iterators and `forEach`
   keep their slot index and see entries appended later (including after a
   `clear`); a re-added key appends. The backing is never compacted or
-  shrunk (it keeps its tombstones until a collector exists, §13). `size` is
+  shrunk, not even by the collector (a running `forEach` holds a slot index
+  in a wasm local; §13). `size` is
   the live entry
   count. Lookup is a linear scan with `__same_value_zero` that skips
   tombstones; the renderer skips them too.
+- **WeakMap / WeakSet** handles (`emit/builtins/weak.rs`) point (`entries`)
+  at a `TYPE_ELEMS` store flagged `ELEMS_FLAG_WEAK` holding `(key, value)`
+  pairs (a `WeakSet`: keys alone), allocated with 4 entries by the first
+  `set` / `add`. Every slot past the live entries holds a `HOLE` key (and an
+  `undefined` value). Lookup is a linear identity scan of the whole store
+  (keys are objects or non-registered symbols, so identity is SameValue);
+  `delete` tombstones the entry in place, `set` / `add` reuse the first
+  `HOLE` or double the store. `live` counts the non-`HOLE` entries. The
+  collector compacts a store in place (§5.7); nothing iterates one, so no
+  slot index can go stale.
+- **WeakRef** blocks hold the target in one weak slot; the collector writes
+  `undefined` there once the target dies (§5.7).
+- **FinalizationRegistry** blocks keep `(target, held, token)` cells (24
+  bytes) in a weak `TYPE_ELEMS` store of the same shape: an unused cell has an
+  `undefined` target, an emptied cell (target collected, cleanup pending) a
+  `HOLE` target. `register` reuses the first unused cell or doubles the store,
+  `unregister(token)` turns every cell of `token` unused. `cleanup` is the
+  callback; `flags` / `job_next` queue the registry's cleanup job (§6.7).
 - **Promise** blocks hold the settlement (`state` ∈ pending `0` / fulfilled
   `1` / rejected `2`, plus the settled `value`), a raw ref to the newest
   reaction record (`reactions`, `0` = none), the creation number `seq` and
@@ -907,19 +936,21 @@ and never nests (`$__gc_busy`).
   (never `0`) and a block is marked iff `gc == $__gc_epoch`; nothing clears
   marks. Fresh blocks (`gc = 0`) are never marked and static blobs are never
   marked at all.
-- **Collection** (`__gc_collect`): set `$__gc_busy`, advance the epoch, mark
-  (below), return a paged mark stack to the pool, tombstone the intern table
-  (§5.3), `__gc_sweep` (§5.6), take back the out-of-memory reserve when it was
-  spent (§5.6), renew the budget, clear `$__gc_busy`. The M3
-  weak steps (ephemeron fixpoint, clearing weak collections and refs) slot in
-  between marking and the intern tombstones.
+- **Collection** (`__gc_collect`): set `$__gc_busy`, advance the epoch, reset
+  the three weak lists to the sentinel `1`, mark (below), run the weak steps
+  (below: ephemeron fixpoint, clear `WeakMap` / `WeakSet` stores, clear
+  `WeakRef`s, process registries), return a paged mark stack to the pool,
+  tombstone the intern table (§5.3), `__gc_sweep` (§5.6), take back the
+  out-of-memory reserve when it was spent (§5.6), renew the budget, clear
+  `$__gc_busy`.
 - **Roots**, visited by every marking pass:
 
   | root | treatment |
   |---|---|
   | shadow stack `[$__sp + 8, SS_SIZE)` | jsvals |
   | `$exc_value`, `$cf_value` (loop-target codes are numbers), `$__this`, `$__new_target`, `$__spread_args`, the module cells (tagged-template sites included) | jsvals |
-  | `$__job_head`, `$__job_tail`, `$__rejected_head` (§6.7); `$__out_buf`, `$__path_buf`, `$__refs_buf` (§6.9) | raw refs |
+  | `$__job_head`, `$__job_tail`, `$__rejected_head`, `$__kept_objects` (§6.7); `$__out_buf`, `$__path_buf`, `$__refs_buf` (§6.9) | raw refs |
+  | every registry on `$__fin_jobs` (linked through `job_next`) | raw refs: a queued cleanup job keeps its registry, its `cleanup` and its held values alive |
   | the intern table | weak; only its own `TYPE_RAW` block (at `$__intern_base - 8`, once grown onto the heap) is marked |
   | the static root list (§4.2) | each block's fields are traced every pass; the block itself is never marked. Static strings, symbols and accessors are immutable and not listed. The `Symbol.for` registry is an intrinsic, so registered symbols stay alive, as the spec requires |
   | `$__json_data/_pos/_len`, `$__intrinsics_dirty`, `$exc_pending`, `$cf_kind`, `$__heap_ptr`, the collector's own globals (`$__gc_reserve` included: its pages are out of the heap's page codes) | integers, not roots |
@@ -939,7 +970,7 @@ and never nests (`$__gc_busy`).
   | type | references traced (offsets from the base) |
   |---|---|
   | `0` `TYPE_STRING`, `19` `TYPE_RAW`, `0xFF` `TYPE_FREE` | none (leaves) |
-  | object family (`1`–`3`, `6`–`10`) | prefix: raw `props @4`, jsval `proto @8`; then per kind below |
+  | object family (`1`–`3`, `6`–`10`, `15`–`18`) | prefix: raw `props @4`, jsval `proto @8`; then per kind below |
   | `1` `TYPE_ARRAY` | raw `elems @20` |
   | `2` `TYPE_OBJECT` classes `0` ordinary, `1` error, `2` arguments, `6` global | prefix only (an inline table is reached through `props`) |
   | `2` classes `3` / `4` / `5` / `7` wrappers | jsval `@16` |
@@ -953,8 +984,11 @@ and never nests (`$__gc_busy`).
   | `10` `TYPE_DATE` | prefix only |
   | `11` `TYPE_ACCESSOR` | jsvals `getter @8`, `setter @16` |
   | `12` `TYPE_PROPS` | entries `k < count @4` at `16 + 16k`: raw key `@+0` (`0` = tombstone), jsval value `@+8` |
-  | `13` `TYPE_ELEMS` | jsval slots `@8 + 8i` for every `i < cap @4` (not `len`, so a stale slot can only retain) |
+  | `13` `TYPE_ELEMS` | jsval slots `@8 + 8i` for every `i < cap @4` (not `len`, so a stale slot can only retain); a store flagged `ELEMS_FLAG_WEAK` is marked but none of its slots is traced |
   | `14` `TYPE_SYMBOL` | jsval `description @8` |
+  | `15` `TYPE_WEAKMAP`, `16` `TYPE_WEAKSET` | raw `entries @20` (the weak store: marked, not traced); the handle is linked into `$__gc_weak` through `weak_next` unless already linked this cycle |
+  | `17` `TYPE_WEAKREF` | nothing past the prefix (`target @24` is weak); linked into `$__gc_weak_refs` |
+  | `18` `TYPE_FINREG` | jsval `cleanup @24`, raw `cells @20` (the weak store: marked, not traced) and each cell's `held` value (slot `3i + 1`; targets and tokens are weak); linked into `$__gc_weak_regs` |
 
   Partially initialized blocks are safe to trace: every unwritten field is
   `0`.
@@ -967,6 +1001,27 @@ and never nests (`$__gc_busy`).
   each group; a pass that overflowed is followed by one that also re-traces
   every marked heap block (`__gc_drain` after each), until a pass completes
   without overflow.
+- **Weak steps**, after marking, in this order. None allocates or runs user
+  code; each walks only the handles traced this cycle, so an unreachable
+  `WeakMap`, `WeakRef` or registry is simply swept (an unreachable registry
+  is not processed and its cleanup never runs). A key or target is *live*
+  when it is a static block or a heap block carrying the epoch.
+  1. *Ephemeron fixpoint*: for every pair of every `$__gc_weak` `WeakMap`
+     whose key is live, visit the value; when that marked anything or
+     overflowed, drain (rescanning until no overflow is left) and repeat,
+     until a pass marks nothing. Values of dead keys stay unmarked.
+  2. *Clear `WeakMap` / `WeakSet`*: compact each store in place, keeping the
+     entries whose key is neither `HOLE` nor dead, refill the tail with empty
+     entries, store the new `live` count, clear `weak_next`.
+  3. *Clear `WeakRef`s*: a dead target becomes `undefined`.
+  4. *Process registries*: a cell whose target died becomes empty (target
+     `HOLE`; its held value was marked by the trace and waits for the
+     cleanup), a dead token becomes `undefined`; a registry that emptied a
+     cell and has no job queued sets `FINREG_FLAG_JOB_QUEUED` and is pushed on
+     `$__fin_jobs` (`HostEnqueueFinalizationRegistryCleanupJob`). The cleanup
+     itself runs at the next `__drain()` checkpoint (§6.7).
+
+  Every `weak_next` link is `0` again after the weak steps.
 
 ---
 
@@ -1500,10 +1555,22 @@ promise operation calls the host.
 - **Draining.** There are no timers or I/O, so the microtask queue is the
   only asynchronous source. `__drain()` is a loop (no recursion, so a long
   reaction chain uses no wasm stack): pop and run jobs until the queue is
-  empty, then the checkpoint — prune the promises a late reaction marked
-  `HANDLED` from the rejected list (M3 adds `ClearKeptObjects` and the
-  finalization cleanup jobs here) — and loop again if the checkpoint queued
-  jobs. Top-level `await v` takes `PromiseResolve(%Promise%, v)`, marks that
+  empty, then the checkpoint, and loop again if the checkpoint queued jobs.
+  The checkpoint (1) prunes the promises a late reaction marked `HANDLED`
+  from the rejected list; (2) `ClearKeptObjects`: empties the
+  `KeepDuringJob` array `$__kept_objects` (length `0`, vacated slots
+  `HOLE`), to which `new WeakRef(t)` and every successful `deref()` push
+  their target; (3) runs at most one finalization cleanup job: it pops the
+  head of `$__fin_jobs`, clears its `FINREG_FLAG_JOB_QUEUED`, and
+  (`CleanupFinalizationRegistry`) turns each emptied cell unused and calls
+  `cleanup(held)` through `__invoke1`, re-reading the cell store for every
+  cell because a callback may `register` (growing the store) or
+  `unregister`. A throw out of a cleanup callback is reported like an
+  uncaught exception (`Uncaught …` on fd 2, exit 1). `__drain()` returns only
+  when both the microtask queue and `$__fin_jobs` are empty. The checkpoints
+  are host-agnostic (no timers, no host hook): a cleanup job runs only after
+  a collection queued it and some later `__drain()` reaches a checkpoint.
+  Top-level `await v` takes `PromiseResolve(%Promise%, v)`, marks that
   promise handled, drains, and yields the fulfillment value (a rejection
   surfaces as an uncaught throw). After `main` returns normally
   `_start` drains whatever remains, so unawaited `then` chains run. If `main`
@@ -1583,6 +1650,9 @@ call site's check (§5.6). The rules:
 - `Map(N)` / `Set(N)`, `Promise { 42 }` / `Promise { <pending> }` /
   `Promise { <rejected> r }`, dates as ISO 8601 UTC (`Invalid Date` for a
   `NaN` time value);
+- `WeakMap { <items unknown> }` / `WeakSet { <items unknown> }`, `WeakRef {}`,
+  `FinalizationRegistry {}` (contents never listed; a subclass instance
+  renders the same form);
 - cycles as `<ref *1> { self: [Circular *1] }`.
 
 Private-name entries (§7.6) are never enumerable, so the renderer does not list
@@ -2426,7 +2496,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 |---|---|
 | global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`, `parseInt(s, radix)`, `parseFloat(s)` (both, like `Number(s)`, skip JS whitespace: Unicode `WhiteSpace`, `LineTerminator`, U+FEFF) |
 | `console` | `log` |
-| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `getOwnPropertySymbols`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over any iterable; a bad entry closes its iterator); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`: a string `@@toStringTag` on the receiver's chain, else the builtin tag; `Map`, `Set`, `Promise`, `Generator`, `AsyncGenerator`, `Symbol`, `Math`, `JSON` and the Array / String / Map / Set Iterator prototypes own a configurable-only `@@toStringTag`), `toLocaleString`, `valueOf`, the `__proto__` accessor, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
+| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `getOwnPropertySymbols`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over any iterable; a bad entry closes its iterator); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`: a string `@@toStringTag` on the receiver's chain, else the builtin tag; `Map`, `Set`, `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`, `Promise`, `Generator`, `AsyncGenerator`, `Symbol`, `Math`, `JSON` and the Array / String / Map / Set Iterator prototypes own a configurable-only `@@toStringTag`), `toLocaleString`, `valueOf`, the `__proto__` accessor, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors, `[@@hasInstance]` (`OrdinaryHasInstance`; non-writable, non-enumerable, non-configurable); `Function(..)` throws `TypeError` |
 | `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (any iterable through its iterator, closed when `mapFn` or the define throws; else an array-like; `this` constructed when a constructor), `Array.fromAsync(items, mapFn, thisArg)` (the same over an async or sync iterable or an array-like, every element and mapped value awaited, §7.8); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`; every callback of the higher-order methods gets all its specified arguments — `reduce` / `reduceRight` `(acc, element, index, array)`, `sort` comparators `(a, b)` — the first `K` positionally and, when there are more, all of them in the spread argument array (§4.3): the inline loop allocates it once and refills it per call, and only when some user function gathers its arguments (a rest parameter or `arguments`) or the callback is a builtin, so other callbacks keep the plain `K`-slot call), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `keys`, `values` (also `[@@iterator]`), `entries` (Array Iterators over `ToObject(this)`, re-reading `length` per step), `toString`, `toLocaleString` (`Invoke(element, "toLocaleString")` per element; `null` / `undefined` / holes are empty), and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` (`constructor[@@species]`; `%Array%`, `%Map%`, `%Set%` and `%Promise%` have the builtin `get [Symbol.species]` returning `this`), `concat` spreads the items `IsConcatSpreadable` accepts (`@@isConcatSpreadable`, else `IsArray`), and `Array.prototype[@@unscopables]` is the spec's `null`-prototype list |
 | `String` | `String(v)`, `new String(v)` (wrapper, virtual indices §5.3); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point; lone surrogates allowed), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `isWellFormed`, `lastIndexOf`, `localeCompare` (code-unit order, not locale collation), `normalize` (all four forms; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat` (a result past `MAX_STRING_LENGTH` code units is a `RangeError`, as for `padStart` / `padEnd`), `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode default case mapping — `SpecialCasing`, `Final_Sigma` — per well-formed run, lone surrogates passed through, in the guest from static tables, `emit/unicode.rs`; a result past `MAX_STRING_LENGTH` code units is a `RangeError`), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `toWellFormed`, `trim`, `trimEnd`, `trimStart` (JS whitespace, one table), `toString`, `valueOf`, `[@@iterator]` (a String Iterator stepping one code point per `next` — a lead and trail surrogate pair is one two-unit string, a lone surrogate its own unit — through `__str_iter_next`); `search`, `match`, `matchAll`, `replace`, `replaceAll`, `split` call an object argument's `@@search` / `@@match` / `@@matchAll` / `@@replace` / `@@split` method with `(O, …)` before `ToString(this)` (`matchAll` / `replaceAll` first require an `IsRegExp` argument's `flags` to hold `g`), and `includes` / `startsWith` / `endsWith` throw a `TypeError` for an `IsRegExp` argument (`ToBoolean(arg[@@match])`); `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`; the RegExp-syntax check of a `search` / `match` pattern runs in the guest); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)`; all run in the guest on code units (`emit/builtins/string.rs`; `normalize` over the generated Unicode tables of `emit/unicode.rs`: full decomposition, canonical ordering, then canonical composition for NFC / NFKC), surrogate pairs combined by `codePointAt` / `fromCodePoint` / `isWellFormed` |
@@ -2434,6 +2504,8 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `Math` | `sumPrecise(items)` (any iterable of numbers, else a `TypeError` after closing it; summed exactly in a fixed-point limb accumulator and rounded once; `NaN` / opposite infinities give `NaN`, no value or only `-0` gives `-0`), and every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` as guest helpers (`emit/libm.rs`, a port of the `libm` crate's musl/msun algorithms, so results are the same on every host); `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
 | `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string (a string's first 10 code units), `toJSON`, wrappers unwrapped, functions and symbols skipped, cycles throw, a lone surrogate written as `\udxxx`), `JSON.parse(text, reviver)` (in-wasm recursive descent, `\uXXXX` escapes incl. lone surrogates, reviver walk) |
 | `Map` / `Set` | `new Map(iterable)`, `new Set(iterable)`; Map `get`/`set`/`has`/`delete`/`clear`/`forEach`/`size`/`keys`/`values`/`entries` (also `[@@iterator]`); Set `add`/`has`/`delete`/`clear`/`forEach`/`size`/`values` (also `keys` and `[@@iterator]`)/`entries`; the iterators walk the live backing entries, so entries appended during iteration are seen |
+| `WeakMap` / `WeakSet` | `new WeakMap(iterable)`, `new WeakSet(iterable)` (calling either without `new` is a `TypeError`; the iterable's entries go through the `set` / `add` read from the new object, like `Map` / `Set`); WeakMap `get`/`set`/`has`/`delete`, WeakSet `add`/`has`/`delete`. A key must be `CanBeHeldWeakly`: an object, or a symbol not in the `Symbol.for` registry (well-known symbols qualify). `set` / `add` of another key throws `TypeError: Invalid value used as weak map key` / `… in weak set`; `get` / `has` / `delete` of one return `undefined` / `false`. A wrong receiver throws `TypeError: Method WeakMap.prototype.set called on incompatible receiver` (per method). Entries die with their key: a value is reachable through the map only while its key is (ephemerons, §5.7); no size, iteration or `clear` |
+| `WeakRef` / `FinalizationRegistry` | `new WeakRef(target)` (`TypeError: WeakRef: target must be an object` unless `CanBeHeldWeakly`), `WeakRef.prototype.deref()` (the target, or `undefined` once collected); creation and every successful `deref()` keep the target alive until the end of the current job (`AddToKeptObjects`, cleared at the next microtask checkpoint, §6.7). `new FinalizationRegistry(cleanup)` (`TypeError: FinalizationRegistry: cleanup must be callable`), `register(target, held, token)` (`TypeError` for a target that cannot be held weakly, `SameValue(target, held)`, or a token that is neither `undefined` nor holdable weakly; returns `undefined`), `unregister(token)` (`TypeError` for a token that cannot be held weakly; removes every cell of `token`, collected or not, and returns whether any was removed). After a collection finds a registered target dead, the next `__drain()` checkpoint calls `cleanup(held)` once per cell (§6.7); a throwing `cleanup` ends the run like an uncaught exception. `cleanupSome` is not provided (a proposal, not ES2025). Both constructors require `new`; subclasses construct |
 | `Promise` | §6.7, §7.8; `then` / `finally` create their result through `SpeciesConstructor(this, %Promise%)` (`get [Symbol.species]` on `%Promise%`); `Promise.resolve` / `Promise.reject` construct from `this` (`PromiseResolve(C, x)` / `NewPromiseCapability(C)`; a non-constructor `this` throws `TypeError`); `Promise.all`, `allSettled`, `any` (all rejected: an `AggregateError` with `errors`), `race` over any iterable (§6.7) |
 | `Date` | `new Date()`, `new Date(value)` (a Date's time value, else `ToPrimitive(value)`: a string is parsed as by `Date.parse`, anything else `ToNumber`), `new Date(year, month[, date, hours, minutes, seconds, ms])` (UTC fields: `MakeDay` / `MakeTime`, `TimeClip`), `Date()` (current time as a string), `Date.now()`, `Date.UTC(year[, month, ..])`, `Date.parse(string)` (`ToString`, then a guest-side parser of exactly the Date Time String Format — `YYYY[-MM[-DD]]` or `±YYYYYY` (not `-000000`), optional `THH:mm[:ss[.sss]]` and `Z` / `±HH:mm`, range-checked fields, `24:00` only as `24:00:00.000`; date-only forms are UTC, a date-time without offset is local time = UTC — and the `toString` (`Www Mmm DD YYYY HH:mm:ss GMT±hhmm[ (..)]`) / `toUTCString` outputs; anything else is `NaN`, the result `TimeClip`ped); `getTime`, `valueOf`, `getFullYear`, `getMonth`, `getDate`, `getDay`, `getHours`, `getMinutes`, `getSeconds`, `getMilliseconds`, the `getUTC*` twins, `getTimezoneOffset` (`0`), Annex B `getYear`; `setMilliseconds`, `setSeconds`, `setMinutes`, `setHours`, `setDate`, `setMonth`, `setFullYear`, the `setUTC*` twins (same body, distinct functions), `setTime`, Annex B `setYear` (`thisTimeValue` first, then `ToNumber` of every argument in order, then a `NaN` time value returns `NaN` unstored — `setFullYear` / `setYear` start from `+0` — else `TimeClip` is stored and returned); `toISOString` (`RangeError` on an invalid date; expanded `±YYYYYY` years), `toJSON`, `toString` (`Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)`), `toDateString` (`Thu Jan 01 1970`), `toTimeString` (`00:00:00 GMT+0000 (Coordinated Universal Time)`), `toUTCString` (`Thu, 01 Jan 1970 00:00:00 GMT`; Annex B `toGMTString` is the same function object), `toLocaleString` / `toLocaleDateString` / `toLocaleTimeString` (the `toString` / `toDateString` / `toTimeString` texts) — the string forms sign a negative year and pad it to four digits (`-0001`) and render an invalid date as `Invalid Date` —, `[@@toPrimitive]` (configurable only) — local time is UTC (`LocalTZA = 0`), computed in wasm |
 | `Symbol` | `Symbol(desc)` (a fresh symbol; `new Symbol()` throws `TypeError`, though `Symbol` is a constructor for `IsConstructor`), `Symbol.for` / `Symbol.keyFor` (the hidden registry; `keyFor` of a non-symbol throws), the 13 well-known symbols (non-writable, non-enumerable, non-configurable); `Symbol.prototype.toString` (`Symbol(desc)`), `valueOf`, the `description` getter (a program that names `description` compiles the accessor dispatch of `__get`), `[@@toPrimitive]`, `[@@toStringTag]` `"Symbol"` (both configurable only), each over `thisSymbolValue` (a symbol or a `CLASS_SYMBOL` wrapper) |
@@ -2536,6 +2608,10 @@ Errors are printed to stderr.
   harness include that is not usable (`async` tests implicitly need
   `doneprintHandle.js`). A test flagged both `raw` and `async` is skipped as
   `flag:async`: a raw source leaves no place to prepend `$DONE`.
+  `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` and
+  `symbols-as-weakmap-keys` are not listed (phase 4); `host-gc-required`
+  stays, because a test cannot force a collection without a host hook
+  (`$262.gc`), which jsc does not provide.
 - **Assembly** (`assemble.rs`). `raw` tests run byte-for-byte; all others are
   `"use strict";` + `sta.js` + `assert.js` + the listed includes + the test
   source, all unmodified. `async` tests additionally get the runner-owned host
@@ -2738,7 +2814,7 @@ Each item below is current behaviour of this tree.
   compile time: a sealed `Symbol` compiles to the intrinsic's address, and the
   member is an ordinary `__get` on it.
 - Not available: `RegExp` (literals and constructor), `BigInt`, `Proxy`, `Reflect`,
-  `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
+  typed arrays, `ArrayBuffer`, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
 - The builtin library is exactly §7.9.
 
@@ -2827,8 +2903,14 @@ Each item below is current behaviour of this tree.
   may run in between; the output (`console.log`) never does.
 - Map / Set backing arrays never shrink: `delete` and `clear` leave
   tombstones (§5.2), so set / delete churn grows the backing without bound
-  and lookups scan the tombstones (compaction needs live iterators to
-  follow the move; phase 4).
+  and lookups scan the tombstones (the collector does not compact them: a
+  running `forEach` or iterator holds a slot index).
+- Collections run only when an allocation exhausts the budget (§5.6); there
+  is no host hook to force one, so when a `WeakRef` empties or a
+  `FinalizationRegistry` cleanup runs depends on allocation volume, and a
+  program that stops allocating may never see either. Cleanup jobs run only
+  at a `__drain()` checkpoint (§6.7), one per checkpoint. A
+  `WeakMap` / `WeakSet` lookup is a linear scan of its store.
 
 ---
 
@@ -2894,17 +2976,20 @@ code-point string iterator, full case mapping, `normalize`).
 
 ### Phase 4 — Runtime independence and memory
 
-**Status: in progress.** Runtime independence (stages R1-R4,
-`design/runtime-memory.md` §7) is done: every module is a self-contained WASI
-preview-1 command that imports exactly `fd_write`, `clock_time_get`,
-`random_get` and `proc_exit`, exports exactly `_start` and `memory`, and runs
-under the `jsc` CLI's wasmtime runner, `wasmtime run`, `@cdlab/jsc` and
-`node:wasi`; the Rust host semantics and the TypeScript shim are deleted.
+**Status: complete** (stages R1-R4 and M1-M3, `design/runtime-memory.md`
+§7). Every module is a self-contained WASI preview-1 command that imports
+exactly `fd_write`, `clock_time_get`, `random_get` and `proc_exit`, exports
+exactly `_start` and `memory`, and runs under the `jsc` CLI's wasmtime
+runner, `wasmtime run`, `@cdlab/jsc` and `node:wasi`; the Rust host semantics
+and the TypeScript shim are deleted. Memory is managed by the guest
+collector (§5.6, §5.7) with catchable out-of-memory, and the weak
+collections, `WeakRef` and `FinalizationRegistry` are built on its weak
+steps.
 
 - Modules import only WASI (output and clock); promises and the microtask queue
   run in the guest; the Rust host semantics and the TypeScript shim are removed.
 - A precise collector (mark-sweep, shadow-stack roots); catchable out-of-memory.
-- `WeakMap`, `WeakRef`, `FinalizationRegistry`.
+- `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`.
 - Browsers run modules through a small WASI polyfill.
 
 ### Phase 5 — Language completeness
@@ -2943,4 +3028,3 @@ under the `jsc` CLI's wasmtime runner, `wasmtime run`, `@cdlab/jsc` and
 - Sloppy mode: strict mode only, permanently or not.
 - `RegExp` engine: written for the guest, or an existing engine compiled in
   (decide before phase 5).
-- WASI preview 1 or preview 2 as the module target (decide before phase 4).

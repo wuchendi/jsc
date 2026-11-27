@@ -92,6 +92,8 @@ fn exports_exactly_start_and_memory() {
 /// | Map / Set | `Map(N)` / `Set(N)` |
 /// | promise | `Promise { v }`, `<pending>`, `<rejected> v` |
 /// | generator | `Object [Generator]` |
+/// | WeakMap / WeakSet | `WeakMap { <items unknown> }` / `WeakSet { <items unknown> }` |
+/// | WeakRef / FinalizationRegistry | `WeakRef {}` / `FinalizationRegistry {}` |
 /// | Date | ISO 8601 UTC, `Invalid Date` for NaN |
 /// | cycles | `<ref *N> ...` / `[Circular *N]` |
 /// | other type byte | `undefined` (not reachable from source) |
@@ -145,6 +147,16 @@ fn render_parity_every_kind() {
         "Promise { 1 } Promise { <pending> } Promise { <rejected> 2 }\n",
     );
     assert_output("function* g() {} console.log(g())", "Object [Generator]\n");
+    assert_output(
+        "console.log(new WeakMap(), new WeakSet(), new WeakRef({}), \
+         new FinalizationRegistry(() => {}))",
+        "WeakMap { <items unknown> } WeakSet { <items unknown> } WeakRef {} \
+         FinalizationRegistry {}\n",
+    );
+    assert_output(
+        "class M extends WeakMap {} console.log([new M(), { r: new WeakRef({}) }])",
+        "[ WeakMap { <items unknown> }, { r: WeakRef {} } ]\n",
+    );
     assert_output(
         "console.log(new Date(0), new Date(NaN), new Date(-1e14))",
         "1970-01-01T00:00:00.000Z Invalid Date -001199-02-15T14:13:20.000Z\n",
