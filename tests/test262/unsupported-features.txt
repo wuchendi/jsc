@@ -4,9 +4,6 @@
 # missing (probed against jsc); partially working features stay enabled so
 # their failures are counted. Remove entries as support lands.
 
-# Symbols as WeakMap keys need WeakMap
-symbols-as-weakmap-keys
-
 # Proxy / Reflect (no globals)
 Proxy
 proxy-missing-checks
@@ -43,11 +40,7 @@ DataView*
 SharedArrayBuffer
 Atomics*
 
-# Weak references and GC-observable behaviour (no constructors / no host hook)
-WeakMap
-WeakSet
-WeakRef
-FinalizationRegistry
+# GC-observable behaviour needing a host-triggered collection (no host hook)
 host-gc-required
 
 # Temporal and ECMA-402 (no globals)

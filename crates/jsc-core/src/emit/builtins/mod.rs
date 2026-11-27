@@ -40,6 +40,7 @@ mod object_static;
 mod promise;
 mod string;
 mod symbol;
+mod weak;
 
 use crate::emit::realm::{ArrayCopyOp, DateBodyOp, DateSetOp};
 pub(super) use array::emit_array_search;
@@ -282,6 +283,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(number::STRINGS)
         .chain(number::SUM_STRINGS)
         .chain(map_set::strings())
+        .chain(weak::strings())
         .chain(promise::strings())
         .chain(generator::strings())
         .chain(generator::async_strings())
@@ -315,6 +317,9 @@ fn emit_builtin_body(
     helpers: Helpers<'_>,
 ) {
     match builtin {
+        Builtin::WeakOp { .. } | Builtin::WeakCell(_) => {
+            weak::emit(builtin, f, frame, strings, helpers);
+        }
         Builtin::FunctionPrototype => wasm!(f; I64Const(UNDEFINED_BITS)),
         Builtin::HasOwnProperty => object::emit_has_own_property(f, frame, strings, helpers),
         Builtin::ObjectToString => object::emit_to_string(f, frame, strings, helpers),
@@ -422,7 +427,9 @@ fn emit_global(builtin: Builtin, f: &mut FnBuilder<'_>, frame: Frame, helpers: H
     }
 }
 
-/// Emit the IR [`fragment`] body of `builtin` into `f`.
+/// Emit the IR [`fragment`] body of `builtin` into `f`; the weak
+/// constructors (`WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`)
+/// go to [`weak::emit`] instead.
 fn emit_fragment(
     builtin: Builtin,
     f: &mut FnBuilder<'_>,
@@ -430,6 +437,10 @@ fn emit_fragment(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    if weak::is_ctor(builtin) {
+        weak::emit(builtin, f, frame, strings, helpers);
+        return;
+    }
     let body = fragment(builtin, frame.k).unwrap_or(IrNode::Undefined);
     emit_node(&body, f, frame.scratch(), strings, helpers);
 }
