@@ -105,7 +105,7 @@ pub(in crate::emit) fn emit_promise_self_error(
 /// The IR fragments the bodies emit, over the locals of `K = k`, for the
 /// static-string scan.
 pub(super) fn fragments(k: u32) -> Vec<IrNode> {
-    let frame = Frame { k };
+    let frame = Frame::new(k);
     let local = IrNode::Local(frame.i64(0));
     vec![
         catch_call(frame),

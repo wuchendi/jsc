@@ -1244,6 +1244,7 @@ fn emit_eager(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, u32::from(kind == EagerKind::Reduce) * 2);
     let e = Eager::new(frame);
     let index = match kind {
         EagerKind::Reduce => 0,

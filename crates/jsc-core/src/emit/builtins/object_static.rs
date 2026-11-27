@@ -200,6 +200,7 @@ fn emit_define_property(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, 3);
     let o = frame.i64(0);
     let (key, list, j, r) = (frame.base(0), frame.base(1), frame.i32(2), frame.i32(3));
     frame.arg(function, 0);

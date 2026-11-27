@@ -354,3 +354,18 @@ fn renderer_class_extends_label() {
         "[Function: Object] [Function: Map]\n",
     );
 }
+
+/// With no positional argument slot (`K = 0`) the `Array` constructor reads
+/// its length or elements from the spread argument array: called,
+/// constructed, by a subclass's `super(...args)`, and `Array.of`.
+#[test]
+fn array_constructor_arguments_past_the_argument_slots() {
+    assert_uncaught(
+        "class A extends Array {}
+         const a = new Array(...[3]), b = Array(...[1, 2, 3]), c = Array.of(...[4, 5, 6]);
+         const d = new A(...[7, 8]), e = Array(...['x']);
+         throw a.length + ' ' + b.join() + ' ' + c.join() + ' ' + d.join() + ' '
+           + (d instanceof A) + ' ' + e.length + e[0];",
+        "3 1,2,3 4,5,6 7,8 true 1x",
+    );
+}

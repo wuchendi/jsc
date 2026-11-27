@@ -73,6 +73,28 @@ fn coercion_order(op: StringOp) -> [u32; 2] {
     }
 }
 
+/// How many leading arguments [`emit_method`] uses after user code may run
+/// (`ToString(this)`, the first coercion, the dispatch lookup): both for an
+/// op that coerces or reads its second argument, one for an op that coerces
+/// or dispatches on its first only, none otherwise (`concat` captures its
+/// own argument array).
+fn method_arg_reads(op: StringOp) -> u32 {
+    let [first, second] = coercions(op);
+    let reads_second = matches!(
+        op,
+        StringOp::PadStart
+            | StringOp::PadEnd
+            | StringOp::Replace
+            | StringOp::ReplaceAll
+            | StringOp::Split
+    );
+    if reads_second || second != Coerce::None {
+        2
+    } else {
+        u32::from(first != Coerce::None || dispatch_of(op).is_some())
+    }
+}
+
 /// Whether `op` with the call-site arguments `args` already of the types its
 /// coercions produce (string / number literals; a missing argument is
 /// `undefined`) runs inline: on a string receiver the builtin is exactly its
@@ -370,6 +392,7 @@ pub(super) fn emit_method(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, method_arg_reads(op));
     let (s, a0, a1, r) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let count = frame.f64(0);
     if op == StringOp::Concat {

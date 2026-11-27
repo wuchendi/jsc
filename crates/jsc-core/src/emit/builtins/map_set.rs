@@ -139,7 +139,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 /// The IR fragments the bodies emit, over the locals of `K = k`, for the
 /// static-string scan.
 pub(super) fn fragments(k: u32) -> Vec<IrNode> {
-    let frame = Frame { k };
+    let frame = Frame::new(k);
     let local = frame.i64(0);
     let mut nodes = vec![not_iterable(local), not_an_entry(local)];
     nodes.extend(
@@ -455,6 +455,7 @@ pub(super) fn emit_ctor(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, 1);
     let map = frame.x64(0);
     let (ctor, kind) = if set {
         (BuiltinCtor::Set, Collection::Set)
