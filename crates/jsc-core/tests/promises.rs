@@ -1089,3 +1089,49 @@ fn thenable_assimilated_per_spec() {
         "then sync false\nt1\nt2\nadopted\nt3\n",
     );
 }
+
+/// A Promise subclass with the implicit `constructor(...args) { super(...args) }`
+/// works in a program with no positional argument slot (`K = 0`: no function
+/// declares a parameter, no call passes an argument). Its executor reaches the
+/// `Promise` constructor in the spread argument array: from
+/// `NewPromiseCapability(C)` in `P.resolve()` / `P.reject()`, from the species
+/// construct of `then`, and from the subclass's `super(...args)`. Every value
+/// observed is `undefined` because passing any other value needs an argument,
+/// which widens `K`; an `await` consumes each promise, the rejection
+/// included, and the report rides an uncaught throw.
+#[test]
+fn subclass_capability_without_argument_slots() {
+    assert_uncaught(
+        "class P extends Promise {}
+         throw P.resolve() instanceof P;",
+        "true",
+    );
+    assert_uncaught(
+        "class P extends Promise {}
+         const a = P.resolve(), b = a.then(), c = P.reject();
+         const v = await b;
+         let caught = 'none';
+         try { await c; } catch (e) { caught = e; }
+         let bad = 'none';
+         try { new P; } catch (e) { bad = e instanceof TypeError; }
+         throw (a instanceof P) + ' ' + (b instanceof P) + ' ' + (c instanceof P) + ' '
+           + (v === undefined) + ' ' + (caught === undefined) + ' ' + bad;",
+        "true true true true true true",
+    );
+}
+
+/// The same subclass with one argument slot (`K = 1`, below the two
+/// settlers): values flow through `then`, a subclass executor, and a
+/// rejection.
+#[test]
+fn subclass_values_with_one_argument_slot() {
+    assert_uncaught(
+        "class P extends Promise {}
+         const v = await P.resolve(1).then(x => x + 1);
+         const n = await new P(r => r(5));
+         let c = 'none';
+         try { await P.reject(2); } catch (e) { c = e; }
+         throw v + ' ' + n + ' ' + c;",
+        "2 5 2",
+    );
+}

@@ -9,6 +9,7 @@
 // The hand-written bodies name their wasm locals tersely, like `props.rs`.
 #![allow(clippy::many_single_char_names)]
 
+use super::array::{CallArg, call_spilling};
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
@@ -129,29 +130,20 @@ fn elem_or_undefined(
 }
 
 /// Call the function in i64 local `target` with `this` = i64 local `this`
-/// and the arguments `args` (i64 locals), leaving its result.
+/// and the arguments `args` (i64 locals), leaving its result (or a pending
+/// throw); past `K` they go in a spread argument array built in the rooted
+/// i64 local `spread`.
 fn call_with(
     function: &mut FnBuilder<'_>,
     target: u32,
     this: u32,
     args: &[u32],
+    spread: u32,
     helpers: Helpers<'_>,
 ) {
-    for slot in 0..helpers.max_args as usize {
-        if let Some(&arg) = args.get(slot) {
-            wasm!(function; LocalGet(arg));
-        } else {
-            wasm!(function; I64Const(UNDEFINED_BITS));
-        }
-    }
-    wasm!(function; LocalGet(this), GlobalSet(THIS_GLOBAL));
-    let count = args.len().min(helpers.max_args as usize);
-    invoke(
-        function,
-        target,
-        |function| emit_argc(count, function),
-        helpers,
-    );
+    let args: Vec<CallArg> = args.iter().copied().map(CallArg::Val).collect();
+    let k = helpers.max_args;
+    call_spilling(function, k, spread, target, Some(this), &args, helpers);
 }
 
 /// `JSON.stringify(value, replacer, space)`.
@@ -396,6 +388,7 @@ pub(in crate::emit) fn emit_json_rep(
     let [elem, s, k, to_json] = [(); 4].map(|()| f.local(Jsval));
     let scratch = 18;
     declare_error_scratch(&mut f);
+    let spread = f.local(Jsval);
     helpers.unwind.borrow_mut().reset();
     let tok = |text: &str| static_key(strings, text);
     let concat = |f: &mut FnBuilder<'_>| wasm!(f; Call(helpers.concat), LocalSet(acc));
@@ -427,13 +420,13 @@ pub(in crate::emit) fn emit_json_rep(
     emit_is_function(&mut f, to_json);
     wasm!(f; If(BlockType::Empty));
     key_string(&mut f);
-    call_with(&mut f, to_json, value, &[key], helpers);
+    call_with(&mut f, to_json, value, &[key], spread, helpers);
     wasm!(f; LocalSet(value));
     return_if_pending(&mut f);
     wasm!(f; End, End);
     wasm!(f; LocalGet(rep), I64Const(UNDEFINED_BITS), I64Ne, If(BlockType::Empty));
     key_string(&mut f);
-    call_with(&mut f, rep, holder, &[key, value], helpers);
+    call_with(&mut f, rep, holder, &[key, value], spread, helpers);
     wasm!(f; LocalSet(value));
     return_if_pending(&mut f);
     wasm!(f; End);
@@ -666,6 +659,7 @@ pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>, leaves: &LeafSet) 
         wasm!(f; End, End, End, Br(0), End, End);
         if !write {
             wasm!(f; LocalGet(o), LocalGet(w), Call(helpers.new_string), LocalSet(dst));
+            emit_oom_check(&mut f, dst, &OOM_RETURN_EMPTY_STR);
         }
     }
     emit_str_canonical(&mut f, w, dst, i, g);
@@ -692,6 +686,7 @@ pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>, leaves: &LeafSet) 
     let [n, i] = [(); 2].map(|()| f.local(int));
     let k = f.local(Base);
     let [array, e] = [(); 2].map(|()| f.local(int));
+    let spread = f.local(Jsval);
     wasm!(f; LocalGet(holder), LocalGet(key), Call(helpers.get), LocalSet(val));
     return_if_pending(&mut f);
     emit_is_pointer(&mut f, val);
@@ -754,7 +749,7 @@ pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>, leaves: &LeafSet) 
     );
     box_heap(&mut f);
     wasm!(f; LocalSet(name));
-    call_with(&mut f, reviver, holder, &[name, val], helpers);
+    call_with(&mut f, reviver, holder, &[name, val], spread, helpers);
     wasm!(f; End);
     finish_builder(f)
 }

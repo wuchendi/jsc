@@ -446,11 +446,13 @@ pub(super) fn emit_sum_precise(
     );
     wasm!(function;
         // A `TYPE_RAW` block; `acc` stays the block base with data at `+8`.
-        I32Const(SUM_SLOTS * 8 + 8), Call(helpers.alloc), LocalTee(acc),
+    );
+    emit_alloc_const(function, helpers, SUM_SLOTS * 8 + 8);
+    wasm!(function;
+        LocalTee(acc),
         I32Const(0), I32Const(SUM_SLOTS * 8 + 8), MemoryFill(0),
         LocalGet(acc), I32Const(i32::from(abi::TYPE_RAW)), I32Store8(MemArg { offset: 0, align: 0, memory_index: 0 }),
         LocalGet(acc), I32Const(SUM_SLOTS * 8), I32Store(MemArg { offset: 4, align: 2, memory_index: 0 }),
-        LocalGet(acc), I32Const(8), I32Add, LocalSet(data),
         I32Const(SUM_MINUS_ZERO), LocalSet(state),
     );
     iter::guarded(function, helpers, |function| {
@@ -488,6 +490,8 @@ pub(super) fn emit_sum_precise(
             LocalGet(state), I32Const(SUM_PLUS_INF), I32LtU, I32And,
             If(BlockType::Empty), I32Const(SUM_FINITE), LocalSet(state),
         );
+        // `data` is re-derived from the rooted `acc` after every safepoint.
+        wasm!(function; LocalGet(acc), I32Const(8), I32Add, LocalSet(data));
         add_exact(function, data, v, [cursor, bound], temps);
         wasm!(function; End, End, End, End, End);
         leave_frame(helpers);
@@ -507,6 +511,7 @@ pub(super) fn emit_sum_precise(
         I64Const(UNDEFINED_BITS), Return, End,
         LocalGet(state), I32Const(SUM_FINITE), I32Eq, If(BlockType::Result(ValType::F64)),
     );
+    wasm!(function; LocalGet(acc), I32Const(8), I32Add, LocalSet(data));
     round_exact(function, data, [cursor, bound, frame.x32(0)], temps);
     wasm!(function;
         F64ReinterpretI64,

@@ -56,8 +56,7 @@ pub(super) fn emit_object_node(
             .all(|(i, k)| !static_keys[..i].contains(k));
 
     // dst = __alloc(size); header word (TYPE_OBJECT) and `props` (dst + 16, or 0).
-    function.instruction(&Instruction::I32Const(size));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, size);
     function.root_temp(TempClass::Base);
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
@@ -268,7 +267,7 @@ fn emit_object_rebox(function: &mut impl Sink) {
 /// closure values (which reuse the `+3` allocation scratch for their OWN blocks)
 /// cannot corrupt the accessor block base. A `MakeAccessor` only ever appears as an
 /// object-literal or class-prototype entry value, so the two closure builds are
-/// the only nested emits and this stack discipline suffices.
+/// the only nested emits. They allocate, so the stacked base is rooted as a temp.
 pub(super) fn emit_make_accessor_node(
     getter: &IrNode,
     setter: &IrNode,
@@ -296,12 +295,13 @@ pub(super) fn emit_make_accessor_node(
 
     // dst = __alloc(ACCESSOR_BLOCK_SIZE); write the TYPE_ACCESSOR byte, keeping dst
     // on the operand stack.
-    function.instruction(&Instruction::I32Const(ACCESSOR_BLOCK_SIZE));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, ACCESSOR_BLOCK_SIZE);
     function.instruction(&Instruction::LocalTee(dst));
     function.instruction(&Instruction::LocalGet(dst));
     function.instruction(&Instruction::I32Const(TYPE_ACCESSOR));
     function.instruction(&Instruction::I32Store8(type_byte));
+    // Root the base on the stack: each closure build below allocates.
+    function.root_temp(TempClass::Base);
 
     // Getter jsval slot. Re-`tee` dst from the stack, push a copy for the store
     // address, evaluate the getter (may clobber the `dst` LOCAL via its own alloc —
@@ -385,7 +385,12 @@ pub(super) fn emit_object_has_node(
     helpers: Helpers<'_>,
 ) {
     emit_key_lookup(key, function, scratch, strings, helpers);
+    // A converted key (an interned index string) is only weakly held by the
+    // intern table while `obj` evaluates.
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Base);
     emit_node(obj, function, scratch, strings, helpers);
+    function.release_temps(mark);
     function.instruction(&Instruction::Call(helpers.has));
     emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::I64ExtendI32U);
@@ -851,10 +856,14 @@ pub(super) fn emit_json_stringify_node(
         HEAP_BITS | i64::from(static_key(strings, "")),
     ));
     function.instruction(&Instruction::LocalGet(scratch));
+    // The value rides the stack across the cycle-stack allocation.
+    let mark = function.temp_mark();
+    function.root_temp(TempClass::Jsval);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::Call(helpers.new_array()));
+    function.release_temps(mark);
     function.instruction(&Instruction::Call(helpers.json_rep()));
     emit_propagate_if_pending(function, helpers);
 }
@@ -890,8 +899,7 @@ pub(super) fn emit_map_new_node(
 
     // Handle: __alloc(MAP_BLOCK_SIZE); object prefix; size = 0;
     // entries = rebox(earr).
-    function.instruction(&Instruction::I32Const(MAP_BLOCK_SIZE));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, MAP_BLOCK_SIZE);
     function.instruction(&Instruction::LocalSet(dst));
     emit_object_prefix(
         function,
@@ -1003,8 +1011,7 @@ pub(super) fn emit_date_new_node(
     emit_time_clip(function, time);
 
     // dst = __alloc(DATE_BLOCK_SIZE); write the TYPE_DATE object prefix.
-    function.instruction(&Instruction::I32Const(DATE_BLOCK_SIZE));
-    function.instruction(&Instruction::Call(helpers.alloc));
+    emit_alloc_const(function, helpers, DATE_BLOCK_SIZE);
     function.instruction(&Instruction::LocalSet(dst));
     emit_object_prefix(
         function,
@@ -1456,7 +1463,8 @@ fn emit_date_iso(bits: u32, function: &mut impl Sink, scratch: u32, helpers: Hel
     let tmp = scratch + 24;
     let abs_year = scratch + 25;
     let bptr = scratch + 3;
-    let at = scratch + 8;
+    // An integer (the year shift, then the write cursor): the raw `+9`.
+    let at = scratch + 9;
     emit_days_tod(function, bits, days, tod, scratch + 25, scratch + 28);
     emit_date_civil(
         function,
@@ -2018,9 +2026,10 @@ pub(super) fn emit_map_op<S: Sink>(
 /// tombstoned in place (`HOLE` key, `undefined` value;
 /// DESIGN.md §5.2). The backing keeps its length, so a live
 /// iterator continues at its index and sees the entries added after the
-/// `clear`. Uses the i32 scratch locals `scratch + 8` / `+ 9`.
+/// `clear`. Uses the raw i32 scratch locals `scratch + 9` / `+ 10`: `at` is
+/// an interior address (never rooted; no safepoint runs in the loop).
 fn emit_map_clear(handle: u32, function: &mut impl Sink, scratch: u32) {
-    let (at, end) = (scratch + 8, scratch + 9);
+    let (at, end) = (scratch + 10, scratch + 9);
     let slot = |offset| MemArg {
         offset,
         align: 3,
@@ -2996,7 +3005,7 @@ fn emit_raise_type_error(
         IrNode::Local(stack),
     );
     emit_node(&error, function, scratch, strings, helpers);
-    function.instruction(&Instruction::GlobalSet(EXC_VALUE_GLOBAL));
+    emit_set_exc_value(function, helpers);
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::GlobalSet(EXC_PENDING_GLOBAL));
     function.instruction(&Instruction::I32Const(0));

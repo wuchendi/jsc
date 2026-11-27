@@ -493,7 +493,6 @@ impl LowerCtx<'_> {
                 callee: Box::new(IrNode::Local(callee)),
                 args,
                 this_local,
-                construct: false,
                 not_callable: not_a_function(None),
             };
             let tail = self.build_chain(call, after)?;
@@ -620,6 +619,8 @@ impl LowerCtx<'_> {
 
     pub(super) fn lower_named_expr(&mut self, expr: &Expr, name: &JsStr) -> anyhow::Result<IrNode> {
         match expr {
+            // A parenthesized (cover) definition is still anonymous.
+            Expr::Paren(p) => self.lower_named_expr(&p.expr, name),
             Expr::Arrow(arrow) => self.lower_arrow(arrow, name),
             Expr::Fn(fn_expr) if fn_expr.ident.is_none() => self.lower_fn_expr(fn_expr, name),
             Expr::Class(class_expr) if class_expr.ident.is_none() => {
@@ -889,7 +890,6 @@ impl LowerCtx<'_> {
                 callee: Box::new(callee),
                 args,
                 this_local,
-                construct: false,
                 not_callable: not_a_function(None),
             },
         ))
@@ -1149,9 +1149,12 @@ impl LowerCtx<'_> {
         // `%String.prototype%`, `%Map.prototype%`, `%Set.prototype%`,
         // `%Promise.prototype%`, `%Date.prototype%` or `%GeneratorPrototype%`
         // builtin: a generic method call with guarded fast paths (DESIGN.md
-        // §6.4).
+        // §6.4). A call with more arguments than `K` (never a source call,
+        // whose arguments widen `K`) takes the ordinary method call, which
+        // passes them all through its spread form.
         if let Expr::Member(member) = callee_expr
             && let MemberProp::Ident(id) = &member.prop
+            && args.len() <= self.shared.max_arity
             && (ARRAY_METHODS.contains(&id.sym.as_ref())
                 || STRING_METHODS.contains(&id.sym.as_ref())
                 || receiver_method(id.sym.as_ref()))
@@ -1321,7 +1324,6 @@ impl LowerCtx<'_> {
             callee: Box::new(IrNode::Local(member_local)),
             args: locals,
             this_local: obj_local,
-            construct: false,
             not_callable: not_a_function(member_source_name(member).as_deref()),
         };
         Ok(IrNode::NamespaceGuard {
@@ -1693,7 +1695,6 @@ impl LowerCtx<'_> {
                 callee: Box::new(IrNode::Local(callee)),
                 args,
                 this_local,
-                construct: false,
                 not_callable: not_a_function(source),
             },
         ]))
@@ -2428,6 +2429,7 @@ impl LowerCtx<'_> {
         key: u32,
     ) -> anyhow::Result<IrNode> {
         match expr {
+            Expr::Paren(p) => self.lower_computed_named_expr(&p.expr, key),
             Expr::Class(class_expr) if class_expr.ident.is_none() => {
                 self.lower_class(&class_expr.class, &JsStr::default(), false, Some(key))
             }
@@ -2826,7 +2828,6 @@ impl PrivateRef {
                     ])),
                     args: Vec::new(),
                     this_local,
-                    construct: false,
                     not_callable: CalleeError::not_a_function(&self.name.to_string()),
                 }
             }
@@ -2872,7 +2873,6 @@ impl PrivateRef {
                             IrNode::Local(stored),
                         ])],
                         this_local,
-                        construct: false,
                         not_callable: CalleeError::not_a_function(&self.name.to_string()),
                     },
                     IrNode::Local(stored),
@@ -3235,15 +3235,24 @@ fn seq_then(mut seq: Vec<IrNode>, last: IrNode) -> IrNode {
 
 /// Whether `expr` is an anonymous function definition named by the property
 /// it initializes (`IsAnonymousFunctionDefinition`): an arrow or a function
-/// expression without its own name.
+/// expression without its own name, possibly parenthesized (a cover form).
 fn is_anonymous_function(expr: &Expr) -> bool {
-    matches!(expr, Expr::Arrow(_)) || matches!(expr, Expr::Fn(f) if f.ident.is_none())
+    match expr {
+        Expr::Paren(p) => is_anonymous_function(&p.expr),
+        Expr::Arrow(_) => true,
+        Expr::Fn(f) => f.ident.is_none(),
+        _ => false,
+    }
 }
 
 /// Whether `expr` is an anonymous function or class definition
 /// (`IsAnonymousFunctionDefinition`), named by the key it is defined under.
 pub(super) fn is_anonymous_definition(expr: &Expr) -> bool {
-    is_anonymous_function(expr) || matches!(expr, Expr::Class(c) if c.ident.is_none())
+    match expr {
+        Expr::Paren(p) => is_anonymous_definition(&p.expr),
+        Expr::Class(c) => c.ident.is_none(),
+        _ => is_anonymous_function(expr),
+    }
 }
 
 /// The compile-time name of a static property key (`""` for a computed key,

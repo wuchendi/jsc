@@ -76,6 +76,11 @@ pub(super) enum Intrinsic {
     /// `%IteratorHelperPrototype%`: the `next` / `return` of the helper
     /// objects the lazy `Iterator.prototype` methods create (DESIGN.md §7.9).
     IteratorHelperPrototype,
+    /// `%OutOfMemoryError%` (design/runtime-memory.md §5.8): the one
+    /// preallocated `RangeError` every out-of-memory condition throws, a
+    /// `CLASS_ERROR` object with the own non-enumerable `message` and
+    /// `stack`; not reachable from the global object.
+    OutOfMemoryError,
 }
 
 /// A builtin iterator family: the receivers of one iterator prototype's
@@ -113,7 +118,7 @@ impl IterKind {
 }
 
 /// The constructors whose prototype is an [`Intrinsic::Prototype`].
-const PLAIN_PROTOTYPES: [BuiltinCtor; 9] = [
+const PLAIN_PROTOTYPES: [BuiltinCtor; 13] = [
     BuiltinCtor::Array,
     BuiltinCtor::String,
     BuiltinCtor::Number,
@@ -123,6 +128,10 @@ const PLAIN_PROTOTYPES: [BuiltinCtor; 9] = [
     BuiltinCtor::Promise,
     BuiltinCtor::Date,
     BuiltinCtor::Symbol,
+    BuiltinCtor::WeakMap,
+    BuiltinCtor::WeakSet,
+    BuiltinCtor::WeakRef,
+    BuiltinCtor::FinalizationRegistry,
 ];
 
 /// A well-known symbol (DESIGN.md §6.4): a static
@@ -256,6 +265,7 @@ impl Intrinsic {
                 Some(Self::AsyncIteratorPrototype)
             }
             Self::ErrorPrototype(_) => Some(Self::ErrorPrototype(ErrorKind::Error)),
+            Self::OutOfMemoryError => Some(Self::ErrorPrototype(ErrorKind::RangeError)),
             // The native error constructors inherit from `Error`.
             Self::Ctor(BuiltinCtor::Error(kind)) if kind != ErrorKind::Error => {
                 Some(Self::Ctor(BuiltinCtor::Error(ErrorKind::Error)))
@@ -285,7 +295,11 @@ impl Intrinsic {
                 | BuiltinCtor::Map
                 | BuiltinCtor::Set
                 | BuiltinCtor::Promise
-                | BuiltinCtor::Date,
+                | BuiltinCtor::Date
+                | BuiltinCtor::WeakMap
+                | BuiltinCtor::WeakSet
+                | BuiltinCtor::WeakRef
+                | BuiltinCtor::FinalizationRegistry,
             ) => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_SELF_ALLOC,
             Self::Ctor(_) => abi::FUNC_FLAG_CONSTRUCTOR,
             _ => 0,
@@ -327,6 +341,8 @@ impl Intrinsic {
     fn class(self) -> u8 {
         if self == Self::Global {
             abi::CLASS_GLOBAL
+        } else if self == Self::OutOfMemoryError {
+            abi::CLASS_ERROR
         } else {
             abi::CLASS_ORDINARY
         }
@@ -392,6 +408,7 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
             Intrinsic::ArrayUnscopables,
             Intrinsic::WrapForValidIteratorPrototype,
             Intrinsic::IteratorHelperPrototype,
+            Intrinsic::OutOfMemoryError,
         ])
 }
 
@@ -570,6 +587,18 @@ pub(super) enum Builtin {
         /// `%Set.prototype%` rather than `%Map.prototype%`.
         set: bool,
     },
+    /// A `%WeakMap.prototype%` (`set == false`: `delete`, `get`, `has`,
+    /// `set`) / `%WeakSet.prototype%` (`add`, `delete`, `has`) method
+    /// (`emit/builtins/weak.rs`).
+    WeakOp {
+        /// `%WeakSet.prototype%` rather than `%WeakMap.prototype%`.
+        set: bool,
+        /// The method.
+        op: MapOp,
+    },
+    /// A `%WeakRef.prototype%` / `%FinalizationRegistry.prototype%` method
+    /// (`emit/builtins/weak.rs`).
+    WeakCell(WeakCellOp),
     /// `Promise.prototype.then`.
     PromiseThen,
     /// `Promise.prototype.catch`.
@@ -1520,6 +1549,17 @@ impl ReflectOp {
         }
     }
 }
+/// A `%WeakRef.prototype%` or `%FinalizationRegistry.prototype%` method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WeakCellOp {
+    /// `WeakRef.prototype.deref`.
+    Deref,
+    /// `FinalizationRegistry.prototype.register`.
+    Register,
+    /// `FinalizationRegistry.prototype.unregister`.
+    Unregister,
+}
+
 /// An `Array.prototype` method that returns a changed copy of its receiver as
 /// a plain array.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1653,7 +1693,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 352] = [
+    pub(super) const ALL: [Builtin; 366] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1732,6 +1772,10 @@ impl Builtin {
         Self::Ctor(BuiltinCtor::Date),
         Self::Ctor(BuiltinCtor::Symbol),
         Self::Ctor(BuiltinCtor::Iterator),
+        Self::Ctor(BuiltinCtor::WeakMap),
+        Self::Ctor(BuiltinCtor::WeakSet),
+        Self::Ctor(BuiltinCtor::WeakRef),
+        Self::Ctor(BuiltinCtor::FinalizationRegistry),
         Self::ObjectStatic(ObjectBuiltinOp::Keys),
         Self::ObjectStatic(ObjectBuiltinOp::Values),
         Self::ObjectStatic(ObjectBuiltinOp::Entries),
@@ -1981,6 +2025,37 @@ impl Builtin {
         },
         Self::CollectionForEach { set: true },
         Self::CollectionSize { set: true },
+        Self::WeakOp {
+            set: false,
+            op: MapOp::Delete,
+        },
+        Self::WeakOp {
+            set: false,
+            op: MapOp::Get,
+        },
+        Self::WeakOp {
+            set: false,
+            op: MapOp::Has,
+        },
+        Self::WeakOp {
+            set: false,
+            op: MapOp::Set,
+        },
+        Self::WeakOp {
+            set: true,
+            op: MapOp::Add,
+        },
+        Self::WeakOp {
+            set: true,
+            op: MapOp::Delete,
+        },
+        Self::WeakOp {
+            set: true,
+            op: MapOp::Has,
+        },
+        Self::WeakCell(WeakCellOp::Deref),
+        Self::WeakCell(WeakCellOp::Register),
+        Self::WeakCell(WeakCellOp::Unregister),
         Self::PromiseThen,
         Self::PromiseCatch,
         Self::PromiseFinally,
@@ -2127,7 +2202,10 @@ impl Builtin {
             Self::Symbol(op) => op.name(),
             Self::DateMethod(op) => op.name(),
             Self::DateBody(op) => op.name(),
-            Self::CollectionOp { op, .. } => op.name(),
+            Self::CollectionOp { op, .. } | Self::WeakOp { op, .. } => op.name(),
+            Self::WeakCell(WeakCellOp::Deref) => "deref",
+            Self::WeakCell(WeakCellOp::Register) => "register",
+            Self::WeakCell(WeakCellOp::Unregister) => "unregister",
             Self::PromiseThen => "then",
             Self::PromiseCatch => "catch",
             Self::PromiseFinally => "finally",
@@ -2224,6 +2302,7 @@ impl Builtin {
             | Self::ArrayToLocaleString
             | Self::DateMethod(_)
             | Self::CollectionSize { .. }
+            | Self::WeakCell(WeakCellOp::Deref)
             | Self::ProtoGet
             | Self::CollectionOp {
                 op: MapOp::Clear, ..
@@ -2237,7 +2316,12 @@ impl Builtin {
             | Self::ArrayShift
             | Self::ArrayCopy(ArrayCopyOp::ToReversed)
             | Self::Ctor(
-                BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Symbol | BuiltinCtor::Iterator,
+                BuiltinCtor::Map
+                | BuiltinCtor::Set
+                | BuiltinCtor::Symbol
+                | BuiltinCtor::Iterator
+                | BuiltinCtor::WeakMap
+                | BuiltinCtor::WeakSet,
             ) => 0,
             Self::Iter(op) => op.length(),
             Self::Ctor(BuiltinCtor::Date) | Self::DateBody(DateBodyOp::Utc) => 7,
@@ -2259,6 +2343,8 @@ impl Builtin {
             | Self::ArrayCopyWithin
             | Self::ArrayCopy(ArrayCopyOp::With | ArrayCopyOp::ToSpliced)
             | Self::CollectionOp { op: MapOp::Set, .. }
+            | Self::WeakOp { op: MapOp::Set, .. }
+            | Self::WeakCell(WeakCellOp::Register)
             | Self::PromiseThen
             | Self::DefineAccessor { .. } => 2,
             Self::StringMethod(op) => op.length(),
@@ -2316,6 +2402,10 @@ impl Builtin {
             Self::CollectionOp { set, .. } | Self::CollectionForEach { set } => {
                 Some(collection(set))
             }
+            Self::WeakOp { set: false, .. } => Some(BuiltinCtor::WeakMap),
+            Self::WeakOp { set: true, .. } => Some(BuiltinCtor::WeakSet),
+            Self::WeakCell(WeakCellOp::Deref) => Some(BuiltinCtor::WeakRef),
+            Self::WeakCell(_) => Some(BuiltinCtor::FinalizationRegistry),
             Self::PromiseThen | Self::PromiseCatch | Self::PromiseFinally => {
                 Some(BuiltinCtor::Promise)
             }
@@ -2449,7 +2539,7 @@ const NUMBER_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 31] = [
+const GLOBALS: [(&str, u32, Value); 35] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -2569,6 +2659,26 @@ const GLOBALS: [(&str, u32, Value); 31] = [
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Iterator)),
     ),
+    (
+        "WeakMap",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::WeakMap)),
+    ),
+    (
+        "WeakSet",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::WeakSet)),
+    ),
+    (
+        "WeakRef",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::WeakRef)),
+    ),
+    (
+        "FinalizationRegistry",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::FinalizationRegistry)),
+    ),
     ("isNaN", METHOD_ATTRS, Value::Method(Builtin::IsNaN)),
     ("isFinite", METHOD_ATTRS, Value::Method(Builtin::IsFinite)),
     (
@@ -2662,6 +2772,13 @@ pub(super) fn registry() -> Vec<Entry> {
                 Value::Method(Builtin::ErrorToString),
             ));
         }
+    }
+    for (key, value) in [
+        ("message", "out of memory"),
+        ("stack", "RangeError: out of memory"),
+    ] {
+        let oom = Intrinsic::OutOfMemoryError;
+        entries.push(entry(oom, key, METHOD_ATTRS, Value::Str(value)));
     }
     for (key, value) in MATH_CONSTANTS {
         entries.push(entry(Intrinsic::Math, key, CONST_ATTRS, Value::Num(value)));
@@ -2864,6 +2981,13 @@ fn well_known_entries(entries: &mut Vec<Entry>) {
     let tags = [
         (Intrinsic::Prototype(BuiltinCtor::Map), "Map"),
         (Intrinsic::Prototype(BuiltinCtor::Set), "Set"),
+        (Intrinsic::Prototype(BuiltinCtor::WeakMap), "WeakMap"),
+        (Intrinsic::Prototype(BuiltinCtor::WeakSet), "WeakSet"),
+        (Intrinsic::Prototype(BuiltinCtor::WeakRef), "WeakRef"),
+        (
+            Intrinsic::Prototype(BuiltinCtor::FinalizationRegistry),
+            "FinalizationRegistry",
+        ),
         (Intrinsic::Prototype(BuiltinCtor::Promise), "Promise"),
         (Intrinsic::GeneratorPrototype, "Generator"),
         (Intrinsic::AsyncGeneratorPrototype, "AsyncGenerator"),
@@ -3149,6 +3273,19 @@ fn symbol_offset(registry: &[Entry], symbol: WellKnown) -> u32 {
 pub(super) fn image_size() -> i32 {
     let symbols = u32::try_from(WellKnown::ALL.len()).unwrap_or(0);
     (symbols_offset(&registry()) + abi::SYMBOL_BLOCK_SIZE * symbols).cast_signed()
+}
+
+/// The addresses of the image's object-family blocks at `base`, for the
+/// collector's static root list (design/runtime-memory.md §5.4): every
+/// intrinsic (the `Symbol.for` registry included), then every builtin
+/// method block. The accessor and symbol blocks are immutable and left out.
+pub(super) fn static_objects(base: i32) -> Vec<u32> {
+    let registry = registry();
+    let base = base.cast_unsigned();
+    intrinsics()
+        .map(|intrinsic| base + intrinsic_offset(&registry, intrinsic))
+        .chain(methods(&registry).map(|builtin| base + method_offset(&registry, builtin)))
+        .collect()
 }
 
 /// The heap-pointer jsval of `intrinsic` in the image at `base`.
@@ -3457,6 +3594,10 @@ mod tests {
                         | BuiltinCtor::String
                         | BuiltinCtor::Map
                         | BuiltinCtor::Set
+                        | BuiltinCtor::WeakMap
+                        | BuiltinCtor::WeakSet
+                        | BuiltinCtor::WeakRef
+                        | BuiltinCtor::FinalizationRegistry
                         | BuiltinCtor::Promise
                         | BuiltinCtor::Date
                 ) | Intrinsic::Ctor(

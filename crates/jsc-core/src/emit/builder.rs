@@ -19,8 +19,8 @@
 //! 4. Slow-path helpers shrink-wrap with [`FnBuilder::frame_begin`] /
 //!    [`FnBuilder::frame_end`]: a `Return` inside the region restores SP, one
 //!    outside does not; a safepoint outside the region, a branch out of it, a
-//!    rooted local written before it and a kept temp rooted before it are
-//!    errors. Without a region the frame covers the whole body.
+//!    rooted local written before or after it and a kept temp rooted before
+//!    it are errors. Without a region the frame covers the whole body.
 //! 5. [`FnBuilder::finish`] solves slots and emits the frame; a function with
 //!    no root live across a safepoint gets none.
 //!
@@ -115,6 +115,9 @@ pub(super) enum BuilderError {
     /// A kept temp is rooted before the frame exists, so its slot store would
     /// go through `$fp = 0` and the slot would then be cleared by the prologue.
     TempBeforeFrame,
+    /// Rooted local `0` is written after [`FnBuilder::frame_end`], so its
+    /// write-through would store through the stale `$fp` of a popped frame.
+    WriteAfterFrame(u32),
 }
 
 impl fmt::Display for BuilderError {
@@ -130,6 +133,9 @@ impl fmt::Display for BuilderError {
                 write!(f, "rooted local {local} is written before the frame region")
             }
             Self::TempBeforeFrame => write!(f, "kept temp rooted before the frame region"),
+            Self::WriteAfterFrame(local) => {
+                write!(f, "rooted local {local} is written after the frame region")
+            }
         }
     }
 }
@@ -397,6 +403,18 @@ impl Layout {
             });
             if let Some(local) = written_early {
                 return Err(BuilderError::WriteBeforeFrame(local));
+            }
+            let written_late = end.and_then(|end| {
+                ops[end..].iter().find_map(|op| match op {
+                    Op::Instr {
+                        kind: Kind::Set(l) | Kind::Tee(l),
+                        ..
+                    } if local_slots.contains_key(l) => Some(*l),
+                    _ => None,
+                })
+            });
+            if let Some(local) = written_late {
+                return Err(BuilderError::WriteAfterFrame(local));
             }
             if temp_slots.keys().any(|root| *root < begin) {
                 return Err(BuilderError::TempBeforeFrame);
@@ -922,6 +940,26 @@ mod tests {
         b.frame_end();
         b.instruction(&Instruction::End);
         assert!(b.finish().is_ok());
+    }
+
+    #[test]
+    fn rooted_local_written_after_region_is_rejected() {
+        let leaves = LeafSet::empty();
+        let mut b = builder(&leaves);
+        let local = b.local(LocalClass::Jsval);
+        b.frame_begin();
+        b.instruction(&Instruction::LocalGet(0));
+        b.instruction(&Instruction::LocalSet(local));
+        b.instruction(&Instruction::Call(99));
+        b.instruction(&Instruction::LocalGet(local));
+        b.instruction(&Instruction::Drop);
+        b.frame_end();
+        b.instruction(&Instruction::LocalGet(0));
+        b.instruction(&Instruction::LocalSet(local));
+        b.instruction(&Instruction::LocalGet(local));
+        b.instruction(&Instruction::Drop);
+        b.instruction(&Instruction::End);
+        assert_eq!(b.finish().err(), Some(BuilderError::WriteAfterFrame(local)));
     }
 
     #[test]

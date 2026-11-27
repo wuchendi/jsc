@@ -347,3 +347,43 @@ fn push_past_the_maximum_length_throws() {
         4_294_967_298.0,
     );
 }
+
+/// With no positional argument slot (`K = 0`: callbacks read `arguments`)
+/// the array methods read their arguments from the spread argument array.
+#[test]
+fn array_method_arguments_past_the_argument_slots() {
+    assert_uncaught(
+        "const sum = function () { return arguments[0] + arguments[1]; };
+         const r = [1, 2, 3].reduce(...[sum, 10]);
+         const i = [1, 2].indexOf(...[2, 1]), j = [2, 1, 2].lastIndexOf(...[2, 1]);
+         const m = [1, 2].map(...[function () { return this.k + arguments[0]; }, { k: 10 }]);
+         const f = [1, 2, 3].find(...[function () { return arguments[0] > this.min; }, { min: 1 }]);
+         throw r + ' ' + i + ' ' + j + ' ' + m.join() + ' ' + f + ' ' + [5, 6].at(...[-1]);",
+        "16 1 0 11,12 2 6",
+    );
+}
+
+/// An array-like's `length` getter that makes a nested spread call
+/// (publishing another argument array) before `indexOf` reads `fromIndex`
+/// leaves that argument intact.
+#[test]
+fn array_method_argument_survives_a_nested_spread_call() {
+    assert_uncaught(
+        "const o = { get length() { Math.max(...[7, 8, 9]); return 3; }, 0: 'x', 1: 'y', 2: 'x' };
+         throw Array.prototype.indexOf.call(...[o, 'x', 1]);",
+        "2",
+    );
+}
+
+/// The string methods read their arguments past the slots (`K = 0`) from the
+/// spread argument array, also after a coercion of an earlier argument made
+/// a nested spread call.
+#[test]
+fn string_method_arguments_past_the_argument_slots() {
+    assert_uncaught(
+        "const s = { valueOf() { Math.max(...[5, 6, 7]); return 1; } };
+         throw 'abc'.slice(...[1, 2]) + ' ' + 'abcd'.slice(...[s, 3]) + ' '
+           + 'abc'.indexOf(...['c', 1]) + ' ' + 'ab'.padStart(...[4, '-']);",
+        "b bc 2 --ab",
+    );
+}

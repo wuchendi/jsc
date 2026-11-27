@@ -1010,3 +1010,15 @@ fn for_in_supports_break_and_continue() {
         "b",
     );
 }
+
+#[test]
+fn cover_parenthesized_definition_is_anonymous() {
+    assert_string("let cover = (function () {}); cover.name", "cover");
+    assert_string("const c = ((() => 1)); c.name", "c");
+    assert_string("var k = (class {}); k.name", "k");
+    assert_string("let x; x = (() => 1); x.name", "x");
+    assert_string("({ id: (function () {}) }).id.name", "id");
+    assert_string("let s = Symbol('d'); ({ [s]: (class {}) })[s].name", "[d]");
+    // A sequence is not an anonymous definition.
+    assert_string("let q = (0, function () {}); q.name", "");
+}

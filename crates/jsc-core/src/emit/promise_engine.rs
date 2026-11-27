@@ -25,6 +25,12 @@
 //! `$__rejected_head`; the checkpoint after each drain prunes the ones a late
 //! reaction marked `HANDLED`, and `_start` reports the oldest survivor by
 //! creation `seq`.
+//!
+//! The same checkpoint empties the `KeepDuringJob` set (`ClearKeptObjects`)
+//! and then runs one queued `FinalizationRegistry` cleanup job (the
+//! registries the collector pushed on `$__fin_jobs`), draining the
+//! microtasks it queued before the next (design/runtime-memory.md §6.3,
+//! §6.4).
 
 use wasm_encoder::{
     BlockType, Function, FunctionSection, Instruction, MemArg, TypeSection, ValType,
@@ -32,12 +38,13 @@ use wasm_encoder::{
 
 use super::realm::SpeciesOp;
 use super::{
-    Builtin, BuiltinCtor, EXC_PENDING_GLOBAL, EXC_VALUE_GLOBAL, FALSE_BITS, FnBuilder, HEAP_BITS,
-    Helpers, Intrinsic, JOB_HEAD_GLOBAL, JOB_TAIL_GLOBAL, LeafSet, PROMISE_SEQ_GLOBAL, RAW_I32,
+    Builtin, BuiltinCtor, EXC_PENDING_GLOBAL, EXC_VALUE_GLOBAL, FALSE_BITS, FIN_JOBS_GLOBAL,
+    FnBuilder, HEAP_BITS, HOLE_BITS, Helpers, Intrinsic, JOB_HEAD_GLOBAL, JOB_TAIL_GLOBAL,
+    KEPT_OBJECTS_GLOBAL, LeafSet, PROC_EXIT_IMPORT, PROMISE_SEQ_GLOBAL, RAW_I32,
     REJECTED_HEAD_GLOBAL, ROOT_BASE, ROOT_JS, SPREAD_ARGS_GLOBAL, Sink, StrOffsets, THIS_GLOBAL,
-    TRUE_BITS, UNDEFINED_BITS, abi, elem_slot, emit_argc, emit_array_elems, emit_is_function,
-    emit_is_object, emit_is_pointer, emit_load_type_byte, emit_settler_value, finish_builder,
-    helper_builder, intrinsic_bits, libm, static_key, unicode,
+    TRUE_BITS, UNDEFINED_BITS, abi, elem_slot, emit_alloc_const, emit_argc, emit_array_elems,
+    emit_is_function, emit_is_object, emit_is_pointer, emit_load_type_byte, emit_settler_value,
+    finish_builder, helper_builder, intrinsic_bits, libm, static_key, unicode,
 };
 
 /// Emit each listed instruction in order.
@@ -228,7 +235,7 @@ pub(super) fn emit_helpers(
         emit_resolve(strings, helpers, leaves, true),
         emit_finally(helpers, leaves),
         emit_run_job(helpers, leaves),
-        emit_drain(helpers, leaves),
+        emit_drain(strings, helpers, leaves),
         emit_first_unhandled(leaves),
         emit_await(helpers, leaves),
         emit_resolving(helpers, leaves),
@@ -269,8 +276,9 @@ fn emit_promise_new(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_JS], &[ROOT_BASE]);
     let (proto, base) = (0, 1);
     let size = abi::PROMISE_BLOCK_SIZE.cast_signed();
+    emit_alloc_const(&mut f, helpers, size);
     wasm!(f;
-        I32Const(size), Call(helpers.alloc), LocalSet(base),
+        LocalSet(base),
         // Header word (type byte, zero gc/flags/class) and a zero `props`.
         LocalGet(base), I64Const(i64::from(TYPE_PROMISE)), I64Store(m64(0)),
         LocalGet(base), LocalGet(proto), I64Store(m64(abi::OBJ_PROTO_OFFSET)),
@@ -322,8 +330,9 @@ fn emit_react(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let (rec, pb, state, old) = (5, 6, 7, 8);
     let size = abi::REACTION_BLOCK_SIZE.cast_signed();
     let slots = abi::REACTION_SLOTS.cast_signed();
+    emit_alloc_const(&mut f, helpers, size);
     wasm!(f;
-        I32Const(size), Call(helpers.alloc), LocalSet(rec),
+        LocalSet(rec),
         LocalGet(rec), I32Const(TYPE_ENV), I32Store8(m8(0)),
         LocalGet(rec), I32Const(slots), I32Store(m32(abi::HEADER_SIZE)),
         LocalGet(rec), LocalGet(on_f), I64Store(m64(ON_FULFILLED)),
@@ -490,8 +499,9 @@ fn queue_thenable_job(
 ) {
     let size = abi::REACTION_BLOCK_SIZE.cast_signed();
     let slots = abi::REACTION_SLOTS.cast_signed();
+    emit_alloc_const(f, helpers, size);
     wasm!(f;
-        I32Const(size), Call(helpers.alloc), LocalSet(rec),
+        LocalSet(rec),
         LocalGet(rec), I32Const(TYPE_ENV), I32Store8(m8(0)),
         LocalGet(rec), I32Const(slots), I32Store(m32(abi::HEADER_SIZE)),
         LocalGet(rec), LocalGet(then), I64Store(m64(ON_FULFILLED)),
@@ -755,10 +765,25 @@ fn call_then(
 
 /// `__drain()`: pop and run jobs until the queue is empty (a loop, never
 /// recursion, so a long reaction chain uses no wasm stack), then the
-/// checkpoint; repeat while the checkpoint left jobs queued.
-fn emit_drain(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[], &[ROOT_BASE, RAW_I32, RAW_I32, RAW_I32]);
-    let (rec, cur, prev, next) = (0, 1, 2, 3);
+/// checkpoint: prune the rejected list, `ClearKeptObjects` (§6.3: the
+/// `KeepDuringJob` array's length becomes `0`, its vacated slots `HOLE`),
+/// and run the cleanup job of the registry at the head of `$__fin_jobs`
+/// (the collector pushes at the head, so this is the most recently queued
+/// one; the order is not spec-observable) (§6.4: pop it, clear [`abi::FINREG_FLAG_JOB_QUEUED`], then
+/// `CleanupFinalizationRegistry`: remove each empty cell and call
+/// `cleanup(held)`). A throw out of a cleanup callback is reported like an
+/// uncaught exception (`Uncaught …` on fd 2, exit 1; Q22). After a cleanup
+/// job the loop drains the microtasks it queued and reaches the checkpoint
+/// again, until both queues are empty.
+fn emit_drain(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[],
+        &[ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, ROOT_JS],
+    );
+    let (rec, cur, prev, next, held) = (0, 1, 2, 3, 4);
+    let data = abi::ELEMS_DATA_OFFSET.cast_signed();
+    let queued = abi::FINREG_FLAG_JOB_QUEUED.cast_signed();
     wasm!(f;
         Loop(BlockType::Empty),
         Block(BlockType::Empty), Loop(BlockType::Empty),
@@ -791,8 +816,60 @@ fn emit_drain(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         End,
         LocalGet(next), LocalSet(cur),
         Br(0), End, End,
-        // Checkpoint 2 (M3 hook): ClearKeptObjects.
-        // Checkpoint 3 (M3 hook): queue the finalization cleanup jobs.
+        // Checkpoint 2: ClearKeptObjects (`cur` walks the vacated slots up to
+        // `next`).
+        GlobalGet(KEPT_OBJECTS_GLOBAL), LocalTee(prev),
+        If(BlockType::Empty),
+        LocalGet(prev), I32Load(m32(abi::ARRAY_ELEMS_OFFSET)), LocalTee(cur),
+        If(BlockType::Empty),
+        LocalGet(prev), I32Load(m32(abi::ARRAY_LEN_OFFSET)), I32Const(3), I32Shl,
+        LocalGet(cur), I32Add, I32Const(data), I32Add, LocalSet(next),
+        LocalGet(cur), I32Const(data), I32Add, LocalSet(cur),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(cur), LocalGet(next), I32GeU, BrIf(1),
+        LocalGet(cur), I64Const(HOLE_BITS), I64Store(m64(0)),
+        LocalGet(cur), I32Const(8), I32Add, LocalSet(cur),
+        Br(0), End, End,
+        End,
+        LocalGet(prev), I32Const(0), I32Store(m32(abi::ARRAY_LEN_OFFSET)),
+        End,
+        // Checkpoint 3: one finalization cleanup job. `rec` is the registry
+        // (rooted across the callbacks), `cur` the cell index.
+        GlobalGet(FIN_JOBS_GLOBAL), LocalTee(rec),
+        If(BlockType::Empty),
+        LocalGet(rec), I32Load(m32(abi::FINREG_JOB_NEXT_OFFSET)), GlobalSet(FIN_JOBS_GLOBAL),
+        LocalGet(rec), I32Const(0), I32Store(m32(abi::FINREG_JOB_NEXT_OFFSET)),
+        LocalGet(rec), LocalGet(rec), I32Load(m32(abi::FINREG_FLAGS_OFFSET)), I32Const(!queued),
+        I32And, I32Store(m32(abi::FINREG_FLAGS_OFFSET)),
+        I32Const(0), LocalSet(cur),
+        // A callback may register (replacing the store) or unregister, so the
+        // store and its capacity are re-read for every cell.
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(rec), I32Load(m32(abi::FINREG_CELLS_OFFSET)), LocalTee(prev), I32Eqz, BrIf(1),
+        LocalGet(cur), I32Const(3), I32Mul, LocalGet(prev), I32Load(m32(abi::ELEMS_CAP_OFFSET)),
+        I32GeU, BrIf(1),
+        // `next` = the cell's address.
+        LocalGet(cur), I32Const(24), I32Mul, LocalGet(prev), I32Add, I32Const(data), I32Add,
+        LocalSet(next),
+        LocalGet(cur), I32Const(1), I32Add, LocalSet(cur),
+        LocalGet(next), I64Load(m64(0)), I64Const(HOLE_BITS), I64Eq,
+        If(BlockType::Empty),
+        LocalGet(next), I64Load(m64(8)), LocalSet(held),
+        LocalGet(next), I64Const(UNDEFINED_BITS), I64Store(m64(0)),
+        LocalGet(next), I64Const(UNDEFINED_BITS), I64Store(m64(8)),
+        LocalGet(next), I64Const(UNDEFINED_BITS), I64Store(m64(16)),
+        LocalGet(rec), I64Load(m64(abi::FINREG_CLEANUP_OFFSET)), LocalGet(held),
+        Call(helpers.invoke1), Drop,
+        GlobalGet(EXC_PENDING_GLOBAL),
+        If(BlockType::Empty),
+        I32Const(2), I32Const(static_key(strings, "Uncaught ")), GlobalGet(EXC_VALUE_GLOBAL),
+        Call(helpers.report()),
+        I32Const(1), Call(PROC_EXIT_IMPORT), Unreachable,
+        End,
+        End,
+        Br(0), End, End,
+        Br(1),
+        End,
         // Loop again when the checkpoint queued jobs.
         GlobalGet(JOB_HEAD_GLOBAL), BrIf(0),
         End,
@@ -872,8 +949,9 @@ fn emit_resolving(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let (p, env) = (0, 1);
     let size = abi::RESOLVING_BLOCK_SIZE.cast_signed();
     let slots = abi::RESOLVING_SLOTS.cast_signed();
+    emit_alloc_const(&mut f, helpers, size);
     wasm!(f;
-        I32Const(size), Call(helpers.alloc), LocalSet(env),
+        LocalSet(env),
         LocalGet(env), I32Const(TYPE_ENV), I32Store8(m8(0)),
         LocalGet(env), I32Const(slots), I32Store(m32(abi::HEADER_SIZE)),
         LocalGet(env), LocalGet(p), I64Store(m64(RESOLVING_PROMISE)),

@@ -750,7 +750,6 @@ impl LowerCtx<'_> {
                         callee: Box::new(func),
                         args: Vec::new(),
                         this_local: class_local,
-                        construct: false,
                         not_callable: CalleeError::not_a_function(CalleeError::EXPRESSION),
                     });
                     continue;
@@ -1049,7 +1048,8 @@ impl LowerCtx<'_> {
                         Some(default) => {
                             let local = self.fresh();
                             out.push(IrStmt::Decl { local, init: read });
-                            let default = self.lower_expr(default)?;
+                            let name = JsStr::from(assign.key.id.sym.as_ref());
+                            let default = self.lower_named_expr(default, &name)?;
                             IrNode::Ternary {
                                 cond: Box::new(IrNode::Binary {
                                     op: BinOp::Eq,
@@ -1160,7 +1160,13 @@ impl LowerCtx<'_> {
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
         let (target, value) = if let Pat::Assign(assign) = target {
-            let default = self.lower_expr(&assign.right)?;
+            // Only an identifier target names an anonymous default.
+            let default = match assign.left.as_ref() {
+                Pat::Ident(ident) => {
+                    self.lower_named_expr(&assign.right, &JsStr::from(ident.id.sym.as_ref()))?
+                }
+                _ => self.lower_expr(&assign.right)?,
+            };
             let value = IrNode::Ternary {
                 cond: Box::new(IrNode::Binary {
                     op: BinOp::Eq,
@@ -1396,8 +1402,13 @@ impl LowerCtx<'_> {
                 ObjectPatProp::Assign(assign) => {
                     let key = IrNode::Str(assign.key.id.sym.as_ref().into());
                     let target = self.assignable_binding(&assign.key.id)?;
-                    let value =
-                        self.apply_default(read(key.clone()), assign.value.as_deref(), out)?;
+                    let name = JsStr::from(assign.key.id.sym.as_ref());
+                    let value = self.apply_default(
+                        read(key.clone()),
+                        assign.value.as_deref(),
+                        Some(&name),
+                        out,
+                    )?;
                     bound_keys.push(key);
                     out.push(IrStmt::Expr(Self::write_assign_ref(target, value)));
                 }
@@ -1443,12 +1454,17 @@ impl LowerCtx<'_> {
         };
         if matches!(target, Pat::Array(_) | Pat::Object(_)) {
             let read = fetch(self, out);
-            let value = self.apply_default(read, default, out)?;
+            let value = self.apply_default(read, default, None, out)?;
             return self.assign_to_target(target, value, out);
         }
+        // Only an identifier reference names an anonymous default.
+        let name = match target {
+            Pat::Ident(ident) => Some(JsStr::from(ident.id.sym.as_ref())),
+            _ => None,
+        };
         let target = self.prepare_assign_ref(target, out)?;
         let read = fetch(self, out);
-        let value = self.apply_default(read, default, out)?;
+        let value = self.apply_default(read, default, name.as_ref(), out)?;
         out.push(IrStmt::Expr(Self::write_assign_ref(target, value)));
         Ok(())
     }
@@ -1457,10 +1473,12 @@ impl LowerCtx<'_> {
     /// default replaces it only when it is `undefined`. The result is stashed in
     /// a temp too, so a `yield` in the default sits in a declaration (which the
     /// generator segmentation diagnoses) rather than inside a member store.
+    /// `name`, the identifier target, names an anonymous default.
     fn apply_default(
         &mut self,
         read: IrNode,
         default: Option<&Expr>,
+        name: Option<&JsStr>,
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<IrNode> {
         let Some(default) = default else {
@@ -1471,7 +1489,10 @@ impl LowerCtx<'_> {
             local: value,
             init: read,
         });
-        let default = self.lower_expr(default)?;
+        let default = match name {
+            Some(name) => self.lower_named_expr(default, name)?,
+            None => self.lower_expr(default)?,
+        };
         let result = self.fresh();
         out.push(IrStmt::Decl {
             local: result,

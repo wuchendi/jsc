@@ -81,7 +81,7 @@ pub(super) fn emit_method(
 /// The IR fragments the bodies emit, over the locals of `K = k`, for the
 /// static-string scan.
 pub(super) fn fragments(k: u32) -> Vec<IrNode> {
-    let frame = Frame { k };
+    let frame = Frame::new(k);
     let mut nodes = vec![
         to_json_object(frame),
         to_iso_string_call(frame),
@@ -237,7 +237,7 @@ pub(super) fn make_day(year: u32, month: u32, date: u32, t: u32) -> [IrNode; 7] 
 /// fields `0`), then `MakeDate(MakeDay(MakeFullYear(year), month, date),
 /// MakeTime(h, min, s, ms))`.
 pub(super) fn date_fields_time(body: &Body, t: u32) -> Vec<IrNode> {
-    let frame = Frame { k: body.k };
+    let frame = Frame::new(body.k);
     let f: [u32; 7] = [
         frame.y64(0),
         frame.y64(1),
@@ -251,11 +251,11 @@ pub(super) fn date_fields_time(body: &Body, t: u32) -> Vec<IrNode> {
         .zip(f)
         .map(|(i, l)| {
             if i == 0 {
-                return assign(l, body.spread_arg(0));
+                return assign(l, body.arg(0));
             }
             let default = if i == 2 { 1.0 } else { 0.0 };
             let present = bin(BinOp::Gt, IrNode::ArgCount(body.k + 1), num(f64::from(i)));
-            assign(l, ternary(present, body.spread_arg(i), num(default)))
+            assign(l, ternary(present, body.arg(i), num(default)))
         })
         .collect();
     seq.extend(f.map(|l| assign(l, to_number(IrNode::Local(l)))));
@@ -270,7 +270,7 @@ pub(super) fn date_fields_time(body: &Body, t: u32) -> Vec<IrNode> {
 
 /// The unclipped `Date.UTC(..)` time value ([`date_fields_time`] in temp 3).
 fn utc_time(frame: Frame) -> IrNode {
-    let body = Body { k: frame.k };
+    let body = frame.body();
     let t = body.temp(3);
     let mut seq = date_fields_time(&body, t);
     seq.push(IrNode::Local(t));
@@ -318,10 +318,10 @@ pub(super) fn emit_utc(
 /// at `t`; a `NaN` `t` is `+0` for `setFullYear` / `setYear` (the caller
 /// returns `NaN` for the others). `setTime(time)` is `ToNumber(time)`.
 fn set_time(op: DateSetOp, frame: Frame) -> IrNode {
-    let body = Body { k: frame.k };
+    let body = frame.body();
     let (this, t) = (frame.i64(0), frame.y64(0));
     let (fields, first, count): (&[DateOp], usize, usize) = match op {
-        DateSetOp::Time => return to_number(body.spread_arg(0)),
+        DateSetOp::Time => return to_number(body.arg(0)),
         DateSetOp::Milliseconds => (&TIME_FIELDS, 3, 1),
         DateSetOp::Seconds => (&TIME_FIELDS, 2, 2),
         DateSetOp::Minutes => (&TIME_FIELDS, 1, 3),
@@ -354,10 +354,10 @@ fn set_time(op: DateSetOp, frame: Frame) -> IrNode {
         } else {
             let i = u32::try_from(j - first).unwrap_or(0);
             if i == 0 {
-                body.spread_arg(0)
+                body.arg(0)
             } else {
                 let present = bin(BinOp::Gt, IrNode::ArgCount(body.k + 1), num(f64::from(i)));
-                ternary(present, body.spread_arg(i), default)
+                ternary(present, body.arg(i), default)
             }
         };
         seq.push(assign(l, value));

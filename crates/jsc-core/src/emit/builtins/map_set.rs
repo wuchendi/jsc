@@ -6,6 +6,8 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+use super::array::{CallArg, push_call};
+
 /// The `TypeError` of `<name>` on a receiver of the wrong kind.
 macro_rules! incompatible {
     ($name:literal) => {
@@ -73,6 +75,52 @@ const NOT_CALLABLE: [CalleeErrorText<'static>; 2] = [
 /// The entry keys a `Map` constructor reads from each iterated entry.
 const ENTRY_KEYS: [&str; 2] = ["0", "1"];
 
+/// The collection a constructor fills from its iterable argument
+/// (`AddEntriesFromIterable` / the `Set` and `WeakSet` constructor loops).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Collection {
+    Map,
+    Set,
+    WeakMap,
+    WeakSet,
+}
+
+impl Collection {
+    /// Every collection.
+    const ALL: [Collection; 4] = [Self::Map, Self::Set, Self::WeakMap, Self::WeakSet];
+
+    /// Whether the adder takes one value (`add`) rather than a key and a
+    /// value read from an entry object (`set`).
+    fn single(self) -> bool {
+        matches!(self, Self::Set | Self::WeakSet)
+    }
+
+    /// The adder's property key.
+    fn adder_key(self) -> &'static str {
+        if self.single() { "add" } else { "set" }
+    }
+
+    /// The constructor's name.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Map => "Map",
+            Self::Set => "Set",
+            Self::WeakMap => "WeakMap",
+            Self::WeakSet => "WeakSet",
+        }
+    }
+
+    /// The builtin adder the constructor calls inline when the new
+    /// collection's adder is still it (`Map` / `Set` only).
+    fn inline_adder(self) -> Option<Builtin> {
+        match self {
+            Self::Map => Some(op(false, MapOp::Set)),
+            Self::Set => Some(op(true, MapOp::Add)),
+            Self::WeakMap | Self::WeakSet => None,
+        }
+    }
+}
+
 /// `CollectionOp { set, op }`.
 const fn op(set: bool, op: MapOp) -> Builtin {
     Builtin::CollectionOp { set, op }
@@ -91,14 +139,15 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 /// The IR fragments the bodies emit, over the locals of `K = k`, for the
 /// static-string scan.
 pub(super) fn fragments(k: u32) -> Vec<IrNode> {
-    let frame = Frame { k };
+    let frame = Frame::new(k);
     let local = frame.i64(0);
-    vec![
-        not_iterable(local),
-        not_an_entry(local),
-        adder_not_callable(local, false),
-        adder_not_callable(local, true),
-    ]
+    let mut nodes = vec![not_iterable(local), not_an_entry(local)];
+    nodes.extend(
+        Collection::ALL
+            .into_iter()
+            .map(|kind| adder_not_callable(local, kind)),
+    );
+    nodes
 }
 
 /// The receiver `TypeError` of `builtin`.
@@ -178,8 +227,8 @@ pub(super) fn not_an_entry(local: u32) -> IrNode {
 
 /// The `TypeError` for a non-callable adder (`map.set` / `set.add`) in
 /// `local`.
-fn adder_not_callable(local: u32, set: bool) -> IrNode {
-    let (key, object) = if set { ("add", "Set") } else { ("set", "Map") };
+fn adder_not_callable(local: u32, kind: Collection) -> IrNode {
+    let (key, object) = (kind.adder_key(), kind.name());
     let message = concat(
         concat(IrNode::Str("'".into()), IrNode::Local(local)),
         IrNode::Str(
@@ -351,22 +400,9 @@ pub(super) fn emit_for_each(
         [key, key, this]
     } else {
         [value, key, this]
-    };
-    for slot in 0..frame.k {
-        if let Some(&local) = args.get(slot as usize) {
-            wasm!(function; LocalGet(local));
-        } else {
-            wasm!(function; I64Const(UNDEFINED_BITS));
-        }
     }
-    wasm!(function; LocalGet(this_arg), GlobalSet(THIS_GLOBAL));
-    let count = args.len().min(frame.k as usize);
-    invoke(
-        function,
-        callback,
-        |function| emit_argc(count, function),
-        helpers,
-    );
+    .map(CallArg::Val);
+    push_call(function, frame, callback, this_arg, &args, helpers);
     wasm!(function; Drop);
     return_if_pending(function);
     wasm!(function;
@@ -380,53 +416,38 @@ pub(super) fn emit_for_each(
 
 /// Call the adder in i64 `adder` with `this` = the collection in i64 `map`
 /// on `args` (a Set's one value, a Map's key and value): inline
-/// `__map_set` when i32 `builtin_adder` is set, else a call (a throw left
-/// pending).
+/// `__map_set` when the i32 `builtin_adder` is given and set, else a call
+/// ([`push_call`], so a Map's value survives a program arity `K` of 1; a
+/// throw left pending).
 fn call_adder(
     function: &mut FnBuilder<'_>,
     frame: Frame,
     map: u32,
     adder: u32,
-    builtin_adder: u32,
+    builtin_adder: Option<u32>,
     args: &[u32],
     helpers: Helpers<'_>,
 ) {
-    wasm!(function; LocalGet(builtin_adder), If(BlockType::Empty), LocalGet(map), I32WrapI64);
-    for &arg in args {
-        wasm!(function; LocalGet(arg));
-    }
-    if args.len() == 1 {
-        wasm!(function; I64Const(UNDEFINED_BITS));
-    }
-    wasm!(function; Call(helpers.map_set), Else);
-    for slot in 0..frame.k {
-        if let Some(&local) = args.get(slot as usize) {
-            wasm!(function; LocalGet(local));
-        } else {
+    if let Some(builtin_adder) = builtin_adder {
+        wasm!(function; LocalGet(builtin_adder), If(BlockType::Empty), LocalGet(map), I32WrapI64);
+        for &arg in args {
+            wasm!(function; LocalGet(arg));
+        }
+        if args.len() == 1 {
             wasm!(function; I64Const(UNDEFINED_BITS));
         }
+        wasm!(function; Call(helpers.map_set), Else);
     }
-    wasm!(function; LocalGet(map), GlobalSet(THIS_GLOBAL));
-    let count = args.len().min(frame.k as usize);
-    invoke(
-        function,
-        adder,
-        |function| emit_argc(count, function),
-        helpers,
-    );
-    wasm!(function; Drop, End);
+    let args: Vec<CallArg> = args.iter().copied().map(CallArg::Val).collect();
+    push_call(function, frame, adder, map, &args, helpers);
+    wasm!(function; Drop);
+    if builtin_adder.is_some() {
+        wasm!(function; End);
+    }
 }
 
 /// `new Map(iterable)` / `new Set(iterable)`: the allocation of
-/// [`super::ctor::fragment`], then, for a non-nullish `iterable`,
-/// `AddEntriesFromIterable` (DESIGN.md §7.8): the adder
-/// `map.set` / `set.add` is read once from the new collection (a user
-/// override runs; the builtin itself is called inline), then each value of
-/// `iterable`'s iterator record (a guarded fast path or the protocol; `<x> is
-/// not iterable` without one) is added. A `Map` entry must be an object,
-/// read at keys `"0"` and `"1"`. A non-object entry (`TypeError`), a
-/// throwing entry read or a throwing adder closes the iterator; a throw from
-/// the iterator itself does not.
+/// [`super::ctor::fragment`], then [`emit_add_from_iterable`].
 pub(super) fn emit_ctor(
     set: bool,
     function: &mut FnBuilder<'_>,
@@ -434,27 +455,49 @@ pub(super) fn emit_ctor(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    let (map, src) = (frame.x64(0), frame.x64(1));
-    let (adder, item, key, value) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
-    let builtin_adder = frame.i32(1);
-    let rec = iter::local_record(frame.z64(0), frame.z64(1), frame.z64(2), frame.z64(3));
-    let scratch = frame.scratch();
-    let ctor = if set {
-        BuiltinCtor::Set
+    let frame = frame.snapshot(function, 1);
+    let map = frame.x64(0);
+    let (ctor, kind) = if set {
+        (BuiltinCtor::Set, Collection::Set)
     } else {
-        BuiltinCtor::Map
+        (BuiltinCtor::Map, Collection::Map)
     };
     let alloc = super::ctor::fragment(ctor, frame.k);
-    emit_node(&alloc, function, scratch, strings, helpers);
+    emit_node(&alloc, function, frame.scratch(), strings, helpers);
     wasm!(function; LocalSet(map));
     return_if_pending(function);
+    emit_add_from_iterable(kind, function, frame, strings, helpers);
+}
+
+/// The iterable argument of a collection constructor whose new collection
+/// is in the rooted i64 `frame.x64(0)`, returning it: for a non-nullish
+/// `iterable`, `AddEntriesFromIterable` (DESIGN.md §7.8): the adder
+/// `set` / `add` is read once from the new collection (a user override runs;
+/// the builtin `Map` / `Set` adder itself is called inline), then each value
+/// of `iterable`'s iterator record (a guarded fast path or the protocol; `<x>
+/// is not iterable` without one) is added. A `Map` / `WeakMap` entry must be
+/// an object, read at keys `"0"` and `"1"`. A non-object entry
+/// (`TypeError`), a throwing entry read or a throwing adder closes the
+/// iterator; a throw from the iterator itself does not.
+pub(super) fn emit_add_from_iterable(
+    kind: Collection,
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (map, src) = (frame.x64(0), frame.x64(1));
+    let (adder, item, key, value) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
+    let set = kind.single();
+    let rec = iter::local_record(frame.z64(0), frame.z64(1), frame.z64(2), frame.z64(3));
+    let scratch = frame.scratch();
     frame.arg(function, 0);
     wasm!(function; LocalSet(src));
     emit_is_nullish(function, src);
     wasm!(function; If(BlockType::Empty), LocalGet(map), Return, End);
-    let name = if set { "add" } else { "set" };
     wasm!(function;
-        LocalGet(map), I32Const(static_key(strings, name)), Call(helpers.get), LocalSet(adder),
+        LocalGet(map), I32Const(static_key(strings, kind.adder_key())), Call(helpers.get),
+        LocalSet(adder),
     );
     return_if_pending(function);
     emit_is_function(function, adder);
@@ -462,19 +505,18 @@ pub(super) fn emit_ctor(
     emit_drop(
         function,
         frame,
-        &adder_not_callable(adder, set),
+        &adder_not_callable(adder, kind),
         strings,
         helpers,
     );
-    let builtin = if set {
-        op(true, MapOp::Add)
-    } else {
-        op(false, MapOp::Set)
-    };
-    wasm!(function;
-        I64Const(UNDEFINED_BITS), Return, End,
-        LocalGet(adder), I64Const(realm::method_bits(builtin, helpers)), I64Eq, LocalSet(builtin_adder),
-    );
+    wasm!(function; I64Const(UNDEFINED_BITS), Return, End);
+    let builtin_adder = kind.inline_adder().map(|builtin| {
+        let flag = frame.i32(1);
+        wasm!(function;
+            LocalGet(adder), I64Const(realm::method_bits(builtin, helpers)), I64Eq, LocalSet(flag),
+        );
+        flag
+    });
     emit_get_iterator(
         &IrNode::Local(src),
         &rec,

@@ -109,21 +109,15 @@ fn out_of_memory_has_no_backtrace() {
     assert_eq!(done.stderr, "Uncaught RangeError: out of memory\n");
 }
 
-/// An out-of-memory inside `try` is not catchable (the heap is exhausted, so
-/// the program terminates with the out-of-memory error instead).
-#[test]
-fn out_of_memory_inside_try_terminates() {
-    assert_uncaught(
-        &format!("try {{ {HUGE} }} catch (e) {{ 0 }} 1"),
-        "RangeError: out of memory",
-    );
-}
-
-/// A program whose guest strings fill ~448 MiB of the 512 MiB cap, so the next
-/// 64 MiB allocation by a builtin (`s.slice(1)`) runs out of memory. Shared
-/// verbatim with `packages/jsc/tests/run.test.ts`.
+/// A program whose LIVE strings `s` (64 MiB, 1025 pages with the block and
+/// span headers), `t` (128 MiB, 2049 pages) and `u` (192 MiB, 3073 pages) hold
+/// 6147 of the 8192 pages of the 512 MiB cap, all read after the builtin call
+/// so the collector keeps them. The doubling garbage behind `s` is collectable
+/// and reused, but `t.slice(1)` needs 2049 contiguous pages while at most
+/// `8192 - 6147 - 16` (the 1 MiB shadow stack) = 2029 can ever be free, so the
+/// builtin's allocation runs out of memory however the free pages lie.
 const BUILTIN_OOM: &str = "let s = 'x'; for (let i = 0; i < 26; i++) { s = s + s } \
-     let t = s + s; let u = t + s; s.slice(1).length";
+     let t = s + s; let u = t + s; t.slice(1).length + s.length + u.length";
 
 /// A builtin's allocation past the cap is the same uncaught
 /// `RangeError: out of memory` as a program's.

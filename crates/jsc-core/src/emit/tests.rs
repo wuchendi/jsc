@@ -13,6 +13,7 @@ fn emit(program: &IrProgram) -> Vec<u8> {
         program,
         CompileOptions {
             print_completion: true,
+            gc_stress: crate::emit::gc_stress_from_env(),
         },
     )
 }
@@ -102,6 +103,14 @@ fn thrown(bytes: &[u8]) -> (u64, Vec<u8>) {
     let done = crate::run::run_inspect(bytes).expect("module should run");
     assert_eq!(done.code, 1, "the final expression throws");
     (done.thrown, done.memory)
+}
+
+/// The `[type, flags, class]` header bytes of the block at `base`, leaving out
+/// the `gc` byte: it is the mark epoch (design/runtime-memory.md §5.2), so any
+/// block that survived a collection (every block under `JSC_GC_STRESS=1`)
+/// carries a non-zero epoch there.
+fn header(memory: &[u8], base: usize) -> [u8; 3] {
+    [memory[base], memory[base + 2], memory[base + 3]]
 }
 
 /// Wrap a single expression into a one-statement program.
@@ -426,66 +435,135 @@ fn typeof_string_literal_reports_string() {
     assert_eq!(completion(&bytes), "string");
 }
 
-/// The data-segment count and the initial `__heap_ptr` of `bytes`.
+/// The data-segment count and the initial `$__heap_ptr` (the heap start) of
+/// `bytes`.
 fn data_layout(bytes: &[u8]) -> (u32, Option<i32>) {
     let mut data_segments = 0;
-    let mut heap_ptr_init = None;
+    let mut heap_start = None;
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         match payload.expect("valid payload") {
             wasmparser::Payload::DataSection(reader) => {
                 data_segments = reader.count();
             }
             wasmparser::Payload::GlobalSection(reader) => {
-                // The heap pointer is the FIRST global; the
+                // The page frontier is the FIRST global; the
                 // exception-unwinding globals follow it and are ignored here.
-                let heap_ptr = reader
+                let frontier = reader
                     .into_iter()
                     .next()
-                    .expect("at least the heap-pointer global")
+                    .expect("at least the frontier global")
                     .expect("valid global");
-                let mut ops = heap_ptr.init_expr.get_operators_reader();
+                let mut ops = frontier.init_expr.get_operators_reader();
                 if let wasmparser::Operator::I32Const { value } = ops.read().expect("init operator")
                 {
-                    heap_ptr_init = Some(value);
+                    heap_start = Some(value);
                 }
             }
             _ => {}
         }
     }
-    (data_segments, heap_ptr_init)
+    (data_segments, heap_start)
 }
 
 #[test]
-fn string_literal_emits_data_segment_and_advances_heap_ptr() {
+fn string_literal_emits_data_segment_below_the_heap() {
     // The literal "foo" (11 bytes, padded to 16) is one more string blob
-    // segment ahead of the function data, the realm image, and the intern table.
+    // segment ahead of the function data, the realm image, and the intern
+    // table; the heap still starts on a page boundary after them.
     let base = emit(&expr_program(IrNode::Num(42.0)));
     let bytes = emit(&expr_program(IrNode::Str("foo".into())));
     validate(&bytes);
-    let (segments, heap_ptr) = data_layout(&bytes);
-    let (base_segments, base_heap_ptr) = data_layout(&base);
+    let (segments, heap_start) = data_layout(&bytes);
+    let (base_segments, base_heap_start) = data_layout(&base);
     assert_eq!(segments, base_segments + 1, "one more string blob");
-    assert_eq!(heap_ptr, base_heap_ptr.map(|p| p + 16));
+    let heap_start = heap_start.expect("frontier init");
+    assert_eq!(heap_start % abi::GC_PAGE_SIZE.cast_signed(), 0);
+    assert!(Some(heap_start) >= base_heap_start);
 }
 
 #[test]
 fn no_literals_starts_heap_after_the_intern_table() {
     // With no string literals, the static strings (the always-interned
     // "length", the realm's and the builtins' strings), the `__fn_info` table
-    // (the two settlers and the builtins), the realm image and the intern table
-    // precede the bump allocator, in that order.
+    // (the two settlers and the builtins), the realm image, the intern table,
+    // the Unicode tables and the collector's static root list (the realm's
+    // object-family blocks) precede the heap, which starts at the next page
+    // boundary.
     let program = expr_program(IrNode::Num(42.0));
     let bytes = emit(&program);
     validate(&bytes);
     let (offsets, strings_end) = collect_strings(&program);
     let info = abi::FN_INFO_ENTRY_SIZE.cast_signed() * (2 + builtin_count());
-    let intern_base = strings_end + info + realm::image_size();
+    let realm_base = strings_end + info;
+    let intern_base = realm_base + realm::image_size();
     let cap = intern_table(&offsets, intern_base).cap;
-    let end = intern_base + 4 * cap + crate::emit::unicode::data_size();
+    let roots = (intern_base + 4 * cap + crate::emit::unicode::data_size() + 3) & -4;
+    let roots_len = i32::try_from(realm::static_objects(realm_base).len()).expect("count");
+    let end = roots + 4 + 4 * roots_len;
+    let page = abi::GC_PAGE_SIZE.cast_signed();
+    assert_eq!(data_layout(&bytes).1, Some((end + page - 1) / page * page));
+}
+
+/// The size-class rule of design/runtime-memory.md §5.6: `16..=256` by 16,
+/// then 512, 1024, 2048; every size maps to the smallest class holding it.
+#[test]
+fn gc_size_class_table() {
+    let sizes: Vec<u32> = (1..=abi::GC_CLASS_COUNT).map(abi::gc_class_size).collect();
+    let mut want: Vec<u32> = (1..=16).map(|c| 16 * c).collect();
+    want.extend([512, 1024, 2048]);
+    assert_eq!(sizes, want);
+    for size in 1..=abi::GC_SMALL_MAX {
+        let class = abi::gc_size_class(size);
+        assert!((1..=abi::GC_CLASS_COUNT).contains(&class), "size {size}");
+        assert!(abi::gc_class_size(class) >= size, "size {size} fits");
+        assert!(
+            class == 1 || abi::gc_class_size(class - 1) < size,
+            "size {size} takes the smallest class"
+        );
+    }
+    assert_eq!(abi::gc_size_class(abi::GC_SMALL_MAX + 1), 0, "large");
+    let table = crate::emit::gc::class_sizes();
+    let decoded: Vec<u32> = table
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
+        .collect();
+    assert_eq!(decoded, want, "static class table");
+}
+
+/// The page table, the free-list heads, the current pages, the class
+/// table and the static mark stack sit in the fixed static area, below every string block and the
+/// heap, and every block size class keeps bases 8-aligned.
+#[test]
+fn gc_static_layout() {
+    assert_eq!(u64::from(abi::GC_PAGE_TABLE_SIZE), abi::MEMORY_MAX_PAGES);
     assert_eq!(
-        data_layout(&bytes).1,
-        Some((end + crate::emit::BLOCK_ALIGN - 1) & -crate::emit::BLOCK_ALIGN)
+        abi::GC_FREE_HEADS,
+        abi::GC_PAGE_TABLE + abi::GC_PAGE_TABLE_SIZE
     );
+    assert_eq!(
+        abi::GC_CUR_PAGES,
+        abi::GC_FREE_HEADS + 4 * abi::GC_CLASS_COUNT
+    );
+    assert_eq!(
+        abi::GC_CLASS_SIZES,
+        abi::GC_CUR_PAGES + 4 * abi::GC_CLASS_COUNT
+    );
+    assert_eq!(
+        abi::GC_MARK_STACK,
+        abi::GC_CLASS_SIZES + 4 * abi::GC_CLASS_COUNT
+    );
+    assert_eq!(
+        abi::STATIC_AREA_END,
+        abi::GC_MARK_STACK + abi::GC_MARK_STACK_SIZE
+    );
+    assert_eq!(abi::STATIC_AREA_END % abi::BLOCK_ALIGN, 0);
+    for class in 1..=abi::GC_CLASS_COUNT {
+        assert_eq!(abi::gc_class_size(class) % abi::BLOCK_ALIGN, 0);
+    }
+    assert_eq!(abi::GC_PAGE_HEADER_SIZE % abi::BLOCK_ALIGN, 0);
+    assert_eq!(abi::GC_LARGE_HEADER_SIZE % abi::BLOCK_ALIGN, 0);
 }
 
 #[test]
@@ -681,8 +759,8 @@ fn heap_blocks_write_the_type_byte_header() {
     // Every heap block begins with its TYPE BYTE at the base offset. Run
     // a literal, take the low 32 bits of the returned jsval as the block base,
     // and assert the byte there is the expected kind (0 string / 1 array / 2
-    // object) followed by the `gc`/`flags`/`class` bytes: zero, except a static
-    // string's `flags`, which carry `INTERNED`.
+    // object) and the `flags`/`class` bytes are zero, except a static string's
+    // `flags`, which carry `INTERNED` ([`header`] skips the `gc` epoch byte).
     for (src, expected_type, flags) in [
         ("\"hi\"", 0u8, crate::abi::STR_FLAG_INTERNED),
         ("[7, 8]", 1u8, 0),
@@ -694,10 +772,9 @@ fn heap_blocks_write_the_type_byte_header() {
         // A heap jsval carries tag 0b101 and the block base in its low 32 bits.
         assert_eq!((bits >> 48) & 0b111, 0b101, "{src} should be a heap jsval");
         let base = (bits & 0xFFFF_FFFF) as usize;
-        assert_eq!(memory[base], expected_type, "type byte for {src}");
         assert_eq!(
-            &memory[base + 1..base + 4],
-            &[0, flags, 0],
+            header(&memory, base),
+            [expected_type, flags, 0],
             "header bytes for {src}"
         );
     }
@@ -837,8 +914,9 @@ fn static_string_blobs_are_8_aligned() {
 fn every_block_is_8_aligned_with_zero_header_bytes() {
     // Guest-allocated (concat, array, object, function, Map, Date, generator)
     // and builtin-allocated (String(n), string/array methods, promises) blocks
-    // all start 8-aligned with header bytes 1..3 (`gc`, `flags`, `class`) zero,
-    // except a fresh arrow's `flags`, which is `LAZY`.
+    // all start 8-aligned with header bytes 2..3 (`flags`, `class`) zero,
+    // except a fresh arrow's `flags`, which is `LAZY`. Byte 1 (`gc`) is the
+    // mark epoch, non-zero after a collection (design/runtime-memory.md §5.2).
     for src in [
         "'x' + 1",
         "let n = 3; [1, n]",
@@ -864,7 +942,6 @@ fn every_block_is_8_aligned_with_zero_header_bytes() {
         let base = (bits & 0xFFFF_FFFF) as usize;
         assert_eq!(base % 8, 0, "{src}: block base {base} is not 8-aligned");
         for (name, offset) in [
-            ("gc", crate::abi::HEADER_GC_OFFSET),
             ("flags", crate::abi::HEADER_FLAGS_OFFSET),
             ("class", crate::abi::HEADER_CLASS_OFFSET),
         ] {
@@ -906,7 +983,7 @@ fn runtime_strings_and_promises_are_aligned_and_zeroed() {
     )));
     let s = base_of(bits);
     assert_eq!(s % 8, 0);
-    assert_eq!(&mem[s..s + 4], &[TYPE_STRING, 0, 0, 0]);
+    assert_eq!(header(&mem, s), [TYPE_STRING, 0, 0]);
     assert_eq!(u32_at(&mem, s + 4), 3);
     // A two-byte concatenation sets the flag; its 3 units take 6 data bytes.
     let (bits, mem) = thrown(&emit_throwing(lower_js(
@@ -914,7 +991,7 @@ fn runtime_strings_and_promises_are_aligned_and_zeroed() {
     )));
     let t = base_of(bits);
     assert_eq!(t % 8, 0);
-    assert_eq!(&mem[t..t + 4], &[TYPE_STRING, 0, STR_FLAG_TWO_BYTE, 0]);
+    assert_eq!(header(&mem, t), [TYPE_STRING, STR_FLAG_TWO_BYTE, 0]);
     assert_eq!(u32_at(&mem, t + 4), 3);
 
     // Two pending promises: the 40-byte runtime-memory.md §3.4 layout, `seq`
@@ -928,7 +1005,7 @@ fn runtime_strings_and_promises_are_aligned_and_zeroed() {
     let (p, q) = (base_of(u64_at(&mem, data)), base_of(u64_at(&mem, data + 8)));
     for at in [p, q] {
         assert_eq!(at % 8, 0);
-        assert_eq!(&mem[at..at + 4], &[TYPE_PROMISE, 0, 0, 0]);
+        assert_eq!(header(&mem, at), [TYPE_PROMISE, 0, 0]);
         assert_eq!(u32_at(&mem, at + 4), 0, "props");
         // `proto` = `%Promise.prototype%`.
         assert_eq!(
@@ -955,6 +1032,12 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         TYPE_ARRAY, TYPE_DATE, TYPE_ELEMS, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT,
         TYPE_PROMISE, TYPE_SET, UNDEFINED,
     };
+    use crate::abi::{
+        ELEMS_FLAG_WEAK, FINREG_CELLS_OFFSET, FINREG_CLEANUP_OFFSET, FINREG_FLAGS_OFFSET,
+        FINREG_JOB_NEXT_OFFSET, HOLE, TYPE_FINREG, TYPE_SYMBOL, TYPE_WEAKMAP, TYPE_WEAKREF,
+        TYPE_WEAKSET, WEAK_ENTRIES_OFFSET, WEAK_LIVE_OFFSET, WEAK_NEXT_OFFSET,
+        WEAKREF_TARGET_OFFSET,
+    };
     let u32_at = |mem: &[u8], at: u32| {
         let at = at as usize;
         u32::from_le_bytes(mem[at..at + 4].try_into().expect("u32"))
@@ -972,8 +1055,8 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         );
         let at = usize::try_from(bits & 0xFFFF_FFFF).expect("base");
         assert_eq!(
-            &mem[at..at + 4],
-            &[TYPE_FUNCTION, 0, 0, 0],
+            header(mem, at),
+            [TYPE_FUNCTION, 0, 0],
             "%Function.prototype%"
         );
     };
@@ -985,7 +1068,7 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         let base = u32::try_from(bits & 0xFFFF_FFFF).expect("base");
         assert_eq!(base % 8, 0, "{src}: 8-aligned");
         let at = base as usize;
-        assert_eq!(&memory[at..at + 4], &[kind, 0, flags, 0], "{src}: header");
+        assert_eq!(header(&memory, at), [kind, flags, 0], "{src}: header");
         assert_eq!(u32_at(&memory, base + OBJ_PROPS_OFFSET), 0, "{src}: props");
         let proto = u64_at(&memory, base + OBJ_PROTO_OFFSET);
         if kind == TYPE_FUNCTION {
@@ -1042,6 +1125,93 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
             "{src}: pairs"
         );
     }
+
+    // A weak collection keeps its pairs (a WeakSet: its keys) in a flagged
+    // element store whose unused and deleted slots hold `HOLE` keys
+    // (`undefined` values); the collector link is clear outside a cycle.
+    // `_start` reports the throw after `main` returned, and its first output
+    // allocates the render buffer: under `gc_stress` that collects while only
+    // the thrown handle and the realm are roots. So every live key is a realm
+    // intrinsic, and the pair positions are not pinned: a collection compacts
+    // the store (the deleted pair's tombstone goes away).
+    let (weak, mem) = heap(
+        "let k = {}; let w = new WeakMap(); w.set(k, 1); w.set(Object.prototype, 2); w.delete(k); w",
+        TYPE_WEAKMAP,
+        0,
+    );
+    assert_eq!(u32_at(&mem, weak + WEAK_NEXT_OFFSET), 0, "weak_next");
+    assert_eq!(u32_at(&mem, weak + WEAK_LIVE_OFFSET), 1, "live pairs");
+    let store = u32_at(&mem, weak + WEAK_ENTRIES_OFFSET);
+    assert_eq!(
+        header(&mem, store as usize),
+        [TYPE_ELEMS, ELEMS_FLAG_WEAK, 0],
+        "weak store"
+    );
+    assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 8, "four pairs");
+    let slot = |i: u32| u64_at(&mem, store + ELEMS_DATA_OFFSET + 8 * i);
+    let (live, empty): (Vec<u32>, Vec<u32>) = (0..4).partition(|&i| slot(2 * i) != HOLE);
+    assert_eq!(live.len(), 1, "one live pair");
+    let key = slot(2 * live[0]);
+    assert_eq!(mem[(key & 0xFFFF_FFFF) as usize], TYPE_OBJECT, "key");
+    assert_eq!(slot(2 * live[0] + 1), 2.0_f64.to_bits(), "value");
+    for i in empty {
+        assert_eq!(
+            [slot(2 * i), slot(2 * i + 1)],
+            [HOLE, UNDEFINED],
+            "empty pair {i}"
+        );
+    }
+    let (weak, mem) = heap(
+        "let w = new WeakSet(); w.add(Symbol.iterator); w",
+        TYPE_WEAKSET,
+        0,
+    );
+    assert_eq!(u32_at(&mem, weak + WEAK_LIVE_OFFSET), 1, "live keys");
+    let store = u32_at(&mem, weak + WEAK_ENTRIES_OFFSET);
+    assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 4, "four keys");
+    let slot = |i: u32| u64_at(&mem, store + ELEMS_DATA_OFFSET + 8 * i);
+    assert_eq!(mem[(slot(0) & 0xFFFF_FFFF) as usize], TYPE_SYMBOL, "key");
+    assert_eq!(slot(1), HOLE, "unused key");
+
+    // A WeakRef holds its target at @24 (kept alive by `KeepDuringJob`: the
+    // drain does not run after a throw); a FinalizationRegistry its cleanup
+    // at @24 and `(target, held, token)` cells in a flagged element store
+    // whose unused cells are all `undefined`; no job is queued (the target is
+    // a realm intrinsic, live at the report's collection) and the collector
+    // links are clear outside a cycle.
+    let (wr, mem) = heap("let o = { a: 1 }; new WeakRef(o)", TYPE_WEAKREF, 0);
+    assert_eq!(u32_at(&mem, wr + WEAK_NEXT_OFFSET), 0, "weak_next");
+    let target = u64_at(&mem, wr + WEAKREF_TARGET_OFFSET);
+    assert_eq!(mem[(target & 0xFFFF_FFFF) as usize], TYPE_OBJECT, "target");
+    let (fr, mem) = heap(
+        "let fr = new FinalizationRegistry(function () {}); fr.register(Object.prototype, 7); fr",
+        TYPE_FINREG,
+        0,
+    );
+    assert_eq!(u32_at(&mem, fr + WEAK_NEXT_OFFSET), 0, "weak_next");
+    assert_eq!(u32_at(&mem, fr + FINREG_FLAGS_OFFSET), 0, "flags");
+    assert_eq!(u32_at(&mem, fr + FINREG_JOB_NEXT_OFFSET), 0, "job_next");
+    let cleanup = u64_at(&mem, fr + FINREG_CLEANUP_OFFSET);
+    assert_eq!(
+        mem[(cleanup & 0xFFFF_FFFF) as usize],
+        TYPE_FUNCTION,
+        "cleanup"
+    );
+    let store = u32_at(&mem, fr + FINREG_CELLS_OFFSET);
+    assert_eq!(
+        header(&mem, store as usize),
+        [TYPE_ELEMS, ELEMS_FLAG_WEAK, 0],
+        "cell store"
+    );
+    assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 12, "four cells");
+    let slot = |i: u32| u64_at(&mem, store + ELEMS_DATA_OFFSET + 8 * i);
+    assert_eq!(mem[(slot(0) & 0xFFFF_FFFF) as usize], TYPE_OBJECT, "target");
+    assert_eq!(
+        [slot(1), slot(2)],
+        [7.0_f64.to_bits(), UNDEFINED],
+        "held, token"
+    );
+    assert_eq!([slot(3), slot(4), slot(5)], [UNDEFINED; 3], "unused cell");
 
     // An array literal owns a `cap = len` store; pushes grow it by doubling
     // from 4, and the handle never moves.
@@ -1377,8 +1547,9 @@ fn leaf_set_matches_the_call_graph() {
 }
 
 /// `__array_push` touches `$__sp` only on its sparse-or-growth path: the
-/// prologue, the sparse `return`, and the region end, all after the two
-/// fast-path tests.
+/// prologue, the sparse `return`, the out-of-memory `return` after
+/// `__array_reserve` (design/runtime-memory.md §5.8), and the region end, all
+/// after the two fast-path tests.
 #[test]
 fn array_push_frame_is_shrink_wrapped() {
     use wasmparser::{Operator, Parser, Payload};
@@ -1425,7 +1596,7 @@ fn array_push_frame_is_shrink_wrapped() {
                 _ => {}
             }
         }
-        assert_eq!(sp_writes, 3);
+        assert_eq!(sp_writes, 4);
         assert_eq!(ifs_before_frame, Some(2));
     });
 }
@@ -1537,5 +1708,177 @@ fn number_conversion_leaves() {
         helpers.msg_str(),
     ] {
         assert!(!leaves.is_leaf(helper), "function {helper} allocates");
+    }
+}
+
+/// The page helpers and the sweep are non-allocating leaves; the per-class
+/// entry `__alloc_small` is an allocation, so a safepoint (runtime-memory.md
+/// §5.3, §5.6). Every module carries the sweep, so it validates.
+#[test]
+fn gc_page_helpers_are_leaves() {
+    let program = expr_program(IrNode::Num(0.0));
+    let (_, strings_end) = collect_strings(&program);
+    let layout = super::FnLayout {
+        info: strings_end,
+        blocks: strings_end,
+        realm: strings_end,
+        unicode: strings_end,
+    };
+    let unwind = std::cell::RefCell::new(super::Unwind::default());
+    let (.., helpers, _) =
+        super::sections::build_type_and_function_sections(&program, &unwind, layout);
+    let leaves = super::roots::leaf_set(helpers);
+    for helper in [
+        helpers.gc_take_pages(),
+        helpers.gc_release_pages(),
+        helpers.gc_sweep(),
+    ] {
+        assert!(leaves.is_leaf(helper), "function {helper} is a leaf");
+    }
+    assert!(!leaves.is_leaf(helpers.alloc_small()));
+    assert!(!leaves.is_leaf(helpers.alloc));
+    validate(&emit(&program));
+}
+
+/// A `gc_stress` interval `N > 1` (runtime-memory.md §5.6): every allocation
+/// collects for the first [`super::GC_STRESS_PREFIX`] collections, then every
+/// `N`th. Off, every allocation and an interval are three distinct modules
+/// (the interval adds `$__gc_stress_count`), and a run that crosses the
+/// prefix (at least two allocations per iteration, 40 000 in all) computes what the default
+/// build does.
+#[test]
+fn gc_stress_interval_after_prefix() {
+    let src = "let keep = []; let sum = 0; \
+               for (let i = 0; i < 20000; i++) { \
+                 const o = { i: i, s: 'k' + i }; \
+                 if (i % 100 === 0) keep.push(o); \
+                 sum += o.s.length; \
+               } \
+               sum + keep.length + keep[199].i + keep[199].s.length";
+    let program = crate::codegen::lower(
+        &crate::frontend::parse(src, crate::frontend::Dialect::Js).expect("parse"),
+    )
+    .expect("lower");
+    let module = |gc_stress| {
+        super::emit(
+            &program,
+            CompileOptions {
+                print_completion: true,
+                gc_stress,
+            },
+        )
+    };
+    let (off, every, interval) = (module(0), module(1), module(7));
+    assert_ne!(off, every);
+    assert_ne!(every, interval);
+    assert_ne!(off, interval);
+    validate(&interval);
+    let expected = completion(&off);
+    assert_eq!(expected, "128996");
+    assert_eq!(completion(&interval), expected);
+}
+
+/// A predicate selecting the IR call node a test rewrites.
+type NodePick<'a> = &'a dyn Fn(&IrNode) -> bool;
+
+/// The argument list of a call node that pushes `K` positional slots.
+fn call_args_mut(node: &mut IrNode) -> Option<&mut Vec<IrNode>> {
+    match node {
+        IrNode::Call { args, .. }
+        | IrNode::CallIndirect { args, .. }
+        | IrNode::MethodCallUser { args, .. }
+        | IrNode::ThisCall { args, .. }
+        | IrNode::Construct { args, .. } => Some(args),
+        _ => None,
+    }
+}
+
+/// Append `extra` to the arguments of the first one-argument call node in
+/// `node` that `pick` accepts; whether one was found.
+fn widen_node(node: &mut IrNode, pick: NodePick<'_>, extra: &[IrNode]) -> bool {
+    if pick(node)
+        && let Some(args) = call_args_mut(node)
+        && args.len() == 1
+    {
+        args.extend_from_slice(extra);
+        return true;
+    }
+    node.children_mut()
+        .into_iter()
+        .any(|child| widen_node(child, pick, extra))
+}
+
+/// [`widen_node`] over a statement list (and the bodies nested in it).
+fn widen_stmts(stmts: &mut [IrStmt], pick: NodePick<'_>, extra: &[IrNode]) -> bool {
+    stmts.iter_mut().any(|stmt| match stmt {
+        IrStmt::Decl { init: node, .. } | IrStmt::Expr(node) | IrStmt::Return(Some(node)) => {
+            widen_node(node, pick, extra)
+        }
+        IrStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            widen_node(cond, pick, extra)
+                || widen_stmts(then_body, pick, extra)
+                || widen_stmts(else_body, pick, extra)
+        }
+        _ => false,
+    })
+}
+
+/// Lower `src` (whose widest call passes one argument, so `K = 1`), append
+/// the arguments `2, 3` to the first one-argument call node `pick` accepts
+/// — the shape of an IR fragment a builtin builds — and run it. The callee
+/// gathers `...r` and completes with `r.length * 10 + r[2]`, so `33` proves
+/// every argument and the real `argc` reached it instead of the surplus
+/// being dropped.
+fn run_widened(src: &str, pick: NodePick<'_>) -> String {
+    let mut program = lower_js(src);
+    assert_eq!(program.arity, 1, "the source fixes K = 1");
+    let extra = [IrNode::Num(2.0), IrNode::Num(3.0)];
+    let found = widen_stmts(&mut program.stmts, pick, &extra)
+        || program
+            .functions
+            .iter_mut()
+            .any(|f| widen_stmts(&mut f.body, pick, &extra));
+    assert!(found, "no matching call node in {src}");
+    let bytes = emit(&program);
+    validate(&bytes);
+    completion(&bytes)
+}
+
+/// An IR call with more arguments than `K` takes the spread call form for
+/// every call node kind: direct, indirect, method, `super.m(..)` and `new`.
+#[test]
+fn ir_calls_past_k_pass_every_argument() {
+    let body = "return r.length * 10 + r[2];";
+    let cases: [(String, NodePick<'_>); 5] = [
+        (format!("function f(...r) {{ {body} }} f(1)"), &|n| {
+            matches!(n, IrNode::Call { .. })
+        }),
+        (
+            format!("let g = function (...r) {{ {body} }}; g = g; g(1)"),
+            &|n| matches!(n, IrNode::CallIndirect { .. }),
+        ),
+        (
+            format!("const o = {{ m(...r) {{ {body} }} }}; o.m(1)"),
+            &|n| matches!(n, IrNode::MethodCallUser { .. }),
+        ),
+        (
+            format!(
+                "class A {{ m(...r) {{ {body} }} }} \
+                 class B extends A {{ m() {{ return super.m(1); }} }} new B().m()"
+            ),
+            &|n| matches!(n, IrNode::ThisCall { .. }),
+        ),
+        (
+            "class C { constructor(...r) { this.v = r.length * 10 + r[2]; } } new C(1).v"
+                .to_owned(),
+            &|n| matches!(n, IrNode::Construct { spread: None, .. }),
+        ),
+    ];
+    for (src, pick) in cases {
+        assert_eq!(run_widened(&src, pick), "33", "{src}");
     }
 }

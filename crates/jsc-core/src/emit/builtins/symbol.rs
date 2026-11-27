@@ -79,8 +79,9 @@ fn new_symbol(
     helpers: Helpers<'_>,
 ) {
     let header = i32::from(abi::TYPE_SYMBOL) | (i32::from(flags) << 16);
+    emit_alloc_const(function, helpers, abi::SYMBOL_BLOCK_SIZE.cast_signed());
     wasm!(function;
-        I32Const(abi::SYMBOL_BLOCK_SIZE.cast_signed()), Call(helpers.alloc), LocalTee(block),
+        LocalTee(block),
         I32Const(header), I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }),
         LocalGet(block), I32Const(0), I32Store(MemArg { offset: 4, align: 2, memory_index: 0 }),
         LocalGet(block), LocalGet(description),

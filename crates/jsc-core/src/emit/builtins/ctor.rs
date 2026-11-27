@@ -14,23 +14,51 @@ use super::date::date_fields_time;
 pub(super) struct Body {
     /// The uniform ABI's positional arity `K`.
     pub(super) k: u32,
+    /// The rooted local holding a snapshot of `$__spread_args`, read instead
+    /// of the global past the `K` slots.
+    spread: Option<u32>,
 }
 
 impl Body {
-    /// Argument `i` (`undefined` past the `K` slots).
-    fn arg(&self, i: u32) -> IrNode {
-        if i < self.k {
-            IrNode::Local(i)
-        } else {
-            IrNode::Undefined
-        }
+    /// The body under `K = k`, reading arguments past the slots from
+    /// `$__spread_args` itself.
+    pub(super) const fn new(k: u32) -> Self {
+        Self::with_spread(k, None)
     }
 
-    /// Argument `i`, past the `K` slots the element of the argument array a
-    /// spread call or construct with more arguments published (`undefined`
-    /// past the argument count). Read it before any user code runs: a nested
-    /// spread call replaces that array.
-    pub(super) fn spread_arg(&self, i: u32) -> IrNode {
+    /// The body under `K = k` reading arguments past the slots from the
+    /// snapshot in local `spread`, when given.
+    pub(super) const fn with_spread(k: u32, spread: Option<u32>) -> Self {
+        Self { k, spread }
+    }
+
+    /// The body under `K = k` of a constructor that reads arguments
+    /// `0..reads` after user code may run (`Get(new.target, "prototype")`),
+    /// with the assignment that must run first: when one is past the `K`
+    /// slots, `$__spread_args` captured into the rooted `Frame::x64(1)`.
+    fn snapshotted(k: u32, reads: u32) -> (Self, Option<IrNode>) {
+        if reads <= k {
+            return (Self::new(k), None);
+        }
+        let local = Frame::new(k).x64(1);
+        let capture = IrNode::Assign {
+            local,
+            value: Box::new(IrNode::SpreadArgsGlobal),
+        };
+        (Self::with_spread(k, Some(local)), Some(capture))
+    }
+
+    /// The published spread argument array: the snapshot, else the global.
+    fn spread_args(&self) -> IrNode {
+        self.spread.map_or(IrNode::SpreadArgsGlobal, IrNode::Local)
+    }
+
+    /// Argument `i`: slot `i`, or past the `K` slots the element of the
+    /// argument array a spread call or construct with more arguments
+    /// published (`undefined` past the argument count). Without a snapshot,
+    /// read it before any user code runs: a nested spread call replaces that
+    /// array.
+    pub(super) fn arg(&self, i: u32) -> IrNode {
         if i < self.k {
             return IrNode::Local(i);
         }
@@ -41,7 +69,7 @@ impl Body {
                 rhs: Box::new(IrNode::Num(f64::from(i))),
             },
             IrNode::Index {
-                obj: Box::new(IrNode::SpreadArgsGlobal),
+                obj: Box::new(self.spread_args()),
                 index: Box::new(IrNode::Num(f64::from(i))),
             },
             IrNode::Undefined,
@@ -130,6 +158,14 @@ pub(super) fn ternary(cond: IrNode, then_branch: IrNode, else_branch: IrNode) ->
     }
 }
 
+/// `node` after the snapshot `capture` of [`Body::snapshotted`], if any.
+fn after(capture: Option<IrNode>, node: IrNode) -> IrNode {
+    match capture {
+        Some(capture) => IrNode::Seq(vec![capture, node]),
+        None => node,
+    }
+}
+
 /// Throw a fresh `TypeError` with `message`.
 fn throw_type_error(message: &str) -> IrNode {
     IrNode::Throw(Box::new(IrNode::error_object(
@@ -150,11 +186,11 @@ fn is_nullish(value: IrNode) -> IrNode {
 
 /// The body of `ctor` over the `K = k` argument slots.
 pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
-    let body = Body { k };
+    let body = Body::new(k);
     match ctor {
         BuiltinCtor::Object => object(&body),
         BuiltinCtor::Function => throw_type_error("the Function constructor is not supported"),
-        BuiltinCtor::Array => array(&body),
+        BuiltinCtor::Array => array(k),
         BuiltinCtor::String => conversion(
             &body,
             ctor,
@@ -166,7 +202,9 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
             conversion(&body, ctor, [ConvertOp::ToBoolean; 2], IrNode::Bool(false))
         }
         BuiltinCtor::Error(ErrorKind::AggregateError) => aggregate_error(&body),
+        // The message is read after `GetPrototypeFromConstructor`.
         BuiltinCtor::Error(kind) => {
+            let (body, capture) = Body::snapshotted(k, 1);
             let (proto, options) = (body.temp(1), body.temp(3));
             let error = IrNode::error_from_argument(
                 kind,
@@ -175,17 +213,18 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
                 body.temp(0),
                 body.temp(2),
             );
-            IrNode::Seq(vec![
+            let steps = vec![
                 IrNode::Assign {
                     local: options,
-                    value: Box::new(body.spread_arg(1)),
+                    value: Box::new(body.arg(1)),
                 },
                 IrNode::Assign {
                     local: proto,
                     value: Box::new(body.proto(ctor)),
                 },
                 IrNode::install_error_cause(error, IrNode::Local(options), proto, body.temp(0)),
-            ])
+            ];
+            IrNode::Seq(capture.into_iter().chain(steps).collect())
         }
         // The allocation only: `map_set::emit_ctor` adds the iterable's values.
         BuiltinCtor::Map | BuiltinCtor::Set => {
@@ -197,14 +236,25 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
             );
             body.requires_new(ctor, map)
         }
+        // The prototype only: `weak::emit_ctor` allocates the handle and adds
+        // the iterable's values (`weak::emit_weak_ref_ctor` /
+        // `weak::emit_finreg_ctor` check their argument first).
+        BuiltinCtor::WeakMap
+        | BuiltinCtor::WeakSet
+        | BuiltinCtor::WeakRef
+        | BuiltinCtor::FinalizationRegistry => body.requires_new(ctor, body.proto(ctor)),
+        // Under `K = 0` the executor of a spread construct (a subclass's
+        // implicit `super(...args)`, a species construct) is in the spread
+        // argument array, read after the `new.target.prototype` lookup.
         BuiltinCtor::Promise => {
+            let (body, capture) = Body::snapshotted(k, 1);
             let promise = IrNode::PromiseCtor {
                 executor: Box::new(body.arg(0)),
                 p_local: body.temp(3),
             };
-            body.requires_new(ctor, body.with_proto(ctor, promise))
+            body.requires_new(ctor, after(capture, body.with_proto(ctor, promise)))
         }
-        BuiltinCtor::Date => date(&body),
+        BuiltinCtor::Date => date(k),
         // A hand-written body (`symbol::emit_ctor`).
         BuiltinCtor::Symbol => IrNode::Undefined,
         // Abstract: only a subclass `new.target` constructs (the allocated
@@ -234,11 +284,11 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
 fn aggregate_error(body: &Body) -> IrNode {
     let ctor = BuiltinCtor::Error(ErrorKind::AggregateError);
     let (obj, proto) = (body.temp(0), body.temp(1));
-    let frame = Frame { k: body.k };
+    let frame = Frame::new(body.k);
     let (errors, message, options) = (frame.y64(0), frame.y64(1), frame.y64(2));
     let capture = |local: u32, i: u32| IrNode::Assign {
         local,
-        value: Box::new(body.spread_arg(i)),
+        value: Box::new(body.arg(i)),
     };
     let error = IrNode::error_from_argument(
         ErrorKind::AggregateError,
@@ -310,8 +360,12 @@ fn object(body: &Body) -> IrNode {
 /// `Array(..)` / `new Array(..)`: one number argument is the length (a
 /// `length` write, so an invalid one throws the `RangeError` and a large one
 /// is sparse); otherwise the arguments are the elements (more than `K` only
-/// through a spread call, whose published argument array is copied).
-fn array(body: &Body) -> IrNode {
+/// through a spread call, whose published argument array is copied). Every
+/// argument is read after `GetPrototypeFromConstructor`, so the published
+/// array is captured first.
+fn array(k: u32) -> IrNode {
+    let (body, capture) = Body::snapshotted(k, k + 1);
+    let body = &body;
     let arr = body.temp(3);
     let with_length = IrNode::Seq(vec![
         IrNode::Assign {
@@ -331,7 +385,7 @@ fn array(body: &Body) -> IrNode {
         rhs: Box::new(IrNode::Str("number".into())),
     };
     let one = ternary(is_number, with_length, IrNode::Array(vec![body.arg(0)]));
-    let spread = IrNode::ArraySpread(vec![SpreadElem::List(IrNode::SpreadArgsGlobal)]);
+    let spread = IrNode::ArraySpread(vec![SpreadElem::List(body.spread_args())]);
     let elements = (0..=body.k).rev().fold(spread, |more, n| {
         ternary(
             body.argc_is(n),
@@ -339,7 +393,8 @@ fn array(body: &Body) -> IrNode {
             more,
         )
     });
-    body.with_proto(BuiltinCtor::Array, ternary(body.argc_is(1), one, elements))
+    let array = body.with_proto(BuiltinCtor::Array, ternary(body.argc_is(1), one, elements));
+    after(capture, array)
 }
 
 /// `String(v)` / `Number(v)` / `Boolean(v)`: the conversion `call` of the
@@ -372,8 +427,11 @@ fn conversion(
 }
 
 /// `new Date()` / `new Date(ms)` / `new Date(year, month, ..)`; called,
-/// `Date()` is the current time as `Date.prototype.toString` renders it.
-fn date(body: &Body) -> IrNode {
+/// `Date()` is the current time as `Date.prototype.toString` renders it. The
+/// arguments (up to seven) are read after `GetPrototypeFromConstructor`.
+fn date(k: u32) -> IrNode {
+    let (body, capture) = Body::snapshotted(k, 7);
+    let body = &body;
     let alloc = ternary(
         body.argc_is(0),
         IrNode::DateNew { arg: None },
@@ -386,9 +444,10 @@ fn date(body: &Body) -> IrNode {
         ),
     );
     let now = body.temp(3);
+    let constructed = body.with_proto(BuiltinCtor::Date, alloc);
     ternary(
         body.constructing(),
-        body.with_proto(BuiltinCtor::Date, alloc),
+        after(capture, constructed),
         IrNode::Seq(vec![
             IrNode::Assign {
                 local: now,

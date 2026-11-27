@@ -42,6 +42,7 @@ pub fn compile(src: &str, options: Option<JsCompileOptions>) -> Result<Vec<u8>, 
         print_completion: options
             .and_then(|options| options.print_completion())
             .unwrap_or(false),
+        gc_stress: 0,
     };
     compile_inner(src, options).map_err(|err| JsError::new(&render_error(&err, src)))
 }

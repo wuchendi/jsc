@@ -64,7 +64,7 @@ Three structural decisions shape the implementation:
   `wasm-encoder` — no C, text, or LLVM intermediate. Builtins are wasm
   functions emitted into every module, installed on static realm objects (§6.4).
 - **One value word.** Every JS value is a single NaN-boxed `i64`; all heap data
-  lives in one linear memory with a bump allocator (§4, §5).
+  lives in one linear memory with a page allocator (§4, §5).
 
 ---
 
@@ -94,7 +94,8 @@ JS source ──▶ swc AST ──▶ IR ──────────▶ wasm 
 3. **emit** (`emit/`) — walks the IR and produces the module: types, imports,
    function bodies, the runtime helpers and builtin bodies, the funcref table,
    memory, globals, exports, and the data segments holding the static region
-   (interned strings, function data, the realm image, the intern table, the Unicode tables).
+   (interned strings, function data, the realm image, the intern table, the Unicode tables,
+   the collector's static root list).
 4. **run** (`run/`, feature `native-run`) — instantiates the module on wasmtime
    with a `Linker` that supplies the four WASI imports (§6.1), calls
    `_start`, and maps `proc_exit` to an exit code. The module itself drains the
@@ -295,19 +296,20 @@ jsval, or the **construct marker** `-(n + 1)` when the callee runs under `new`
 | `5 … 4+n` | the `n` user functions |
 | then | runtime helpers in a fixed order (§6.2): `__alloc` … `__to_number` |
 | then | `__invoke1`, `__async_step`, the two `new Promise` settlers, `new_string`, `__new_array`, `__has_own` |
-| then | the builtin bodies, one per `Builtin::ALL` entry (`emit/realm.rs`, 142 entries) |
+| then | the builtin bodies, one per `Builtin::ALL` entry (`emit/realm.rs`, 366 entries) |
 | then | `__to_primitive`, `__to_string`, `__add`, `__compare`, `__array_join`, `__to_object`, `__json_rep`, `__json_indent`, `__json_revive`, and the rest of §6.2 up to the private-name helpers |
 | then | the renderer helpers (§6.2), then `_start` |
-| last | the Unicode helpers (`emit/unicode.rs`), the `Math` helpers (`emit/libm.rs`), then the promise engine (`emit/promise_engine.rs`, §6.7) |
+| last | the Unicode helpers (`emit/unicode.rs`), the `Math` helpers (`emit/libm.rs`), the promise engine (`emit/promise_engine.rs`, §6.7), then the allocator helpers (`emit/gc.rs`, §5.6) |
 
-**Table.** A funcref table of exactly `n + 2 + 142` entries (min = max), filled
+**Table.** A funcref table of exactly `n + 2 + 366` entries (min = max), filled
 by one active element segment: slots `0 … n-1` are the user functions, slots
 `n` and `n + 1` the two settlers, then the builtin bodies in `Builtin::ALL`
 order. A function value's `func_idx` is a slot in this table. Every module has
 the table, including one without user functions.
 
-**Memory.** One linear memory, `min = 1` page, `max = 8192` pages (512 MiB,
-`abi::MEMORY_MAX_PAGES`), exported as `"memory"`.
+**Memory.** One linear memory, `min` = the pages below the heap start,
+`max = 8192` pages (512 MiB, `abi::MEMORY_MAX_PAGES`), exported as
+`"memory"`.
 
 **Globals.**
 
@@ -315,7 +317,7 @@ None is exported.
 
 | index | name | type | role |
 |---|---|---|---|
-| 0 | `$__heap_ptr` | `i32` | bump-allocator cursor (§5.6) |
+| 0 | `$__heap_ptr` | `i32` | page frontier: the end of the highest heap page obtained (§5.6) |
 | 1 | `$exc_pending` | `i32` | `1` while an exception propagates |
 | 2 | `$exc_value` | `i64` | the in-flight thrown jsval |
 | 3 | `$cf_kind` | `i32` | pending `return`/`break`/`continue` routed through `finally` |
@@ -334,7 +336,22 @@ None is exported.
 | 26–27 | `$__job_head`, `$__job_tail` | `i32` | promise job queue, raw refs (§6.7) |
 | 28 | `$__promise_seq` | `i32` | promise creation counter (§6.7) |
 | 29 | `$__rejected_head` | `i32` | rejected-promise list head, raw ref (§6.7) |
-| 30+ | module cells | `i64` | one cell pointer per module binding (`30 + slot`, §7.1), then one per tagged-template site (§7.4) |
+| 30 | `$__gc_debt` | `i32` | allocation budget left before a collection, initialized to `GC_MIN_BUDGET` (§5.6) |
+| 31 | `$__gc_live` | `i32` | bytes surviving the last sweep (§5.6) |
+| 32 | `$__gc_epoch` | `i32` | mark epoch, `1..=255`, initialized to `1` (§5.1) |
+| 33 | `$__gc_busy` | `i32` | `1` while a collection runs |
+| 34 | `$__gc_free_pages` | `i32` | pages in the free-page pool (§5.6) |
+| 35 | `$__gc_large` | `i32` | head of the large-span list, raw ref (§5.6) |
+| 36–38 | `$__gc_stack`, `$__gc_stack_top`, `$__gc_stack_end` | `i32` | the mark stack of the running collection: base, first free entry, end (§5.7) |
+| 39 | `$__gc_overflow` | `i32` | set when a mark-stack push found no room (§5.7) |
+| 40 | `$__gc_reserve` | `i32` | the out-of-memory reserve's first page, `0` while spent (§5.6) |
+| 41 | `$__gc_weak` | `i32` | the running collection's `WeakMap` / `WeakSet` list, linked through `weak_next`, sentinel `1` = empty (§5.7) |
+| 42 | `$__gc_weak_refs` | `i32` | the running collection's `WeakRef` list, same shape (§5.7) |
+| 43 | `$__gc_weak_regs` | `i32` | the running collection's `FinalizationRegistry` list, same shape (§5.7) |
+| 44 | `$__kept_objects` | `i32` | the `KeepDuringJob` set: raw ref to an internal array handle, `0` until the first push (§6.7) |
+| 45 | `$__fin_jobs` | `i32` | pending finalization cleanup jobs: raw ref to a registry, linked through `job_next`, `0` = none (§6.7) |
+| 46+ | module cells | `i64` | one cell pointer per module binding (`46 + slot`, §7.1), then one per tagged-template site (§7.4) |
+| after the cells | `$__gc_stress_count` | `i32` | test-only `gc_stress` interval above `1`: collections run so far, saturating at `GC_STRESS_PREFIX` (§5.6); absent otherwise |
 
 **Exports.** Exactly `_start: () -> ()` and `memory` (§6.8).
 
@@ -358,15 +375,17 @@ for `8N + 8` bytes, never from `$fp + 8`, which wraps to `0` at `$fp = -8`. The
 collector (M2) scans `[$__sp + 8, SS_SIZE)`. Overflow wraps below `0` and the
 first slot store traps: at `$fp = -8` the static-offset address does not wrap.
 
-**Static region (data segments).** Everything from `SS_SIZE` to the initial
-heap pointer is laid out by the compiler, in this order:
+**Static region (data segments).** Everything from `SS_SIZE` to the heap
+start is laid out by the compiler, in this order:
 
 | range (from `SS_SIZE`) | contents |
 |---|---|
 | `0 … 7` | null guard word; the `u32` at `abi::FN_INFO_ADDR = SS_SIZE + 4` holds the base of the function info table |
 | `8 … 47` | WASI scratch area (`abi::WASI_SCRATCH`): one iovec, `nwritten`, the clock result and the random seed buffer |
 | `48 … 95` | the iovec (`abi::OOM_IOVEC`) and bytes of the static out-of-memory line (§5.6) |
-| `96 …` `abi::STATIC_AREA_END` | the number-conversion scratch and tables: `abi::DEC_SCRATCH`, the decimal parser tables, `abi::NUM_SCRATCH_ADDR`, `abi::RYU_TABLES_ADDR` |
+| `96 … 103` | 8 zero bytes read as an empty one-byte string (`abi::OOM_EMPTY_STR`), the dummy result of a failed string allocation (§5.6) |
+| `104 …` `abi::GC_PAGE_TABLE` | the number-conversion scratch and tables: `abi::DEC_SCRATCH`, the decimal parser tables, `abi::NUM_SCRATCH_ADDR`, `abi::RYU_TABLES_ADDR`, then 4 padding bytes: the allocator area's end is rounded up to `abi::BLOCK_ALIGN` with the pad placed before it, so `abi::GC_MARK_STACK`, `abi::STATIC_AREA_END` and every block after it are 8-aligned (const-asserted in `abi.rs`) |
+| `abi::GC_PAGE_TABLE …` `abi::STATIC_AREA_END` | the allocator's static state (§5.6): the page table (one byte per page, 8 KiB), the per-class free-list heads and current pages (`u32[19]` each, zero), the class size table (`u32[19]`), the collector's static mark stack (`abi::GC_MARK_STACK`, 4 KiB, §5.7) |
 | `abi::STATIC_AREA_END …` `abi::STATIC_AREA_END + libm::STATIC_SIZE` | the `Math` block (`emit/libm.rs`): the constant tables of `rem_pio2_large` and `atan`, then the working arrays of `rem_pio2_large` |
 | from `HEAP_BASE = abi::STATIC_AREA_END + libm::STATIC_SIZE` | every distinct string literal and static key, one `TYPE_STRING` block each, 8-byte aligned, `flags = INTERNED` (plus `ARRAY_INDEX` for a canonical index spelling) |
 | next | the function info table: one 8-byte entry `[name: u32 interned key][length: u32]` per funcref slot (user functions, the two settlers, the builtins) |
@@ -374,8 +393,10 @@ heap pointer is laid out by the compiler, in this order:
 | next | the realm image (§6.4) |
 | next | the intern table: a power-of-two array of `u32` slots (§5.3) |
 | next | the Unicode tables (case runs, special casing, `Cased` / `Case_Ignorable` / `Alphanumeric` ranges): one raw segment, never traced, generated into `emit/unicode_data.rs` by `tools/unicode-tables` |
+| next (4-aligned) | the collector's static root list `[count: u32][addr: u32 × count]`: every static declaration block, then the realm image's intrinsic and builtin-method blocks (§5.7) |
 
-`$__heap_ptr` starts right after the Unicode tables, rounded up to 8. Identical literals share one
+The heap starts at the first 64 KiB page boundary after the static root list
+(the initial `$__heap_ptr`). Identical literals share one
 blob, so a literal costs no run-time allocation and its address is its
 interned property key.
 
@@ -395,8 +416,35 @@ interned property key.
   extra arguments are ignored, and `argc` carries the real count. A spread call
   (`f(...xs)`) fills the `K` positional slots from the flattened array and
   publishes the whole array in `$__spread_args`, so a callee that gathers its
-  arguments (a rest parameter, `arguments`, a variadic builtin) reads the
-  elements beyond `K` from it.
+  arguments (a rest parameter, `arguments`, a variadic builtin, a builtin
+  constructor's argument such as the `Promise` executor) reads the elements
+  beyond `K` from it. Every builtin body reads an argument past `K` from that
+  array (`undefined` past `argc`), never as a silent `undefined`. A nested
+  spread call publishes a fresh array, so a builtin that reads an argument
+  past `K` after user code may run (a coercion, a getter, a callback,
+  `Get(new.target, "prototype")`) first snapshots `$__spread_args` into a
+  rooted local and reads that; when every argument it reads fits in `K` it
+  emits no snapshot.
+- **Builtin calls into user code.** A builtin calling a function value with
+  more arguments than `K` (a `forEach` callback's `(value, key, map)`, a
+  replacer's `(key, value)`, a `replace` callback's `(match, position,
+  string)`, a constructor's executor under `K = 0`) never drops the surplus:
+  it fills the `K` slots, passes the real `argc`, and publishes all the
+  arguments in a fresh spread argument array, exactly like a spread call. When
+  that allocation runs out of memory the callee is not called and the
+  `RangeError` propagates. The same holds for a promise reaction or a
+  `FinalizationRegistry` cleanup callback under `K = 0` (`__invoke1` passes
+  its one argument in a one-element spread array), for a one-argument
+  accessor-style call under `K = 0` (a setter, `@@toPrimitive` with its hint,
+  `@@hasInstance`: the same one-element array; on OOM the call yields
+  `undefined` with the `RangeError` pending), for an inline array
+  higher-order method whose callback may gather more than `K` arguments (the
+  shared spill array is allocated, and checked, before the first callback),
+  and for an IR call node a builtin builds with more literal arguments than
+  `K`: it is emitted as the equivalent spread call (a direct call, an indirect
+  call, a method call, or a `new` /
+  `super(..)`), a compile-time choice that leaves every call fitting in `K` —
+  every source call — unchanged.
 - **`this`.** `this` rides the `$__this` global rather than a parameter. A method
   call `obj.m(args)` evaluates `obj` and the arguments, then sets
   `$__this = obj` immediately before `call_indirect`; a plain call resets it to
@@ -421,16 +469,17 @@ Every heap block starts with a 4-byte header (`HEADER_SIZE = 4`):
 | byte | field | values |
 |---|---|---|
 | 0 | `kind` | the type byte (§5.2) |
-| 1 | `gc` | GC epoch mark; always `0` until the collector lands |
+| 1 | `gc` | mark epoch (§5.7): the block is marked iff `gc == $__gc_epoch`; `0` on a fresh block and on every static blob |
 | 2 | `flags` | per kind, `0` = default (below) |
 | 3 | `class` | `TYPE_OBJECT` sub-class (§5.2); `0` for every other kind |
 
-Every block base is 8-byte aligned (`BLOCK_ALIGN = 8`): `__alloc` rounds every
-request up and static blobs are padded, so `i64` slots at block offsets ≡ 0
-(mod 8) are naturally aligned. Multi-byte fields are little-endian.
+Every block base is 8-byte aligned (`BLOCK_ALIGN = 8`): heap blocks sit on
+16-byte slot or span boundaries (§5.6) and static blobs are padded, so `i64`
+slots at block offsets ≡ 0 (mod 8) are naturally aligned. Multi-byte fields are little-endian.
 
 The **object family** — `TYPE_ARRAY`, `TYPE_OBJECT`, `TYPE_FUNCTION`,
-`TYPE_MAP`, `TYPE_SET`, `TYPE_PROMISE`, `TYPE_GENERATOR`, `TYPE_DATE` — shares
+`TYPE_MAP`, `TYPE_SET`, `TYPE_PROMISE`, `TYPE_GENERATOR`, `TYPE_DATE`,
+`TYPE_WEAKMAP`, `TYPE_WEAKSET`, `TYPE_WEAKREF`, `TYPE_FINREG` — shares
 a 16-byte prefix (`OBJ_PREFIX_SIZE = 16`):
 
 | offset | size | field |
@@ -471,7 +520,11 @@ the array bits is ever cleared (except `JOINING`).
 | `10` `TYPE_DATE` | `Date` | prefix, `ms: f64 @16` (the `TimeClip`ped time value; local time is UTC, `LocalTZA = 0`) | 24 | `object` |
 | `11` `TYPE_ACCESSOR` | accessor pair (internal) | header, pad, `getter: i64 @8`, `setter: i64 @16` | 24 | — |
 | `12` `TYPE_PROPS` | own-property table (internal) | §5.3 | `16 + 16·cap` | — |
-| `13` `TYPE_ELEMS` | array element store (internal) | header, `cap: u32 @4`, `elem: i64 × cap @8` | `8 + 8·cap` | — |
+| `13` `TYPE_ELEMS` | array element store (internal) | header (flags: `1` `ELEMS_FLAG_WEAK`, the entry store of a weak collection or registry), `cap: u32 @4`, `elem: i64 × cap @8` | `8 + 8·cap` | — |
+| `15` `TYPE_WEAKMAP` | `WeakMap` | prefix, `weak_next: u32 @16` (collector scratch, `0` outside a collection), `entries: u32 @20` → weak `TYPE_ELEMS` of `(key, value)` pairs (`0` until the first entry), `live: u32 @24`, pad | 32 | `object` |
+| `16` `TYPE_WEAKSET` | `WeakSet` | same as `TYPE_WEAKMAP`; the store holds keys alone | 32 | `object` |
+| `17` `TYPE_WEAKREF` | `WeakRef` | prefix, `weak_next: u32 @16`, pad, `target: i64 @24` (weak; `undefined` once collected) | 32 | `object` |
+| `18` `TYPE_FINREG` | `FinalizationRegistry` | prefix, `weak_next: u32 @16`, `cells: u32 @20` → weak `TYPE_ELEMS` of `(target, held, token)` triples, `cleanup: i64 @24`, `flags: u32 @32` (`1` `FINREG_FLAG_JOB_QUEUED`), `job_next: u32 @36` (the `$__fin_jobs` link) | 40 | `object` |
 | `19` `TYPE_RAW` | internal raw buffer | header, `len: u32 @4`, `len` bytes from `@8`, no references (the grown intern table, `Math.sumPrecise` accumulator) | 8 + `len` | — |
 | `14` `TYPE_SYMBOL` | Symbol primitive | header (flags: `4` `SYMBOL_FLAG_REGISTERED`, `8` `SYMBOL_FLAG_PRIVATE` (a private name, §7.6, phase 5a); bits `1`/`2` always clear), reserved `u32 @4` = 0, `description: i64 @8` (string or `undefined`) | 16 | `symbol` |
 
@@ -514,10 +567,29 @@ Notes per kind:
   value) and `clear` tombstones every pair, so live iterators and `forEach`
   keep their slot index and see entries appended later (including after a
   `clear`); a re-added key appends. The backing is never compacted or
-  shrunk (it keeps its tombstones until a collector exists, §13). `size` is
+  shrunk, not even by the collector (a running `forEach` holds a slot index
+  in a wasm local; §13). `size` is
   the live entry
   count. Lookup is a linear scan with `__same_value_zero` that skips
   tombstones; the renderer skips them too.
+- **WeakMap / WeakSet** handles (`emit/builtins/weak.rs`) point (`entries`)
+  at a `TYPE_ELEMS` store flagged `ELEMS_FLAG_WEAK` holding `(key, value)`
+  pairs (a `WeakSet`: keys alone), allocated with 4 entries by the first
+  `set` / `add`. Every slot past the live entries holds a `HOLE` key (and an
+  `undefined` value). Lookup is a linear identity scan of the whole store
+  (keys are objects or non-registered symbols, so identity is SameValue);
+  `delete` tombstones the entry in place, `set` / `add` reuse the first
+  `HOLE` or double the store. `live` counts the non-`HOLE` entries. The
+  collector compacts a store in place (§5.7); nothing iterates one, so no
+  slot index can go stale.
+- **WeakRef** blocks hold the target in one weak slot; the collector writes
+  `undefined` there once the target dies (§5.7).
+- **FinalizationRegistry** blocks keep `(target, held, token)` cells (24
+  bytes) in a weak `TYPE_ELEMS` store of the same shape: an unused cell has an
+  `undefined` target, an emptied cell (target collected, cleanup pending) a
+  `HOLE` target. `register` reuses the first unused cell or doubles the store,
+  `unregister(token)` turns every cell of `token` unused. `cleanup` is the
+  callback; `flags` / `job_next` queue the registry's cleanup job (§6.7).
 - **Promise** blocks hold the settlement (`state` ∈ pending `0` / fulfilled
   `1` / rejected `2`, plus the settled `value`), a raw ref to the newest
   reaction record (`reactions`, `0` = none), the creation number `seq` and
@@ -572,8 +644,8 @@ and `value` in place.
 - **Insertion order** is slot order. **Delete** writes `key = 0` and value
   `undefined` and decrements `live`; later slots keep their index.
 - **Growth** (`__define`): a missing table starts at capacity 4; a full one is
-  rebuilt at `max(4, 2·live)` (the same capacity when tombstones free half),
-  copying live entries in order and keeping the watch flag and bit, and the
+  rebuilt at `max(4, 2·live)` (the same capacity when tombstones free half,
+  unless it is `0`: an empty static realm table), copying live entries in order and keeping the watch flag and bit, and the
   owner's `props` slot is rewritten. The owner handle never moves. Literals and
   class instances reserve their static key count up front. A static realm
   table that overflows is rebuilt on the heap the same way.
@@ -585,6 +657,12 @@ emits the initial table containing every static string. `__intern(s)` returns
 the canonical block for `s`'s content, inserting `s` (and flagging it) on a
 miss and doubling the table into a heap copy once more than half full;
 `__intern_find(s)` returns `0` on a miss, which means "absent everywhere".
+The table is **weak** (§5.7): after marking, the collector turns the slot of
+every unmarked heap string into the tombstone `1`; the probe passes over a
+tombstone, an insertion never reuses one, `$__intern_count` keeps counting
+them until the next growth, and growth moves only the strings (slots `> 1`)
+and restarts the count from them. A key nobody references is therefore
+freed, and interning the same content later yields a new canonical block.
 Literal-key sites pass the constant key address; computed keys go through
 `__to_key(v, insert)` (`ToPropertyKey`: an interned string is its own key, a
 symbol is its own key — its block address, never interned —, an object is
@@ -592,8 +670,7 @@ converted with `ToPrimitive` (hint string; a `Symbol` wrapper yields its
 symbol) first, an integer `0 ≤ v < 2^32 - 1` is formatted in the guest,
 anything else goes through `__to_string`). `__define` sets the table's
 `HAS_SYMBOL_KEYS` when it appends a symbol key. Lookups use `insert = 0` but still intern a canonical
-array index, so an element is found by an index key no property used. The
-table is never pruned.
+array index, so an element is found by an index key no property used.
 
 **String exotic indices.** A `CLASS_STRING` wrapper has no per-index table
 entries: `__str_exotic_index(o, key)` returns the code-unit index when `o` is
@@ -614,7 +691,8 @@ aliases, captured bindings, and member receivers all observe `push`.
   `elems + ELEMS_DATA_OFFSET + 8·i` (`ELEMS_DATA_OFFSET = 8`); slots past
   `len` are unused.
 - **Holes.** A hole slot holds `HOLE`. Literal elisions, `delete a[i]`, gaps
-  left by growth, and truncation produce holes. A hole is not an own
+  left by growth, and truncation produce holes; `pop` writes `HOLE` into the
+  slot it vacates, so a store never keeps a removed element alive. A hole is not an own
   property: `hasOwnProperty` and own-key enumeration skip it and the
   renderer prints `<N empty items>`, while `[[Get]]` and `HasProperty` (and
   so `in`, member reads, spread, destructuring, `for-of`, `JSON.stringify`,
@@ -743,71 +821,234 @@ in the data segment (§4.2), so it has one identity for the whole run.
   the bound function itself (recognised by its `env`), else the incoming
   `new.target`.
 
-### 5.6 `__alloc` and memory growth
+### 5.6 Allocator, pages and memory growth
 
-`__alloc(size: i32) -> i32` is a bump allocator over the `$__heap_ptr` global,
-which starts at the first free offset after the static region (the module
-declares enough initial pages to hold that region):
+The heap (`emit/gc.rs`, `emit/runtime.rs::emit_alloc`) is a run of 64 KiB
+pages from the first page boundary after the static region up to the
+**frontier** `$__heap_ptr`. Every block comes back zeroed, header included, so
+callers write only the fields they set and a fresh block's `gc` byte is `0`.
 
-1. Round `size` up to 8; `old = __heap_ptr`; `end = u64(old) + u64(size)`
-   (computed in `i64`, so it cannot wrap).
-2. Fast path: if `end <= memory.size * 64 KiB`, set `__heap_ptr = end`, zero the
-   4 header bytes, and return `old`.
-3. Otherwise grow: try `memory.grow(max(need, memory.size))` (at least doubling);
-   if that fails, retry with exactly `need` pages.
-4. If both fail (the 8192-page / 512 MiB maximum is reached), write the static
-   line `abi::OOM_LINE` to fd 2 through its static iovec and call `proc_exit(1)`.
+- **Page table** (`abi::GC_PAGE_TABLE`, one byte per wasm page, 8 KiB,
+  indexed by `address >> 16`): `0` not heap (the shadow stack, the static
+  region, pages above the frontier), `1..=19` a small page of that class,
+  `0xFE` a large-span head, `0xFD` a large-span tail (and any page handed out
+  by `__gc_take_pages` before its caller re-codes it), `0xFC` a page in the
+  free-page pool.
+- **Size classes** (19): `16..=256` by 16 (classes `1..=16`), then `512`,
+  `1024`, `2048` (classes `17..=19`); a size maps to `(size + 15) >> 4` when
+  `<= 256`, else `17 + ceil_log2(size) - 9` (`abi::gc_size_class`). The slot
+  sizes are a static `u32[19]` (`abi::GC_CLASS_SIZES`).
+- **Small page**: a 16-byte header (`class`, `bump` = the first slot never
+  allocated, `live` = slots that survived the last sweep, reserved), then
+  slots of the class size from `page + 16`. Each class has one **current
+  page** (`abi::GC_CUR_PAGES`, `u32[19]`) it bump-allocates from.
+- **Free slot**: `[0xFF TYPE_FREE][0][0][0][next_free: u32 @4]`, on a
+  per-class list headed in the static `u32[19]` at `abi::GC_FREE_HEADS`.
+- **Large span**: a request above 2048 bytes takes `k = ceil((size + 16) /
+  64 KiB)` contiguous pages with a 16-byte pre-header (`pages`,
+  `next_large`), the block at `page + 16`; spans are linked from
+  `$__gc_large`.
 
-**Out of memory.** The report is the fixed `Uncaught RangeError: out of memory`
-line; writing it allocates nothing. An out-of-memory condition inside `try` is
-not catchable; the program terminates with exit code `1`.
+**`__alloc_small(class)`**, the per-class entry: constant-size sites call it
+with the class computed at compile time (`gc::emit_alloc_const`). In order:
 
-**No free.** Nothing is ever freed. Store and table growth abandons the old
-block. Long-running allocation-heavy programs consume memory monotonically up
-to the 512 MiB cap.
+1. Budget (`gc::emit_gc_budget`): `$__gc_debt -= size(class)`; when it goes
+   negative outside a collection (`$__gc_busy`), `__gc_collect` runs (§5.7),
+   which renews the budget to `max(GC_MIN_BUDGET, $__gc_live)`
+   (`GC_MIN_BUDGET = 4 MiB`, so the heap stays near twice the live size).
+2. Pop the class free list and `memory.fill` the slot with zeros.
+3. Bump the class's current page while the slot fits.
+4. Take one page from `__gc_take_pages(1)`, code it with the class, and make
+   it the current page.
+5. Collect before running out: when no page could be taken and this request
+   has not collected yet, `__gc_collect` runs once and the request retries
+   from step 2.
+6. Out of memory (below): from the reserve, else the fatal exit.
 
-### 5.7 Garbage collection (design; implemented in phase 4)
+**`__alloc(size)`**, for variable sizes, computes the class and calls
+`__alloc_small`, or for a large size runs the budget step (`k` pages) and
+takes a span from `__gc_take_pages(k)`, with the same single
+collect-and-retry when the take fails; then it returns `0` (below).
+**`__alloc_fixed(size)`** is `__alloc` for callers that write the whole block
+unconditionally — the constant-size sites above 2048 bytes
+(`gc::emit_alloc_const`), the render buffers (§6.9), and `__new_array`'s
+element stores of up to 32 765 slots — and never returns `0`: a span that
+fits the reserve comes from it like a small request.
 
-The layouts above are chosen so a collector can be added without relayout:
+**`gc_stress`** (`CompileOptions::gc_stress: u32`, test only; the CLI does
+not expose it) is a collection interval in allocations: under any nonzero
+value the budget step subtracts `1` per allocation instead of the bytes, and
+the budget starts at `0`. At `1` every renewal sets it to `0`, so every
+allocation collects. At `N > 1` the first `GC_STRESS_PREFIX` (30 000)
+collections, counted in `$__gc_stress_count` (an i32 global after the module
+cells, emitted only then), renew it to `0`, so a run collects at every
+allocation until then and at every `N`th allocation afterwards. At `0` (every
+non-test build) none of this is emitted: the budget counts bytes and the
+module has no extra global.
 
-- **Algorithm.** Precise, non-moving, stop-the-world mark-sweep. Non-moving
-  because handles are identities and emitted code holds raw `i32` bases. No write barriers; the only heap-store
-  sites are `__set`/`__define`, element stores, and cell stores.
-- **Allocation.** Segregated size classes (16..256 by 16, then powers of two to
-  2 KiB) in 64 KiB pages with a per-page class header, so no per-block size
-  word; large objects in a list with a 16-byte pre-header. `__alloc` collects
-  when the allocation budget since the last collection is spent, then grows
-  memory; the 512 MiB cap stays.
-- **Roots.** A shadow stack in linear memory: each function reserves slots for
-  jsvals live across a safepoint (any call that may allocate), clears them on
-  entry, and pops them on every exit including the exception paths; the
-  collector does not move blocks, so a raw `i32` base is rooted as `HEAP |
-  base` and stays valid. Each helper declares every parameter and local as a
-  jsval, a base or key, or raw, and the builder rejects an undeclared one; a
-  raw local holds an integer, an interior address, or a base that another root
-  keeps reachable, and never shares a local with a rooted value. Helpers with a
-  cold allocating path (`__array_push`, `__array_reserve`, `__intern` growth,
-  `__prop_find` materialization) push the frame only on that path. Global roots are
-  `$exc_value`, `$cf_value`, `$__this`, `$__new_target`, `$__spread_args`, and
-  the module cells. The static region is a root region: static object-family
-  blocks are traced, never swept. The host holds no roots (§6.8).
-- **Tracing.** A jsval slot is a pointer iff the exact `QNAN` + heap-tag test
-  holds (`HOLE` is not a pointer). Raw `u32` references are traced by kind:
-  the object-family prefix (`props`, `proto`), an array's `elems` store (slots
-  `0..len`), a property table's live keys and values, a function's or
-  generator's `env`, Map/Set `entries`, a promise's `value`, a wrapper's
-  `[[PrimitiveValue]]`, env cells, a cell's value, an accessor's getter and
-  setter, a symbol's description, an iterator object's jsval slots (its
-  `[[IteratedObject]]`, and a helper's or wrapper's underlying iterator,
-  `next`, callback and inner iterator). Symbol keys are traced like string
-  keys; registered symbols stay alive through the static `Symbol.for`
-  registry table, as the spec requires. Map/Set backings are compacted only
-  together with a forwarding step that live iterators follow.
-- **Intern table.** Weak: the sweep clears slots whose string is unmarked.
-- **Reserved now.** Header byte 1, 8-byte alignment, every internal store a
-  headered block (the grown intern table and the `Math.sumPrecise` accumulator
-  are `TYPE_RAW` blocks with their data at `+8`), every reference at a kind-known offset, no host allocation, and truncation
-  writing `HOLE`.
+**`__gc_take_pages(k) -> base | 0`** never calls `__alloc`: with at least `k`
+pages in the pool (`$__gc_free_pages`) it takes the first run of `k` free
+pages in the page table and zeroes them; otherwise it advances the frontier,
+growing memory by `max(need, memory.size)` pages (at least doubling) and, if
+that fails, by exactly `need`. Pages above the frontier were never written,
+so they are already zero. It returns `0` when memory cannot supply the
+pages. `__gc_release_pages(base, k)` returns pages to the pool.
+
+**`__gc_sweep()`** (the last step of a collection, §5.7) clears
+the class lists, walks every small page from its first slot to `bump`, keeps
+the slots whose `gc` byte is `$__gc_epoch`, rewrites every other one as a
+free slot on a page-local list, then returns a page with no survivor to the
+pool (dropping it as its class's current page) or splices its list onto the
+class list and stores its `live`; unmarked large spans are unlinked and
+released; `$__gc_live` becomes the surviving bytes. Blocks in the static
+region are on no heap page and are never swept.
+
+**Out of memory** (design/runtime-memory.md §5.8) is a catchable
+`RangeError`: every one throws the same static `%OutOfMemoryError%` (a realm
+intrinsic of class `CLASS_ERROR`, `proto` `%RangeError.prototype%`, own
+non-enumerable `message` `"out of memory"` and `stack`
+`"RangeError: out of memory"`, unreachable from the global object), by setting
+`$exc_value` to it and `$exc_pending`.
+
+- **Reserve.** `abi::GC_RESERVE_PAGES` (4 pages, 256 KiB) are held out of the
+  pool in `$__gc_reserve`, taken by the first collection and, once spent,
+  taken back by the next collection that finds them.
+- **A request that must not fail** (a small one, `__alloc_fixed`) releases
+  the reserve to the pool on out of memory, throws, and retries: the caller
+  gets a valid zeroed block, writes its fields, and its next exception check
+  unwinds. With the reserve spent (or a fixed span larger than it) it writes
+  the static line `abi::OOM_LINE` (`Uncaught RangeError: out of memory`) to
+  fd 2 through its static iovec — allocating nothing — and calls
+  `proc_exit(1)`.
+- **A large variable-size request** (`__alloc`; a span beyond the cap
+  included) throws and returns `0`. Every such caller checks and leaves a
+  valid dummy with the exception pending: a string builder returns the static
+  empty string `abi::OOM_EMPTY_STR` (a builtin returns `undefined`),
+  `__new_string` returns `0` to its one large caller (`__json_indent`),
+  `__new_array` an empty array, `__array_reserve` / `__define` / `__intern`
+  leave the store, table or intern table unchanged (`__array_push`,
+  `__array_concat`, `__array_set` / `__array_define`, `__array_set_length` and the
+  `__new_array` callers with a run-time length then stop before writing).
+- **Propagation.** User code checks `$exc_pending` after the pure allocators
+  (`__concat` through `+` and `String`, `__array_push`, `__array_concat`,
+  `__new_array` with a run-time length, `SetFunctionName`'s `__define`, a
+  global's `__define`) and before and after `console.log`, so no dummy
+  reaches a binding, a property or the output. An engine-built error, and a
+  `throw`, whose construction ran out of memory throw the pending
+  `%OutOfMemoryError%` instead (`expr.rs::emit_set_exc_value`), so no error
+  with a dummy message escapes.
+
+### 5.7 Garbage collection
+
+`emit/gc.rs`: a precise, non-moving, stop-the-world mark-sweep, run only
+inside the allocator (§5.6 steps 1 and 5). Non-moving because handles are
+identities, emitted code keeps raw `i32` bases in locals and on the operand
+stack, object literals co-allocate their property table inside the object,
+and interned keys compare by address: a raw base never needs re-deriving
+after a safepoint, its block only needs to be rooted while the base is live.
+No write barriers. A collection never calls `__alloc`, never runs user code
+and never nests (`$__gc_busy`).
+
+- **Shadow stack.** Each function reserves a slot for every jsval or base
+  live across a safepoint (any call that may allocate), clears its slots on
+  entry, and pops them on every exit including the exception paths; a raw
+  `i32` base is rooted as `HEAP | base`. Each helper declares every parameter
+  and local as a jsval, a base or key, or raw, and the builder rejects an
+  undeclared one, a rooted local written before or after a shrink-wrapped
+  frame region, and a safepoint outside it; a raw local holds an integer, an
+  interior address, or a base that another root keeps reachable. Helpers with
+  a cold allocating path (`__array_push`, `__array_reserve`, `__intern`
+  growth, `__prop_find` materialization) push the frame only on that path.
+- **Marks.** Header byte `gc` holds an epoch: `$__gc_epoch` cycles `1..=255`
+  (never `0`) and a block is marked iff `gc == $__gc_epoch`; nothing clears
+  marks. Fresh blocks (`gc = 0`) are never marked and static blobs are never
+  marked at all.
+- **Collection** (`__gc_collect`): set `$__gc_busy`, advance the epoch, reset
+  the three weak lists to the sentinel `1`, mark (below), run the weak steps
+  (below: ephemeron fixpoint, clear `WeakMap` / `WeakSet` stores, clear
+  `WeakRef`s, process registries), return a paged mark stack to the pool,
+  tombstone the intern table (§5.3), `__gc_sweep` (§5.6), take back the
+  out-of-memory reserve when it was spent (§5.6), renew the budget, clear
+  `$__gc_busy`.
+- **Roots**, visited by every marking pass:
+
+  | root | treatment |
+  |---|---|
+  | shadow stack `[$__sp + 8, SS_SIZE)` | jsvals |
+  | `$exc_value`, `$cf_value` (loop-target codes are numbers), `$__this`, `$__new_target`, `$__spread_args`, the module cells (tagged-template sites included) | jsvals |
+  | `$__job_head`, `$__job_tail`, `$__rejected_head`, `$__kept_objects` (§6.7); `$__out_buf`, `$__path_buf`, `$__refs_buf` (§6.9) | raw refs |
+  | every registry on `$__fin_jobs` (linked through `job_next`) | raw refs: a queued cleanup job keeps its registry, its `cleanup` and its held values alive |
+  | the intern table | weak; only its own `TYPE_RAW` block (at `$__intern_base - 8`, once grown onto the heap) is marked |
+  | the static root list (§4.2) | each block's fields are traced every pass; the block itself is never marked. Static strings, symbols and accessors are immutable and not listed. The `Symbol.for` registry is an intrinsic, so registered symbols stay alive, as the spec requires |
+  | `$__json_data/_pos/_len`, `$__intrinsics_dirty`, `$exc_pending`, `$cf_kind`, `$__heap_ptr`, the collector's own globals (`$__gc_reserve` included: its pages are out of the heap's page codes) | integers, not roots |
+
+- **Visiting** a reference (`__gc_visit`): a jsval is followed iff its top 16
+  bits are `0x7FFD` (`HEAP`; `HOLE` and every number fail the test); a raw
+  `u32` ref of `0` is none. A heap address that the page table shows to be a
+  small slot start or a large span's block is marked and pushed unless already
+  marked. An interior heap address holding a `TYPE_PROPS` header (an object
+  literal's or error's inline table) and a static `TYPE_PROPS` / `TYPE_ELEMS`
+  (a static block's table, which user code may write heap values into) are
+  pushed without marking: each is reached only through its owner, so it is
+  traced on every trace of the owner and no stale mark can hide it. Anything
+  else is ignored.
+- **Tracing** (`__gc_trace`, by type byte):
+
+  | type | references traced (offsets from the base) |
+  |---|---|
+  | `0` `TYPE_STRING`, `19` `TYPE_RAW`, `0xFF` `TYPE_FREE` | none (leaves) |
+  | object family (`1`–`3`, `6`–`10`, `15`–`18`) | prefix: raw `props @4`, jsval `proto @8`; then per kind below |
+  | `1` `TYPE_ARRAY` | raw `elems @20` |
+  | `2` `TYPE_OBJECT` classes `0` ordinary, `1` error, `2` arguments, `6` global | prefix only (an inline table is reached through `props`) |
+  | `2` classes `3` / `4` / `5` / `7` wrappers | jsval `@16` |
+  | `2` class `8` iterators | jsval `@16`; kinds `>= 16` (the `Iterator.from` wrapper `16`, the lazy helpers `17..=21`, the async-from-sync iterator `32`) also jsvals `@32`, `@40`; helpers also `@56`, `@64`, `@72` (`@24`, `@28` and a helper's `f64 @48` are not references) |
+  | `3` `TYPE_FUNCTION` | jsval `env @24` (a bound function's `[target, boundThis, ...args]` array, a settler's resolving record) |
+  | `4` `TYPE_ENV` | jsval slots `@8 + 8k`, `k < count @4`: closure envs, generator frames, async-generator request records, promise reaction / job / thenable-job records, resolving-function records, `Array.fromAsync` state |
+  | `5` `TYPE_CELL` | jsval `@4` (unaligned) |
+  | `6` `TYPE_MAP`, `7` `TYPE_SET` | jsval `entries @24` |
+  | `8` `TYPE_PROMISE` | raw `reactions @20`, jsval `value @24`, raw `rejected_next @36` |
+  | `9` `TYPE_GENERATOR` | jsval `env @32`, raw `queue @40`, `queue_tail @44` |
+  | `10` `TYPE_DATE` | prefix only |
+  | `11` `TYPE_ACCESSOR` | jsvals `getter @8`, `setter @16` |
+  | `12` `TYPE_PROPS` | entries `k < count @4` at `16 + 16k`: raw key `@+0` (`0` = tombstone), jsval value `@+8` |
+  | `13` `TYPE_ELEMS` | jsval slots `@8 + 8i` for every `i < cap @4` (not `len`, so a stale slot can only retain); a store flagged `ELEMS_FLAG_WEAK` is marked but none of its slots is traced |
+  | `14` `TYPE_SYMBOL` | jsval `description @8` |
+  | `15` `TYPE_WEAKMAP`, `16` `TYPE_WEAKSET` | raw `entries @20` (the weak store: marked, not traced); the handle is linked into `$__gc_weak` through `weak_next` unless already linked this cycle |
+  | `17` `TYPE_WEAKREF` | nothing past the prefix (`target @24` is weak); linked into `$__gc_weak_refs` |
+  | `18` `TYPE_FINREG` | jsval `cleanup @24`, raw `cells @20` (the weak store: marked, not traced) and each cell's `held` value (slot `3i + 1`; targets and tokens are weak); linked into `$__gc_weak_regs` |
+
+  Partially initialized blocks are safe to trace: every unwritten field is
+  `0`.
+- **Mark stack.** `u32` bases, starting on the static 4 KiB stack at
+  `abi::GC_MARK_STACK`, so marking always makes progress; a full stack moves
+  to `max(1, 2·size / 64 KiB)` fresh pages from `__gc_take_pages` (copied,
+  paged storage released), never `__alloc`. When no page is left the pushed
+  block stays unmarked and `$__gc_overflow` is set. Marking is a sequence of
+  passes: visit the roots, trace the static root list, drain the stack after
+  each group; a pass that overflowed is followed by one that also re-traces
+  every marked heap block (`__gc_drain` after each), until a pass completes
+  without overflow.
+- **Weak steps**, after marking, in this order. None allocates or runs user
+  code; each walks only the handles traced this cycle, so an unreachable
+  `WeakMap`, `WeakRef` or registry is simply swept (an unreachable registry
+  is not processed and its cleanup never runs). A key or target is *live*
+  when it is a static block or a heap block carrying the epoch.
+  1. *Ephemeron fixpoint*: for every pair of every `$__gc_weak` `WeakMap`
+     whose key is live, visit the value; when that marked anything or
+     overflowed, drain (rescanning until no overflow is left) and repeat,
+     until a pass marks nothing. Values of dead keys stay unmarked.
+  2. *Clear `WeakMap` / `WeakSet`*: compact each store in place, keeping the
+     entries whose key is neither `HOLE` nor dead, refill the tail with empty
+     entries, store the new `live` count, clear `weak_next`.
+  3. *Clear `WeakRef`s*: a dead target becomes `undefined`.
+  4. *Process registries*: a cell whose target died becomes empty (target
+     `HOLE`; its held value was marked by the trace and waits for the
+     cleanup), a dead token becomes `undefined`; a registry that emptied a
+     cell and has no job queued sets `FINREG_FLAG_JOB_QUEUED` and is pushed on
+     `$__fin_jobs` (`HostEnqueueFinalizationRegistryCleanupJob`). The cleanup
+     itself runs at the next `__drain()` checkpoint (§6.7).
+
+  Every `weak_next` link is `0` again after the weak steps.
 
 ---
 
@@ -864,6 +1105,7 @@ function-index order:
 | renderer (§6.9) | `__render_top(v)`, `__render(v, depth)`, `__render_heap(p, depth)`, `__render_array(p, depth)`, `__render_object(p, depth)`, `__render_function(p, depth)`, `__render_props(..)`, `__render_entry(e, quote, first, open, depth)`, `__render_key(key, quote)`, `__render_lookup(o, key)`, `__heap_object(v)`, `__str_of(v)`, `__fn_name(v)`, `__date_text(v)` |
 | entry | `_start` (§4.2) |
 | promise engine (§6.7), after the Unicode and libm helpers | `__promise_new(proto)`, `__promise_enqueue(rec)`, `__promise_react(p, on_f, on_r, result, kind)`, `__promise_settle(p, state, v)`, `__promise_then(p, on_f, on_r)`, `__promise_resolve(v)`, `__promise_reject(v)`, `__promise_finally(p, on_finally)`, `__run_job(rec)`, `__drain()`, `__first_unhandled()`, `__promise_await(v)`, `__promise_resolving(p)`, `__async_spawn(gen)`, `__async_drive(gen, result, sent)` |
+| allocator and collector (§5.6, §5.7), after the promise engine | `__alloc_small(class)`, `__gc_take_pages(k)`, `__gc_release_pages(base, k)`, `__gc_sweep()`, `__gc_collect()`, `__gc_visit(ref)`, `__gc_trace(block)`, `__gc_drain()`, `__alloc_fixed(size)` |
 
 The string helpers work on code units at either width: `__concat` makes a
 two-byte result iff either operand is two-byte (widening the one-byte side)
@@ -1055,10 +1297,11 @@ inheriting `%IteratorPrototype%`), `%AsyncIteratorPrototype%`
 `%AsyncIteratorPrototype%`), and the
 hidden `Symbol.for` registry (`proto` `null`, unreachable from the global
 object; its table maps interned keys to the registered symbols),
-`Array.prototype[@@unscopables]` (`proto` `null`), and
+`Array.prototype[@@unscopables]` (`proto` `null`),
 `%WrapForValidIteratorPrototype%` and `%IteratorHelperPrototype%` (each a
 `next` / `return`, inheriting `%IteratorPrototype%`; the latter's
-`@@toStringTag` is `"Iterator Helper"`). Each
+`@@toStringTag` is `"Iterator Helper"`), and the hidden `%OutOfMemoryError%`
+(§5.6). Each
 constructor owns `length`, `name`, a
 non-writable `prototype`, and its statics (`%Array%`, `%Map%`, `%Set%` and
 `%Promise%` also `get [@@species]`); each prototype owns a
@@ -1339,10 +1582,22 @@ promise operation calls the host.
 - **Draining.** There are no timers or I/O, so the microtask queue is the
   only asynchronous source. `__drain()` is a loop (no recursion, so a long
   reaction chain uses no wasm stack): pop and run jobs until the queue is
-  empty, then the checkpoint — prune the promises a late reaction marked
-  `HANDLED` from the rejected list (M3 adds `ClearKeptObjects` and the
-  finalization cleanup jobs here) — and loop again if the checkpoint queued
-  jobs. Top-level `await v` takes `PromiseResolve(%Promise%, v)`, marks that
+  empty, then the checkpoint, and loop again if the checkpoint queued jobs.
+  The checkpoint (1) prunes the promises a late reaction marked `HANDLED`
+  from the rejected list; (2) `ClearKeptObjects`: empties the
+  `KeepDuringJob` array `$__kept_objects` (length `0`, vacated slots
+  `HOLE`), to which `new WeakRef(t)` and every successful `deref()` push
+  their target; (3) runs at most one finalization cleanup job: it pops the
+  head of `$__fin_jobs`, clears its `FINREG_FLAG_JOB_QUEUED`, and
+  (`CleanupFinalizationRegistry`) turns each emptied cell unused and calls
+  `cleanup(held)` through `__invoke1`, re-reading the cell store for every
+  cell because a callback may `register` (growing the store) or
+  `unregister`. A throw out of a cleanup callback is reported like an
+  uncaught exception (`Uncaught …` on fd 2, exit 1). `__drain()` returns only
+  when both the microtask queue and `$__fin_jobs` are empty. The checkpoints
+  are host-agnostic (no timers, no host hook): a cleanup job runs only after
+  a collection queued it and some later `__drain()` reaches a checkpoint.
+  Top-level `await v` takes `PromiseResolve(%Promise%, v)`, marks that
   promise handled, drains, and yields the fulfillment value (a rejection
   surfaces as an uncaught throw). After `main` returns normally
   `_start` drains whatever remains, so unawaited `then` chains run. If `main`
@@ -1397,8 +1652,10 @@ throws. `console.log` joins its arguments with one space and ends the line with
 one `fd_write` to fd 1; `__report` writes one
 `prefix + value + "\n"` line to its fd (the `Uncaught …` reports and the `-p`
 completion, §4.2). A failed or stalled write ends the program with
-`proc_exit(1)`. The buffer, recursion path and ref table are headerless
-`__alloc` blocks. The rules:
+`proc_exit(1)`. The buffer, recursion path and ref table are `TYPE_RAW`
+blocks from `__alloc_fixed`: an out-of-memory while they grow hands a block
+from the reserve and leaves the `RangeError` pending for the `console.log`
+call site's check (§5.6). The rules:
 
 - numbers by the ECMAScript Number::toString rules, through `__num_to_str`
   (shortest round-trip digits, exponential form at `>= 1e21` and `< 1e-6`,
@@ -1420,6 +1677,9 @@ completion, §4.2). A failed or stalled write ends the program with
 - `Map(N)` / `Set(N)`, `Promise { 42 }` / `Promise { <pending> }` /
   `Promise { <rejected> r }`, dates as ISO 8601 UTC (`Invalid Date` for a
   `NaN` time value);
+- `WeakMap { <items unknown> }` / `WeakSet { <items unknown> }`, `WeakRef {}`,
+  `FinalizationRegistry {}` (contents never listed; a subclass instance
+  renders the same form);
 - cycles as `<ref *1> { self: [Circular *1] }`.
 
 Private-name entries (§7.6) are never enumerable, so the renderer does not list
@@ -1504,7 +1764,14 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   thrown its `TypeError`, so a key's `toString` never runs then); a
   short-circuited `&&=` / `||=` / `??=` skips both the right-hand side and
   the store, so no setter runs. An anonymous function assigned by `=` or a logical assignment to an
-  unparenthesized identifier is named after it. An invalid target (`f() = 1`,
+  unparenthesized identifier is named after it. The same `NamedEvaluation`
+  names an anonymous function, arrow, generator, async function or class
+  (also parenthesized, a cover form such as `x = (function () {})`) used as
+  a declaration initializer, an object-literal value, or a default in a
+  binding pattern, an assignment pattern or a parameter, after the target
+  identifier; a member or nested-pattern target names nothing, a named
+  definition keeps its own name, and a class with an own static `name`
+  member keeps that member. An invalid target (`f() = 1`,
   `1 = 2`, `a + b = c`, `(a, b) = c`, `a?.b = 1`) is an early `SyntaxError`
   (`Invalid left-hand side in assignment`).
 - **Conditional** `c ? a : b`, optional chaining `a?.b`, `a?.[k]`, `a?.()`,
@@ -2058,8 +2325,9 @@ literal or object pattern key.
   `ReferenceError: Cannot access 'x' before initialization`,
   `RangeError: Invalid array length`, a `JSON.parse` `SyntaxError`, the
   `%ThrowTypeError%` `TypeError`, and others.
-- Out of memory is reported as `Uncaught RangeError: out of memory` and is not
-  catchable (§5.6).
+- Out of memory throws a `RangeError` (`message` `"out of memory"`), always the
+  same object, catchable like any other; only an out-of-memory that finds the
+  reserve already spent ends the program (§5.6).
 
 ### 7.8 Iteration, generators & async
 
@@ -2255,7 +2523,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 |---|---|
 | global | `globalThis`, `NaN`, `Infinity`, `undefined`, `isNaN`, `isFinite`, `parseInt(s, radix)`, `parseFloat(s)` (both, like `Number(s)`, skip JS whitespace: Unicode `WhiteSpace`, `LineTerminator`, U+FEFF) |
 | `console` | `log` |
-| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `getOwnPropertySymbols`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over any iterable; a bad entry closes its iterator); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`: a string `@@toStringTag` on the receiver's chain, else the builtin tag; `Map`, `Set`, `Promise`, `Generator`, `AsyncGenerator`, `Symbol`, `Math`, `JSON` and the Array / String / Map / Set Iterator prototypes own a configurable-only `@@toStringTag`), `toLocaleString`, `valueOf`, the `__proto__` accessor, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
+| `Object` | `Object(v)` / `new Object(v)` (ToObject), `Object.keys`, `Object.values`, `Object.entries`, `Object.defineProperty`, `defineProperties`, `getOwnPropertyDescriptor`, `getOwnPropertyDescriptors`, `getOwnPropertyNames`, `getOwnPropertySymbols`, `preventExtensions`, `isExtensible`, `seal`, `isSealed`, `freeze`, `isFrozen` (§6.3; primitives: the setters return them, `isExtensible` is `false`, `isSealed` / `isFrozen` are `true`), `create`, `getPrototypeOf`, `setPrototypeOf`, `assign`, `hasOwn`, `is`, `fromEntries` (over any iterable; a bad entry closes its iterator); `Object.prototype.hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`, `toString` (`[object Tag]`: a string `@@toStringTag` on the receiver's chain, else the builtin tag; `Map`, `Set`, `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`, `Promise`, `Generator`, `AsyncGenerator`, `Symbol`, `Math`, `JSON` and the Array / String / Map / Set Iterator prototypes own a configurable-only `@@toStringTag`), `toLocaleString`, `valueOf`, the `__proto__` accessor, `__defineGetter__`, `__defineSetter__`, `__lookupGetter__`, `__lookupSetter__` |
 | `Function` | `Function.prototype.call`, `apply` (`CreateListFromArrayLike`: arrays, `arguments`, any object with `length`), `bind` (bound function exotic objects, §5.5), `toString` (always the `NativeFunction` form `function name() { [native code] }`: no source text is kept; the name is omitted unless it is an `IdentifierName`, optionally after `get `/`set `); `%Function.prototype%` `length`/`name`, `caller`/`arguments` `%ThrowTypeError%` accessors, `[@@hasInstance]` (`OrdinaryHasInstance`; non-writable, non-enumerable, non-configurable); `Function(..)` throws `TypeError` |
 | `Array` | `Array(n)` / `new Array(..)`, `Array.isArray`, `Array.of`, `Array.from(items, mapFn, thisArg)` (any iterable through its iterator, closed when `mapFn` or the define throws; else an array-like; `this` constructed when a constructor), `Array.fromAsync(items, mapFn, thisArg)` (the same over an async or sync iterable or an array-like, every element and mapped value awaited, §7.8); `push` / `pop` (variadic), `map`, `filter`, `forEach`, `reduce`, `reduceRight` (with or without an initial value; callbacks receive `(element, index, array)` and `thisArg`; every callback of the higher-order methods gets all its specified arguments — `reduce` / `reduceRight` `(acc, element, index, array)`, `sort` comparators `(a, b)` — the first `K` positionally and, when there are more, all of them in the spread argument array (§4.3): the inline loop allocates it once and refills it per call, and only when some user function gathers its arguments (a rest parameter or `arguments`) or the callback is a builtin, so other callbacks keep the plain `K`-slot call), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`, `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice`, `concat`, `flat`, `flatMap`, `keys`, `values` (also `[@@iterator]`), `entries` (Array Iterators over `ToObject(this)`, re-reading `length` per step), `toString`, `toLocaleString` (`Invoke(element, "toLocaleString")` per element; `null` / `undefined` / holes are empty), and the mutating `splice`, `sort(comparefn)` (a stable bottom-up merge sort; `undefined`s last, holes after them), `reverse`, `shift`, `unshift`, `fill`, `copyWithin`, and the change-by-copy `with`, `toReversed`, `toSorted(comparefn)` (the same stable sort), `toSpliced` (each reads every index by `Get`, so holes become `undefined`, and returns a plain `ArrayCreate` array, never a species instance) — every method generic over array-likes; `map` / `filter` / `slice` / `splice` / `concat` / `flat` / `flatMap` create their result by `ArraySpeciesCreate` (`constructor[@@species]`; `%Array%`, `%Map%`, `%Set%` and `%Promise%` have the builtin `get [Symbol.species]` returning `this`), `concat` spreads the items `IsConcatSpreadable` accepts (`@@isConcatSpreadable`, else `IsArray`), and `Array.prototype[@@unscopables]` is the spec's `null`-prototype list |
 | `String` | `String(v)`, `new String(v)` (wrapper, virtual indices §5.3); `String.fromCharCode`, `String.fromCodePoint` (`RangeError` for a non-code-point; lone surrogates allowed), `String.raw` (over any `{ raw: array-like }`); `at`, `charAt`, `charCodeAt`, `codePointAt`, `concat`, `endsWith`, `includes`, `indexOf`, `isWellFormed`, `lastIndexOf`, `localeCompare` (code-unit order, not locale collation), `normalize` (all four forms; an unknown form is a `RangeError`), `padEnd`, `padStart`, `repeat` (a result past `MAX_STRING_LENGTH` code units is a `RangeError`, as for `padStart` / `padEnd`), `slice`, `split`, `startsWith`, `substring`, `toLowerCase`, `toUpperCase` (full Unicode default case mapping — `SpecialCasing`, `Final_Sigma` — per well-formed run, lone surrogates passed through, in the guest from static tables, `emit/unicode.rs`; a result past `MAX_STRING_LENGTH` code units is a `RangeError`), `toLocaleLowerCase`, `toLocaleUpperCase` (no locale data: the same mappings), `toWellFormed`, `trim`, `trimEnd`, `trimStart` (JS whitespace, one table), `toString`, `valueOf`, `[@@iterator]` (a String Iterator stepping one code point per `next` — a lead and trail surrogate pair is one two-unit string, a lone surrogate its own unit — through `__str_iter_next`); `search`, `match`, `matchAll`, `replace`, `replaceAll`, `split` call an object argument's `@@search` / `@@match` / `@@matchAll` / `@@replace` / `@@split` method with `(O, …)` before `ToString(this)` (`matchAll` / `replaceAll` first require an `IsRegExp` argument's `flags` to hold `g`), and `includes` / `startsWith` / `endsWith` throw a `TypeError` for an `IsRegExp` argument (`ToBoolean(arg[@@match])`); `search`, `match`, `replace`, `replaceAll` with string patterns (`$$`, `$&`, `` $` ``, `$'` substitutions; function replacers get `(match, position, string)`; the RegExp-syntax check of a `search` / `match` pattern runs in the guest); `.length`, indexing. Every generic method is `RequireObjectCoercible(this)` then `ToString(this)`; all run in the guest on code units (`emit/builtins/string.rs`; `normalize` over the generated Unicode tables of `emit/unicode.rs`: full decomposition, canonical ordering, then canonical composition for NFC / NFKC), surrogate pairs combined by `codePointAt` / `fromCodePoint` / `isWellFormed` |
@@ -2263,6 +2531,8 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `Math` | `sumPrecise(items)` (any iterable of numbers, else a `TypeError` after closing it; summed exactly in a fixed-point limb accumulator and rounded once; `NaN` / opposite infinities give `NaN`, no value or only `-0` gives `-0`), and every ES2025 function: `floor`, `ceil`, `round`, `trunc`, `abs`, `sqrt`, `sign`, `min`, `max`, `hypot` (variadic), `pow`, `clz32`, `fround`, `imul` in wasm; `cbrt`, `log`, `log2`, `log10`, `log1p`, `exp`, `expm1`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh` as guest helpers (`emit/libm.rs`, a port of the `libm` crate's musl/msun algorithms, so results are the same on every host); `random` on the host (§6.1); `E`, `LN10`, `LN2`, `LOG10E`, `LOG2E`, `PI`, `SQRT1_2`, `SQRT2` |
 | `JSON` | `JSON.stringify(value, replacer, space)` (replacer function or property list, `space` number/string (a string's first 10 code units), `toJSON`, wrappers unwrapped, functions and symbols skipped, cycles throw, a lone surrogate written as `\udxxx`), `JSON.parse(text, reviver)` (in-wasm recursive descent, `\uXXXX` escapes incl. lone surrogates, reviver walk) |
 | `Map` / `Set` | `new Map(iterable)`, `new Set(iterable)`; Map `get`/`set`/`has`/`delete`/`clear`/`forEach`/`size`/`keys`/`values`/`entries` (also `[@@iterator]`); Set `add`/`has`/`delete`/`clear`/`forEach`/`size`/`values` (also `keys` and `[@@iterator]`)/`entries`; the iterators walk the live backing entries, so entries appended during iteration are seen |
+| `WeakMap` / `WeakSet` | `new WeakMap(iterable)`, `new WeakSet(iterable)` (calling either without `new` is a `TypeError`; the iterable's entries go through the `set` / `add` read from the new object, like `Map` / `Set`); WeakMap `get`/`set`/`has`/`delete`, WeakSet `add`/`has`/`delete`. A key must be `CanBeHeldWeakly`: an object, or a symbol not in the `Symbol.for` registry (well-known symbols qualify). `set` / `add` of another key throws `TypeError: Invalid value used as weak map key` / `… in weak set`; `get` / `has` / `delete` of one return `undefined` / `false`. A wrong receiver throws `TypeError: Method WeakMap.prototype.set called on incompatible receiver` (per method). Entries die with their key: a value is reachable through the map only while its key is (ephemerons, §5.7); no size, iteration or `clear` |
+| `WeakRef` / `FinalizationRegistry` | `new WeakRef(target)` (`TypeError: WeakRef: target must be an object` unless `CanBeHeldWeakly`), `WeakRef.prototype.deref()` (the target, or `undefined` once collected); creation and every successful `deref()` keep the target alive until the end of the current job (`AddToKeptObjects`, cleared at the next microtask checkpoint, §6.7). `new FinalizationRegistry(cleanup)` (`TypeError: FinalizationRegistry: cleanup must be callable`), `register(target, held, token)` (`TypeError` for a target that cannot be held weakly, `SameValue(target, held)`, or a token that is neither `undefined` nor holdable weakly; returns `undefined`), `unregister(token)` (`TypeError` for a token that cannot be held weakly; removes every cell of `token`, collected or not, and returns whether any was removed). After a collection finds a registered target dead, the next `__drain()` checkpoint calls `cleanup(held)` once per cell (§6.7); a throwing `cleanup` ends the run like an uncaught exception. `cleanupSome` is not provided (a proposal, not ES2025). Both constructors require `new`; subclasses construct |
 | `Promise` | §6.7, §7.8; `then` / `finally` create their result through `SpeciesConstructor(this, %Promise%)` (`get [Symbol.species]` on `%Promise%`); `Promise.resolve` / `Promise.reject` construct from `this` (`PromiseResolve(C, x)` / `NewPromiseCapability(C)`; a non-constructor `this` throws `TypeError`); `Promise.all`, `allSettled`, `any` (all rejected: an `AggregateError` with `errors`), `race` over any iterable (§6.7) |
 | `Date` | `new Date()`, `new Date(value)` (a Date's time value, else `ToPrimitive(value)`: a string is parsed as by `Date.parse`, anything else `ToNumber`), `new Date(year, month[, date, hours, minutes, seconds, ms])` (UTC fields: `MakeDay` / `MakeTime`, `TimeClip`), `Date()` (current time as a string), `Date.now()`, `Date.UTC(year[, month, ..])`, `Date.parse(string)` (`ToString`, then a guest-side parser of exactly the Date Time String Format — `YYYY[-MM[-DD]]` or `±YYYYYY` (not `-000000`), optional `THH:mm[:ss[.sss]]` and `Z` / `±HH:mm`, range-checked fields, `24:00` only as `24:00:00.000`; date-only forms are UTC, a date-time without offset is local time = UTC — and the `toString` (`Www Mmm DD YYYY HH:mm:ss GMT±hhmm[ (..)]`) / `toUTCString` outputs; anything else is `NaN`, the result `TimeClip`ped); `getTime`, `valueOf`, `getFullYear`, `getMonth`, `getDate`, `getDay`, `getHours`, `getMinutes`, `getSeconds`, `getMilliseconds`, the `getUTC*` twins, `getTimezoneOffset` (`0`), Annex B `getYear`; `setMilliseconds`, `setSeconds`, `setMinutes`, `setHours`, `setDate`, `setMonth`, `setFullYear`, the `setUTC*` twins (same body, distinct functions), `setTime`, Annex B `setYear` (`thisTimeValue` first, then `ToNumber` of every argument in order, then a `NaN` time value returns `NaN` unstored — `setFullYear` / `setYear` start from `+0` — else `TimeClip` is stored and returned); `toISOString` (`RangeError` on an invalid date; expanded `±YYYYYY` years), `toJSON`, `toString` (`Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)`), `toDateString` (`Thu Jan 01 1970`), `toTimeString` (`00:00:00 GMT+0000 (Coordinated Universal Time)`), `toUTCString` (`Thu, 01 Jan 1970 00:00:00 GMT`; Annex B `toGMTString` is the same function object), `toLocaleString` / `toLocaleDateString` / `toLocaleTimeString` (the `toString` / `toDateString` / `toTimeString` texts) — the string forms sign a negative year and pad it to four digits (`-0001`) and render an invalid date as `Invalid Date` —, `[@@toPrimitive]` (configurable only) — local time is UTC (`LocalTZA = 0`), computed in wasm |
 | `Symbol` | `Symbol(desc)` (a fresh symbol; `new Symbol()` throws `TypeError`, though `Symbol` is a constructor for `IsConstructor`), `Symbol.for` / `Symbol.keyFor` (the hidden registry; `keyFor` of a non-symbol throws), the 13 well-known symbols (non-writable, non-enumerable, non-configurable); `Symbol.prototype.toString` (`Symbol(desc)`), `valueOf`, the `description` getter (a program that names `description` compiles the accessor dispatch of `__get`), `[@@toPrimitive]`, `[@@toStringTag]` `"Symbol"` (both configurable only), each over `thisSymbolValue` (a symbol or a `CLASS_SYMBOL` wrapper) |
@@ -2308,7 +2578,9 @@ assignment`, `private name #x is not defined`.
 - An uncaught JS exception fails the run with `Uncaught <rendered value>`
   (e.g. `Uncaught TypeError: Cannot read properties of null (reading 'x')`,
   `Uncaught 1`); an unhandled rejection with `Uncaught (in promise) <value>`.
-- Heap exhaustion fails with `Uncaught RangeError: out of memory` (§5.6).
+- Uncaught heap exhaustion fails with `Uncaught RangeError: out of memory`, as
+  does an out-of-memory that finds the reserve spent (the static line,
+  §5.6).
 - Remaining machine faults surface as wasmtime traps.
 
 ---
@@ -2363,6 +2635,10 @@ Errors are printed to stderr.
   harness include that is not usable (`async` tests implicitly need
   `doneprintHandle.js`). A test flagged both `raw` and `async` is skipped as
   `flag:async`: a raw source leaves no place to prepend `$DONE`.
+  `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` and
+  `symbols-as-weakmap-keys` are not listed (phase 4); `host-gc-required`
+  stays, because a test cannot force a collection without a host hook
+  (`$262.gc`), which jsc does not provide.
 - **Assembly** (`assemble.rs`). `raw` tests run byte-for-byte; all others are
   `"use strict";` + `sta.js` + `assert.js` + the listed includes + the test
   source, all unmodified. `async` tests additionally get the runner-owned host
@@ -2398,8 +2674,8 @@ Errors are printed to stderr.
   | `968dd97` | 19243 | 30014 | 47665 |
   | `eee36ef` | 19378 | 30014 | 47665 |
 
-  The current metric is its last row: **28219 / 32889 eligible tests pass
-  (≈ 85.8 %)**; `baseline.txt` holds the same 28219 paths. The drop in
+  The current metric is its last row: **29492 / 33051 eligible tests pass
+  (≈ 89.2 %)**; `baseline.txt` holds the same 29492 paths. The drop in
   rate at `d0f5e6a` is the 3180 newly eligible `async` tests (84 pass); at
   `15be3e0` the 3620 tests including `propertyHelper.js` became eligible
   (1413 pass).
@@ -2451,6 +2727,15 @@ test262 checkout is absent, as in this job). Dev and test builds use
 `opt-level = 1` for the workspace and `opt-level = 3` for dependencies
 (`Cargo.toml`), because every test compiles and runs JS programs through swc,
 the emitter and wasmtime.
+
+**Job `gc-stress`** (matrix of 4, 60-minute timeout): `JSC_GC_STRESS=127
+cargo nextest run -p jsc-core --partition count:N/4`, the jsc-core suite once
+more with every program compiled with the `gc_stress` interval 127 (§5.6:
+every allocation collects for the first 30 000 collections, then every 127th;
+the shared test helpers read the variable; the `gc_*` canaries always use
+interval 1; design/runtime-memory.md §7.1 `gc_stress_run_suite`), excluding
+the opcount binary and the `memory` binary (heap-cap and million-allocation
+tests); collection must not change any output.
 
 **Job `test262`** (baseline regression gate, 90-minute timeout): fetch test262
 (cached on the hash of `scripts/test262-fetch.sh`), `cargo build --release -p
@@ -2556,7 +2841,7 @@ Each item below is current behaviour of this tree.
   compile time: a sealed `Symbol` compiles to the intrinsic's address, and the
   member is an ordinary `__get` on it.
 - Not available: `RegExp` (literals and constructor), `BigInt`, `Proxy`, `Reflect`,
-  `WeakMap`/`WeakSet`/`WeakRef`, typed arrays, `ArrayBuffer`, `Intl`, `eval`.
+  typed arrays, `ArrayBuffer`, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
 - The builtin library is exactly §7.9.
 
@@ -2639,12 +2924,20 @@ Each item below is current behaviour of this tree.
   gets no `<ref *N>` marker.
 - The renderer's `Error` `name` / `message` lookup materializes a lazy
   function on the prototype chain.
-- No garbage collection (§5.7): memory only grows, up to 512 MiB, and
-  exhaustion is not catchable. The intern table never shrinks.
+- An out-of-memory in an allocation that hands back a block from the reserve
+  (§5.6) is thrown at the next exception check, so straight-line code
+  without a check (arithmetic, local writes, a store into a fresh literal)
+  may run in between; the output (`console.log`) never does.
 - Map / Set backing arrays never shrink: `delete` and `clear` leave
   tombstones (§5.2), so set / delete churn grows the backing without bound
-  and lookups scan the tombstones (compaction needs live iterators to
-  follow the move; phase 4).
+  and lookups scan the tombstones (the collector does not compact them: a
+  running `forEach` or iterator holds a slot index).
+- Collections run only when an allocation exhausts the budget (§5.6); there
+  is no host hook to force one, so when a `WeakRef` empties or a
+  `FinalizationRegistry` cleanup runs depends on allocation volume, and a
+  program that stops allocating may never see either. Cleanup jobs run only
+  at a `__drain()` checkpoint (§6.7), one per checkpoint. A
+  `WeakMap` / `WeakSet` lookup is a linear scan of its store.
 
 ---
 
@@ -2710,17 +3003,20 @@ code-point string iterator, full case mapping, `normalize`).
 
 ### Phase 4 — Runtime independence and memory
 
-**Status: in progress.** Runtime independence (stages R1-R4,
-`design/runtime-memory.md` §7) is done: every module is a self-contained WASI
-preview-1 command that imports exactly `fd_write`, `clock_time_get`,
-`random_get` and `proc_exit`, exports exactly `_start` and `memory`, and runs
-under the `jsc` CLI's wasmtime runner, `wasmtime run`, `@cdlab/jsc` and
-`node:wasi`; the Rust host semantics and the TypeScript shim are deleted.
+**Status: complete** (stages R1-R4 and M1-M3, `design/runtime-memory.md`
+§7). Every module is a self-contained WASI preview-1 command that imports
+exactly `fd_write`, `clock_time_get`, `random_get` and `proc_exit`, exports
+exactly `_start` and `memory`, and runs under the `jsc` CLI's wasmtime
+runner, `wasmtime run`, `@cdlab/jsc` and `node:wasi`; the Rust host semantics
+and the TypeScript shim are deleted. Memory is managed by the guest
+collector (§5.6, §5.7) with catchable out-of-memory, and the weak
+collections, `WeakRef` and `FinalizationRegistry` are built on its weak
+steps.
 
 - Modules import only WASI (output and clock); promises and the microtask queue
   run in the guest; the Rust host semantics and the TypeScript shim are removed.
 - A precise collector (mark-sweep, shadow-stack roots); catchable out-of-memory.
-- `WeakMap`, `WeakRef`, `FinalizationRegistry`.
+- `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`.
 - Browsers run modules through a small WASI polyfill.
 
 ### Phase 5 — Language completeness
@@ -2759,4 +3055,3 @@ under the `jsc` CLI's wasmtime runner, `wasmtime run`, `@cdlab/jsc` and
 - Sloppy mode: strict mode only, permanently or not.
 - `RegExp` engine: written for the guest, or an existing engine compiled in
   (decide before phase 5).
-- WASI preview 1 or preview 2 as the module target (decide before phase 4).

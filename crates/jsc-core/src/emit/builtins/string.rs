@@ -6,6 +6,7 @@
 //! `localeCompare` is `__str_cmp`, code-unit order.
 //! `toString` / `valueOf` are `thisStringValue`.
 
+use super::array::{CallArg, call_spilling, push_call};
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
@@ -69,6 +70,28 @@ fn coercion_order(op: StringOp) -> [u32; 2] {
         [1, 0]
     } else {
         [0, 1]
+    }
+}
+
+/// How many leading arguments [`emit_method`] uses after user code may run
+/// (`ToString(this)`, the first coercion, the dispatch lookup): both for an
+/// op that coerces or reads its second argument, one for an op that coerces
+/// or dispatches on its first only, none otherwise (`concat` captures its
+/// own argument array).
+fn method_arg_reads(op: StringOp) -> u32 {
+    let [first, second] = coercions(op);
+    let reads_second = matches!(
+        op,
+        StringOp::PadStart
+            | StringOp::PadEnd
+            | StringOp::Replace
+            | StringOp::ReplaceAll
+            | StringOp::Split
+    );
+    if reads_second || second != Coerce::None {
+        2
+    } else {
+        u32::from(first != Coerce::None || dispatch_of(op).is_some())
     }
 }
 
@@ -369,6 +392,7 @@ pub(super) fn emit_method(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, method_arg_reads(op));
     let (s, a0, a1, r) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let count = frame.f64(0);
     if op == StringOp::Concat {
@@ -553,6 +577,7 @@ fn emit_case_map(
         |f| wasm!(f; LocalGet(s.n)),
         |f| wasm!(f; I32Const(0)),
         dst,
+        &OOM_RETURN_UNDEFINED,
     );
     wasm!(function; I32Const(0), LocalSet(i));
     count_loop(function, i, s.n, |function| {
@@ -767,59 +792,18 @@ fn emit_dispatch(
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, not_callable_text(symbol), strings, helpers);
     wasm!(function; End);
-    let args: &[u32] = if matches!(
+    let args: &[CallArg] = if matches!(
         op,
         StringOp::Replace | StringOp::ReplaceAll | StringOp::Split
     ) {
         frame.arg(function, 1);
         wasm!(function; LocalSet(a1));
-        &[s, a1]
+        &[CallArg::Val(s), CallArg::Val(a1)]
     } else {
-        &[s]
+        &[CallArg::Val(s)]
     };
-    call_with(function, frame, m, a0, args, helpers);
+    push_call(function, frame, m, a0, args, helpers);
     wasm!(function; Return, End, End);
-}
-
-/// Call the function in i64 local `callee` with `this` = i64 local `this`
-/// and the arguments `args` (i64 locals), leaving its result; arguments past
-/// `K` go in a published spread argument array.
-fn call_with(
-    function: &mut FnBuilder<'_>,
-    frame: Frame,
-    callee: u32,
-    this: u32,
-    args: &[u32],
-    helpers: Helpers<'_>,
-) {
-    for slot in 0..frame.k {
-        if let Some(&local) = args.get(slot as usize) {
-            wasm!(function; LocalGet(local));
-        } else {
-            wasm!(function; I64Const(UNDEFINED_BITS));
-        }
-    }
-    if args.len() > frame.k as usize {
-        let spread = frame.scratch() + 38;
-        let n = i32::try_from(args.len()).unwrap_or(i32::MAX);
-        wasm!(function;
-            I32Const(n), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
-            LocalSet(spread),
-        );
-        for (j, &arg) in (0u64..).zip(args) {
-            wasm!(function; LocalGet(spread), I32WrapI64);
-            emit_array_elems(function);
-            wasm!(function; LocalGet(arg), I64Store(elem_slot(j)));
-        }
-        wasm!(function; LocalGet(spread), GlobalSet(SPREAD_ARGS_GLOBAL));
-    }
-    wasm!(function; LocalGet(this), GlobalSet(THIS_GLOBAL));
-    invoke(
-        function,
-        callee,
-        |function| emit_argc(args.len(), function),
-        helpers,
-    );
 }
 
 /// Throw a `RangeError` with `text` (`[message, stack]`), followed by the
@@ -1111,6 +1095,7 @@ fn emit_substring(
         |f| wasm!(f; LocalGet(n)),
         |f| wasm!(f; LocalGet(src.w)),
         dst,
+        &OOM_RETURN_UNDEFINED,
     );
     wasm!(function; LocalGet(dst), I32Const(abi::STR_DATA_OFFSET.cast_signed()), I32Add);
     src.addr(function, from);
@@ -1500,6 +1485,7 @@ fn emit_repeat(
         |f| wasm!(f; LocalGet(total)),
         |f| wasm!(f; LocalGet(s.w)),
         dst,
+        &OOM_RETURN_UNDEFINED,
     );
     emit_copy_units(function, d, |f| wasm!(f; I32Const(0)), s, s.n, done);
     wasm!(function;
@@ -1577,6 +1563,7 @@ fn emit_pad(
         |f| wasm!(f; LocalGet(total)),
         |f| wasm!(f; LocalGet(width)),
         dst,
+        &OOM_RETURN_UNDEFINED,
     );
     let (fill_at, recv_at) = if op == StringOp::PadStart {
         (None, Some(fill))
@@ -1820,6 +1807,7 @@ fn emit_well_formed(
             |f| wasm!(f; LocalGet(s.n)),
             |f| wasm!(f; I32Const(1)),
             dst,
+            &OOM_RETURN_UNDEFINED,
         );
         emit_copy_units(function, d, |f| wasm!(f; I32Const(0)), s, s.n, i);
         emit_lone_surrogates(function, d, i, c, |f| {
@@ -1885,22 +1873,9 @@ fn emit_replace(
     // its `ToString` result is appended.
     push_number(function, pos);
     wasm!(function; LocalSet(r));
-    let args = [search, r, s];
-    for slot in 0..frame.k {
-        if let Some(&local) = args.get(slot as usize) {
-            wasm!(function; LocalGet(local));
-        } else {
-            wasm!(function; I64Const(UNDEFINED_BITS));
-        }
-    }
-    wasm!(function; I64Const(UNDEFINED_BITS), GlobalSet(THIS_GLOBAL));
-    let count = args.len().min(frame.k as usize);
-    invoke(
-        function,
-        replacer,
-        |function| emit_argc(count, function),
-        helpers,
-    );
+    let args = [search, r, s].map(CallArg::Val);
+    let spread = frame.scratch() + 38;
+    call_spilling(function, frame.k, spread, replacer, None, &args, helpers);
     wasm!(function; LocalSet(v));
     return_if_pending(function);
     to_string(function, v, helpers);
@@ -2037,6 +2012,7 @@ pub(super) fn emit_from_char_code(
         |f| wasm!(f; LocalGet(argc), I32Const(i32::from(code_point)), I32Shl),
         |f| wasm!(f; I32Const(1)),
         dst,
+        &OOM_RETURN_UNDEFINED,
     );
     count_loop(function, idx, argc, |function| {
         arg_at(function, frame, idx, spread, value);

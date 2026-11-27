@@ -77,7 +77,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 /// The IR fragments the bodies emit, over the locals of `K = k`, for the
 /// static-string scan.
 pub(super) fn fragments(k: u32) -> Vec<IrNode> {
-    let frame = Frame { k };
+    let frame = Frame::new(k);
     let local = frame.i64(0);
     let mut nodes = vec![
         not_async_iterable(local, local),
@@ -459,8 +459,9 @@ pub(super) fn create(
 ) {
     let header = TYPE_OBJECT | (i32::from(abi::CLASS_ITERATOR) << 24);
     let proto = intrinsic_bits(Intrinsic::AsyncFromSyncIteratorPrototype, helpers);
+    emit_alloc_const(function, helpers, BLOCK_SIZE);
     wasm!(function;
-        I32Const(BLOCK_SIZE), Call(helpers.alloc), LocalTee(obj),
+        LocalTee(obj),
         I32Const(header), I32Store(m32(0)),
         LocalGet(obj), I32Const(0), I32Store(m32(abi::OBJ_PROPS_OFFSET)),
         LocalGet(obj), I64Const(proto), I64Store(m64(abi::OBJ_PROTO_OFFSET)),

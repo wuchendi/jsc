@@ -14,8 +14,9 @@ use super::unicode_data::{
     DECOMPOSITION_POOL, DECOMPOSITIONS, SPECIAL_LOWER, SPECIAL_UPPER,
 };
 use super::{
-    FnBuilder, Helpers, LeafSet, LocalClass, RAW_I32, ROOT_BASE, Sink, abi, emit_alloc_str,
-    emit_str_two_byte, emit_str_unit, emit_surrogate_pair_at, finish_builder, helper_builder,
+    FnBuilder, Helpers, LeafSet, LocalClass, OOM_RETURN_EMPTY_STR, RAW_I32, ROOT_BASE, Sink, abi,
+    emit_alloc_str, emit_str_two_byte, emit_str_unit, emit_surrogate_pair_at, finish_builder,
+    helper_builder,
 };
 
 /// Emit each listed instruction in order.
@@ -523,6 +524,7 @@ fn emit_map(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         |f| wasm!(f; LocalGet(out)),
         |f| wasm!(f; LocalGet(wide)),
         dst,
+        &OOM_RETURN_EMPTY_STR,
     );
     wasm!(f; Br(0), End, I32Const(0), End);
     finish_builder(f)
@@ -871,6 +873,7 @@ fn normalize_decompose(f: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
         |f| wasm!(f; LocalGet(count), I32Const(1), I32Shl),
         |f| wasm!(f; I32Const(1)),
         buf,
+        &OOM_RETURN_EMPTY_STR,
     );
     wasm!(f; Br(1), End, End);
 }
@@ -1039,6 +1042,7 @@ fn normalize_encode(f: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
         |f| wasm!(f; LocalGet(units)),
         |f| wasm!(f; LocalGet(wide)),
         dst,
+        &OOM_RETURN_EMPTY_STR,
     );
     wasm!(f; I32Const(0), LocalSet(i), I32Const(0), LocalSet(j));
     let put = |f: &mut FnBuilder<'_>, value: &dyn Fn(&mut FnBuilder<'_>)| {

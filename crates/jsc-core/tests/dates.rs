@@ -871,3 +871,28 @@ fn date_now_from_wasi_clock() {
         true,
     );
 }
+
+/// With no positional argument slot (`K = 0`: no function declares a
+/// parameter, no call passes an argument) every argument of a spread
+/// `new Date(...)` / `Date.UTC(...)` is past the slots, read from the spread
+/// argument array; with one slot (`K = 1`) the fields after the first are.
+#[test]
+fn date_fields_past_the_argument_slots() {
+    let report = "const d = new Date(...[2020, 1, 2, 3, 4, 5, 6]);
+         throw d.toISOString() + ' ' + Date.UTC(...[2020, 1, 2, 3, 4, 5, 6]) + ' '
+           + new Date(...[86400000]).getTime();";
+    let expected = "2020-02-02T03:04:05.006Z 1580612645006 86400000";
+    assert_uncaught(report, expected);
+    assert_uncaught(&format!("const id = x => x; {report}"), expected);
+}
+
+/// A field's `valueOf` that makes a nested spread call (publishing another
+/// argument array) before the later fields are converted leaves them intact.
+#[test]
+fn date_fields_survive_a_nested_spread_call() {
+    assert_uncaught(
+        "const y = { valueOf() { Math.max(...[1, 2, 3]); return 2020; } };
+         throw new Date(...[y, 1, 2]).toISOString() + ' ' + Date.UTC(...[y, 1, 2]);",
+        "2020-02-02T00:00:00.000Z 1580601600000",
+    );
+}

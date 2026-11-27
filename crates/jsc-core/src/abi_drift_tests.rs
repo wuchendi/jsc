@@ -102,6 +102,58 @@ fn object_family_layout_matches_design() {
     }
 }
 
+/// Pins the weak-collection handle layout to runtime-memory.md §5.4 / §6.2:
+/// type bytes 15 / 16, 32 B, `weak_next` @16, `entries` @20, `live` @24.
+#[test]
+fn weak_collection_layout_matches_design() {
+    use super::{
+        BLOCK_ALIGN, ELEMS_FLAG_WEAK, TYPE_WEAKMAP, TYPE_WEAKSET, WEAK_BLOCK_SIZE,
+        WEAK_ENTRIES_OFFSET, WEAK_LIVE_OFFSET, WEAK_NEXT_OFFSET,
+    };
+    assert_eq!((TYPE_WEAKMAP, TYPE_WEAKSET), (15, 16));
+    assert_eq!(
+        [
+            WEAK_NEXT_OFFSET,
+            WEAK_ENTRIES_OFFSET,
+            WEAK_LIVE_OFFSET,
+            WEAK_BLOCK_SIZE
+        ],
+        [16, 20, 24, 32]
+    );
+    assert_eq!(WEAK_BLOCK_SIZE % BLOCK_ALIGN, 0);
+    assert_eq!(ELEMS_FLAG_WEAK, 1);
+}
+
+/// Pins the `WeakRef` and `FinalizationRegistry` layouts to
+/// runtime-memory.md §5.4 / §6.3 / §6.4: type bytes 17 / 18; a `WeakRef` is
+/// 32 B with `target` @24; a registry is 40 B with `cells` @20, `cleanup`
+/// @24, `flags` @32 (`1` = job queued) and `job_next` @36; both keep the
+/// collector link at the weak collections' `weak_next` @16.
+#[test]
+fn weakref_finreg_layout_matches_design() {
+    use super::{
+        BLOCK_ALIGN, FINREG_BLOCK_SIZE, FINREG_CELLS_OFFSET, FINREG_CLEANUP_OFFSET,
+        FINREG_FLAG_JOB_QUEUED, FINREG_FLAGS_OFFSET, FINREG_JOB_NEXT_OFFSET, TYPE_FINREG,
+        TYPE_WEAKREF, WEAK_NEXT_OFFSET, WEAKREF_BLOCK_SIZE, WEAKREF_TARGET_OFFSET,
+    };
+    assert_eq!((TYPE_WEAKREF, TYPE_FINREG), (17, 18));
+    assert_eq!(WEAK_NEXT_OFFSET, 16);
+    assert_eq!([WEAKREF_TARGET_OFFSET, WEAKREF_BLOCK_SIZE], [24, 32]);
+    assert_eq!(
+        [
+            FINREG_CELLS_OFFSET,
+            FINREG_CLEANUP_OFFSET,
+            FINREG_FLAGS_OFFSET,
+            FINREG_JOB_NEXT_OFFSET,
+            FINREG_BLOCK_SIZE
+        ],
+        [20, 24, 32, 36, 40]
+    );
+    assert_eq!(FINREG_FLAG_JOB_QUEUED, 1);
+    assert_eq!(WEAKREF_BLOCK_SIZE % BLOCK_ALIGN, 0);
+    assert_eq!(FINREG_BLOCK_SIZE % BLOCK_ALIGN, 0);
+}
+
 /// Pins the `TYPE_PROPS` table layout, attribute bits, and flag bits to
 /// `DESIGN.md` sections 5.1-5.3.
 #[test]
@@ -196,4 +248,43 @@ fn symbol_layout_matches_design() {
     // Section 5.4: the iterator objects' class byte.
     assert_eq!(CLASS_ITERATOR, CLASS_SYMBOL + 1);
     assert_eq!(TYPEOF_STRINGS[6], "symbol");
+}
+
+/// Pins the allocator layout to design/runtime-memory.md §5.6: page-table
+/// codes, the small-page header, the large-span pre-header, the free slot
+/// and the minimum budget (Q13).
+#[test]
+fn allocator_layout_matches_design() {
+    use super::{
+        GC_CLASS_COUNT, GC_FREE_NEXT_OFFSET, GC_LARGE_HEADER_SIZE, GC_LARGE_NEXT_OFFSET,
+        GC_LARGE_PAGES_OFFSET, GC_MIN_BUDGET, GC_PAGE_BUMP_OFFSET, GC_PAGE_CLASS_OFFSET,
+        GC_PAGE_FREE, GC_PAGE_HEADER_SIZE, GC_PAGE_LARGE_HEAD, GC_PAGE_LARGE_TAIL,
+        GC_PAGE_LIVE_OFFSET, GC_PAGE_SIZE, GC_SMALL_MAX, HEADER_GC_OFFSET, TYPE_FREE,
+    };
+    assert_eq!(GC_PAGE_SIZE, 65_536);
+    assert_eq!(
+        (GC_PAGE_LARGE_HEAD, GC_PAGE_LARGE_TAIL, GC_PAGE_FREE),
+        (0xFE, 0xFD, 0xFC)
+    );
+    assert_eq!((GC_CLASS_COUNT, GC_SMALL_MAX), (19, 2048));
+    assert_eq!(
+        (
+            GC_PAGE_CLASS_OFFSET,
+            GC_PAGE_BUMP_OFFSET,
+            GC_PAGE_LIVE_OFFSET,
+            GC_PAGE_HEADER_SIZE
+        ),
+        (0, 4, 8, 16)
+    );
+    assert_eq!(
+        (
+            GC_LARGE_PAGES_OFFSET,
+            GC_LARGE_NEXT_OFFSET,
+            GC_LARGE_HEADER_SIZE
+        ),
+        (0, 4, 16)
+    );
+    assert_eq!((TYPE_FREE, GC_FREE_NEXT_OFFSET), (0xFF, 4));
+    assert_eq!(HEADER_GC_OFFSET, 1);
+    assert_eq!(GC_MIN_BUDGET, 4 << 20);
 }

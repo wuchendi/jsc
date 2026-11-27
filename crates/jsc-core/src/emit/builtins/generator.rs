@@ -31,7 +31,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 /// The IR fragments the bodies emit, over the locals of `K = k`, for the
 /// static-string scan.
 pub(super) fn fragments(k: u32) -> Vec<IrNode> {
-    let local = Frame { k }.i64(0);
+    let local = Frame::new(k).i64(0);
     vec![
         resume(local, local),
         done_result(local),
@@ -280,7 +280,7 @@ pub(super) fn async_strings() -> impl Iterator<Item = &'static str> {
 /// The IR fragments the async generator bodies emit, for the static-string
 /// scan.
 pub(super) fn async_fragments(k: u32) -> Vec<IrNode> {
-    let local = Frame { k }.i64(0);
+    let local = Frame::new(k).i64(0);
     vec![iter_result(local, false)]
 }
 
@@ -526,7 +526,10 @@ pub(super) fn emit_async_method(
     wasm!(function;
         I64Const(intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Promise), helpers)),
         Call(helpers.promise_new()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(promise),
-        I32Const(REQ_SIZE), Call(helpers.alloc), LocalTee(record),
+    );
+    emit_alloc_const(function, helpers, REQ_SIZE);
+    wasm!(function;
+        LocalTee(record),
         I32Const(TYPE_ENV), I32Store8(MemArg { offset: 0, align: 0, memory_index: 0 }),
         LocalGet(record), I32Const(4), I32Store(m32(u64::from(HEADER_SIZE.cast_unsigned()))),
         LocalGet(record), LocalGet(arg), I64Store(m64(REQ_VALUE)),

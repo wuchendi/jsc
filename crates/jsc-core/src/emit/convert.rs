@@ -117,8 +117,8 @@ pub(super) fn throw_if_symbol(
     emit_is_symbol(f, v);
     wasm!(f; If(BlockType::Empty));
     emit_node(&callee_type_error(text), f, scratch, strings, helpers);
+    emit_set_exc_value(f, helpers);
     wasm!(f;
-        GlobalSet(EXC_VALUE_GLOBAL),
         I32Const(1), GlobalSet(EXC_PENDING_GLOBAL),
         I32Const(0), GlobalSet(CF_KIND_GLOBAL),
     );

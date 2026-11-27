@@ -200,6 +200,7 @@ fn emit_define_property(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let frame = frame.snapshot(function, 3);
     let o = frame.i64(0);
     let (key, list, j, r) = (frame.base(0), frame.base(1), frame.i32(2), frame.i32(3));
     frame.arg(function, 0);
@@ -353,8 +354,9 @@ fn emit_get_own_property_descriptors(
     arg_to_object(function, frame, 0, v, strings, helpers);
     wasm!(function; LocalGet(v), I32WrapI64, LocalSet(key));
     emit_materialize(function, key, helpers);
+    emit_alloc_const(function, helpers, abi::OBJ_PREFIX_SIZE.cast_signed());
     wasm!(function;
-        I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(res),
+        LocalSet(res),
     );
     emit_object_prefix(
         function,
@@ -500,8 +502,9 @@ fn emit_create(
     frame.arg(function, 0);
     wasm!(function; LocalSet(proto));
     require_proto(function, proto, helpers);
+    emit_alloc_const(function, helpers, abi::OBJ_PREFIX_SIZE.cast_signed());
     wasm!(function;
-        I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalTee(base),
+        LocalTee(base),
         I64Const(i64::from(TYPE_OBJECT)), I64Store(m64(0)),
         LocalGet(base), LocalGet(proto), I64Store(m64(OBJ_PROTO_OFFSET)),
         LocalGet(base), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(o),
@@ -755,7 +758,8 @@ fn emit_from_entries(
         strings,
         helpers,
     );
-    wasm!(function; I32Const(abi::OBJ_PREFIX_SIZE.cast_signed()), Call(helpers.alloc), LocalSet(res));
+    emit_alloc_const(function, helpers, abi::OBJ_PREFIX_SIZE.cast_signed());
+    wasm!(function; LocalSet(res));
     emit_object_prefix(
         function,
         res,
