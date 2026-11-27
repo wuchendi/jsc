@@ -197,6 +197,9 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
             );
             body.requires_new(ctor, map)
         }
+        // The prototype only: `weak::emit_ctor` allocates the handle and adds
+        // the iterable's values.
+        BuiltinCtor::WeakMap | BuiltinCtor::WeakSet => body.requires_new(ctor, body.proto(ctor)),
         BuiltinCtor::Promise => {
             let promise = IrNode::PromiseCtor {
                 executor: Box::new(body.arg(0)),

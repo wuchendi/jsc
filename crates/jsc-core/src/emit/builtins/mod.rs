@@ -40,6 +40,7 @@ mod object_static;
 mod promise;
 mod string;
 mod symbol;
+mod weak;
 
 use crate::emit::realm::{ArrayCopyOp, DateBodyOp, DateSetOp};
 pub(super) use array::emit_array_search;
@@ -282,6 +283,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(number::STRINGS)
         .chain(number::SUM_STRINGS)
         .chain(map_set::strings())
+        .chain(weak::strings())
         .chain(promise::strings())
         .chain(generator::strings())
         .chain(generator::async_strings())
@@ -315,6 +317,9 @@ fn emit_builtin_body(
     helpers: Helpers<'_>,
 ) {
     match builtin {
+        Builtin::WeakOp { .. } | Builtin::Ctor(BuiltinCtor::WeakMap | BuiltinCtor::WeakSet) => {
+            weak::emit(builtin, f, frame, strings, helpers);
+        }
         Builtin::FunctionPrototype => wasm!(f; I64Const(UNDEFINED_BITS)),
         Builtin::HasOwnProperty => object::emit_has_own_property(f, frame, strings, helpers),
         Builtin::ObjectToString => object::emit_to_string(f, frame, strings, helpers),

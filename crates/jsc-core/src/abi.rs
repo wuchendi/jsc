@@ -698,6 +698,41 @@ pub(crate) const TYPE_SYMBOL: u8 = 14;
 /// output, path and ref buffers). Never a user value.
 pub(crate) const TYPE_RAW: u8 = 19;
 
+/// TYPE BYTE of a `WeakMap` handle (design/runtime-memory.md §6.2): the
+/// object-family prefix, then `[weak_next:u32 @16][entries:u32 @20]
+/// [live:u32 @24][pad:u32]`. `weak_next` is collector scratch (the link of
+/// the cycle's weak-collection list, `0` outside a collection); `entries` is
+/// a raw ref to a [`TYPE_ELEMS`] store flagged [`ELEMS_FLAG_WEAK`] holding
+/// `(key, value)` pairs at slots `2i`, `2i + 1` (`0` until the first `set`);
+/// `live` counts the pairs whose key is not `HOLE`. A deleted or never used
+/// pair is `(HOLE, undefined)`. Maps to `typeof` "object".
+pub(crate) const TYPE_WEAKMAP: u8 = 15;
+
+/// TYPE BYTE of a `WeakSet` handle: the [`TYPE_WEAKMAP`] layout with keys
+/// only (one slot per key, `HOLE` when deleted or unused).
+pub(crate) const TYPE_WEAKSET: u8 = 16;
+
+/// Byte offset (from a [`TYPE_WEAKMAP`] / [`TYPE_WEAKSET`] block base) of the
+/// u32 collector link.
+pub(crate) const WEAK_NEXT_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_WEAKMAP`] / [`TYPE_WEAKSET`] block base) of the
+/// u32 raw ref to the entry store.
+pub(crate) const WEAK_ENTRIES_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
+/// Byte offset (from a [`TYPE_WEAKMAP`] / [`TYPE_WEAKSET`] block base) of the
+/// u32 live entry count.
+pub(crate) const WEAK_LIVE_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_WEAKMAP`] / [`TYPE_WEAKSET`] handle block.
+pub(crate) const WEAK_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// [`TYPE_ELEMS`] header `flags` bit (byte [`HEADER_FLAGS_OFFSET`]): the
+/// store is the entry store of a weak collection. Tracing it visits nothing
+/// (its keys are weak, its values ephemerons), so neither a mark-stack drain
+/// nor an overflow rescan makes its entries strong.
+pub(crate) const ELEMS_FLAG_WEAK: u8 = 1;
+
 /// Byte offset (from a [`TYPE_SYMBOL`] block base) of the `description` jsval
 /// (an `i64`: a string jsval or `undefined`).
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -709,8 +744,8 @@ pub(crate) const SYMBOL_BLOCK_SIZE: u32 = 16;
 
 /// [`TYPE_SYMBOL`] header `flags` bit (byte [`HEADER_FLAGS_OFFSET`]): the
 /// symbol is in the `Symbol.for` registry (its description is the registry
-/// key), so `Symbol.keyFor` returns the description.
-#[cfg_attr(not(test), allow(dead_code))]
+/// key), so `Symbol.keyFor` returns the description. A registered symbol
+/// cannot be held weakly (`CanBeHeldWeakly`).
 pub(crate) const SYMBOL_FLAG_REGISTERED: u8 = 4;
 
 /// [`TYPE_SYMBOL`] header `flags` bit: the symbol is a private name (`#x`,

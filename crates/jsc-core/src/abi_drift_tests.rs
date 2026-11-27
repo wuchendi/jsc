@@ -102,6 +102,28 @@ fn object_family_layout_matches_design() {
     }
 }
 
+/// Pins the weak-collection handle layout to runtime-memory.md §5.4 / §6.2:
+/// type bytes 15 / 16, 32 B, `weak_next` @16, `entries` @20, `live` @24.
+#[test]
+fn weak_collection_layout_matches_design() {
+    use super::{
+        BLOCK_ALIGN, ELEMS_FLAG_WEAK, TYPE_WEAKMAP, TYPE_WEAKSET, WEAK_BLOCK_SIZE,
+        WEAK_ENTRIES_OFFSET, WEAK_LIVE_OFFSET, WEAK_NEXT_OFFSET,
+    };
+    assert_eq!((TYPE_WEAKMAP, TYPE_WEAKSET), (15, 16));
+    assert_eq!(
+        [
+            WEAK_NEXT_OFFSET,
+            WEAK_ENTRIES_OFFSET,
+            WEAK_LIVE_OFFSET,
+            WEAK_BLOCK_SIZE
+        ],
+        [16, 20, 24, 32]
+    );
+    assert_eq!(WEAK_BLOCK_SIZE % BLOCK_ALIGN, 0);
+    assert_eq!(ELEMS_FLAG_WEAK, 1);
+}
+
 /// Pins the `TYPE_PROPS` table layout, attribute bits, and flag bits to
 /// `DESIGN.md` sections 5.1-5.3.
 #[test]
