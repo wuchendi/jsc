@@ -1777,3 +1777,108 @@ fn gc_stress_interval_after_prefix() {
     assert_eq!(expected, "128996");
     assert_eq!(completion(&interval), expected);
 }
+
+/// A predicate selecting the IR call node a test rewrites.
+type NodePick<'a> = &'a dyn Fn(&IrNode) -> bool;
+
+/// The argument list of a call node that pushes `K` positional slots.
+fn call_args_mut(node: &mut IrNode) -> Option<&mut Vec<IrNode>> {
+    match node {
+        IrNode::Call { args, .. }
+        | IrNode::CallIndirect { args, .. }
+        | IrNode::MethodCallUser { args, .. }
+        | IrNode::ThisCall { args, .. }
+        | IrNode::Construct { args, .. } => Some(args),
+        _ => None,
+    }
+}
+
+/// Append `extra` to the arguments of the first one-argument call node in
+/// `node` that `pick` accepts; whether one was found.
+fn widen_node(node: &mut IrNode, pick: NodePick<'_>, extra: &[IrNode]) -> bool {
+    if pick(node)
+        && let Some(args) = call_args_mut(node)
+        && args.len() == 1
+    {
+        args.extend_from_slice(extra);
+        return true;
+    }
+    node.children_mut()
+        .into_iter()
+        .any(|child| widen_node(child, pick, extra))
+}
+
+/// [`widen_node`] over a statement list (and the bodies nested in it).
+fn widen_stmts(stmts: &mut [IrStmt], pick: NodePick<'_>, extra: &[IrNode]) -> bool {
+    stmts.iter_mut().any(|stmt| match stmt {
+        IrStmt::Decl { init: node, .. } | IrStmt::Expr(node) | IrStmt::Return(Some(node)) => {
+            widen_node(node, pick, extra)
+        }
+        IrStmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            widen_node(cond, pick, extra)
+                || widen_stmts(then_body, pick, extra)
+                || widen_stmts(else_body, pick, extra)
+        }
+        _ => false,
+    })
+}
+
+/// Lower `src` (whose widest call passes one argument, so `K = 1`), append
+/// the arguments `2, 3` to the first one-argument call node `pick` accepts
+/// — the shape of an IR fragment a builtin builds — and run it. The callee
+/// gathers `...r` and completes with `r.length * 10 + r[2]`, so `33` proves
+/// every argument and the real `argc` reached it instead of the surplus
+/// being dropped.
+fn run_widened(src: &str, pick: NodePick<'_>) -> String {
+    let mut program = lower_js(src);
+    assert_eq!(program.arity, 1, "the source fixes K = 1");
+    let extra = [IrNode::Num(2.0), IrNode::Num(3.0)];
+    let found = widen_stmts(&mut program.stmts, pick, &extra)
+        || program
+            .functions
+            .iter_mut()
+            .any(|f| widen_stmts(&mut f.body, pick, &extra));
+    assert!(found, "no matching call node in {src}");
+    let bytes = emit(&program);
+    validate(&bytes);
+    completion(&bytes)
+}
+
+/// An IR call with more arguments than `K` takes the spread call form for
+/// every call node kind: direct, indirect, method, `super.m(..)` and `new`.
+#[test]
+fn ir_calls_past_k_pass_every_argument() {
+    let body = "return r.length * 10 + r[2];";
+    let cases: [(String, NodePick<'_>); 5] = [
+        (format!("function f(...r) {{ {body} }} f(1)"), &|n| {
+            matches!(n, IrNode::Call { .. })
+        }),
+        (
+            format!("let g = function (...r) {{ {body} }}; g = g; g(1)"),
+            &|n| matches!(n, IrNode::CallIndirect { .. }),
+        ),
+        (
+            format!("const o = {{ m(...r) {{ {body} }} }}; o.m(1)"),
+            &|n| matches!(n, IrNode::MethodCallUser { .. }),
+        ),
+        (
+            format!(
+                "class A {{ m(...r) {{ {body} }} }} \
+                 class B extends A {{ m() {{ return super.m(1); }} }} new B().m()"
+            ),
+            &|n| matches!(n, IrNode::ThisCall { .. }),
+        ),
+        (
+            "class C { constructor(...r) { this.v = r.length * 10 + r[2]; } } new C(1).v"
+                .to_owned(),
+            &|n| matches!(n, IrNode::Construct { spread: None, .. }),
+        ),
+    ];
+    for (src, pick) in cases {
+        assert_eq!(run_widened(&src, pick), "33", "{src}");
+    }
+}

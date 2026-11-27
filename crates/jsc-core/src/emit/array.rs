@@ -513,7 +513,8 @@ enum HofArgc {
 /// whole loop). When no user function gathers its arguments only a builtin
 /// callee (a funcref slot past the user functions and the settlers) can, so
 /// any other callback keeps `spill = 0` and receives the `K` positional
-/// arguments alone, as if passed directly.
+/// arguments alone, as if passed directly. When the allocation runs out of
+/// memory no callback runs: the `RangeError` unwinds like any throw.
 fn emit_hof_spill_seed<S: Sink>(
     function: &mut S,
     helpers: Helpers<'_>,
@@ -521,12 +522,16 @@ fn emit_hof_spill_seed<S: Sink>(
     spill: u32,
     all: u32,
 ) {
+    // Allocate the spread argument array into `spill`; when that runs out of
+    // memory, unwind with the `RangeError` before any callback runs.
     let alloc = |function: &mut S| {
         function.instruction(&Instruction::I32Const(all.cast_signed()));
         function.instruction(&Instruction::Call(helpers.new_array()));
         function.instruction(&Instruction::I64ExtendI32U);
         function.instruction(&Instruction::I64Const(HEAP_BITS));
         function.instruction(&Instruction::I64Or);
+        function.instruction(&Instruction::LocalSet(spill));
+        emit_propagate_if_pending(function, helpers);
     };
     if helpers.gathers_arguments {
         alloc(function);
@@ -540,13 +545,15 @@ fn emit_hof_spill_seed<S: Sink>(
         }));
         function.instruction(&Instruction::I32Const(first_builtin.cast_signed()));
         function.instruction(&Instruction::I32GeU);
-        function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
         alloc(function);
         function.instruction(&Instruction::Else);
         function.instruction(&Instruction::I64Const(0));
+        function.instruction(&Instruction::LocalSet(spill));
+        leave_frame(helpers);
         function.instruction(&Instruction::End);
     }
-    function.instruction(&Instruction::LocalSet(spill));
 }
 
 /// The `TypeError` of `reduce` over no element without an initial value.
