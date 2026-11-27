@@ -204,9 +204,12 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
         | BuiltinCtor::WeakSet
         | BuiltinCtor::WeakRef
         | BuiltinCtor::FinalizationRegistry => body.requires_new(ctor, body.proto(ctor)),
+        // Under `K = 0` the executor of a spread construct (a subclass's
+        // implicit `super(...args)`, a species construct) is in the spread
+        // argument array (read after only the `new.target.prototype` lookup).
         BuiltinCtor::Promise => {
             let promise = IrNode::PromiseCtor {
-                executor: Box::new(body.arg(0)),
+                executor: Box::new(body.spread_arg(0)),
                 p_local: body.temp(3),
             };
             body.requires_new(ctor, body.with_proto(ctor, promise))
