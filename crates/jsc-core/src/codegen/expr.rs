@@ -493,7 +493,6 @@ impl LowerCtx<'_> {
                 callee: Box::new(IrNode::Local(callee)),
                 args,
                 this_local,
-                construct: false,
                 not_callable: not_a_function(None),
             };
             let tail = self.build_chain(call, after)?;
@@ -891,7 +890,6 @@ impl LowerCtx<'_> {
                 callee: Box::new(callee),
                 args,
                 this_local,
-                construct: false,
                 not_callable: not_a_function(None),
             },
         ))
@@ -1326,7 +1324,6 @@ impl LowerCtx<'_> {
             callee: Box::new(IrNode::Local(member_local)),
             args: locals,
             this_local: obj_local,
-            construct: false,
             not_callable: not_a_function(member_source_name(member).as_deref()),
         };
         Ok(IrNode::NamespaceGuard {
@@ -1698,7 +1695,6 @@ impl LowerCtx<'_> {
                 callee: Box::new(IrNode::Local(callee)),
                 args,
                 this_local,
-                construct: false,
                 not_callable: not_a_function(source),
             },
         ]))
@@ -2832,7 +2828,6 @@ impl PrivateRef {
                     ])),
                     args: Vec::new(),
                     this_local,
-                    construct: false,
                     not_callable: CalleeError::not_a_function(&self.name.to_string()),
                 }
             }
@@ -2878,7 +2873,6 @@ impl PrivateRef {
                             IrNode::Local(stored),
                         ])],
                         this_local,
-                        construct: false,
                         not_callable: CalleeError::not_a_function(&self.name.to_string()),
                     },
                     IrNode::Local(stored),

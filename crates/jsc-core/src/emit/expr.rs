@@ -1023,7 +1023,6 @@ pub(super) fn emit_this_call(
         callee,
         args,
         this_local,
-        construct,
         not_callable,
     } = node
     else {
@@ -1031,19 +1030,11 @@ pub(super) fn emit_this_call(
     };
     let this_local = *this_local;
     if let Some(spread) = spilled_args(args, helpers) {
-        // `super(...args)` passes the construct marker; any other call binds
-        // `this` = the enclosing instance, as a method call on it would.
-        let target = if *construct {
-            SpreadCallee::This {
-                callee: callee.clone(),
-                this_local,
-            }
-        } else {
-            SpreadCallee::Method {
-                callee: callee.clone(),
-                this_local,
-                not_callable: not_callable.clone(),
-            }
+        // Bind `this` = the enclosing instance, as a method call on it would.
+        let target = SpreadCallee::Method {
+            callee: callee.clone(),
+            this_local,
+            not_callable: not_callable.clone(),
         };
         emit_call_spread(&target, &spread, function, scratch, strings, helpers);
         return;
@@ -1087,11 +1078,7 @@ pub(super) fn emit_this_call(
         memory_index: 0,
     }));
     // Argument count (env-last ABI: after env, before the funcref index).
-    if *construct {
-        emit_construct_argc(call_argc(args.len(), helpers), function);
-    } else {
-        emit_argc(call_argc(args.len(), helpers), function);
-    }
+    emit_argc(call_argc(args.len(), helpers), function);
     // Funcref-table index (at FUNC_INDEX_OFFSET), on top for call_indirect.
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(MemArg {
@@ -2946,15 +2933,14 @@ pub(super) fn emit_call_spread(
             function.instruction(&Instruction::Call(*func + IMPORT_FUNC_COUNT));
             emit_propagate_if_pending(function, helpers);
         }
-        SpreadCallee::Indirect(callee, _)
-        | SpreadCallee::This { callee, .. }
-        | SpreadCallee::Method { callee, .. } => {
+        SpreadCallee::Indirect(callee, not_callable)
+        | SpreadCallee::Method {
+            callee,
+            not_callable,
+            ..
+        } => {
             let cb = scratch + 7;
-            let text = match target {
-                SpreadCallee::Indirect(_, not_callable)
-                | SpreadCallee::Method { not_callable, .. } => callee_error_text(not_callable),
-                _ => EXPRESSION_NOT_A_FUNCTION,
-            };
+            let text = callee_error_text(not_callable);
             // The callee is evaluated first (JS order) and kept on the operand
             // stack, rooted, while the argument array is built (a call nested in
             // the arguments reuses the scratch locals), then stashed.
@@ -2969,12 +2955,9 @@ pub(super) fn emit_call_spread(
             function.instruction(&Instruction::I32WrapI64);
             function.instruction(&Instruction::LocalSet(cb));
             emit_spread_arg_slots(base, len, function, helpers);
-            // A plain indirect call binds `this = undefined`; `super(...)`
-            // keeps the enclosing constructor's `this`; a method call binds the
-            // receiver.
-            if let SpreadCallee::This { this_local, .. } | SpreadCallee::Method { this_local, .. } =
-                target
-            {
+            // A plain indirect call binds `this = undefined`; a method call
+            // binds the receiver.
+            if let SpreadCallee::Method { this_local, .. } = target {
                 function.instruction(&Instruction::LocalGet(*this_local));
                 function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
             } else {
@@ -2988,12 +2971,7 @@ pub(super) fn emit_call_spread(
                 memory_index: 0,
             }));
             emit_publish_spread_args(base, function);
-            // `super(...)` passes the construct marker.
-            if matches!(target, SpreadCallee::This { .. }) {
-                emit_spread_construct_argc(len, function);
-            } else {
-                emit_spread_argc(len, function);
-            }
+            emit_spread_argc(len, function);
             // Funcref-table index (FUNC_INDEX_OFFSET), on top for call_indirect.
             function.instruction(&Instruction::LocalGet(cb));
             function.instruction(&Instruction::I32Load(MemArg {

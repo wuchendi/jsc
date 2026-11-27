@@ -379,12 +379,23 @@ pub(super) fn emit_accessor_call(
     helpers: Helpers<'_>,
 ) {
     let mut pushed = 0;
+    // With `K = 0` the argument goes in a fresh one-element spread argument
+    // array. When that allocation runs out of memory the callee is not
+    // called: the call yields `undefined` with the `RangeError` pending (every
+    // caller propagates a pending exception after the call).
+    let spill = arg.is_some() && helpers.max_args == 0;
     if let Some(arg) = arg {
         if helpers.max_args >= 1 {
             wasm!(function; LocalGet(arg));
             pushed = 1;
         } else {
-            wasm!(function; I32Const(1), Call(helpers.new_array()), LocalTee(base));
+            wasm!(function;
+                I32Const(1), Call(helpers.new_array()), LocalSet(base),
+                GlobalGet(EXC_PENDING_GLOBAL),
+                If(BlockType::Result(ValType::I64)), I64Const(UNDEFINED_BITS),
+                Else,
+                LocalGet(base),
+            );
             emit_array_elems(function);
             wasm!(function; LocalGet(arg), I64Store(elem_slot(0)));
             emit_publish_spread_args(base, function);
@@ -403,6 +414,9 @@ pub(super) fn emit_accessor_call(
         LocalGet(base), I32Load(m32(FUNC_INDEX_OFFSET)),
         CallIndirect { type_index: helpers.fn_type, table_index: 0 },
     );
+    if spill {
+        wasm!(function; End);
+    }
 }
 
 /// Raise the `__prop_throw` `TypeError` of `mode` for the receiver jsval in
