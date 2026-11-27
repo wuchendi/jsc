@@ -6,6 +6,8 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+use super::array::{CallArg, push_call};
+
 /// The `TypeError` of `<name>` on a receiver of the wrong kind.
 macro_rules! incompatible {
     ($name:literal) => {
@@ -427,7 +429,8 @@ pub(super) fn emit_for_each(
 
 /// Call the adder in i64 `adder` with `this` = the collection in i64 `map`
 /// on `args` (a Set's one value, a Map's key and value): inline
-/// `__map_set` when the i32 `builtin_adder` is given and set, else a call (a
+/// `__map_set` when the i32 `builtin_adder` is given and set, else a call
+/// ([`push_call`], so a Map's value survives a program arity `K` of 1; a
 /// throw left pending).
 fn call_adder(
     function: &mut FnBuilder<'_>,
@@ -448,21 +451,8 @@ fn call_adder(
         }
         wasm!(function; Call(helpers.map_set), Else);
     }
-    for slot in 0..frame.k {
-        if let Some(&local) = args.get(slot as usize) {
-            wasm!(function; LocalGet(local));
-        } else {
-            wasm!(function; I64Const(UNDEFINED_BITS));
-        }
-    }
-    wasm!(function; LocalGet(map), GlobalSet(THIS_GLOBAL));
-    let count = args.len().min(frame.k as usize);
-    invoke(
-        function,
-        adder,
-        |function| emit_argc(count, function),
-        helpers,
-    );
+    let args: Vec<CallArg> = args.iter().copied().map(CallArg::Val).collect();
+    push_call(function, frame, adder, map, &args, helpers);
     wasm!(function; Drop);
     if builtin_adder.is_some() {
         wasm!(function; End);
