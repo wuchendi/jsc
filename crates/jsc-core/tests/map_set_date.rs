@@ -744,3 +744,31 @@ fn date_reads_spread_arguments_past_the_slots() {
         1_577_934_245_006.0,
     );
 }
+
+/// `forEach` hands its callback all three arguments `(value, key, map)`
+/// (a Set: `(value, value, set)`) also when the program's widest call takes
+/// fewer (`K = 2`: only the `forEach(cb, thisArg)` call itself): the third
+/// travels in the published spread argument array. Also under `gc_stress`.
+#[test]
+fn for_each_passes_three_arguments_past_a_small_arity() {
+    let callback = "function () {
+           console.log(arguments.length + ' ' + arguments[0] + ' ' + arguments[1] + ' '
+             + (arguments[2] === c) + ' ' + (this === t));
+         }";
+    common::assert_same_under_gc_stress(
+        &format!(
+            "const t = {{}};
+             const c = new Map([['k1', 'v1'], ['k2', 'v2']]);
+             c.forEach({callback}, t);"
+        ),
+        "3 v1 k1 true true\n3 v2 k2 true true\n",
+    );
+    common::assert_same_under_gc_stress(
+        &format!(
+            "const t = {{}};
+             const c = new Set(['x', 'y']);
+             c.forEach({callback}, t);"
+        ),
+        "3 x x true true\n3 y y true true\n",
+    );
+}

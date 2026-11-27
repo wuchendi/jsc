@@ -734,3 +734,17 @@ fn string_builders_store_units_in_place() {
     assert_string("\"é\".padEnd(3, \"é\")", "ééé");
     assert_number("\"😀\".padEnd(4, \"😀\").length", 4.0);
 }
+
+/// A `replace` / `replaceAll` callback receives `(match, position, string)`
+/// also when the program's widest call takes two arguments (`K = 2`): the
+/// string travels in the published spread argument array.
+#[test]
+fn replace_callback_gets_the_string_past_a_small_arity() {
+    assert_output(
+        "console.log('abc'.replace('b', function () {
+           return arguments.length + ':' + arguments[1] + ':' + arguments[2];
+         }));
+         console.log('abab'.replaceAll('b', function () { return arguments[2].length; }));",
+        "a3:1:abcc\na4a4\n",
+    );
+}

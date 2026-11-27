@@ -400,22 +400,9 @@ pub(super) fn emit_for_each(
         [key, key, this]
     } else {
         [value, key, this]
-    };
-    for slot in 0..frame.k {
-        if let Some(&local) = args.get(slot as usize) {
-            wasm!(function; LocalGet(local));
-        } else {
-            wasm!(function; I64Const(UNDEFINED_BITS));
-        }
     }
-    wasm!(function; LocalGet(this_arg), GlobalSet(THIS_GLOBAL));
-    let count = args.len().min(frame.k as usize);
-    invoke(
-        function,
-        callback,
-        |function| emit_argc(count, function),
-        helpers,
-    );
+    .map(CallArg::Val);
+    push_call(function, frame, callback, this_arg, &args, helpers);
     wasm!(function; Drop);
     return_if_pending(function);
     wasm!(function;

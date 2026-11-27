@@ -1089,3 +1089,15 @@ fn thenable_assimilated_per_spec() {
         "then sync false\nt1\nt2\nadopted\nt3\n",
     );
 }
+
+/// `NewPromiseCapability(C)` constructs a Promise subclass with its executor
+/// also in a program with no positional argument slot (`K = 0`: no call
+/// passes an argument): the executor travels in a spread argument array.
+#[test]
+fn subclass_capability_without_argument_slots() {
+    assert_uncaught(
+        "class P extends Promise {}
+         throw P.resolve() instanceof P;",
+        "true",
+    );
+}

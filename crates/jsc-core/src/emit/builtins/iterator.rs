@@ -18,6 +18,7 @@
 //! `flatMap`) or remaining limit (`take` / `drop`), the callback, and for
 //! `flatMap` the inner record (iterator `undefined` while none is open).
 
+use super::array::{CallArg, call_spilling};
 use super::iter::guarded;
 #[allow(clippy::wildcard_imports)]
 use super::*;
@@ -376,40 +377,9 @@ fn call_args(
     args: &[u32],
     helpers: Helpers<'_>,
 ) {
-    for slot in 0..frame.k {
-        if let Some(&local) = args.get(slot as usize) {
-            wasm!(function; LocalGet(local));
-        } else {
-            wasm!(function; I64Const(UNDEFINED_BITS));
-        }
-    }
-    if args.len() > frame.k as usize {
-        let spread = frame.scratch() + 38;
-        let n = i32::try_from(args.len()).unwrap_or(i32::MAX);
-        wasm!(function;
-            I32Const(n), Call(helpers.new_array()),
-            I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(spread),
-        );
-        for (j, &arg) in (0u64..).zip(args) {
-            wasm!(function; LocalGet(spread), I32WrapI64);
-            emit_array_elems(function);
-            wasm!(function; LocalGet(arg), I64Store(elem_slot(j)));
-        }
-        wasm!(function; LocalGet(spread), GlobalSet(SPREAD_ARGS_GLOBAL));
-    }
-    if let Some(this) = this {
-        wasm!(function; LocalGet(this));
-    } else {
-        wasm!(function; I64Const(UNDEFINED_BITS));
-    }
-    wasm!(function; GlobalSet(THIS_GLOBAL));
-    let count = args.len();
-    invoke(
-        function,
-        callee,
-        |function| emit_argc(count, function),
-        helpers,
-    );
+    let args: Vec<CallArg> = args.iter().copied().map(CallArg::Val).collect();
+    let spread = frame.scratch() + 38;
+    call_spilling(function, frame.k, spread, callee, this, &args, helpers);
 }
 
 /// Push the result of the internal protocol builtin `op` with `this` = i64

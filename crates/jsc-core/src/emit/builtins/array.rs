@@ -1254,18 +1254,40 @@ pub(super) fn push_call(
     args: &[CallArg],
     helpers: Helpers<'_>,
 ) {
+    let spread = frame.scratch() + 38;
+    call_spilling(function, frame.k, spread, callee, Some(this), args, helpers);
+}
+
+/// Call the function in i64 `callee` with `this` = i64 `this` (`undefined`
+/// when `None`) over `args` under the arity `k`, leaving its result (or a
+/// pending throw). With more than `k` arguments, all of them go in a fresh
+/// spread argument array (built in the rooted i64 local `spread`) published
+/// for the callee; when that allocation runs out of memory the callee is
+/// not called and `undefined` is left with the `RangeError` pending. With at
+/// most `k`, only the positional slots are pushed.
+pub(super) fn call_spilling(
+    function: &mut FnBuilder<'_>,
+    k: u32,
+    spread: u32,
+    callee: u32,
+    this: Option<u32>,
+    args: &[CallArg],
+    helpers: Helpers<'_>,
+) {
     let push = |function: &mut FnBuilder<'_>, arg: Option<&CallArg>| match arg {
         Some(CallArg::Val(local)) => wasm!(function; LocalGet(*local)),
         Some(CallArg::Index(local)) => index_value(function, *local),
         None => wasm!(function; I64Const(UNDEFINED_BITS)),
     };
-    for slot in 0..frame.k {
-        push(function, args.get(slot as usize));
-    }
-    if args.len() > frame.k as usize {
-        let spread = frame.scratch() + 38;
+    let spill = args.len() > k as usize;
+    if spill {
         let n = i32::try_from(args.len()).unwrap_or(i32::MAX);
-        wasm!(function; I32Const(n), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(spread));
+        wasm!(function;
+            I32Const(n), Call(helpers.new_array()), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+            LocalSet(spread),
+            GlobalGet(EXC_PENDING_GLOBAL),
+            If(BlockType::Result(ValType::I64)), I64Const(UNDEFINED_BITS), Else,
+        );
         for (j, arg) in (0u64..).zip(args) {
             wasm!(function; LocalGet(spread), I32WrapI64);
             emit_array_elems(function);
@@ -1274,7 +1296,14 @@ pub(super) fn push_call(
         }
         wasm!(function; LocalGet(spread), GlobalSet(SPREAD_ARGS_GLOBAL));
     }
-    wasm!(function; LocalGet(this), GlobalSet(THIS_GLOBAL));
+    for slot in 0..k {
+        push(function, args.get(slot as usize));
+    }
+    match this {
+        Some(this) => wasm!(function; LocalGet(this)),
+        None => wasm!(function; I64Const(UNDEFINED_BITS)),
+    }
+    wasm!(function; GlobalSet(THIS_GLOBAL));
     let count = args.len();
     invoke(
         function,
@@ -1282,6 +1311,9 @@ pub(super) fn push_call(
         |function| emit_argc(count, function),
         helpers,
     );
+    if spill {
+        wasm!(function; End);
+    }
 }
 
 /// [`push_call`] with the result into i64 `result`; a throw returns.
