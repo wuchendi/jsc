@@ -1299,9 +1299,10 @@ pub(super) fn call_spilling(
     for slot in 0..k {
         push(function, args.get(slot as usize));
     }
-    match this {
-        Some(this) => wasm!(function; LocalGet(this)),
-        None => wasm!(function; I64Const(UNDEFINED_BITS)),
+    if let Some(this) = this {
+        wasm!(function; LocalGet(this));
+    } else {
+        wasm!(function; I64Const(UNDEFINED_BITS));
     }
     wasm!(function; GlobalSet(THIS_GLOBAL));
     let count = args.len();
