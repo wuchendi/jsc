@@ -198,12 +198,20 @@ fn call(
     push_call(function, frame, f, undef, &args, helpers);
 }
 
-/// `Construct(c, [executor])` for the constructor in i64 `c`.
+/// `Construct(c, [executor])` for the constructor in i64 `c`; with no
+/// positional slot (`K = 0`) the executor goes in a spread argument array.
 fn construct(frame: Frame, c: u32, executor: u32) -> IrNode {
+    let executor = IrNode::Local(executor);
+    let (args, spread) = if frame.k == 0 {
+        let spread = IrNode::ArraySpread(vec![SpreadElem::Item(executor)]);
+        (Vec::new(), Some(Box::new(spread)))
+    } else {
+        (vec![executor], None)
+    };
     IrNode::Construct {
         callee: Box::new(IrNode::Local(c)),
-        args: vec![IrNode::Local(executor)],
-        spread: None,
+        args,
+        spread,
         callee_local: frame.y64(2),
         this_local: frame.y64(3),
         reserve: 0,
