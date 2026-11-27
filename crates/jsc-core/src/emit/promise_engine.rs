@@ -767,8 +767,9 @@ fn call_then(
 /// recursion, so a long reaction chain uses no wasm stack), then the
 /// checkpoint: prune the rejected list, `ClearKeptObjects` (§6.3: the
 /// `KeepDuringJob` array's length becomes `0`, its vacated slots `HOLE`),
-/// and run the cleanup job of the oldest-pushed registry on `$__fin_jobs`
-/// (§6.4: pop it, clear [`abi::FINREG_FLAG_JOB_QUEUED`], then
+/// and run the cleanup job of the registry at the head of `$__fin_jobs`
+/// (the collector pushes at the head, so this is the most recently queued
+/// one; the order is not spec-observable) (§6.4: pop it, clear [`abi::FINREG_FLAG_JOB_QUEUED`], then
 /// `CleanupFinalizationRegistry`: remove each empty cell and call
 /// `cleanup(held)`). A throw out of a cleanup callback is reported like an
 /// uncaught exception (`Uncaught …` on fd 2, exit 1; Q22). After a cleanup
