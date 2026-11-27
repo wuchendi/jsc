@@ -1129,8 +1129,13 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     // A weak collection keeps its pairs (a WeakSet: its keys) in a flagged
     // element store whose unused and deleted slots hold `HOLE` keys
     // (`undefined` values); the collector link is clear outside a cycle.
+    // `_start` reports the throw after `main` returned, and its first output
+    // allocates the render buffer: under `gc_stress` that collects while only
+    // the thrown handle and the realm are roots. So every live key is a realm
+    // intrinsic, and the pair positions are not pinned: a collection compacts
+    // the store (the deleted pair's tombstone goes away).
     let (weak, mem) = heap(
-        "let k = {}; let w = new WeakMap(); w.set(k, 1); w.set({}, 2); w.delete(k); w",
+        "let k = {}; let w = new WeakMap(); w.set(k, 1); w.set(Object.prototype, 2); w.delete(k); w",
         TYPE_WEAKMAP,
         0,
     );
@@ -1144,11 +1149,23 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     );
     assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 8, "four pairs");
     let slot = |i: u32| u64_at(&mem, store + ELEMS_DATA_OFFSET + 8 * i);
-    assert_eq!([slot(0), slot(1)], [HOLE, UNDEFINED], "deleted pair");
-    assert_eq!(mem[(slot(2) & 0xFFFF_FFFF) as usize], TYPE_OBJECT, "key");
-    assert_eq!(slot(3), 2.0_f64.to_bits(), "value");
-    assert_eq!([slot(4), slot(5)], [HOLE, UNDEFINED], "unused pair");
-    let (weak, mem) = heap("let w = new WeakSet(); w.add(Symbol()); w", TYPE_WEAKSET, 0);
+    let (live, empty): (Vec<u32>, Vec<u32>) = (0..4).partition(|&i| slot(2 * i) != HOLE);
+    assert_eq!(live.len(), 1, "one live pair");
+    let key = slot(2 * live[0]);
+    assert_eq!(mem[(key & 0xFFFF_FFFF) as usize], TYPE_OBJECT, "key");
+    assert_eq!(slot(2 * live[0] + 1), 2.0_f64.to_bits(), "value");
+    for i in empty {
+        assert_eq!(
+            [slot(2 * i), slot(2 * i + 1)],
+            [HOLE, UNDEFINED],
+            "empty pair {i}"
+        );
+    }
+    let (weak, mem) = heap(
+        "let w = new WeakSet(); w.add(Symbol.iterator); w",
+        TYPE_WEAKSET,
+        0,
+    );
     assert_eq!(u32_at(&mem, weak + WEAK_LIVE_OFFSET), 1, "live keys");
     let store = u32_at(&mem, weak + WEAK_ENTRIES_OFFSET);
     assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 4, "four keys");
@@ -1156,16 +1173,18 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     assert_eq!(mem[(slot(0) & 0xFFFF_FFFF) as usize], TYPE_SYMBOL, "key");
     assert_eq!(slot(1), HOLE, "unused key");
 
-    // A WeakRef holds its target at @24; a FinalizationRegistry its cleanup
+    // A WeakRef holds its target at @24 (kept alive by `KeepDuringJob`: the
+    // drain does not run after a throw); a FinalizationRegistry its cleanup
     // at @24 and `(target, held, token)` cells in a flagged element store
-    // whose unused cells are all `undefined`; no job is queued and the
-    // collector links are clear outside a cycle.
+    // whose unused cells are all `undefined`; no job is queued (the target is
+    // a realm intrinsic, live at the report's collection) and the collector
+    // links are clear outside a cycle.
     let (wr, mem) = heap("let o = { a: 1 }; new WeakRef(o)", TYPE_WEAKREF, 0);
     assert_eq!(u32_at(&mem, wr + WEAK_NEXT_OFFSET), 0, "weak_next");
     let target = u64_at(&mem, wr + WEAKREF_TARGET_OFFSET);
     assert_eq!(mem[(target & 0xFFFF_FFFF) as usize], TYPE_OBJECT, "target");
     let (fr, mem) = heap(
-        "let t = {}; let fr = new FinalizationRegistry(function () {}); fr.register(t, 7); fr",
+        "let fr = new FinalizationRegistry(function () {}); fr.register(Object.prototype, 7); fr",
         TYPE_FINREG,
         0,
     );
