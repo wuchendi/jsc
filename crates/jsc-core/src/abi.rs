@@ -733,6 +733,54 @@ pub(crate) const WEAK_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
 /// nor an overflow rescan makes its entries strong.
 pub(crate) const ELEMS_FLAG_WEAK: u8 = 1;
 
+/// TYPE BYTE of a `WeakRef` (design/runtime-memory.md §6.3): the
+/// object-family prefix, then `[weak_next:u32 @16][pad:u32][target:i64 @24]`.
+/// `weak_next` is collector scratch (the link of the cycle's `WeakRef` list,
+/// `0` outside a collection); `target` is the weakly held object or symbol,
+/// `undefined` once the collector cleared it. Maps to `typeof` "object".
+pub(crate) const TYPE_WEAKREF: u8 = 17;
+
+/// Byte offset (from a [`TYPE_WEAKREF`] block base) of the `target` jsval.
+pub(crate) const WEAKREF_TARGET_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_WEAKREF`] block.
+pub(crate) const WEAKREF_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// TYPE BYTE of a `FinalizationRegistry` (design/runtime-memory.md §6.4):
+/// the object-family prefix, then `[weak_next:u32 @16][cells:u32 @20]
+/// [cleanup:i64 @24][flags:u32 @32][job_next:u32 @36]`. `weak_next` is
+/// collector scratch (the cycle's registry list); `cells` is a raw ref to a
+/// [`TYPE_ELEMS`] store flagged [`ELEMS_FLAG_WEAK`] of `(target, held,
+/// token)` triples at slots `3i..3i + 3` (`0` until the first `register`);
+/// `cleanup` is the strong callback; `flags` holds
+/// [`FINREG_FLAG_JOB_QUEUED`]; `job_next` links the registry into the
+/// pending cleanup-job list `$__fin_jobs` (`0` ends it). A cell whose target
+/// was collected is empty (`target = HOLE`, `held` kept for the cleanup); an
+/// unused or removed cell is `(undefined, undefined, undefined)`. Maps to
+/// `typeof` "object".
+pub(crate) const TYPE_FINREG: u8 = 18;
+
+/// Byte offset (from a [`TYPE_FINREG`] block base) of the u32 raw ref to
+/// the cell store.
+pub(crate) const FINREG_CELLS_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
+/// Byte offset (from a [`TYPE_FINREG`] block base) of the `cleanup` jsval.
+pub(crate) const FINREG_CLEANUP_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// Byte offset (from a [`TYPE_FINREG`] block base) of the u32 flags.
+pub(crate) const FINREG_FLAGS_OFFSET: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// Byte offset (from a [`TYPE_FINREG`] block base) of the u32 raw link in
+/// the cleanup-job list.
+pub(crate) const FINREG_JOB_NEXT_OFFSET: u32 = OBJ_PREFIX_SIZE + 20;
+
+/// The byte size of a [`TYPE_FINREG`] block.
+pub(crate) const FINREG_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 24;
+
+/// [`TYPE_FINREG`] `flags` bit: the registry is on the `$__fin_jobs` list
+/// (a cleanup job is queued).
+pub(crate) const FINREG_FLAG_JOB_QUEUED: u32 = 1;
+
 /// Byte offset (from a [`TYPE_SYMBOL`] block base) of the `description` jsval
 /// (an `i64`: a string jsval or `undefined`).
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]

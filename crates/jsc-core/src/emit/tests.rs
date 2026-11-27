@@ -1033,8 +1033,10 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         TYPE_PROMISE, TYPE_SET, UNDEFINED,
     };
     use crate::abi::{
-        ELEMS_FLAG_WEAK, HOLE, TYPE_SYMBOL, TYPE_WEAKMAP, TYPE_WEAKSET, WEAK_ENTRIES_OFFSET,
-        WEAK_LIVE_OFFSET, WEAK_NEXT_OFFSET,
+        ELEMS_FLAG_WEAK, FINREG_CELLS_OFFSET, FINREG_CLEANUP_OFFSET, FINREG_FLAGS_OFFSET,
+        FINREG_JOB_NEXT_OFFSET, HOLE, TYPE_FINREG, TYPE_SYMBOL, TYPE_WEAKMAP, TYPE_WEAKREF,
+        TYPE_WEAKSET, WEAK_ENTRIES_OFFSET, WEAK_LIVE_OFFSET, WEAK_NEXT_OFFSET,
+        WEAKREF_TARGET_OFFSET,
     };
     let u32_at = |mem: &[u8], at: u32| {
         let at = at as usize;
@@ -1153,6 +1155,44 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
     let slot = |i: u32| u64_at(&mem, store + ELEMS_DATA_OFFSET + 8 * i);
     assert_eq!(mem[(slot(0) & 0xFFFF_FFFF) as usize], TYPE_SYMBOL, "key");
     assert_eq!(slot(1), HOLE, "unused key");
+
+    // A WeakRef holds its target at @24; a FinalizationRegistry its cleanup
+    // at @24 and `(target, held, token)` cells in a flagged element store
+    // whose unused cells are all `undefined`; no job is queued and the
+    // collector links are clear outside a cycle.
+    let (wr, mem) = heap("let o = { a: 1 }; new WeakRef(o)", TYPE_WEAKREF, 0);
+    assert_eq!(u32_at(&mem, wr + WEAK_NEXT_OFFSET), 0, "weak_next");
+    let target = u64_at(&mem, wr + WEAKREF_TARGET_OFFSET);
+    assert_eq!(mem[(target & 0xFFFF_FFFF) as usize], TYPE_OBJECT, "target");
+    let (fr, mem) = heap(
+        "let t = {}; let fr = new FinalizationRegistry(function () {}); fr.register(t, 7); fr",
+        TYPE_FINREG,
+        0,
+    );
+    assert_eq!(u32_at(&mem, fr + WEAK_NEXT_OFFSET), 0, "weak_next");
+    assert_eq!(u32_at(&mem, fr + FINREG_FLAGS_OFFSET), 0, "flags");
+    assert_eq!(u32_at(&mem, fr + FINREG_JOB_NEXT_OFFSET), 0, "job_next");
+    let cleanup = u64_at(&mem, fr + FINREG_CLEANUP_OFFSET);
+    assert_eq!(
+        mem[(cleanup & 0xFFFF_FFFF) as usize],
+        TYPE_FUNCTION,
+        "cleanup"
+    );
+    let store = u32_at(&mem, fr + FINREG_CELLS_OFFSET);
+    assert_eq!(
+        header(&mem, store as usize),
+        [TYPE_ELEMS, ELEMS_FLAG_WEAK, 0],
+        "cell store"
+    );
+    assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 12, "four cells");
+    let slot = |i: u32| u64_at(&mem, store + ELEMS_DATA_OFFSET + 8 * i);
+    assert_eq!(mem[(slot(0) & 0xFFFF_FFFF) as usize], TYPE_OBJECT, "target");
+    assert_eq!(
+        [slot(1), slot(2)],
+        [7.0_f64.to_bits(), UNDEFINED],
+        "held, token"
+    );
+    assert_eq!([slot(3), slot(4), slot(5)], [UNDEFINED; 3], "unused cell");
 
     // An array literal owns a `cap = len` store; pushes grow it by doubling
     // from 4, and the handle never moves.

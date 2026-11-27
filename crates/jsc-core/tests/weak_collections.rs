@@ -2,7 +2,9 @@
 //! §6.2): the prototype methods, `CanBeHeldWeakly`, the constructors and
 //! their iterable argument, and the collector's ephemeron semantics — a
 //! value lives while its key does, and the entry of an unreachable key is
-//! reclaimed.
+//! reclaimed. `WeakRef` and `FinalizationRegistry` (§6.3, §6.4): the API
+//! surface and its `TypeError`s, `KeepDuringJob` until the microtask
+//! checkpoint, and cleanup callbacks run from the `__drain()` checkpoint.
 
 #![allow(clippy::expect_used)]
 
@@ -316,5 +318,281 @@ fn ephemeron_chain_fixpoint() {
          }
          console.log(n);",
         "20\n",
+    );
+}
+
+/// Assert `src`, compiled with `gc_stress = 1`, exits 1 after printing
+/// `stdout`, reporting exactly `Uncaught {expected}` on stderr.
+fn stressed_uncaught(src: &str, stdout: &str, expected: &str) {
+    let done = exec_gc_stress(src, false).expect("runs under gc_stress");
+    assert_eq!(
+        (done.code, done.stdout.as_str(), done.stderr.as_str()),
+        (1, stdout, format!("Uncaught {expected}\n").as_str()),
+        "`{src}` under gc_stress"
+    );
+}
+
+/// A `WeakRef` whose target only it references keeps the target for the
+/// rest of the job that created it (`KeepDuringJob`), even though every
+/// allocation collects; once the checkpoint of a top-level `await` cleared
+/// the kept objects, the next collection clears the reference and `deref()`
+/// returns `undefined`.
+#[test]
+fn weakref_cleared_after_checkpoint() {
+    stressed(
+        "let r;
+         function make() { r = new WeakRef({ tag: 'x' }); }
+         make();
+         for (let i = 0; i < 20; i++) { let junk = [i, { i }]; }
+         function tag() { let t = r.deref(); return t === undefined ? 'gone' : t.tag; }
+         let before = tag();
+         await 0;
+         for (let i = 0; i < 20; i++) { let junk = [i, { i }]; }
+         console.log(before, tag());",
+        "x gone\n",
+    );
+}
+
+/// Within one job the target survives collections at every allocation:
+/// created, churned and dereferenced repeatedly, it is the same object; a
+/// target that stays strongly reachable survives a checkpoint too.
+#[test]
+fn weakref_kept_during_job() {
+    stressed(
+        "let r;
+         function make() { r = new WeakRef({ tag: 'kept' }); }
+         make();
+         let seen = [];
+         for (let i = 0; i < 5; i++) {
+           for (let j = 0; j < 10; j++) { let junk = { j, s: 'j' + j }; }
+           seen.push(r.deref().tag);
+         }
+         let first = r.deref();
+         for (let j = 0; j < 10; j++) { let junk = [j]; }
+         console.log(seen.join(), first === r.deref());",
+        "kept,kept,kept,kept,kept true\n",
+    );
+    stressed(
+        "let held = { tag: 'strong' };
+         let r = new WeakRef(held);
+         await 0;
+         for (let i = 0; i < 20; i++) { let junk = [i]; }
+         console.log(r.deref() === held, r.deref().tag);",
+        "true strong\n",
+    );
+}
+
+/// The cleanup callback runs once the target is collected, with the held
+/// value, only after `main` and every queued microtask finished.
+#[test]
+fn finreg_cleanup_runs_after_drain() {
+    stressed(
+        "const fr = new FinalizationRegistry(h => console.log('cleanup', h));
+         (function () { fr.register({}, 'held'); })();
+         for (let i = 0; i < 10; i++) { let junk = [i]; }
+         Promise.resolve().then(() => console.log('micro'));
+         console.log('main');",
+        "main\nmicro\ncleanup held\n",
+    );
+    // A microtask the cleanup queues runs before the program ends; a symbol
+    // target is collected like an object.
+    stressed(
+        "const fr = new FinalizationRegistry(h => {
+           console.log('cleanup', h);
+           Promise.resolve(h).then(v => console.log('after', v));
+         });
+         (function () { fr.register(Symbol('t'), 'sym'); })();
+         for (let i = 0; i < 10; i++) { let junk = [i]; }
+         console.log('main');",
+        "main\ncleanup sym\nafter sym\n",
+    );
+}
+
+/// `unregister(token)` removes every cell registered with the token,
+/// collected or not, and reports whether it removed any; the cleanup then
+/// runs for the remaining cell only. A target may be its own token.
+#[test]
+fn finreg_unregister_token() {
+    stressed(
+        "const fr = new FinalizationRegistry(h => console.log('cleanup', h));
+         const token = {};
+         (function () { fr.register({}, 'a', token); fr.register({}, 'b'); fr.register({}, 'c', token); })();
+         for (let i = 0; i < 10; i++) { let junk = [i]; }
+         console.log(fr.unregister(token), fr.unregister(token), fr.unregister({}));",
+        "true false false\ncleanup b\n",
+    );
+    assert_string(
+        "const fr = new FinalizationRegistry(() => {});
+         const t = {}, s = Symbol('k');
+         let r = [fr.register(t, 1, t), fr.register(s, 2, s)];
+         r.push(fr.unregister(t), fr.unregister(s), fr.unregister(t), fr.unregister(Symbol.iterator));
+         r.join()",
+        ",,true,true,false,false",
+    );
+}
+
+/// `register(target, held)` with `held` the target itself is a `TypeError`.
+#[test]
+fn finreg_target_equals_held_throws() {
+    assert_string(
+        "const fr = new FinalizationRegistry(() => {});
+         const o = {}, s = Symbol();
+         let r = [];
+         for (const v of [o, s]) {
+           try { fr.register(v, v); r.push('no'); }
+           catch (e) { r.push(e instanceof TypeError, e.message); }
+         }
+         r.push(fr.register(o, {}, o) === undefined);
+         r.join()",
+        "true,FinalizationRegistry.register: target and holdings must not be same,\
+         true,FinalizationRegistry.register: target and holdings must not be same,true",
+    );
+}
+
+/// The API surface: prototypes, names, lengths, `@@toStringTag`, `deref`
+/// returning the target, `register` returning `undefined`, the console
+/// forms, and subclassing through `new.target`.
+#[test]
+fn weakref_finreg_api_surface() {
+    assert_string(
+        "let o = {};
+         let r = new WeakRef(o);
+         let fr = new FinalizationRegistry(() => {});
+         [typeof r, typeof fr, r.deref() === o, Object.prototype.toString.call(r),
+          Object.prototype.toString.call(fr), WeakRef.length, WeakRef.name,
+          FinalizationRegistry.length, FinalizationRegistry.name, WeakRef.prototype.deref.length,
+          FinalizationRegistry.prototype.register.length,
+          FinalizationRegistry.prototype.unregister.length,
+          Object.getPrototypeOf(r) === WeakRef.prototype,
+          Object.getPrototypeOf(fr) === FinalizationRegistry.prototype,
+          WeakRef.prototype.constructor === WeakRef,
+          FinalizationRegistry.prototype.constructor === FinalizationRegistry,
+          r instanceof WeakRef, fr instanceof FinalizationRegistry,
+          fr.register(o, 'h') === undefined, Object.getOwnPropertyNames(r).length,
+          'cleanupSome' in fr].join()",
+        "object,object,true,[object WeakRef],[object FinalizationRegistry],1,WeakRef,1,\
+         FinalizationRegistry,0,2,1,true,true,true,true,true,true,true,0,false",
+    );
+    assert_output(
+        "console.log(new WeakRef({}), new FinalizationRegistry(() => {}))",
+        "WeakRef {} FinalizationRegistry {}\n",
+    );
+    assert_string(
+        "class R extends WeakRef { tag() { return 'r'; } }
+         class F extends FinalizationRegistry {}
+         let o = {};
+         let r = new R(o), f = new F(() => {});
+         [r.tag(), r.deref() === o, r instanceof WeakRef, f instanceof F,
+          f.register(o, 1) === undefined].join()",
+        "r,true,true,true,true",
+    );
+}
+
+/// Calling either constructor without `new` is a `TypeError`, checked
+/// before the argument.
+#[test]
+fn weakref_finreg_constructor_without_new_throws() {
+    assert_uncaught(
+        "WeakRef({})",
+        "TypeError: Constructor WeakRef requires 'new'",
+    );
+    assert_uncaught(
+        "WeakRef(1)",
+        "TypeError: Constructor WeakRef requires 'new'",
+    );
+    assert_uncaught(
+        "FinalizationRegistry(() => {})",
+        "TypeError: Constructor FinalizationRegistry requires 'new'",
+    );
+}
+
+/// The argument `TypeError`s: a `WeakRef` target, a registry target or a
+/// token that cannot be held weakly (primitives, registered symbols), a
+/// non-callable cleanup, and the receiver checks; the argument check runs
+/// before the `new.target` prototype read.
+#[test]
+fn weakref_finreg_invalid_arguments_throw() {
+    assert_string(
+        "let r = [];
+         for (const t of [1, 'k', null, undefined, true, Symbol.for('r')]) {
+           try { new WeakRef(t); r.push('no'); }
+           catch (e) { r.push(e instanceof TypeError && e.message === 'WeakRef: target must be an object'); }
+         }
+         r.join()",
+        "true,true,true,true,true,true",
+    );
+    assert_uncaught(
+        "new FinalizationRegistry(1)",
+        "TypeError: FinalizationRegistry: cleanup must be callable",
+    );
+    assert_string(
+        "const fr = new FinalizationRegistry(() => {});
+         let r = [];
+         for (const [f, args] of [[fr.register, [1, 'h']], [fr.register, [Symbol.for('x'), 'h']],
+                                  [fr.register, [{}, 'h', 1]], [fr.register, [{}, 'h', Symbol.for('t')]],
+                                  [fr.unregister, [1]], [fr.unregister, [undefined]],
+                                  [fr.unregister, [Symbol.for('t')]]]) {
+           try { f.apply(fr, args); r.push('no'); } catch (e) { r.push(e.message); }
+         }
+         r.join('|')",
+        "FinalizationRegistry.register: invalid target|FinalizationRegistry.register: invalid target|\
+         FinalizationRegistry.register: invalid unregister token|\
+         FinalizationRegistry.register: invalid unregister token|\
+         FinalizationRegistry.unregister: invalid unregister token|\
+         FinalizationRegistry.unregister: invalid unregister token|\
+         FinalizationRegistry.unregister: invalid unregister token",
+    );
+    assert_string(
+        "let r = [];
+         for (const [f, recv] of [[WeakRef.prototype.deref, {}], [WeakRef.prototype.deref, new WeakMap()],
+                                  [FinalizationRegistry.prototype.register, new WeakRef({})],
+                                  [FinalizationRegistry.prototype.unregister, undefined]]) {
+           try { f.call(recv, {}); r.push('no'); } catch (e) { r.push(e instanceof TypeError); }
+         }
+         r.join()",
+        "true,true,true,true",
+    );
+    assert_uncaught(
+        "WeakRef.prototype.deref.call({})",
+        "TypeError: Method WeakRef.prototype.deref called on incompatible receiver",
+    );
+    assert_string(
+        "let calls = 0;
+         let nt = function () {}.bind(null);
+         Object.defineProperty(nt, 'prototype', { get() { calls++; return WeakRef.prototype; } });
+         let r = [];
+         try { Reflect.construct(WeakRef, [1], nt); r.push('no'); } catch (e) { r.push(e instanceof TypeError); }
+         try { Reflect.construct(FinalizationRegistry, [1], nt); r.push('no'); } catch (e) { r.push(e instanceof TypeError); }
+         r.push(calls, Reflect.construct(WeakRef, [{}], nt) instanceof WeakRef, calls);
+         r.join()",
+        "true,true,0,true,1",
+    );
+}
+
+/// Symbols that are not in the `Symbol.for` registry are valid `WeakRef`
+/// targets and registry targets and tokens; well-known symbols too.
+#[test]
+fn weakref_symbol_targets() {
+    assert_string(
+        "let s = Symbol('d');
+         let r = [new WeakRef(s).deref() === s, new WeakRef(Symbol.iterator).deref() === Symbol.iterator];
+         const fr = new FinalizationRegistry(() => {});
+         r.push(fr.register(s, 'h', Symbol.asyncIterator) === undefined, fr.unregister(Symbol.asyncIterator));
+         r.join()",
+        "true,true,true,true",
+    );
+}
+
+/// A throw out of a cleanup callback is reported like an uncaught exception
+/// (`Uncaught ...` on stderr, exit 1) after `main` finished.
+#[test]
+fn finreg_cleanup_throw_is_uncaught() {
+    stressed_uncaught(
+        "const fr = new FinalizationRegistry(h => { throw new Error('cleanup ' + h); });
+         (function () { fr.register({}, 'x'); })();
+         for (let i = 0; i < 10; i++) { let junk = [i]; }
+         console.log('end');",
+        "end\n",
+        "Error: cleanup x",
     );
 }

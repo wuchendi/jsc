@@ -124,6 +124,36 @@ fn weak_collection_layout_matches_design() {
     assert_eq!(ELEMS_FLAG_WEAK, 1);
 }
 
+/// Pins the `WeakRef` and `FinalizationRegistry` layouts to
+/// runtime-memory.md §5.4 / §6.3 / §6.4: type bytes 17 / 18; a `WeakRef` is
+/// 32 B with `target` @24; a registry is 40 B with `cells` @20, `cleanup`
+/// @24, `flags` @32 (`1` = job queued) and `job_next` @36; both keep the
+/// collector link at the weak collections' `weak_next` @16.
+#[test]
+fn weakref_finreg_layout_matches_design() {
+    use super::{
+        BLOCK_ALIGN, FINREG_BLOCK_SIZE, FINREG_CELLS_OFFSET, FINREG_CLEANUP_OFFSET,
+        FINREG_FLAG_JOB_QUEUED, FINREG_FLAGS_OFFSET, FINREG_JOB_NEXT_OFFSET, TYPE_FINREG,
+        TYPE_WEAKREF, WEAK_NEXT_OFFSET, WEAKREF_BLOCK_SIZE, WEAKREF_TARGET_OFFSET,
+    };
+    assert_eq!((TYPE_WEAKREF, TYPE_FINREG), (17, 18));
+    assert_eq!(WEAK_NEXT_OFFSET, 16);
+    assert_eq!([WEAKREF_TARGET_OFFSET, WEAKREF_BLOCK_SIZE], [24, 32]);
+    assert_eq!(
+        [
+            FINREG_CELLS_OFFSET,
+            FINREG_CLEANUP_OFFSET,
+            FINREG_FLAGS_OFFSET,
+            FINREG_JOB_NEXT_OFFSET,
+            FINREG_BLOCK_SIZE
+        ],
+        [20, 24, 32, 36, 40]
+    );
+    assert_eq!(FINREG_FLAG_JOB_QUEUED, 1);
+    assert_eq!(WEAKREF_BLOCK_SIZE % BLOCK_ALIGN, 0);
+    assert_eq!(FINREG_BLOCK_SIZE % BLOCK_ALIGN, 0);
+}
+
 /// Pins the `TYPE_PROPS` table layout, attribute bits, and flag bits to
 /// `DESIGN.md` sections 5.1-5.3.
 #[test]
