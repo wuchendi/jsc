@@ -459,7 +459,9 @@ pub(super) fn emit_new_array(helpers: Helpers<'_>, proto: i64, leaves: &LeafSet)
 /// [`super::emit_call_indirect`]'s env-last ABI: push the
 /// single real argument into slot `a0` (padding the remaining `K-1` positional
 /// slots with `undefined`), reset `this`, push the callee's own environment, the
-/// argument count (`1`), and the funcref-table index, then `call_indirect`. The
+/// argument count (`1`), and the funcref-table index, then `call_indirect`
+/// (with `K = 0` the argument rides a one-element spread argument array
+/// instead). The
 /// callback's result is left on the stack; a throw inside it sets `$exc_pending`
 /// (which the caller checks after the call), so no propagation is emitted here.
 /// The two `i64` params occupy locals 0/1; one extra `i32` local holds the
@@ -467,12 +469,28 @@ pub(super) fn emit_new_array(helpers: Helpers<'_>, proto: i64, leaves: &LeafSet)
 pub(super) fn emit_invoke1(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut function = helper_builder(leaves, &[ROOT_JS, ROOT_JS], &[RAW_I32]);
     let (callee, arg, base) = (0, 1, 2);
+    let k = helpers.max_args;
+    // With `K = 0` the argument has no positional slot: it goes in a fresh
+    // one-element spread argument array (built in `base` before `base` takes
+    // the callee), published for the callee like any call passing more than
+    // `K` arguments. When that allocation runs out of memory the callee is not
+    // called: `undefined` is returned with the `RangeError` pending.
+    if k == 0 {
+        wasm!(function;
+            I32Const(1), Call(helpers.new_array()), LocalSet(base),
+            GlobalGet(EXC_PENDING_GLOBAL),
+            If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+            LocalGet(base),
+        );
+        emit_array_elems(&mut function);
+        wasm!(function; LocalGet(arg), I64Store(elem_slot(0)));
+        emit_publish_spread_args(base, &mut function);
+    }
     // base = i32.wrap(callee).
     function.instruction(&Instruction::LocalGet(callee));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalSet(base));
     // K padded positional slots: `arg` fills `a0`, the rest are `undefined`.
-    let k = helpers.max_args;
     if k >= 1 {
         function.instruction(&Instruction::LocalGet(arg));
     }

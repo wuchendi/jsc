@@ -1151,9 +1151,12 @@ impl LowerCtx<'_> {
         // `%String.prototype%`, `%Map.prototype%`, `%Set.prototype%`,
         // `%Promise.prototype%`, `%Date.prototype%` or `%GeneratorPrototype%`
         // builtin: a generic method call with guarded fast paths (DESIGN.md
-        // §6.4).
+        // §6.4). A call with more arguments than `K` (never a source call,
+        // whose arguments widen `K`) takes the ordinary method call, which
+        // passes them all through its spread form.
         if let Expr::Member(member) = callee_expr
             && let MemberProp::Ident(id) = &member.prop
+            && args.len() <= self.shared.max_arity
             && (ARRAY_METHODS.contains(&id.sym.as_ref())
                 || STRING_METHODS.contains(&id.sym.as_ref())
                 || receiver_method(id.sym.as_ref()))

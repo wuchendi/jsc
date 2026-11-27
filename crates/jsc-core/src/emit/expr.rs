@@ -85,6 +85,11 @@ fn emit_node_inner(
             function.instruction(&Instruction::LocalTee(*local));
         }
         IrNode::Call { func, args } => {
+            if let Some(spread) = spilled_args(args, helpers) {
+                let target = SpreadCallee::Direct(*func);
+                emit_call_spread(&target, &spread, function, scratch, strings, helpers);
+                return;
+            }
             // Direct call to a known function declaration (env-last ABI): push the
             // K padded args, then a trailing `undefined` env (a top-level function
             // never captures) and the argument count, then a plain `call`. The
@@ -806,9 +811,22 @@ fn emit_node_inner(
     }
 }
 
+/// The argument array of an IR call passing more arguments than the `K`
+/// positional slots, or `None` when they fit. A source call never does (the
+/// arity scan widens `K` to the widest call); an IR fragment built by a
+/// builtin can, and its call is then emitted as the equivalent spread call,
+/// which passes every argument and the real `argc` instead of dropping the
+/// surplus. The decision is compile-time only: a call that fits emits as
+/// before.
+fn spilled_args(args: &[IrNode], helpers: Helpers<'_>) -> Option<IrNode> {
+    (args.len() > helpers.max_args as usize)
+        .then(|| IrNode::ArraySpread(args.iter().cloned().map(SpreadElem::Item).collect()))
+}
+
 /// Push the `K` positional argument jsvals of a uniform-ABI call frame onto the
-/// stack (env-last ABI): exactly `helpers.max_args` slots, surplus arguments
-/// evaluated then dropped, missing arguments padded with `undefined`. The
+/// stack (env-last ABI): every argument, then `undefined` padding up to
+/// `helpers.max_args` slots. Callers route a call with more than `K` arguments
+/// to its spread form first ([`spilled_args`]), so nothing is dropped. The
 /// trailing `env` slot is pushed by the caller *after* these (a direct call
 /// pushes `undefined`; an indirect call pushes the callee's own environment),
 /// then the callee index if indirect.
@@ -820,14 +838,9 @@ pub(super) fn emit_call_args(
     helpers: Helpers<'_>,
 ) {
     let k = helpers.max_args as usize;
-    for (i, arg) in args.iter().enumerate() {
+    for arg in args {
         emit_node(arg, function, scratch, strings, helpers);
-        // JS ignores extra arguments; drop any beyond the fixed K slots.
-        if i >= k {
-            function.instruction(&Instruction::Drop);
-        } else {
-            function.root_node(arg);
-        }
+        function.root_node(arg);
     }
     // Missing arguments are `undefined`.
     for _ in args.len()..k {
@@ -873,6 +886,27 @@ pub(super) fn emit_method_call_user(
     else {
         unreachable!("emit_method_call_user is only called with a MethodCallUser node")
     };
+    if let Some(spread) = spilled_args(args, helpers) {
+        // `obj[key](...args)`: the receiver into `obj_local`, the member read
+        // from it, then the spread call binding `this` = the receiver.
+        let callee = IrNode::Seq(vec![
+            IrNode::Assign {
+                local: *obj_local,
+                value: obj.clone(),
+            },
+            IrNode::Index {
+                obj: Box::new(IrNode::Local(*obj_local)),
+                index: key.clone(),
+            },
+        ]);
+        let target = SpreadCallee::Method {
+            callee: Box::new(callee),
+            this_local: *obj_local,
+            not_callable: not_callable.clone(),
+        };
+        emit_call_spread(&target, &spread, function, scratch, strings, helpers);
+        return;
+    }
     let (obj_local, callee_val) = (*obj_local, *callee_local);
     // Evaluate the receiver ONCE into a stable frame local (survives argument
     // evaluation, the member read, and the `__this` set).
@@ -996,6 +1030,24 @@ pub(super) fn emit_this_call(
         unreachable!("emit_this_call is only called with a ThisCall node")
     };
     let this_local = *this_local;
+    if let Some(spread) = spilled_args(args, helpers) {
+        // `super(...args)` passes the construct marker; any other call binds
+        // `this` = the enclosing instance, as a method call on it would.
+        let target = if *construct {
+            SpreadCallee::This {
+                callee: callee.clone(),
+                this_local,
+            }
+        } else {
+            SpreadCallee::Method {
+                callee: callee.clone(),
+                this_local,
+                not_callable: not_callable.clone(),
+            }
+        };
+        emit_call_spread(&target, &spread, function, scratch, strings, helpers);
+        return;
+    }
     let base = scratch + 7;
 
     // K padded argument slots (deepest on the stack).
@@ -1700,6 +1752,22 @@ pub(super) fn emit_construct<S: Sink>(
     else {
         unreachable!("emit_construct is only called with a Construct node")
     };
+    if spread.is_none()
+        && let Some(spread) = spilled_args(args, helpers)
+    {
+        let node = IrNode::Construct {
+            callee: callee.clone(),
+            args: Vec::new(),
+            spread: Some(Box::new(spread)),
+            callee_local: *callee_local,
+            this_local: *this_local,
+            reserve: *reserve,
+            not_constructor: not_constructor.clone(),
+            new_target: new_target.clone(),
+        };
+        emit_construct(&node, function, scratch, strings, helpers);
+        return;
+    }
     let (f, this) = (*callee_local, *this_local);
     // `new.target`: the callee itself, or the derived class for `super(..)`.
     let emit_new_target = |function: &mut S| match new_target {
@@ -2560,6 +2628,11 @@ pub(super) fn emit_call_indirect(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    if let Some(spread) = spilled_args(args, helpers) {
+        let target = SpreadCallee::Indirect(Box::new(callee.clone()), not_callable.clone());
+        emit_call_spread(&target, &spread, function, scratch, strings, helpers);
+        return;
+    }
     let base = scratch + 7;
     // K padded argument slots (deepest on the stack).
     emit_call_args(args, function, scratch, strings, helpers);
