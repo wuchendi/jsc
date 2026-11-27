@@ -508,8 +508,8 @@ fn weakref_finreg_constructor_without_new_throws() {
 
 /// The argument `TypeError`s: a `WeakRef` target, a registry target or a
 /// token that cannot be held weakly (primitives, registered symbols), a
-/// non-callable cleanup, and the receiver checks; the argument check runs
-/// before the `new.target` prototype read.
+/// non-callable cleanup, and the receiver checks; from a derived constructor
+/// the argument check throws out of `super(...)` before `this` is bound.
 #[test]
 fn weakref_finreg_invalid_arguments_throw() {
     assert_string(
@@ -557,15 +557,15 @@ fn weakref_finreg_invalid_arguments_throw() {
         "TypeError: Method WeakRef.prototype.deref called on incompatible receiver",
     );
     assert_string(
-        "let calls = 0;
-         let nt = function () {}.bind(null);
-         Object.defineProperty(nt, 'prototype', { get() { calls++; return WeakRef.prototype; } });
+        "let log = [];
+         class R extends WeakRef { constructor(t) { log.push('r'); super(t); log.push('r-done'); } }
+         class F extends FinalizationRegistry { constructor(c) { log.push('f'); super(c); log.push('f-done'); } }
          let r = [];
-         try { Reflect.construct(WeakRef, [1], nt); r.push('no'); } catch (e) { r.push(e instanceof TypeError); }
-         try { Reflect.construct(FinalizationRegistry, [1], nt); r.push('no'); } catch (e) { r.push(e instanceof TypeError); }
-         r.push(calls, Reflect.construct(WeakRef, [{}], nt) instanceof WeakRef, calls);
+         try { new R(1); r.push('no'); } catch (e) { r.push(e instanceof TypeError); }
+         try { new F(1); r.push('no'); } catch (e) { r.push(e instanceof TypeError); }
+         r.push(new R({}) instanceof R, log.join(' '));
          r.join()",
-        "true,true,0,true,1",
+        "true,true,true,r f r r-done",
     );
 }
 

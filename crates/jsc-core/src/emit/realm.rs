@@ -3594,6 +3594,10 @@ mod tests {
                         | BuiltinCtor::String
                         | BuiltinCtor::Map
                         | BuiltinCtor::Set
+                        | BuiltinCtor::WeakMap
+                        | BuiltinCtor::WeakSet
+                        | BuiltinCtor::WeakRef
+                        | BuiltinCtor::FinalizationRegistry
                         | BuiltinCtor::Promise
                         | BuiltinCtor::Date
                 ) | Intrinsic::Ctor(
