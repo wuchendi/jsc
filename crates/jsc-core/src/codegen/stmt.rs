@@ -750,7 +750,6 @@ impl LowerCtx<'_> {
                         callee: Box::new(func),
                         args: Vec::new(),
                         this_local: class_local,
-                        construct: false,
                         not_callable: CalleeError::not_a_function(CalleeError::EXPRESSION),
                     });
                     continue;

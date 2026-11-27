@@ -475,7 +475,6 @@ impl Delegate {
                 callee: Box::new(callee),
                 args: vec![slot_get(self.received)],
                 this_local: self.this_local,
-                construct: false,
                 not_callable: CalleeError::not_a_function(name),
             },
         ])
@@ -1457,9 +1456,7 @@ impl CfgBuilder {
                 self.linearize_bound_call(obj, callee, args, obj_local, not_callable)
             }
             // `o.#m(..)` with a suspend (DESIGN.md §7.6).
-            node @ IrNode::ThisCall {
-                construct: false, ..
-            } => self.linearize_this_call(node),
+            node @ IrNode::ThisCall { .. } => self.linearize_this_call(node),
             IrNode::NamespaceGuard {
                 obj,
                 key,
@@ -1561,7 +1558,6 @@ impl CfgBuilder {
                 callee: Box::new(callee),
                 args: lowered,
                 this_local,
-                construct: false,
                 not_callable,
             },
         ]))

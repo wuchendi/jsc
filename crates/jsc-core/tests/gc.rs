@@ -482,3 +482,83 @@ fn gc_symbol_registry_first_entry_survives() {
         "true true r1\n",
     );
 }
+
+/// A spread `new F(...a)` / `super(...a)` with more arguments than `K` holds
+/// its argument array across `Get(new.target, "prototype")` (a lazy function's
+/// first `prototype` read materializes it) and the `this` allocation, and
+/// publishes it only after both: every argument, heap strings all, reaches
+/// the callee past `K`.
+#[test]
+fn gc_spread_construct_args_survive() {
+    same_under_stress(
+        "function churn() { let t = []; for (let i = 0; i < 8; i++) t.push({ i: 'g' + i }); return t.length; }
+         function F(...r) { churn(); this.v = r.join(','); }
+         function P(...r) { this.w = r.join('|'); }
+         class D extends P { constructor(...a) { churn(); super(...a); } }
+         const a = []; for (let i = 0; i < 10; i++) a.push('a' + i);
+         const x = new F(...a), y = new D(...a);
+         console.log(x.v, x instanceof F, y.w, y instanceof D);",
+        "a0,a1,a2,a3,a4,a5,a6,a7,a8,a9 true a0|a1|a2|a3|a4|a5|a6|a7|a8|a9 true\n",
+    );
+}
+
+/// Run a `K = 0` program (no call passes an argument, so its report rides an
+/// uncaught throw) plain and under `gc_stress`, asserting the same report.
+fn assert_uncaught_same_under_stress(src: &str, expected: &str) {
+    let expected = format!("Uncaught {expected}\n");
+    let plain = common::exec(src, false).expect("program should compile and not trap");
+    assert_eq!(
+        (plain.code, plain.stderr.as_str()),
+        (1, expected.as_str()),
+        "`{src}`"
+    );
+    let stressed = common::exec_gc_stress(src, false).expect("runs under gc_stress");
+    assert_eq!(
+        (stressed.code, stressed.stderr.as_str()),
+        (1, expected.as_str()),
+        "`{src}` under gc_stress"
+    );
+}
+
+/// With no positional argument slot (`K = 0`) a user `@@toPrimitive` still
+/// receives its hint: it travels in a one-element spread argument array.
+#[test]
+fn accessor_call_without_argument_slots_passes_the_hint() {
+    assert_uncaught_same_under_stress(
+        "const o = { [Symbol.toPrimitive]() { return arguments.length + ':' + arguments[0]; } };
+         throw `${o}` + ' ' + (o + '');",
+        "1:string 1:default",
+    );
+}
+
+/// With `K = 0`, when the one-element argument array of a `@@toPrimitive`
+/// call runs out of memory, the method is not called and the `RangeError`
+/// propagates. The heap is filled deterministically (no call passes an
+/// argument, so strings grow by doubling): large strings into a pre-grown
+/// array take every free page (a large request failing never touches the
+/// reserve); pairs of 32-byte-class blocks (a two-element literal's store and
+/// handle) then exhaust that class, whose out-of-memory releases the reserve;
+/// dropping one 64 MiB string lets the next collection take the reserve back,
+/// and a second large fill takes every page again. The array handle of the
+/// argument array (32-byte class) then has no slot.
+#[test]
+fn accessor_call_without_argument_slots_out_of_memory() {
+    common::assert_uncaught(
+        "let hit = 0, keep = null, r = 'none', j = 0;
+         const o = { [Symbol.toPrimitive]() { hit = 1; return 'p'; } };
+         const slots = []; for (let i = 0; i < 16384; i++) slots[i] = 0;
+         let p14 = 'x'; for (let i = 0; i < 14; i++) p14 = p14 + p14;
+         let p20 = p14; for (let i = 0; i < 6; i++) p20 = p20 + p20;
+         let p26 = p20; for (let i = 0; i < 6; i++) p26 = p26 + p26;
+         try { for (;;) slots[j++] = p26 + 'x'; } catch (e) {}
+         try { for (;;) slots[j++] = p20 + 'x'; } catch (e) {}
+         try { for (;;) slots[j++] = p14 + 'x'; } catch (e) {}
+         try { for (;;) keep = [keep, 0]; } catch (e) {}
+         slots[0] = 0;
+         try { for (;;) slots[j++] = p14 + 'x'; } catch (e) {}
+         try { r = +o; } catch (e) { r = e; }
+         keep = null;
+         throw (r instanceof RangeError) + ' ' + hit;",
+        "true 0",
+    );
+}

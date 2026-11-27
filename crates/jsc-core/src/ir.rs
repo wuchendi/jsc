@@ -961,15 +961,6 @@ pub enum SpreadCallee {
     /// An indirect call through a computed function value, with the
     /// `TypeError` it throws when that value is not callable.
     Indirect(Box<IrNode>, CalleeError),
-    /// A `super(...args)` call: the parent constructor value, invoked with
-    /// `this` kept as the enclosing constructor's snapshot in `this_local`
-    /// (like [`IrNode::ThisCall`]) and the construct marker as `argc`.
-    This {
-        /// The parent constructor function value.
-        callee: Box<IrNode>,
-        /// The enclosing constructor's `this` snapshot local.
-        this_local: u32,
-    },
     /// A method call `obj.m(...args)` / `obj[k](...args)`: `callee` stores the
     /// receiver into `this_local` and then reads the method from it, so the
     /// call binds `this` = the receiver (like [`IrNode::MethodCallUser`]).
@@ -1967,9 +1958,6 @@ pub enum IrNode {
         /// The enclosing method/constructor's `this` snapshot local, rebound as
         /// `__this` for the call.
         this_local: u32,
-        /// `super(..)`: pass the construct marker (`argc = -(n + 1)`), so the
-        /// parent class constructor accepts the call.
-        construct: bool,
         /// The `TypeError` thrown when `callee` is not callable.
         not_callable: CalleeError,
     },
@@ -2851,7 +2839,7 @@ impl IrNode {
                 }
             }),
             IrNode::CallSpread { target, args } => {
-                matches!(target, SpreadCallee::Indirect(callee, _) | SpreadCallee::This { callee, .. } | SpreadCallee::Method { callee, .. } if f(callee))
+                matches!(target, SpreadCallee::Indirect(callee, _) | SpreadCallee::Method { callee, .. } if f(callee))
                     || f(args)
             }
         }
@@ -3123,9 +3111,8 @@ impl IrNode {
                 .collect(),
             IrNode::CallSpread { target, args } => {
                 let mut out = Vec::new();
-                if let SpreadCallee::Indirect(callee, _)
-                | SpreadCallee::This { callee, .. }
-                | SpreadCallee::Method { callee, .. } = target
+                if let SpreadCallee::Indirect(callee, _) | SpreadCallee::Method { callee, .. } =
+                    target
                 {
                     out.push(&mut **callee);
                 }

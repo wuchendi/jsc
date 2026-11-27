@@ -427,13 +427,17 @@ interned property key.
   that allocation runs out of memory the callee is not called and the
   `RangeError` propagates. The same holds for a promise reaction or a
   `FinalizationRegistry` cleanup callback under `K = 0` (`__invoke1` passes
-  its one argument in a one-element spread array), for an inline array
+  its one argument in a one-element spread array), for a one-argument
+  accessor-style call under `K = 0` (a setter, `@@toPrimitive` with its hint,
+  `@@hasInstance`: the same one-element array; on OOM the call yields
+  `undefined` with the `RangeError` pending), for an inline array
   higher-order method whose callback may gather more than `K` arguments (the
   shared spill array is allocated, and checked, before the first callback),
   and for an IR call node a builtin builds with more literal arguments than
   `K`: it is emitted as the equivalent spread call (a direct call, an indirect
-  call, a method call, a `super` call or a `new`), a compile-time choice that
-  leaves every call fitting in `K` — every source call — unchanged.
+  call, a method call, a call on the enclosing `this`, or a `new` /
+  `super(..)`), a compile-time choice that leaves every call fitting in `K` —
+  every source call — unchanged.
 - **`this`.** `this` rides the `$__this` global rather than a parameter. A method
   call `obj.m(args)` evaluates `obj` and the arguments, then sets
   `$__this = obj` immediately before `call_indirect`; a plain call resets it to
