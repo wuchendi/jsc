@@ -19,8 +19,10 @@
 //! allocation gives up (out of memory, §5.8: [`emit_oom_reserve`] /
 //! [`emit_oom_large`]). It bumps the epoch, marks from the roots
 //! ([`emit_collect`]) through the mark stack (`__gc_visit` / `__gc_trace` /
-//! `__gc_drain`), tombstones the unmarked heap strings of the weak intern
-//! table, and sweeps. `__gc_sweep` frees every unmarked slot
+//! `__gc_drain`), runs the ephemeron fixpoint of the `WeakMaps` and clears the
+//! weak collections' dead entries ([`emit_ephemerons`],
+//! [`emit_weak_clear`]), tombstones the unmarked heap strings of the weak
+//! intern table, and sweeps. `__gc_sweep` frees every unmarked slot
 //! (`gc != $__gc_epoch`) onto rebuilt class lists, returns empty pages and
 //! unmarked large spans to the pool and recomputes `$__gc_live`; then it
 //! takes back the out-of-memory reserve ([`abi::GC_RESERVE_PAGES`] pages,
@@ -35,11 +37,11 @@ use super::{
     CF_VALUE_GLOBAL, EXC_PENDING_GLOBAL, EXC_VALUE_GLOBAL, FD_WRITE_IMPORT, GC_BUSY_GLOBAL,
     GC_DEBT_GLOBAL, GC_EPOCH_GLOBAL, GC_FREE_PAGES_GLOBAL, GC_LARGE_GLOBAL, GC_LIVE_GLOBAL,
     GC_OVERFLOW_GLOBAL, GC_RESERVE_GLOBAL, GC_STACK_END_GLOBAL, GC_STACK_GLOBAL,
-    GC_STACK_TOP_GLOBAL, HEAP_BASE, HEAP_PTR_GLOBAL, Helpers, INTERN_BASE_GLOBAL,
-    INTERN_CAP_GLOBAL, JOB_HEAD_GLOBAL, JOB_TAIL_GLOBAL, LeafSet, MODULE_CELL_GLOBAL_BASE,
-    NEW_TARGET_GLOBAL, OUT_BUF_GLOBAL, PATH_BUF_GLOBAL, PROC_EXIT_IMPORT, RAW_I32, RAW_I64,
-    REFS_BUF_GLOBAL, REJECTED_HEAD_GLOBAL, SP_GLOBAL, SPREAD_ARGS_GLOBAL, Sink, THIS_GLOBAL, abi,
-    finish_builder, helper_builder, promise_engine, realm,
+    GC_STACK_TOP_GLOBAL, GC_WEAK_GLOBAL, HEAP_BASE, HEAP_PTR_GLOBAL, HOLE_BITS, Helpers,
+    INTERN_BASE_GLOBAL, INTERN_CAP_GLOBAL, JOB_HEAD_GLOBAL, JOB_TAIL_GLOBAL, LeafSet,
+    MODULE_CELL_GLOBAL_BASE, NEW_TARGET_GLOBAL, OUT_BUF_GLOBAL, PATH_BUF_GLOBAL, PROC_EXIT_IMPORT,
+    RAW_I32, RAW_I64, REFS_BUF_GLOBAL, REJECTED_HEAD_GLOBAL, SP_GLOBAL, SPREAD_ARGS_GLOBAL, Sink,
+    THIS_GLOBAL, UNDEFINED_BITS, abi, finish_builder, helper_builder, promise_engine, realm,
 };
 
 /// Emit each listed instruction in order: `wasm!(function; LocalGet(0), ..)`.
@@ -631,8 +633,10 @@ fn emit_visit_value(f: &mut impl Sink, helpers: Helpers<'_>, v: u32) {
 /// The static mark stack's end.
 const MARK_STACK_END: i32 = (abi::GC_MARK_STACK + abi::GC_MARK_STACK_SIZE).cast_signed();
 
-/// Emit `__gc_collect()` (§5.6 "Collection order", without the M3 weak
-/// steps): set `$__gc_busy`, advance `$__gc_epoch` (`1..=255`), mark, then
+/// Emit `__gc_collect()` (§5.6 "Collection order"): set `$__gc_busy`,
+/// advance `$__gc_epoch` (`1..=255`), empty the weak-collection list, mark,
+/// run the ephemeron fixpoint ([`emit_ephemerons`]), clear the `WeakMaps` and
+/// `WeakSets` ([`emit_weak_clear`]), then
 /// release a paged mark stack, tombstone the intern table's unmarked heap
 /// strings (slot value `1`), `__gc_sweep`, take the out-of-memory reserve
 /// when it is not held (§5.8), and renew the budget to
@@ -649,10 +653,10 @@ const MARK_STACK_END: i32 = (abi::GC_MARK_STACK + abi::GC_MARK_STACK_SIZE).cast_
 /// full and no page to grow into leaves its block unmarked and sets
 /// `$__gc_overflow`; a pass that overflowed is followed by one that also
 /// re-traces every marked heap block, until a pass completes without
-/// overflow. The ephemeron fixpoint and the weak clearing of M3 (§6.2) slot
-/// in between the last pass and the intern tombstones.
+/// overflow. Tracing a `WeakMap` / `WeakSet` links it into the `$__gc_weak` list
+/// the weak steps walk.
 fn emit_collect(helpers: Helpers<'_>, leaves: &LeafSet, gc: GcLayout) -> Function {
-    let mut f = helper_builder(leaves, &[], &[RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I64]);
+    let mut f = helper_builder(leaves, &[], &COLLECT_LOCALS);
     let (p, end, first, c, v) = (0, 1, 2, 3, 4);
     let hs = gc.heap_start;
     let gc_byte = abi::HEADER_GC_OFFSET;
@@ -664,6 +668,7 @@ fn emit_collect(helpers: Helpers<'_>, leaves: &LeafSet, gc: GcLayout) -> Functio
         I32Const(abi::GC_MARK_STACK.cast_signed()), GlobalSet(GC_STACK_GLOBAL),
         I32Const(abi::GC_MARK_STACK.cast_signed()), GlobalSet(GC_STACK_TOP_GLOBAL),
         I32Const(MARK_STACK_END), GlobalSet(GC_STACK_END_GLOBAL),
+        I32Const(1), GlobalSet(GC_WEAK_GLOBAL),
         I32Const(1), LocalSet(first),
         Loop(BlockType::Empty),
         I32Const(0), GlobalSet(GC_OVERFLOW_GLOBAL),
@@ -725,6 +730,12 @@ fn emit_collect(helpers: Helpers<'_>, leaves: &LeafSet, gc: GcLayout) -> Functio
         I32Const(0), LocalSet(first),
         GlobalGet(GC_OVERFLOW_GLOBAL), BrIf(0),
         End,
+    );
+    emit_ephemerons(&mut f, helpers, gc, WEAK_LOCALS);
+    emit_weak_clear(&mut f, gc, WEAK_LOCALS);
+    // The WeakRef clearing and the FinalizationRegistry processing (§5.6)
+    // follow here, before the intern tombstones.
+    wasm!(f;
         // Return a paged mark stack to the pool.
         GlobalGet(GC_STACK_GLOBAL), I32Const(hs), I32GeU,
         If(BlockType::Empty),
@@ -750,6 +761,198 @@ fn emit_collect(helpers: Helpers<'_>, leaves: &LeafSet, gc: GcLayout) -> Functio
     emit_renew(&mut f, helpers, gc);
     wasm!(f; I32Const(0), GlobalSet(GC_BUSY_GLOBAL), End);
     finish_builder(f)
+}
+
+/// The locals of [`emit_collect`] its weak steps use: `c` (i32) and `v`
+/// (i64) are shared scratch; `h` walks the weak-collection list; `at`,
+/// `end`, `out` walk an entry store; `live` counts the kept entries;
+/// `stride` is an entry's byte size; `key` (i64) holds the entry's key.
+#[derive(Clone, Copy)]
+struct WeakLocals {
+    c: u32,
+    v: u32,
+    h: u32,
+    at: u32,
+    end: u32,
+    out: u32,
+    live: u32,
+    stride: u32,
+    key: u32,
+}
+
+/// The locals of [`emit_collect`]: `p`, `end`, `first`, `c` (i32), `v`
+/// (i64), then the rest of [`WEAK_LOCALS`].
+const COLLECT_LOCALS: [super::LocalClass; 12] = [
+    RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I64, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
+    RAW_I32, RAW_I64,
+];
+
+/// The weak steps' locals within [`COLLECT_LOCALS`].
+const WEAK_LOCALS: WeakLocals = WeakLocals {
+    c: 3,
+    v: 4,
+    h: 5,
+    at: 6,
+    end: 7,
+    out: 8,
+    live: 9,
+    stride: 10,
+    key: 11,
+};
+
+/// Emit: walk the `$__gc_weak` list, running `body` with local `h` at each
+/// handle whose entry store is non-empty, `at` at its first slot and `end`
+/// past its last; the link `weak_next` is read after `body` (and, when
+/// `unlink`, cleared).
+fn walk_weak_list(
+    f: &mut super::FnBuilder<'_>,
+    l: WeakLocals,
+    unlink: bool,
+    body: impl FnOnce(&mut super::FnBuilder<'_>),
+) {
+    let data = abi::ELEMS_DATA_OFFSET.cast_signed();
+    wasm!(f;
+        GlobalGet(GC_WEAK_GLOBAL), LocalSet(l.h),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(l.h), I32Const(1), I32Eq, BrIf(1),
+        LocalGet(l.h), I32Load(m32(abi::WEAK_ENTRIES_OFFSET)), LocalTee(l.at),
+        If(BlockType::Empty),
+        LocalGet(l.at), I32Load(m32(abi::ELEMS_CAP_OFFSET)), I32Const(3), I32Shl,
+        LocalGet(l.at), I32Add, I32Const(data), I32Add, LocalSet(l.end),
+        LocalGet(l.at), I32Const(data), I32Add, LocalSet(l.at),
+    );
+    body(f);
+    wasm!(f;
+        End,
+        LocalGet(l.h), I32Load(m32(abi::WEAK_NEXT_OFFSET)), LocalSet(l.at),
+    );
+    if unlink {
+        wasm!(f; LocalGet(l.h), I32Const(0), I32Store(m32(abi::WEAK_NEXT_OFFSET)));
+    }
+    wasm!(f;
+        LocalGet(l.at), LocalSet(l.h),
+        Br(0),
+        End, End,
+    );
+}
+
+/// Emit: push `1` when the heap-reference jsval in local `key` is live this
+/// cycle — a static block (never collected) or a heap block carrying the
+/// epoch (through the i32 scratch `c`).
+fn key_is_live(f: &mut impl Sink, gc: GcLayout, key: u32, c: u32) {
+    wasm!(f;
+        LocalGet(key), I32WrapI64, LocalTee(c), I32Const(gc.heap_start), I32LtU,
+        LocalGet(c), I32Load8U(m8(abi::HEADER_GC_OFFSET)), GlobalGet(GC_EPOCH_GLOBAL), I32Eq,
+        I32Or,
+    );
+}
+
+/// Emit the ephemeron fixpoint (§6.2) after the marking passes: repeat {
+/// for every pair of every traced `WeakMap` whose key is live and whose value
+/// is a heap reference, `__gc_visit` the value (marking it if unmarked);
+/// when that marked anything (the mark stack is not empty) or overflowed,
+/// drain, rescan until no overflow is left, and go again } until a pass
+/// marks nothing. Values of dead keys stay unmarked.
+fn emit_ephemerons(
+    f: &mut super::FnBuilder<'_>,
+    helpers: Helpers<'_>,
+    gc: GcLayout,
+    l: WeakLocals,
+) {
+    wasm!(f; Loop(BlockType::Empty));
+    walk_weak_list(f, l, false, |f| {
+        wasm!(f;
+            LocalGet(l.h), I32Load8U(m8(0)), I32Const(i32::from(abi::TYPE_WEAKMAP)), I32Eq,
+            If(BlockType::Empty),
+            Block(BlockType::Empty), Loop(BlockType::Empty),
+            LocalGet(l.at), LocalGet(l.end), I32GeU, BrIf(1),
+            LocalGet(l.at), I64Load(m64(0, 3)), LocalTee(l.key), I64Const(48), I64ShrU,
+            I64Const(HEAP_TAG), I64Eq,
+            If(BlockType::Empty),
+        );
+        key_is_live(f, gc, l.key, l.c);
+        wasm!(f; If(BlockType::Empty), LocalGet(l.at), I64Load(m64(8, 3)));
+        emit_visit_value(f, helpers, l.v);
+        wasm!(f;
+            End,
+            End,
+            LocalGet(l.at), I32Const(16), I32Add, LocalSet(l.at),
+            Br(0),
+            End, End,
+            End,
+        );
+    });
+    wasm!(f;
+        GlobalGet(GC_STACK_TOP_GLOBAL), GlobalGet(GC_STACK_GLOBAL), I32Ne,
+        GlobalGet(GC_OVERFLOW_GLOBAL), I32Or,
+        If(BlockType::Empty),
+        Call(helpers.gc_drain()),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        GlobalGet(GC_OVERFLOW_GLOBAL), I32Eqz, BrIf(1),
+        I32Const(0), GlobalSet(GC_OVERFLOW_GLOBAL),
+    );
+    emit_rescan(f, helpers);
+    wasm!(f;
+        Br(0),
+        End, End,
+        Br(1),
+        End,
+        End,
+    );
+}
+
+/// Emit the `WeakMap` / `WeakSet` clearing (§6.2): for every handle of the
+/// `$__gc_weak` list, compact its store in place, keeping the entries whose
+/// key is neither `HOLE` nor a dead heap block, rewrite the tail as empty
+/// entries (`HOLE` keys, `undefined` values), store the new `live` count,
+/// and clear the handle's `weak_next` link (leaving every link `0` outside
+/// a collection). Allocates nothing.
+fn emit_weak_clear(f: &mut super::FnBuilder<'_>, gc: GcLayout, l: WeakLocals) {
+    walk_weak_list(f, l, true, |f| {
+        wasm!(f;
+            I32Const(16), I32Const(8),
+            LocalGet(l.h), I32Load8U(m8(0)), I32Const(i32::from(abi::TYPE_WEAKMAP)), I32Eq,
+            Select, LocalSet(l.stride),
+            LocalGet(l.at), LocalSet(l.out),
+            I32Const(0), LocalSet(l.live),
+            Block(BlockType::Empty), Loop(BlockType::Empty),
+            LocalGet(l.at), LocalGet(l.end), I32GeU, BrIf(1),
+            // keep = key != HOLE && (not a heap reference || live).
+            LocalGet(l.at), I64Load(m64(0, 3)), LocalTee(l.key), I64Const(HOLE_BITS), I64Ne,
+            If(BlockType::Result(I32)),
+            LocalGet(l.key), I64Const(48), I64ShrU, I64Const(HEAP_TAG), I64Eq,
+            If(BlockType::Result(I32)),
+        );
+        key_is_live(f, gc, l.key, l.c);
+        wasm!(f;
+            Else, I32Const(1), End,
+            Else, I32Const(0), End,
+            If(BlockType::Empty),
+            LocalGet(l.out), LocalGet(l.key), I64Store(m64(0, 3)),
+            LocalGet(l.stride), I32Const(16), I32Eq,
+            If(BlockType::Empty),
+            LocalGet(l.out), LocalGet(l.at), I64Load(m64(8, 3)), I64Store(m64(8, 3)),
+            End,
+            LocalGet(l.out), LocalGet(l.stride), I32Add, LocalSet(l.out),
+            LocalGet(l.live), I32Const(1), I32Add, LocalSet(l.live),
+            End,
+            LocalGet(l.at), LocalGet(l.stride), I32Add, LocalSet(l.at),
+            Br(0),
+            End, End,
+            // The tail.
+            Block(BlockType::Empty), Loop(BlockType::Empty),
+            LocalGet(l.out), LocalGet(l.end), I32GeU, BrIf(1),
+            LocalGet(l.out), I64Const(HOLE_BITS), I64Store(m64(0, 3)),
+            LocalGet(l.stride), I32Const(16), I32Eq,
+            If(BlockType::Empty),
+            LocalGet(l.out), I64Const(UNDEFINED_BITS), I64Store(m64(8, 3)),
+            End,
+            LocalGet(l.out), LocalGet(l.stride), I32Add, LocalSet(l.out),
+            Br(0),
+            End, End,
+            LocalGet(l.h), LocalGet(l.live), I32Store(m32(abi::WEAK_LIVE_OFFSET)),
+        );
+    });
 }
 
 /// Emit the end of [`emit_collect`] after the sweep: take back the
@@ -990,6 +1193,13 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     run(&mut f, 8, 3, false);
     wasm!(f; Return, End);
     is(&mut f, abi::TYPE_ELEMS);
+    // A weak collection's store: its slots are weak keys and ephemeron
+    // values, visited only by the weak steps of `__gc_collect`.
+    wasm!(f;
+        LocalGet(b), I32Load8U(m8(abi::HEADER_FLAGS_OFFSET)),
+        I32Const(i32::from(abi::ELEMS_FLAG_WEAK)), I32And,
+        If(BlockType::Empty), Return, End,
+    );
     run(&mut f, abi::ELEMS_DATA_OFFSET, 3, false);
     wasm!(f; Return, End);
     is(&mut f, abi::TYPE_PROPS);
@@ -1006,8 +1216,27 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     is(&mut f, abi::TYPE_SYMBOL);
     jsval(&mut f, abi::SYMBOL_DESCRIPTION_OFFSET);
     wasm!(f; Return, End);
-    // Strings, raw buffers and free slots are leaves; the object family
-    // (`1..=3`, `6..=10`) starts with `props` and `proto`.
+    // A WeakMap / WeakSet: the prefix and its entry store (marked, never
+    // traced: see `TYPE_ELEMS`), and a link into the cycle's weak list
+    // unless an earlier trace (an overflow rescan) linked it already.
+    wasm!(f;
+        LocalGet(ty), I32Const(i32::from(abi::TYPE_WEAKMAP)), I32Sub, I32Const(1), I32LeU,
+        If(BlockType::Empty),
+    );
+    raw(&mut f, abi::OBJ_PROPS_OFFSET);
+    jsval(&mut f, abi::OBJ_PROTO_OFFSET);
+    raw(&mut f, abi::WEAK_ENTRIES_OFFSET);
+    wasm!(f;
+        LocalGet(b), I32Load(m32(abi::WEAK_NEXT_OFFSET)), I32Eqz,
+        If(BlockType::Empty),
+        LocalGet(b), GlobalGet(GC_WEAK_GLOBAL), I32Store(m32(abi::WEAK_NEXT_OFFSET)),
+        LocalGet(b), GlobalSet(GC_WEAK_GLOBAL),
+        End,
+        Return,
+        End,
+    );
+    // Strings, raw buffers and free slots are leaves; the rest of the object
+    // family (`1..=3`, `6..=10`) starts with `props` and `proto`.
     wasm!(f;
         LocalGet(ty), I32Eqz, LocalGet(ty), I32Const(i32::from(abi::TYPE_DATE)), I32GtU, I32Or,
         If(BlockType::Empty), Return, End,

@@ -118,7 +118,7 @@ impl IterKind {
 }
 
 /// The constructors whose prototype is an [`Intrinsic::Prototype`].
-const PLAIN_PROTOTYPES: [BuiltinCtor; 9] = [
+const PLAIN_PROTOTYPES: [BuiltinCtor; 11] = [
     BuiltinCtor::Array,
     BuiltinCtor::String,
     BuiltinCtor::Number,
@@ -128,6 +128,8 @@ const PLAIN_PROTOTYPES: [BuiltinCtor; 9] = [
     BuiltinCtor::Promise,
     BuiltinCtor::Date,
     BuiltinCtor::Symbol,
+    BuiltinCtor::WeakMap,
+    BuiltinCtor::WeakSet,
 ];
 
 /// A well-known symbol (DESIGN.md §6.4): a static
@@ -291,7 +293,9 @@ impl Intrinsic {
                 | BuiltinCtor::Map
                 | BuiltinCtor::Set
                 | BuiltinCtor::Promise
-                | BuiltinCtor::Date,
+                | BuiltinCtor::Date
+                | BuiltinCtor::WeakMap
+                | BuiltinCtor::WeakSet,
             ) => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_SELF_ALLOC,
             Self::Ctor(_) => abi::FUNC_FLAG_CONSTRUCTOR,
             _ => 0,
@@ -578,6 +582,15 @@ pub(super) enum Builtin {
     CollectionSize {
         /// `%Set.prototype%` rather than `%Map.prototype%`.
         set: bool,
+    },
+    /// A `%WeakMap.prototype%` (`set == false`: `delete`, `get`, `has`,
+    /// `set`) / `%WeakSet.prototype%` (`add`, `delete`, `has`) method
+    /// (`emit/builtins/weak.rs`).
+    WeakOp {
+        /// `%WeakSet.prototype%` rather than `%WeakMap.prototype%`.
+        set: bool,
+        /// The method.
+        op: MapOp,
     },
     /// `Promise.prototype.then`.
     PromiseThen,
@@ -1662,7 +1675,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 352] = [
+    pub(super) const ALL: [Builtin; 361] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -1741,6 +1754,8 @@ impl Builtin {
         Self::Ctor(BuiltinCtor::Date),
         Self::Ctor(BuiltinCtor::Symbol),
         Self::Ctor(BuiltinCtor::Iterator),
+        Self::Ctor(BuiltinCtor::WeakMap),
+        Self::Ctor(BuiltinCtor::WeakSet),
         Self::ObjectStatic(ObjectBuiltinOp::Keys),
         Self::ObjectStatic(ObjectBuiltinOp::Values),
         Self::ObjectStatic(ObjectBuiltinOp::Entries),
@@ -1990,6 +2005,34 @@ impl Builtin {
         },
         Self::CollectionForEach { set: true },
         Self::CollectionSize { set: true },
+        Self::WeakOp {
+            set: false,
+            op: MapOp::Delete,
+        },
+        Self::WeakOp {
+            set: false,
+            op: MapOp::Get,
+        },
+        Self::WeakOp {
+            set: false,
+            op: MapOp::Has,
+        },
+        Self::WeakOp {
+            set: false,
+            op: MapOp::Set,
+        },
+        Self::WeakOp {
+            set: true,
+            op: MapOp::Add,
+        },
+        Self::WeakOp {
+            set: true,
+            op: MapOp::Delete,
+        },
+        Self::WeakOp {
+            set: true,
+            op: MapOp::Has,
+        },
         Self::PromiseThen,
         Self::PromiseCatch,
         Self::PromiseFinally,
@@ -2136,7 +2179,7 @@ impl Builtin {
             Self::Symbol(op) => op.name(),
             Self::DateMethod(op) => op.name(),
             Self::DateBody(op) => op.name(),
-            Self::CollectionOp { op, .. } => op.name(),
+            Self::CollectionOp { op, .. } | Self::WeakOp { op, .. } => op.name(),
             Self::PromiseThen => "then",
             Self::PromiseCatch => "catch",
             Self::PromiseFinally => "finally",
@@ -2246,7 +2289,12 @@ impl Builtin {
             | Self::ArrayShift
             | Self::ArrayCopy(ArrayCopyOp::ToReversed)
             | Self::Ctor(
-                BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Symbol | BuiltinCtor::Iterator,
+                BuiltinCtor::Map
+                | BuiltinCtor::Set
+                | BuiltinCtor::Symbol
+                | BuiltinCtor::Iterator
+                | BuiltinCtor::WeakMap
+                | BuiltinCtor::WeakSet,
             ) => 0,
             Self::Iter(op) => op.length(),
             Self::Ctor(BuiltinCtor::Date) | Self::DateBody(DateBodyOp::Utc) => 7,
@@ -2268,6 +2316,7 @@ impl Builtin {
             | Self::ArrayCopyWithin
             | Self::ArrayCopy(ArrayCopyOp::With | ArrayCopyOp::ToSpliced)
             | Self::CollectionOp { op: MapOp::Set, .. }
+            | Self::WeakOp { op: MapOp::Set, .. }
             | Self::PromiseThen
             | Self::DefineAccessor { .. } => 2,
             Self::StringMethod(op) => op.length(),
@@ -2325,6 +2374,8 @@ impl Builtin {
             Self::CollectionOp { set, .. } | Self::CollectionForEach { set } => {
                 Some(collection(set))
             }
+            Self::WeakOp { set: false, .. } => Some(BuiltinCtor::WeakMap),
+            Self::WeakOp { set: true, .. } => Some(BuiltinCtor::WeakSet),
             Self::PromiseThen | Self::PromiseCatch | Self::PromiseFinally => {
                 Some(BuiltinCtor::Promise)
             }
@@ -2458,7 +2509,7 @@ const NUMBER_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 31] = [
+const GLOBALS: [(&str, u32, Value); 33] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -2577,6 +2628,16 @@ const GLOBALS: [(&str, u32, Value); 31] = [
         "Iterator",
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Iterator)),
+    ),
+    (
+        "WeakMap",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::WeakMap)),
+    ),
+    (
+        "WeakSet",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::WeakSet)),
     ),
     ("isNaN", METHOD_ATTRS, Value::Method(Builtin::IsNaN)),
     ("isFinite", METHOD_ATTRS, Value::Method(Builtin::IsFinite)),
@@ -2880,6 +2941,8 @@ fn well_known_entries(entries: &mut Vec<Entry>) {
     let tags = [
         (Intrinsic::Prototype(BuiltinCtor::Map), "Map"),
         (Intrinsic::Prototype(BuiltinCtor::Set), "Set"),
+        (Intrinsic::Prototype(BuiltinCtor::WeakMap), "WeakMap"),
+        (Intrinsic::Prototype(BuiltinCtor::WeakSet), "WeakSet"),
         (Intrinsic::Prototype(BuiltinCtor::Promise), "Promise"),
         (Intrinsic::GeneratorPrototype, "Generator"),
         (Intrinsic::AsyncGeneratorPrototype, "AsyncGenerator"),

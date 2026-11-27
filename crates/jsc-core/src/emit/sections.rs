@@ -593,13 +593,14 @@ pub(super) fn build_globals(
     // of `0` under `gc_stress`), `$__gc_live`, `$__gc_epoch` (1), `$__gc_busy`,
     // `$__gc_free_pages`, `$__gc_large`, then the mark stack's `$__gc_stack`,
     // `$__gc_stack_top`, `$__gc_stack_end` and `$__gc_overflow` (set by each
-    // collection), and `$__gc_reserve` (taken by the first collection).
+    // collection), `$__gc_reserve` (taken by the first collection), and the
+    // weak-collection list head `$__gc_weak` (1, the empty list's sentinel).
     let budget = if gc.stress == 0 {
         abi::GC_MIN_BUDGET.cast_signed()
     } else {
         0
     };
-    for init in [budget, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0] {
+    for init in [budget, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1] {
         let (ty, init) = mut_i32(init);
         globals.global(ty, &init);
     }

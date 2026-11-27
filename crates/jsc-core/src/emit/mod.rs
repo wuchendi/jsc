@@ -220,12 +220,17 @@ const GC_OVERFLOW_GLOBAL: u32 = 39;
 /// released by the first out-of-memory and taken again by the next
 /// collection (design/runtime-memory.md §5.8).
 const GC_RESERVE_GLOBAL: u32 = 40;
+/// The head of the cycle's weak-collection list (`$__gc_weak`, raw `i32`
+/// ref, init 1 = empty): every `WeakMap` / `WeakSet` handle traced in a
+/// collection is linked through its `weak_next` slot, the list ending at the
+/// sentinel `1` (design/runtime-memory.md §6.2).
+const GC_WEAK_GLOBAL: u32 = 41;
 
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
 /// the renderer, RNG, promise-engine and collector globals and set in `main`'s
 /// prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 41;
+const MODULE_CELL_GLOBAL_BASE: u32 = 42;
 
 /// An array hole (see [`abi::HOLE`]): the element-slot bit pattern of a
 /// missing element. Every element read maps it to `undefined`.

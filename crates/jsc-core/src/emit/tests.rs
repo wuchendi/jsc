@@ -1032,6 +1032,10 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
         TYPE_ARRAY, TYPE_DATE, TYPE_ELEMS, TYPE_FUNCTION, TYPE_GENERATOR, TYPE_MAP, TYPE_OBJECT,
         TYPE_PROMISE, TYPE_SET, UNDEFINED,
     };
+    use crate::abi::{
+        ELEMS_FLAG_WEAK, HOLE, TYPE_SYMBOL, TYPE_WEAKMAP, TYPE_WEAKSET, WEAK_ENTRIES_OFFSET,
+        WEAK_LIVE_OFFSET, WEAK_NEXT_OFFSET,
+    };
     let u32_at = |mem: &[u8], at: u32| {
         let at = at as usize;
         u32::from_le_bytes(mem[at..at + 4].try_into().expect("u32"))
@@ -1119,6 +1123,36 @@ fn object_family_blocks_carry_the_prefix_and_payload_offsets() {
             "{src}: pairs"
         );
     }
+
+    // A weak collection keeps its pairs (a WeakSet: its keys) in a flagged
+    // element store whose unused and deleted slots hold `HOLE` keys
+    // (`undefined` values); the collector link is clear outside a cycle.
+    let (weak, mem) = heap(
+        "let k = {}; let w = new WeakMap(); w.set(k, 1); w.set({}, 2); w.delete(k); w",
+        TYPE_WEAKMAP,
+        0,
+    );
+    assert_eq!(u32_at(&mem, weak + WEAK_NEXT_OFFSET), 0, "weak_next");
+    assert_eq!(u32_at(&mem, weak + WEAK_LIVE_OFFSET), 1, "live pairs");
+    let store = u32_at(&mem, weak + WEAK_ENTRIES_OFFSET);
+    assert_eq!(
+        header(&mem, store as usize),
+        [TYPE_ELEMS, ELEMS_FLAG_WEAK, 0],
+        "weak store"
+    );
+    assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 8, "four pairs");
+    let slot = |i: u32| u64_at(&mem, store + ELEMS_DATA_OFFSET + 8 * i);
+    assert_eq!([slot(0), slot(1)], [HOLE, UNDEFINED], "deleted pair");
+    assert_eq!(mem[(slot(2) & 0xFFFF_FFFF) as usize], TYPE_OBJECT, "key");
+    assert_eq!(slot(3), 2.0_f64.to_bits(), "value");
+    assert_eq!([slot(4), slot(5)], [HOLE, UNDEFINED], "unused pair");
+    let (weak, mem) = heap("let w = new WeakSet(); w.add(Symbol()); w", TYPE_WEAKSET, 0);
+    assert_eq!(u32_at(&mem, weak + WEAK_LIVE_OFFSET), 1, "live keys");
+    let store = u32_at(&mem, weak + WEAK_ENTRIES_OFFSET);
+    assert_eq!(u32_at(&mem, store + ELEMS_CAP_OFFSET), 4, "four keys");
+    let slot = |i: u32| u64_at(&mem, store + ELEMS_DATA_OFFSET + 8 * i);
+    assert_eq!(mem[(slot(0) & 0xFFFF_FFFF) as usize], TYPE_SYMBOL, "key");
+    assert_eq!(slot(1), HOLE, "unused key");
 
     // An array literal owns a `cap = len` store; pushes grow it by doubling
     // from 4, and the handle never moves.
