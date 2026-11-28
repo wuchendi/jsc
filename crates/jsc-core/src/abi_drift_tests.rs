@@ -339,7 +339,7 @@ fn bigint_layout_matches_design() {
 }
 
 /// Pins the binary-data type bytes and the `ArrayBuffer` layout to
-/// `DESIGN.md` §5.8: type bytes 24 / 25 / 26 (20 is `Proxy`, 21 `BigInt`, 22 / 23 spare); a
+/// `DESIGN.md` §5.2: type bytes 24 / 25 / 26 (20 is `Proxy`, 21 `BigInt`, 22 / 23 spare); a
 /// 32 B buffer with `data` @16, `byte_length` @20, `max_byte_length` @24;
 /// flags `RESIZABLE` = 2, `DETACHED` = 4; byte lengths up to 2^29.
 #[test]
@@ -371,7 +371,7 @@ fn array_buffer_layout_matches_design() {
     assert_eq!(u64::from(BYTE_LENGTH_MAX), MEMORY_MAX_PAGES * 65_536);
 }
 
-/// Pins the typed-array layout to `DESIGN.md` §5.8.3: a 32 B block with
+/// Pins the typed-array layout to `DESIGN.md` §5.2: a 32 B block with
 /// `buffer` @16, `kind` @20, `shift` @21, `byte_offset` @24, `array_length`
 /// @28; flags `LENGTH_TRACKING` = 2, `RESIZABLE_BUFFER` = 4.
 #[test]
@@ -403,7 +403,7 @@ fn typed_array_layout_matches_design() {
     );
 }
 
-/// Pins the `DataView` layout to `DESIGN.md` §5.8.3: a 32 B view with
+/// Pins the `DataView` layout to `DESIGN.md` §5.2: a 32 B view with
 /// `buffer` @16, `byte_offset` @20, `byte_length` @24; flags
 /// `LENGTH_TRACKING` = 2, `RESIZABLE_BUFFER` = 4.
 #[test]

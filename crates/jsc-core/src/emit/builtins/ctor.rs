@@ -248,7 +248,7 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
         // The "requires 'new'" check only: `array_buffer::emit_ctor` and
         // `data_view::emit_ctor` convert the arguments before they read the
         // prototype, `typed_array::emit_ctor` runs the overloads (DESIGN.md
-        // §5.8.7).
+        // §7.9).
         BuiltinCtor::ArrayBuffer | BuiltinCtor::DataView | BuiltinCtor::Typed(_) => {
             body.requires_new(ctor, IrNode::Undefined)
         }

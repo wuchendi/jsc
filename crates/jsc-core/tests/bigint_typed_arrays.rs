@@ -370,3 +370,21 @@ fn bigint_element_reads_never_wrong_out_of_memory() {
         0.0,
     );
 }
+
+/// A `BigInt64Array` reached only through `globalThis` by a run-time key
+/// (no static name of a binary or `BigInt` constructor), read with static
+/// keys: a literal index, a destructuring numeric key, and a member read
+/// right after an element read. Each yields the element.
+#[test]
+fn static_key_reads_of_computed_global_bigint_typed_array() {
+    assert_output(
+        r#"const k = "Big" + "Int" + "64" + "Array";
+           const t = new globalThis[k](2);
+           t[0] = 5n;
+           t[1] = -7n;
+           const { 0: a, 1: b } = t;
+           const o = { x: t[1] };
+           console.log(t[0], a, b, o.x, typeof a);"#,
+        "5n 5n -7n -7n bigint\n",
+    );
+}

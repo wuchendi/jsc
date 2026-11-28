@@ -25,7 +25,7 @@ macro_rules! wasm {
 /// `__gc_take_pages(k)` (failing that, one collection and a retry); the head
 /// page is coded [`abi::GC_PAGE_LARGE_HEAD`], its pre-header records `k` and
 /// links the span onto `$__gc_large`, and the block starts after the
-/// pre-header. When memory cannot supply the span (§5.8) `__alloc` throws
+/// pre-header. When memory cannot supply the span (design/runtime-memory.md §5.8) `__alloc` throws
 /// `%OutOfMemoryError%` and returns `0`, which every variable-size caller
 /// checks; `__alloc_fixed`, whose callers write the block unconditionally,
 /// takes the span from the out-of-memory reserve like a small request
@@ -344,7 +344,7 @@ const RESERVE_ELEMS: u32 =
 
 /// Emit `store = alloc(8 + 8 * cap)` as a [`TYPE_ELEMS`] block with its
 /// `cap` written, leaving the base in local `store`: `alloc` turns the pushed
-/// size into a base. A `0` base (out of memory, §5.8) runs `oom` instead,
+/// size into a base. A `0` base (out of memory, design/runtime-memory.md §5.8) runs `oom` instead,
 /// which must leave the function.
 fn emit_new_elems<S: Sink>(
     function: &mut S,

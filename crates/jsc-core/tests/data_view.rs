@@ -1,4 +1,4 @@
-//! Integration tests: `DataView` (DESIGN.md §5.8): the constructor's
+//! Integration tests: `DataView` (DESIGN.md §7.9): the constructor's
 //! overloads, errors and coercion order, length-tracking views over
 //! resizable buffers, detaching through `transfer`, the getters, every
 //! number get / set pair in both byte orders with edge values, the index
@@ -345,7 +345,7 @@ fn value_conversions() {
 }
 
 /// A NaN of any payload written as raw bits reads back as the canonical NaN
-/// (DESIGN.md §5.8.6): never a pointer, boolean or `undefined`.
+/// (DESIGN.md §6.2): never a pointer, boolean or `undefined`.
 #[test]
 fn nan_reads_are_canonical() {
     assert_string(
@@ -519,7 +519,7 @@ fn subclassing_and_aliasing() {
     );
 }
 
-/// The console form (DESIGN.md §5.8.8): length, offset and the buffer;
+/// The console form (DESIGN.md §6.9): length, offset and the buffer;
 /// both numbers `0` once out of bounds or detached; nested like any value.
 #[test]
 fn rendering() {

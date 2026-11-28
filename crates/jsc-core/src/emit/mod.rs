@@ -805,7 +805,7 @@ const PROP_THROW_PROXY_INVARIANT: i32 = 31;
 const PROP_THROW_PROXY_FALSISH_OP: i32 = 32;
 /// `__prop_throw`'s `mode` argument: a typed-array method or getter (the
 /// `key`, its name) on a receiver that is not a typed array (DESIGN.md
-/// §5.8.4). Modes `44..=51` belong to the binary-data workstream.
+/// §6.2). Modes `44..=51` belong to the binary-data workstream.
 const PROP_THROW_TA_INCOMPATIBLE: i32 = 44;
 /// `__prop_throw`'s `mode` argument: a typed-array method (the `key`, its
 /// name) on an out-of-bounds or detached typed array.
@@ -978,7 +978,7 @@ impl Unwind {
     }
 }
 
-/// Whether a program can reach binary data (DESIGN.md §5.8.5).
+/// Whether a program can reach binary data (DESIGN.md §6.4).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BinaryData {
     /// No binary-data object can exist.
@@ -1210,14 +1210,15 @@ struct Helpers<'a> {
     /// observe more than `K` arguments, so a call passing more of them
     /// publishes the spread argument array only for a builtin callee.
     gathers_arguments: bool,
-    /// Whether the program builds any accessor ([`IrNode::MakeAccessor`]).
-    /// When `false`, `__get` / `__set` omit the getter/setter invocation and
+    /// Whether the program builds any accessor ([`IrNode::MakeAccessor`]),
+    /// can create a proxy, or can read a `BigInt` typed-array element (which
+    /// may run out of memory). When `false`, `__get` / `__set` omit the getter/setter invocation and
     /// member accesses skip the post-call exception check.
     has_accessors: bool,
     /// Whether the program tests an intrinsics dirty bit (DESIGN.md §6.4). When
     /// `false`, `__set` / `__define` / `__delete` do not set the bits.
     dirty_tracking: bool,
-    /// Whether the program can reach binary data (DESIGN.md §5.8.5). When
+    /// Whether the program can reach binary data (DESIGN.md §6.4). When
     /// not, the collector and the renderer leave out their binary-data arms.
     binary: BinaryData,
     /// Whether the program can create a proxy (DESIGN.md §6.11 reachability
