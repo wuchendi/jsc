@@ -141,10 +141,16 @@ jobs:
           --partition count:${{ matrix.part }}/4
           -E 'not (binary(opcount) | binary(memory))'
 
+  # test262 in four parallel shards (`--partition K/4`: round-robin over the
+  # sorted test list); each shard checks only the baseline entries it owns.
   test262:
-    name: test262 (baseline regression gate)
+    name: test262 (shard ${{ matrix.partition }}/4)
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v7
 
@@ -153,8 +159,12 @@ jobs:
         with:
           toolchain: 1.99.1
 
+      # All shards restore the same release build; only shard 1 (which also
+      # builds the M1 harness tests) saves it, so parallel saves never collide.
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ matrix.partition == 1 }}
 
       # The pinned test262 SHA lives in the fetch script, so key on its hash.
       - name: Cache test262 checkout
@@ -172,22 +182,58 @@ jobs:
       # M1: the official sta.js + assert.js compile and run unmodified. The
       # tests return early without the checkout, so require it first.
       - name: M1 harness tests
+        if: matrix.partition == 1
         run: |
           test -f .tmp/test262/harness/assert.js
           cargo test --release -p jsc --test test262_harness -- --nocapture
 
-      # Fails if any test passing in tests/test262/baseline.txt regressed.
+      # Fails if any baseline test owned by this shard regressed.
       - name: Check against baseline
-        run: cargo run --release -p jsc-test262 -- --check
+        run: cargo run --release -p jsc-test262 -- --check --partition ${{ matrix.partition }}/4
 
-      # Per-test results, so the baseline and history can be regenerated from CI.
-      - name: Upload test262 results
+      - name: Upload shard results
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-results-${{ matrix.partition }}
+          path: .tmp/test262-results.tsv
+          if-no-files-found: ignore
+
+  # Merges the shard results into the single `test262-results` artifact (one
+  # TSV sorted by path, as an unpartitioned run writes it), so the baseline
+  # and history can be regenerated from CI. Runs even when a shard's check
+  # failed; a failed shard still fails the workflow, and a missing shard
+  # result fails this job.
+  test262-results:
+    name: test262 (merge results)
+    runs-on: ubuntu-latest
+    needs: test262
+    if: always()
+    steps:
+      - name: Download shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: test262-results-*
+          path: shards
+
+      - name: Merge shard results
+        run: |
+          for k in 1 2 3 4; do
+            test -f "shards/test262-results-$k/test262-results.tsv" || {
+              echo "missing results of shard $k/4" >&2
+              exit 1
+            }
+          done
+          mkdir -p .tmp
+          cat shards/test262-results-*/test262-results.tsv \
+            | LC_ALL=C sort -t "$(printf '\t')" -k1,1 > .tmp/test262-results.tsv
+          wc -l .tmp/test262-results.tsv
+
+      - name: Upload test262 results
         uses: actions/upload-artifact@v4
         with:
           name: test262-results
           path: .tmp/test262-results.tsv
-          if-no-files-found: ignore
 
   # NOTE: portable musl / multi-platform release binaries are built by
   # release.yml on `v*` tags (and manual dispatch), not on every push.
