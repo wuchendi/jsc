@@ -589,7 +589,8 @@ cleared; only on a `DICTIONARY` array). Functions additionally: `2` `ASYNC`,
 Arrays additionally: `4` `SPARSE`, `8` `JOINING` (set while `join` runs, so a
 cyclic element joins as `""`), `16` `LENGTH_READONLY` (`length` is
 non-writable; only on a `DICTIONARY` array), `32` `DICTIONARY` (§5.4). None of
-the array bits is ever cleared (except `JOINING`).
+the array bits is ever cleared (except `JOINING`, and `SPARSE` on a
+non-dictionary array whose store covers `length` again).
 Binary data (§5.2): an `ArrayBuffer` additionally `2` `AB_FLAG_RESIZABLE`,
 `4` `AB_FLAG_DETACHED` (bit `8` is kept free for an immutable buffer, which
 is not implemented); a typed array `2` `TA_FLAG_LENGTH_TRACKING`
@@ -865,8 +866,8 @@ aliases, captured bindings, and member receivers all observe `push`.
   a default-attribute element, store through `__array_define` /
   `__sparse_define` (the same element paths without `__proto_set`).
 - **Growth.** `__array_reserve(base, need)` (behind `push` and every bulk
-  append) grows the store to `max(need, 4, 2·cap)` slots and copies the `len`
-  live ones. A store
+  append) grows the store to `max(need, 4, 2·cap)` slots and copies the
+  `min(len, cap)` live ones. A store
   `a[i] = v` with `i ≥ len` stays dense while `i < len + 1024` (`DENSE_GAP`;
   store capacity `max(4, 2·cap, i + 1)`, gap filled with holes,
   `len = i + 1`). The bound is a gap, not a multiple of the capacity: each
@@ -874,11 +875,24 @@ aliases, captured bindings, and member receivers all observe `push`.
   (`x[2^k - 2]`) go sparse instead of doubling the store until memory runs
   out.
 - **Sparse arrays.** A larger gap (a store or a `length` growth to
-  `i ≥ len + 1024`) sets `SPARSE` (never cleared): the store is
-  kept for indices `< cap`, and every element at or past `cap` is an
-  array-index key in the handle's own property table. `length` may then exceed
-  the store; every element operation on a sparse array goes through
-  `__sparse_get` / `__sparse_set`.
+  `i ≥ len + 1024`) sets `SPARSE`: the store is
+  kept for indices `< cap` (holes past `length`), and every element at or past
+  `cap` is an array-index key in the handle's own property table. `length` may
+  then exceed the store — a pure `length` growth leaves the written prefix in
+  the store and the tail as implicit holes, with no table key; every element
+  operation on a sparse array goes through `__sparse_get` / `__sparse_set`.
+- **Re-densify.** Outside dictionary mode a sparse store at `i == cap` (the
+  first index past the store, `0` without one; `__sparse_set` /
+  `__sparse_define`, so also `push`) grows the store instead of adding a table
+  key: `__array_reserve(o, i + 1)`, the new slots become holes, every
+  array-index table key in `cap..cap'` moves into its slot (outside dictionary
+  mode an index key is a default data property), then element `i` is stored
+  (an absent one first offered to `__proto_set`). Once the store covers
+  `length` (`cap' ≥ length`) no index key is left in the table and `SPARSE` is
+  cleared, as it is when a `length` shrink leaves `length ≤ cap`. So
+  `a.length = 10000; a.fill(7)` and a push loop after a far write stay linear
+  (the store doubles), while a store elsewhere past `cap` (a fill from the
+  end) still adds table keys.
 - **Dictionary mode.** Before an element takes non-default attributes
   (`defineProperty` with `writable`/`enumerable`/`configurable` false or an
   accessor), before the array becomes non-extensible (`preventExtensions` /
@@ -904,7 +918,8 @@ aliases, captured bindings, and member receivers all observe `push`.
   `RangeError: Invalid array length`; shrinking turns `n..len` into holes
   (keeping the store) and drops a sparse array's index keys `≥ n`, stopping at
   the highest non-configurable element `k ≥ n` (then `length = k + 1` and
-  `Cannot delete property 'k'` is thrown); growing fills holes densely within
+  `Cannot delete property 'k'` is thrown; a non-dictionary sparse array whose
+  new `length ≤ cap` is dense again); growing fills holes densely within
   the dense bound, else makes the array sparse without allocating the gap.
   `defineProperty(a, "length", d)` first converts a `value` (`ToUint32` and
   `ToNumber`, two conversions; an abrupt one propagates and a mismatch is the
@@ -4733,6 +4748,9 @@ Each item below is current behaviour of this tree.
   property table, so element access on a large frozen or attributed array is
   `O(n)`; the renderer prints an accessor element as `undefined` and omit a
   non-enumerable one.
+- A sparse array (§5.4) keeps the elements past its store in the same
+  linear-scan table: only stores at the store's end re-densify, so filling a
+  far-grown array backwards (or at scattered indices) is `O(n)` per element.
 - `Object.defineProperties` (and `Object.create`'s `Properties`) reads the
   enumerable own keys of its `Properties` argument once, before reading any
   descriptor.

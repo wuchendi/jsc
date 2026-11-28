@@ -90,7 +90,8 @@ const FNV_PRIME: u32 = 0x0100_0193;
 
 /// The dense bound of an array store (DESIGN.md §5.4): an element store at
 /// `i >= len + DENSE_GAP`, or a `length` growth past it, makes the array
-/// `SPARSE` instead of allocating the gap. The bound is a gap, not a multiple
+/// `SPARSE` instead of allocating the gap (contiguous stores from the store's
+/// end grow it back, `emit_sparse_regrow`). The bound is a gap, not a multiple
 /// of the capacity, so each store can add at most this many hole slots and
 /// stores that keep doubling the index stay small.
 const DENSE_GAP: i32 = 1024;
@@ -2390,7 +2391,9 @@ pub(super) fn emit_sparse_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
 
 /// `__sparse_set(o: i32, i: i32, v: i64)`: the strict `[[Set]]` of element
 /// `i` of the `SPARSE` array `o` — a store slot when `i < cap` (a hole slot
-/// after `__proto_set` leaves it to the array), else `__set`
+/// after `__proto_set` leaves it to the array), at `i == cap` outside
+/// dictionary mode a grown store (`emit_sparse_regrow`, which may make the
+/// array dense again), else `__set`
 /// of the interned index key `i` (so a read-only or accessor element and a
 /// non-extensible array behave as on any object) — then raise `length` to
 /// `i + 1` when `i` is at or past it (a push at the maximum length `2^32 - 1`
@@ -2405,15 +2408,16 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>, define: bool, leaves: &LeafS
     let mut f = helper_builder(
         leaves,
         &[ROOT_BASE, RAW_I32, ROOT_JS],
-        &[RAW_I32, ROOT_BASE],
+        &[
+            RAW_I32, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
+        ],
     );
     let (o, i, v, a, k) = (0, 1, 2, 3, 4);
+    let (cap, j, e, end, m) = (5, 6, 7, 8, 9);
     wasm!(f;
         LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(a),
-        If(BlockType::Result(ValType::I32)),
-        LocalGet(i), LocalGet(a), I32Load(m32(ELEMS_CAP_OFFSET)), I32LtU,
-        Else, I32Const(0),
-        End,
+        If(BlockType::Result(ValType::I32)), LocalGet(a), I32Load(m32(ELEMS_CAP_OFFSET)), Else, I32Const(0), End,
+        LocalTee(cap), LocalGet(i), I32GtU,
         If(BlockType::Empty),
     );
     if !define {
@@ -2432,6 +2436,9 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>, define: bool, leaves: &LeafS
     wasm!(f;
         LocalGet(v), I64Store(m64(ELEMS_DATA_OFFSET)),
         Else,
+    );
+    emit_sparse_regrow(&mut f, helpers, define, [o, i, v, a, cap, j, e, end, m, k]);
+    wasm!(f;
         LocalGet(i), Call(helpers.index_string), Call(helpers.intern), LocalSet(k),
         LocalGet(i), LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), I32GeU,
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_LENGTH_READONLY), I32And, I32Const(0), I32Ne,
@@ -2464,6 +2471,100 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>, define: bool, leaves: &LeafS
         End,
     );
     finish_builder(f)
+}
+
+/// The re-densify arm of `__sparse_set` / `__sparse_define` (DESIGN.md
+/// §5.4), entered when element `i` is past the store (`cap`, `0` without
+/// one): a store at `i == cap` on a `SPARSE` array outside dictionary mode
+/// extends the store instead of adding a table key. `__array_reserve(o, i +
+/// 1)` grows it to `cap'`, the slots `min(len, cap)..cap'` become holes, and
+/// every array-index table key in `cap..cap'` moves into its slot (outside
+/// dictionary mode an index key is a default data property, so the slot
+/// represents it exactly). Then element `i` is stored (without `define`, an
+/// absent one first offers the write to `__proto_set`), `length` rises past
+/// `i`, and once `cap' >= length` no index key is left in the table and the
+/// array is dense again (`SPARSE` cleared). Returns from the helper when it
+/// applies (or on out of memory, with nothing stored), else falls through.
+/// The locals are `[o, i, v, a, cap, j, e, end, m, k]`; `a` and the last
+/// five are scratch.
+fn emit_sparse_regrow(
+    f: &mut FnBuilder<'_>,
+    helpers: Helpers<'_>,
+    define: bool,
+    locals: [u32; 10],
+) {
+    let [o, i, v, a, cap, j, e, end, m, k] = locals;
+    wasm!(f;
+        LocalGet(i), LocalGet(cap), I32Eq,
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_DICTIONARY), I32And, I32Eqz, I32And,
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(i), I32Const(1), I32Add, Call(helpers.array_reserve()),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
+        // Hole the slots min(len, cap)..cap' the copy did not carry; j ends
+        // at cap'.
+        LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), LocalTee(j),
+        LocalGet(cap), LocalGet(j), LocalGet(cap), I32LtU, Select, LocalSet(j),
+        LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), I32Load(m32(ELEMS_CAP_OFFSET)), LocalSet(end),
+    );
+    emit_fill_holes(f, o, j, end);
+    // Fold the table's index keys in cap..cap' into their slots.
+    wasm!(f;
+        LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(a),
+        If(BlockType::Empty),
+        LocalGet(a), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(a), I32Add,
+        I32Const(P_HEADER), I32Add, LocalSet(end),
+        LocalGet(a), I32Const(P_HEADER), I32Add, LocalSet(e),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(e), LocalGet(end), I32GeU, BrIf(1),
+        LocalGet(e), I32Load(m32(E_KEY)), LocalTee(k),
+        If(BlockType::Empty),
+        LocalGet(k), I32Load8U(m8(FLAGS)), I32Const(STR_ARRAY_INDEX), I32And,
+        If(BlockType::Empty),
+        LocalGet(k), Call(helpers.index_value), LocalTee(m), LocalGet(cap), I32GeU,
+        LocalGet(m), LocalGet(j), I32LtU, I32And,
+        If(BlockType::Empty),
+    );
+    emit_elem_addr(f, o, m);
+    wasm!(f;
+        LocalGet(e), I64Load(m64(E_VALUE)), I64Store(m64(ELEMS_DATA_OFFSET)),
+        LocalGet(e), I64Const(0), I64Store(m64(0)),
+        LocalGet(e), I64Const(UNDEFINED_BITS), I64Store(m64(E_VALUE)),
+        LocalGet(a), LocalGet(a), I32Load(m32(P_LIVE)), I32Const(1), I32Sub, I32Store(m32(P_LIVE)),
+        End,
+        End,
+        End,
+        LocalGet(e), I32Const(ENTRY), I32Add, LocalSet(e),
+        Br(0),
+        End, End,
+        End,
+    );
+    if !define {
+        // An absent element: the prototype chain may consume the write.
+        emit_elem_addr(f, o, i);
+        wasm!(f;
+            I64Load(m64(ELEMS_DATA_OFFSET)), I64Const(HOLE_BITS), I64Eq,
+            If(BlockType::Empty),
+            LocalGet(o), LocalGet(i), LocalGet(v), Call(helpers.proto_set()),
+            If(BlockType::Empty), Return, End,
+            End,
+        );
+    }
+    emit_elem_addr(f, o, i);
+    wasm!(f;
+        LocalGet(v), I64Store(m64(ELEMS_DATA_OFFSET)),
+        LocalGet(i), LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), I32GeU,
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(i), I32Const(1), I32Add, I32Store(m32(ARRAY_LEN_OFFSET)),
+        End,
+        // The store covers the length: dense again.
+        LocalGet(j), LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), I32GeU,
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(!ARRAY_SPARSE), I32And,
+        I32Store8(m8(FLAGS)),
+        End,
+        Return,
+        End,
+    );
 }
 
 /// `__protos_indexless(o: i32) -> i32`: `1` when nothing on the `proto`
@@ -2666,9 +2767,13 @@ pub(super) fn emit_proto_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
 /// a GC walk see no stale element); a `SPARSE` array also drops its index
 /// keys `>= n`, except that a non-configurable element `k >= n` stops the
 /// deletion: the length becomes `k + 1` (the highest such `k`) and `Cannot
-/// delete property 'k'` is left pending. A growth past the length fills holes
-/// densely while `n - 1 < len + DENSE_GAP` and otherwise makes the
-/// array `SPARSE` without allocating the gap. Then `len = n`.
+/// delete property 'k'` is left pending. Outside dictionary mode a `SPARSE`
+/// array whose new length is within its store (`n <= cap`) is dense again. A
+/// dense growth past the length fills holes densely while `n - 1 < len +
+/// DENSE_GAP` and otherwise makes the array `SPARSE` without allocating the
+/// gap: the store keeps the written prefix, the tail is holes past it, and a
+/// later fill from the store's end re-densifies it (`__sparse_set`). Then
+/// `len = n`.
 #[allow(clippy::too_many_lines)] // one straight-line helper body
 pub(super) fn emit_array_set_length(
     strings: &StrOffsets,
@@ -2812,6 +2917,14 @@ pub(super) fn emit_array_set_length(
         End,
         End,
         LocalGet(o), LocalGet(n), I32Store(m32(ARRAY_LEN_OFFSET)),
+        // Outside dictionary mode a length within the store leaves no index
+        // key in the table: dense again.
+        LocalGet(n), LocalGet(cap), I32LeU,
+        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_DICTIONARY), I32And, I32Eqz, I32And,
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(!ARRAY_SPARSE), I32And,
+        I32Store8(m8(FLAGS)),
+        End,
         LocalGet(stopped),
         If(BlockType::Empty),
         LocalGet(o),

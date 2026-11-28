@@ -2,7 +2,9 @@
 #![allow(clippy::expect_used)]
 
 mod common;
-use common::{assert_bool, assert_number, assert_string, eval_text};
+use common::{
+    assert_bool, assert_eval, assert_number, assert_same_under_gc_stress, assert_string, eval_text,
+};
 
 // --- array growth: push / pop -------------------------------------------------
 
@@ -267,5 +269,183 @@ fn array_prototype_is_an_array() {
     assert_string(
         "Array.prototype[1] = 'x'; [0, , 2].map(v => v).join()",
         "0,x,2",
+    );
+}
+
+// --- length growth and re-densify (DESIGN.md §5.4) ---------------------------
+
+/// The wasm instructions `src` executes (wasmtime fuel), as the opcount gate
+/// measures them.
+fn fuel(src: &str) -> u64 {
+    let program = jsc_core::frontend::parse(src, jsc_core::frontend::Dialect::Js).expect("parse");
+    let ir = jsc_core::codegen::lower(&program).expect("lower");
+    let wasm = jsc_core::emit::emit(&ir, jsc_core::emit::CompileOptions::default());
+    let capture = jsc_core::run::Capture::new();
+    let outcome = jsc_core::run::run(
+        &wasm,
+        jsc_core::run::Sinks::Capture(capture.clone()),
+        Some(1 << 40),
+    )
+    .expect("program runs cleanly");
+    assert_eq!(outcome.code, 0, "{}", capture.stderr());
+    outcome.fuel
+}
+
+/// A pure `length` growth then a `fill` from 0 (the test262
+/// `copyWithin/coerced-values-*-detached*` setup) writes every element and
+/// lists every key.
+#[test]
+fn length_growth_then_fill_writes_every_element() {
+    assert_string(
+        "let a = []; a.length = 10000; a.fill(7, 0);
+         let ok = true;
+         for (let i = 0; i < 10000; i++) if (a[i] !== 7) ok = false;
+         ok + ',' + a.length + ',' + Object.keys(a).length + ',' + a.reduce((s, v) => s + v, 0)",
+        "true,10000,10000,70000",
+    );
+}
+
+/// The fill after a pure `length` growth re-densifies the store, so fill plus
+/// a full sequential read is linear: fuel(1e4) stays well under 2.5x
+/// fuel(5e3) (index keys in the linear-scan table would be ~4x).
+#[test]
+fn length_growth_then_fill_is_linear() {
+    let program = |n: u32| {
+        format!(
+            "const a = []; a.length = {n}; a.fill(7, 0);
+             let s = 0; for (let i = 0; i < {n}; i++) s += a[i];
+             console.log(s)"
+        )
+    };
+    let half = fuel(&program(5_000));
+    let full = fuel(&program(10_000));
+    assert!(
+        full * 2 < half * 5,
+        "grown-then-filled array is not dense: fuel(5e3) = {half}, fuel(1e4) = {full}"
+    );
+}
+
+/// The tail a pure `length` growth adds is holes: absent own properties, read
+/// through the prototype chain.
+#[test]
+fn length_growth_tail_is_holes() {
+    assert_string(
+        "Array.prototype[5000] = 'p';
+         let a = []; a.length = 10000;
+         [a[5000], 5000 in a, a.hasOwnProperty(5000), a.hasOwnProperty(4999),
+          Object.keys(a).length, a.length].join()",
+        "p,false,false,false,0,10000",
+    );
+}
+
+/// JSON, spread, `for-in`, search and rendering of a grown array see the
+/// written prefix and holes for the tail.
+#[test]
+fn length_growth_observers() {
+    assert_string(
+        "let a = [1, 2]; a.length = 3000;
+         let keys = []; for (const k in a) keys.push(k);
+         [JSON.stringify(a).length, [...a].length, [...a][2] === undefined, keys.join(' '),
+          a.indexOf(undefined), a.includes(undefined), a[1]].join()",
+        "14995,3000,true,0 1,-1,true,2",
+    );
+    assert_eval(
+        "let a = [1]; a.length = 5000; a",
+        "[ 1, <4999 empty items> ]",
+    );
+}
+
+/// A far element store on a small array still goes `SPARSE`: keys, length and
+/// the gap stay correct.
+#[test]
+fn far_write_still_sparse() {
+    assert_string(
+        "let a = [1, 2]; a[100000] = 3;
+         [a.length, Object.keys(a).join(' '), a[100000], a[50000] === undefined, 50000 in a].join()",
+        "100001,0 1 100000,3,true,false",
+    );
+}
+
+/// Contiguous stores from the store's end after a far write grow the store
+/// back, folding the far element in when the store reaches it: values, keys
+/// and key order stay correct throughout.
+#[test]
+fn contiguous_writes_after_sparsify() {
+    assert_string(
+        "let a = [0]; a[5000] = 'far';
+         for (let i = 1; i < 3000; i++) a[i] = i;
+         let k1 = Object.keys(a);
+         let first = [a.length, k1.length, k1[2999], k1[3000], a[2999], a[5000]].join();
+         for (let i = 3000; i < 6000; i++) if (i !== 5000) a[i] = i;
+         let k2 = Object.keys(a);
+         [first, a.length, k2.length, k2.every((k, i) => k === String(i)), a[5000], a[5999],
+          4000 in a].join('|')",
+        "5001,3001,2999,5000,2999,far|6000|6000|true|far|5999|true",
+    );
+    assert_string(
+        "let b = []; b[3000] = 'x';
+         for (let i = 0; i < 3000; i++) b[i] = i;
+         b.push('y');
+         [b.length, b[3000], b[3001], Object.keys(b).length, b.indexOf('x')].join()",
+        "3002,x,y,3002,3000",
+    );
+}
+
+/// A store that re-densifies a grown array still offers an absent element to
+/// the prototype chain first: an inherited setter consumes it.
+#[test]
+fn regrow_consults_prototype_setter() {
+    assert_string(
+        "let log = '';
+         Object.defineProperty(Array.prototype, '0', { set(v) { log += v; }, configurable: true });
+         let a = []; a.length = 5000; a[0] = 1; a[1] = 2;
+         [log, a.hasOwnProperty(0), a[1], a.length].join()",
+        "1,false,2,5000",
+    );
+}
+
+/// A `length` shrink after a growth drops the tail; later pushes append at the
+/// new end.
+#[test]
+fn length_shrink_after_growth() {
+    assert_string(
+        "let a = [1, 2, 3]; a.length = 5000; a.length = 2; a.push(9);
+         [a.length, a.join(), Object.keys(a).join()].join('|')",
+        "3|1,2,9|0,1,2",
+    );
+    assert_string(
+        "let a = []; a.length = 5000; a.fill(1); a.length = 10;
+         [a.length, Object.keys(a).length, a[9], 10 in a].join()",
+        "10,10,1,false",
+    );
+}
+
+/// `delete` inside a grown tail: a hole before the fill, an absent element
+/// after it.
+#[test]
+fn delete_in_grown_tail() {
+    assert_string(
+        "let a = [1]; a.length = 5000;
+         [delete a[3000], a.length, Object.keys(a).join()].join()",
+        "true,5000,0",
+    );
+    assert_string(
+        "let a = []; a.length = 5000; a.fill(1); delete a[4000]; delete a[10];
+         [a.length, 4000 in a, 10 in a, Object.keys(a).length, a[4000] === undefined].join()",
+        "5000,false,false,4998,true",
+    );
+}
+
+/// Growth + fill and the sparse -> dense fold survive a collection at every
+/// allocation (the folded table elements move into the regrown store).
+#[test]
+fn length_growth_and_regrow_gc_stress() {
+    assert_same_under_gc_stress(
+        "let a = []; a.length = 5000; a.fill('s' + 1, 0);
+         let b = [{ v: 1 }]; b[4000] = { v: 2 };
+         for (let i = 1; i < 4000; i++) b[i] = { v: i };
+         let s = 0; for (const o of b) s += o.v;
+         console.log(a.length, a[4999], s, Object.keys(b).length)",
+        "5000 s1 7998003 4001\n",
     );
 }
