@@ -1935,7 +1935,8 @@ fn emit_select_object(function: &mut impl Sink, local: u32, alt: &Instruction<'_
 }
 
 /// Push `1` if the jsval in `local` is an object (a heap value other than a
-/// string or a symbol), else `0`.
+/// string, a symbol or a `BigInt`), else `0`. A program that can produce no
+/// `BigInt` (DESIGN.md §6.10.9) skips the `BigInt` test.
 pub(super) fn emit_is_object(function: &mut impl Sink, local: u32) {
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
@@ -1946,10 +1947,12 @@ pub(super) fn emit_is_object(function: &mut impl Sink, local: u32) {
     function.instruction(&Instruction::I32Const(TYPE_SYMBOL));
     function.instruction(&Instruction::I32Ne);
     function.instruction(&Instruction::I32And);
-    emit_load_type_byte(function, local);
-    function.instruction(&Instruction::I32Const(TYPE_BIGINT));
-    function.instruction(&Instruction::I32Ne);
-    function.instruction(&Instruction::I32And);
+    if roots::bigints_reachable() {
+        emit_load_type_byte(function, local);
+        function.instruction(&Instruction::I32Const(TYPE_BIGINT));
+        function.instruction(&Instruction::I32Ne);
+        function.instruction(&Instruction::I32And);
+    }
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
@@ -3204,20 +3207,26 @@ pub(super) fn emit_typeof_node(
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     // HEAP: map the type byte -> typeof index. Base is 3 ("object", array/object);
     // override string -> 4, function -> 5, symbol -> 6 and bigint -> 7 with
-    // layered selects.
+    // layered selects (no bigint select when the program can produce no
+    // `BigInt`, DESIGN.md §6.10.9).
+    let bigints = helpers.has_bigints();
     function.instruction(&Instruction::I64Const(4)); // val1: "string"
     function.instruction(&Instruction::I64Const(6)); // val1: "symbol"
-    function.instruction(&Instruction::I64Const(7)); // val1: "bigint"
+    if bigints {
+        function.instruction(&Instruction::I64Const(7)); // val1: "bigint"
+    }
     function.instruction(&Instruction::I64Const(5)); // val1: "function"
     function.instruction(&Instruction::I64Const(3)); // val2: base "object"
     emit_load_type_byte(function, scratch);
     function.instruction(&Instruction::I32Const(TYPE_FUNCTION));
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::Select); // function ? 5 : 3
-    emit_load_type_byte(function, scratch);
-    function.instruction(&Instruction::I32Const(TYPE_BIGINT));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Select); // bigint ? 7 : (function ? 5 : 3)
+    if bigints {
+        emit_load_type_byte(function, scratch);
+        function.instruction(&Instruction::I32Const(TYPE_BIGINT));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::Select); // bigint ? 7 : (function ? 5 : 3)
+    }
     emit_load_type_byte(function, scratch);
     function.instruction(&Instruction::I32Const(TYPE_SYMBOL));
     function.instruction(&Instruction::I32Eq);
@@ -3263,8 +3272,10 @@ pub(super) fn emit_typeof_node(
             .unwrap_or(HEAP_BASE);
         HEAP_BITS | i64::from(offset)
     };
+    // "bigint" is the last word; index 7 never arises without a `BigInt`.
+    let words = crate::abi::TYPEOF_STRINGS.len() - usize::from(!bigints);
     function.instruction(&Instruction::I64Const(word_ptr(0)));
-    for k in 1..crate::abi::TYPEOF_STRINGS.len() {
+    for k in 1..words {
         function.instruction(&Instruction::I64Const(word_ptr(k)));
         function.instruction(&Instruction::LocalGet(scratch));
         function.instruction(&Instruction::I32WrapI64);

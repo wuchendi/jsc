@@ -112,6 +112,11 @@ pub(super) fn build_type_and_function_sections<'a>(
         } else {
             BinaryData::Unreachable
         },
+        bigints: if program_has_bigint(program) {
+            BigInts::Reachable
+        } else {
+            BigInts::Unreachable
+        },
         unicode: layout.unicode,
         fn_info: layout.info,
     };
@@ -1453,6 +1458,38 @@ fn program_has_binary(program: &IrProgram) -> bool {
             BINARY_NAMES.contains(&global.name.as_str())
         }
         IrNode::Str(s) => BINARY_NAMES.iter().any(|name| s == name),
+        _ => false,
+    })
+}
+
+/// The names through which a program can obtain a `BigInt` without a
+/// literal (DESIGN.md §6.10.9): the `BigInt` global, the `BigInt` typed
+/// arrays and the `DataView` `BigInt` accessors.
+const BIGINT_NAMES: [&str; 7] = [
+    "BigInt",
+    "BigInt64Array",
+    "BigUint64Array",
+    "getBigInt64",
+    "getBigUint64",
+    "setBigInt64",
+    "setBigUint64",
+];
+
+/// Whether `program` can produce a `BigInt` (DESIGN.md §6.10.9): it has a
+/// `BigInt` literal, names a [`BIGINT_NAMES`] source (the intrinsic, a global
+/// reference, or a string such as a static member key), or uses the global
+/// object as a value, which could reach `BigInt` by a computed name. When
+/// not, the numeric operators emit their Number-only code.
+pub(super) fn program_has_bigint(program: &IrProgram) -> bool {
+    program_any(program, |n| match n {
+        IrNode::BigInt { .. }
+        | IrNode::Intrinsic(GlobalIntrinsic::Global | GlobalIntrinsic::Ctor(BuiltinCtor::BigInt)) => {
+            true
+        }
+        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
+            BIGINT_NAMES.contains(&global.name.as_str())
+        }
+        IrNode::Str(s) => BIGINT_NAMES.iter().any(|name| s == name),
         _ => false,
     })
 }

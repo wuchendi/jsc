@@ -907,6 +907,17 @@ enum BinaryData {
     Reachable,
 }
 
+/// Whether a program can produce a `BigInt` (DESIGN.md §6.10.9).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BigInts {
+    /// No `BigInt` can exist: the numeric operators emit their Number-only
+    /// code.
+    Unreachable,
+    /// The program has a `BigInt` literal or names a `BigInt` source or the
+    /// global object.
+    Reachable,
+}
+
 #[derive(Clone, Copy)]
 struct Helpers<'a> {
     /// The call-depth limit of the call-stack guard
@@ -1103,6 +1114,10 @@ struct Helpers<'a> {
     /// Whether the program can reach binary data (DESIGN.md §5.8.5). When
     /// not, the collector and the renderer leave out their binary-data arms.
     binary: BinaryData,
+    /// Whether the program can produce a `BigInt` (DESIGN.md §6.10.9). When
+    /// not, the numeric operators, `ToNumeric` sites and `Number(x)` emit
+    /// their Number-only code and reference no `BigInt` kernel.
+    bigints: BigInts,
     /// Base address of the Unicode tables (see [`unicode`]).
     unicode: i32,
     /// Base address of the `__fn_info` table (see [`FnLayout`]). The static
@@ -1371,6 +1386,11 @@ impl Helpers<'_> {
     /// Whether the program can reach binary data ([`Self::binary`]).
     fn has_binary(self) -> bool {
         self.binary == BinaryData::Reachable
+    }
+
+    /// Whether the program can produce a `BigInt` ([`Self::bigints`]).
+    fn has_bigints(self) -> bool {
+        self.bigints == BigInts::Reachable
     }
 
     /// `__ab_alloc(size) -> block | 0` (see [`binary`]).
@@ -1727,6 +1747,17 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     if options.no_stack_guard {
         helpers.stack_guard = None;
     }
+    // A program that can produce no `BigInt` (DESIGN.md §6.10.9) is emitted
+    // from its Number-only IR, with the gate published to the emitters that
+    // take no `Helpers` for the rest of this module.
+    let _bigint_scope = roots::BigIntScope::enter(helpers.has_bigints());
+    let number_only;
+    let program = if helpers.has_bigints() {
+        program
+    } else {
+        number_only = lower_number_only(program);
+        &number_only
+    };
     module.section(&types);
 
     // Import section: exactly the four WASI functions (indices 0..=3).

@@ -708,15 +708,20 @@ pub(super) fn emit_cond(
     function.instruction(&Instruction::Else);
     // ARRAY / OBJECT / FUNCTION: unconditionally truthy; a BigInt iff
     // nonzero (its `len` shares the string's offset): type != BIGINT | len != 0.
-    emit_load_type_byte(function, value);
-    function.instruction(&Instruction::I32Const(TYPE_BIGINT));
-    function.instruction(&Instruction::I32Ne);
-    function.instruction(&Instruction::LocalGet(value));
-    function.instruction(&Instruction::I32WrapI64);
-    emit_load_str_len(function);
-    function.instruction(&Instruction::I32Const(0));
-    function.instruction(&Instruction::I32Ne);
-    function.instruction(&Instruction::I32Or);
+    // Without a reachable `BigInt` (DESIGN.md §6.10.9) the arm is a constant.
+    if helpers.has_bigints() {
+        emit_load_type_byte(function, value);
+        function.instruction(&Instruction::I32Const(TYPE_BIGINT));
+        function.instruction(&Instruction::I32Ne);
+        function.instruction(&Instruction::LocalGet(value));
+        function.instruction(&Instruction::I32WrapI64);
+        emit_load_str_len(function);
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::I32Ne);
+        function.instruction(&Instruction::I32Or);
+    } else {
+        function.instruction(&Instruction::I32Const(1));
+    }
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
     // NON-HEAP boxed: is_boolean ? (bits & 1) : 0.

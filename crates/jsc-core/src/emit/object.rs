@@ -2777,8 +2777,9 @@ pub(super) fn emit_index_op_set_node(
     });
     function.instruction(&Instruction::LocalSet(new_local));
     // A member `++`/`--` (`rhs` is the step `±1`) converts the current value
-    // with ToNumeric first and steps it in its own type.
-    let new_value = if *kind == OpSetKind::Compound {
+    // with ToNumeric first and steps it in its own type; without a reachable
+    // `BigInt` (DESIGN.md §6.10.9) that is `ToNumber`, then `+ rhs`.
+    let new_value = if *kind == OpSetKind::Compound || !helpers.has_bigints() {
         IrNode::Binary {
             op,
             lhs: Box::new(IrNode::Local(new_local)),
@@ -2792,7 +2793,11 @@ pub(super) fn emit_index_op_set_node(
     };
     if *kind != OpSetKind::Compound {
         let old_num = IrNode::ConvertCall {
-            op: ConvertOp::ToNumeric,
+            op: if helpers.has_bigints() {
+                ConvertOp::ToNumeric
+            } else {
+                ConvertOp::ToNumber
+            },
             arg: Box::new(IrNode::Local(new_local)),
             radix: None,
         };

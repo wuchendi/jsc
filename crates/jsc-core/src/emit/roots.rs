@@ -22,7 +22,40 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+
+thread_local! {
+    /// Whether the program being emitted can produce a `BigInt`
+    /// ([`Helpers::has_bigints`], DESIGN.md §6.10.9), for the emitters that
+    /// take no [`Helpers`]: [`classify`] and [`emit_is_object`]. `true`
+    /// outside [`BigIntScope`], the sound default.
+    static BIGINTS: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Whether the program being emitted can produce a `BigInt` (see
+/// [`BIGINTS`]).
+pub(super) fn bigints_reachable() -> bool {
+    BIGINTS.get()
+}
+
+/// Publishes [`Helpers::has_bigints`] to [`bigints_reachable`] for the
+/// emission of one module; dropping it restores the sound default.
+pub(super) struct BigIntScope;
+
+impl BigIntScope {
+    /// Enter the emission of a module whose gate is `reachable`.
+    pub(super) fn enter(reachable: bool) -> Self {
+        BIGINTS.set(reachable);
+        Self
+    }
+}
+
+impl Drop for BigIntScope {
+    fn drop(&mut self) {
+        BIGINTS.set(true);
+    }
+}
 
 /// The non-allocating leaf helpers, as wasm function indices. WASI imports
 /// never call back; the remaining `env` imports do and are not leaves.
@@ -236,8 +269,15 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
             ..
         } => ValueClass::numeric(),
         // `>>>`, the relational and the equality operators never yield a
-        // `BigInt`; every other arithmetic operator may (DESIGN.md §6.10.5).
-        IrNode::Binary { op, .. } if !is_numeric_op(*op) => ValueClass::numeric(),
+        // `BigInt`; every other arithmetic operator may (DESIGN.md §6.10.5),
+        // unless the program can produce none (§6.10.9): then only `+`
+        // (a string) may be a heap value, and `++` / `--` is a number.
+        IrNode::Binary { op, .. }
+            if !is_numeric_op(*op) || (*op != BinOp::Add && !bigints_reachable()) =>
+        {
+            ValueClass::numeric()
+        }
+        IrNode::IncDec { .. } if !bigints_reachable() => ValueClass::numeric(),
         // `++` / `--` of a local: numeric iff the local is.
         IrNode::IncDec { local, .. } => ValueClass {
             numeric: Some(vec![*local]),
