@@ -2227,9 +2227,9 @@ are emitted only when the program can produce a BigInt (§6.10.9).
   unchanged. Every ToBoolean site (`!`, `&&` / `||`, conditions, `Boolean(v)`,
   the array callbacks) goes through `emit_cond`.
 - **Rendering** (`emit/render.rs`, `__render_heap`): a BigInt prints as its
-  decimal digits plus `n` (`1n`, `-12n`), the same at top level, inside
-  arrays / objects / Map and Set entries (`[ 1n, 2n ]`, `{ a: 1n }`,
-  `Map(1) { 1n => 1 }`); a wrapper as `[BigInt: 1n]`. The digits come from
+  decimal digits plus `n` (`1n`, `-12n`), the same at top level and inside
+  arrays / objects (`[ 1n, 2n ]`, `{ a: 1n }`; Map and Set list no entries,
+  `Map(1)`); a wrapper as `[BigInt: 1n]`. The digits come from
   `__bigint_to_string(v, 10)` followed by `__out_str`; its allocation may
   run out of memory like the render buffers (§6.9). `__msg_str` (error
   message text) appends the `n` too; `__prim_str` (ToString) has no `n`.
