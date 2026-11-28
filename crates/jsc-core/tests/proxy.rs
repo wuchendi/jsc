@@ -513,7 +513,9 @@ fn proxy_on_prototype_chain() {
     );
     assert_string(
         "const base = new Proxy({}, { get(t, k, r) { return 'super:' + String(k) + ':' + (r === b); } });
-         const b = { __proto__: base, m() { return super.x; } };
+         class B { m() { return super.x; } }
+         Object.setPrototypeOf(B.prototype, base);
+         const b = new B();
          b.m()",
         "super:x:true",
     );
