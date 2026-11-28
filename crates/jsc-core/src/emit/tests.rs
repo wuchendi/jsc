@@ -2136,6 +2136,81 @@ fn bigint_gate_shakes_out_the_operator_kernels() {
     );
 }
 
+/// BigInt-only texts: the JSON, `ToNumber`, size, division and exponent
+/// errors of the kernels and helper arms, and a `%BigInt.prototype%`
+/// receiver error of the builtins.
+const BIGINT_TEXTS: [&str; 6] = [
+    "Do not know how to serialize a BigInt",
+    "Cannot convert a BigInt value to a number",
+    "Maximum BigInt size exceeded",
+    "Division by zero",
+    "Exponent must be non-negative",
+    "BigInt.prototype.toString requires that 'this' be a BigInt",
+];
+
+/// Gate-closed programs exercising the always-present helpers that carry a
+/// `BigInt` arm when the gate is open (DESIGN.md §6.10.9).
+const GATE_CLOSED_PROGRAMS: [&str; 3] = [
+    "console.log('hi')",
+    "const m = new Map([[1, 'a'], [-0, 'z']]); const s = new Set([1, 2]);
+     console.log(m.get(1), m.get(0), s.has(2), m, s)",
+    "const o = { a: 1 }; const k = 'a';
+     console.log(typeof o, o === o, 1 == '1', o == '[object Object]', String(o), JSON.stringify(o));
+     try { null[k]; } catch (e) { console.log(String(e)); }",
+];
+
+/// With the `bigints` gate closed (DESIGN.md §6.10.9) the module carries no
+/// `BigInt` kernel body, no `BigInt` builtin body and no `BigInt`-only string,
+/// even unshaken; prepending `1n;` opens the gate and brings them back.
+#[test]
+fn bigint_gate_drops_kernels_builtins_and_strings() {
+    use super::registry::Big;
+    let kernels = [
+        Big::New,
+        Big::Eq,
+        Big::Hash,
+        Big::ToString,
+        Big::ToF64,
+        Big::LooseEq,
+        Big::ToBigInt,
+        Big::NumericOp,
+    ];
+    let carries = |wasm: &[u8], text: &str| wasm.windows(text.len()).any(|w| w == text.as_bytes());
+    let bigint_builtins = || realm::Builtin::ALL.into_iter().filter(|b| b.is_bigint());
+    assert_eq!(bigint_builtins().count(), 6);
+    for src in GATE_CLOSED_PROGRAMS {
+        shaken_stubs(src, |bigints, helpers, stubs| {
+            assert!(!bigints, "`{src}` has no BigInt source");
+            for kernel in kernels {
+                let index = (helpers.bigint(kernel) - super::IMPORT_FUNC_COUNT) as usize;
+                assert!(stubs[index], "{kernel:?} must be a stub in `{src}`");
+            }
+            for builtin in bigint_builtins() {
+                let index = (helpers.builtin_index(builtin) - super::IMPORT_FUNC_COUNT) as usize;
+                assert!(stubs[index], "{builtin:?} must be a stub in `{src}`");
+            }
+        });
+        let open = format!("1n; {src}");
+        shaken_stubs(&open, |bigints, helpers, stubs| {
+            assert!(bigints, "`1n` opens the gate");
+            let index = (helpers.bigint(Big::ToString) - super::IMPORT_FUNC_COUNT) as usize;
+            assert!(!stubs[index], "the renderer keeps `__bigint_to_string`");
+        });
+        let closed_wasm = emit(&lower_js(src));
+        let open_wasm = emit(&lower_js(&open));
+        for text in BIGINT_TEXTS {
+            assert!(!carries(&closed_wasm, text), "`{src}` carries `{text}`");
+            assert!(carries(&open_wasm, text), "`{open}` lacks `{text}`");
+        }
+        assert!(closed_wasm.len() < open_wasm.len(), "`{src}`");
+        assert_eq!(
+            completion(&compile(src)),
+            completion(&compile(&open)),
+            "`{src}` and `{open}` complete alike"
+        );
+    }
+}
+
 /// Each `BigInt` source opens the gate (DESIGN.md §6.10.9); Number-only
 /// programs, the Number typed arrays and look-alike names do not.
 #[test]

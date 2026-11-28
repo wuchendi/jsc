@@ -3374,6 +3374,12 @@ impl Builtin {
             _ => false,
         }
     }
+
+    /// Whether this is the `BigInt` constructor, a `BigInt` static or a
+    /// `%BigInt.prototype%` method (DESIGN.md §6.10.7, §6.10.9).
+    pub(super) fn is_bigint(self) -> bool {
+        matches!(self, Self::BigInt(_) | Self::Ctor(BuiltinCtor::BigInt))
+    }
 }
 
 /// Builtin methods and error `name`/`message`: writable, configurable, not

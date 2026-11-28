@@ -940,12 +940,15 @@ fn emit_prim_str(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -
     // roots itself, so it needs no root here.
     let mut f = helper_builder(leaves, &[RAW_I64], &[]);
     let at = |text: &str| static_key(strings, text);
-    bigint::emit_is_bigint(&mut f, v);
-    wasm!(f;
-        If(BlockType::Empty),
-        LocalGet(v), I32Const(10), Call(helpers.bigint(registry::Big::ToString)), Return,
-        End,
-    );
+    // Without the `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    if helpers.bigints() {
+        bigint::emit_is_bigint(&mut f, v);
+        wasm!(f;
+            If(BlockType::Empty),
+            LocalGet(v), I32Const(10), Call(helpers.bigint(registry::Big::ToString)), Return,
+            End,
+        );
+    }
     emit_is_number(&mut f, v);
     wasm!(f;
         If(BlockType::Result(ValType::I32)),
@@ -980,15 +983,22 @@ fn emit_msg_str(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) ->
         I32Const(static_key(strings, OBJECT_TEXT)),
         Else,
     );
-    // A BigInt reads `1n`, as in the console.
-    bigint::emit_is_bigint(&mut f, v);
+    // A BigInt reads `1n`, as in the console; without the `bigints` gate no
+    // BigInt exists (DESIGN.md §6.10.9).
+    if helpers.bigints() {
+        bigint::emit_is_bigint(&mut f, v);
+        wasm!(f;
+            If(BlockType::Result(ValType::I32)),
+            LocalGet(v), Call(helpers.prim_str()),
+            I32Const(static_key(strings, bigint::SUFFIX)), Call(helpers.concat),
+            Else,
+        );
+    }
+    wasm!(f; LocalGet(v), Call(helpers.prim_str()));
+    if helpers.bigints() {
+        wasm!(f; End);
+    }
     wasm!(f;
-        If(BlockType::Result(ValType::I32)),
-        LocalGet(v), Call(helpers.prim_str()),
-        I32Const(static_key(strings, bigint::SUFFIX)), Call(helpers.concat),
-        Else,
-        LocalGet(v), Call(helpers.prim_str()),
-        End,
         End,
         End,
         End,

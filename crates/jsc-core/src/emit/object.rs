@@ -3058,15 +3058,20 @@ pub(super) fn emit_nullish_throw(
     // The partial message sits under the conversion's safepoint.
     let mark = function.temp_mark();
     function.root_temp(TempClass::Base);
-    // A BigInt key names its property key, ToString (`1n` reads '1').
-    bigint::emit_is_bigint(&mut function, key);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::Call(helpers.prim_str()));
-    function.instruction(&Instruction::Else);
+    // A BigInt key names its property key, ToString (`1n` reads '1');
+    // without the `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    if helpers.bigints() {
+        bigint::emit_is_bigint(&mut function, key);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        function.instruction(&Instruction::LocalGet(key));
+        function.instruction(&Instruction::Call(helpers.prim_str()));
+        function.instruction(&Instruction::Else);
+    }
     function.instruction(&Instruction::LocalGet(key));
     function.instruction(&Instruction::Call(helpers.msg_str()));
-    function.instruction(&Instruction::End);
+    if helpers.bigints() {
+        function.instruction(&Instruction::End);
+    }
     concat(&mut function);
     function.release_temps(mark);
     function.instruction(&Instruction::I32Const(at(NULLISH_SUFFIX)));
@@ -3163,13 +3168,18 @@ pub(super) fn emit_prop_throw(
     function.instruction(&Instruction::I32Const(at(PRIM_CREATE_MID)));
     concat(&mut function);
     function.instruction(&Instruction::I32Const(at("number")));
-    function.instruction(&Instruction::I32Const(at("bigint")));
+    // Without the `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    if helpers.bigints() {
+        function.instruction(&Instruction::I32Const(at("bigint")));
+    }
     function.instruction(&Instruction::I32Const(at("symbol")));
     function.instruction(&Instruction::I32Const(at("string")));
     emit_is_symbol(&mut function, recv);
     function.instruction(&Instruction::Select);
-    bigint::emit_is_bigint(&mut function, recv);
-    function.instruction(&Instruction::Select);
+    if helpers.bigints() {
+        bigint::emit_is_bigint(&mut function, recv);
+        function.instruction(&Instruction::Select);
+    }
     function.instruction(&Instruction::I32Const(at("boolean")));
     emit_is_pointer(&mut function, recv);
     function.instruction(&Instruction::Select);

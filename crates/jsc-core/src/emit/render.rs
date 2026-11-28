@@ -728,14 +728,18 @@ fn render_leaf(
     is(f, TYPE_SYMBOL);
     render_symbol(f, strings, helpers, p, tmp);
     wasm!(f; Return, End);
-    // A BigInt: its decimal digits and `n` (DESIGN.md §6.10.2).
-    is(f, i32::from(abi::TYPE_BIGINT));
-    box_heap(f, p);
-    wasm!(f;
-        I32Const(10), Call(helpers.bigint(super::registry::Big::ToString)), Call(helpers.out_str()),
-    );
-    lit(f, strings, helpers, super::bigint::SUFFIX);
-    wasm!(f; Return, End);
+    // A BigInt: its decimal digits and `n` (DESIGN.md §6.10.2); without the
+    // `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    if helpers.bigints() {
+        is(f, i32::from(abi::TYPE_BIGINT));
+        box_heap(f, p);
+        wasm!(f;
+            I32Const(10), Call(helpers.bigint(super::registry::Big::ToString)),
+            Call(helpers.out_str()),
+        );
+        lit(f, strings, helpers, super::bigint::SUFFIX);
+        wasm!(f; Return, End);
+    }
     for (kind, open) in [(TYPE_MAP, "Map("), (TYPE_SET, "Set(")] {
         is(f, kind);
         lit(f, strings, helpers, open);

@@ -496,10 +496,13 @@ pub(in crate::emit) fn emit_json_rep(
     };
     // `GetV(value, "toJSON")` of an object or a BigInt (through
     // `%BigInt.prototype%`).
+    // Without the `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
     emit_is_object(&mut f, value);
-    bigint::emit_is_bigint(&mut f, value);
+    if helpers.bigints() {
+        bigint::emit_is_bigint(&mut f, value);
+        wasm!(f; I32Or);
+    }
     wasm!(f;
-        I32Or,
         If(BlockType::Empty),
         LocalGet(value), I32Const(tok("toJSON")), Call(helpers.get), LocalSet(to_json),
     );
@@ -519,16 +522,18 @@ pub(in crate::emit) fn emit_json_rep(
     wasm!(f; End);
     unwrap_primitive(&mut f, value);
     // A BigInt left after `toJSON` and the replacer cannot be serialized.
-    bigint::emit_is_bigint(&mut f, value);
-    wasm!(f; If(BlockType::Empty));
-    emit_throw_error(
-        &callee_type_error(bigint::BIGINT_JSON),
-        &mut f,
-        scratch,
-        strings,
-        helpers,
-    );
-    wasm!(f; End);
+    if helpers.bigints() {
+        bigint::emit_is_bigint(&mut f, value);
+        wasm!(f; If(BlockType::Empty));
+        emit_throw_error(
+            &callee_type_error(bigint::BIGINT_JSON),
+            &mut f,
+            scratch,
+            strings,
+            helpers,
+        );
+        wasm!(f; End);
+    }
     wasm!(f; LocalGet(value), I64Const(UNDEFINED_BITS), I64Eq);
     emit_is_function(&mut f, value, helpers);
     wasm!(f; I32Or);

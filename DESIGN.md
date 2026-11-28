@@ -371,8 +371,10 @@ global object and no read of a global by a run-time name. A family the
 program cannot reach still emits `unreachable` stubs that record no use
 (`builtins::gated_off`: `Proxy` under the proxy gate, `Reflect` under the `Reflect` gate, the
 binary-data builtins and `__render_binary` / `__ta_canonical` under
-`has_binary`, §6.4), and the static strings only such stubs would look up
-are not interned (`builtins::gated_strings`, `builtins::strings(binary)`). Breaking
+`has_binary`, §6.4, the `BigInt` builtins and every `Big` kernel under
+`bigints`, §6.10.9), and the static strings only such stubs would look up
+are not interned (`builtins::gated_strings`, `builtins::strings(binary,
+bigints)`). Breaking
 the rule is what made every program the full runtime after the `Reflect`
 merge (`Reflect.set` reached via `"constructor"` → `Map` → `"set"`), and
 every proxy program after it (`__own_prop`, `__proxy_own_keys`).
@@ -2245,8 +2247,8 @@ produce a BigInt (the `bigints` gate, §6.10.9) the cold arm of every
 numeric operator calls `__numeric_op` / `__numeric_unary` /
 `__bigint_add_small` (§6.10.5), so the operator kernels and the conversions
 they reach are kept. With the gate closed no operator, `ToNumeric` or
-`Number(x)` site references a BigInt kernel; the kernels still reached are
-the B2a ones called from always-present runtime helpers (§6.10.9).
+`Number(x)` site references a BigInt kernel, and every kernel is an
+`unreachable` stub (§6.10.9).
 
 | operation | helper / site | rule |
 |---|---|---|
@@ -2667,20 +2669,43 @@ never needs a root), and the missing `typeof`, ToBoolean, equality and
 the operators, their rooting and the GC behave exactly as §6.10.5
 describes.
 
-**Cost model.** A gate-closed program pays nothing in user code relative to
-the pre-B2a emission. The runtime helpers that every program may keep stay
-shared and keep their B2a BigInt tests, rather than emitting two variants
-of each body: `__same_value_zero`, `__map_hash`, `__loose_eq`,
-`__to_number`, `__prim_str`, `__msg_str`, `__to_object`, `__json_rep`, the
-renderer, `__get`'s primitive-receiver dispatch, `__prop_throw`'s receiver
-kind and the `__own_keys` / `__has_own` / `__delete` / `__for_in_keys`
-guards. Each costs one `emit_is_bigint` test (a pointer test, then a
-type-byte load: about 15 instructions) plus an `if`, executed only on the
-call path that reaches it (a non-string operand of `__same_value_zero`, a
-non-string key in `__map_hash`, a heap primitive in the others). They keep
-the B2a kernels they call (`__bigint_eq`, `__bigint_hash`,
-`__bigint_loose_eq`, `__bigint_to_string`) in modules that keep those
-helpers.
+**Cost model.** A gate-closed program pays nothing for BigInt, in user
+code or in the runtime:
+
+- *Kernels.* Every `Big` group body (`registry.rs`) is an `unreachable`
+  stub, shaken or not (`full_runtime`), so it looks up no string; the leaf
+  graph declares the eight non-allocating kernels without callees.
+- *Builtins.* The `BigInt` constructor, `asIntN` / `asUintN` and the
+  `%BigInt.prototype%` methods (`Builtin::is_bigint`) are `gated_off`
+  stubs like the binary-data ones (§6.4). `Builtin::ALL`, the funcref
+  table and the realm image are unchanged, so no index moves between a
+  gate-closed and a gate-open program; the image keeps the `BigInt` global,
+  the constructor, `%BigInt.prototype%` and their keys (the binary-data
+  rule, §6.4). Nothing can observe that their bodies are stubs: `BigInt`
+  is reached only by its name (a trigger) or through the global object
+  (`holds_global`, a trigger), and `%BigInt.prototype%` only from a BigInt
+  or the constructor.
+- *Always-present helpers.* `__same_value_zero`, `__map_hash`, the
+  `__loose_eq` fallback, `__to_number` (`throw_if_bigint`), `__prim_str`,
+  `__msg_str`, `__to_object`, the JSON serializer, the renderer's heap
+  leaves, `__get`'s and `__symbol_get`'s primitive-receiver dispatch,
+  `__prop_throw`'s receiver kind, `__nullish_throw`'s key and the
+  `__own_keys` / `__has_own` / `__delete` / `__for_in_keys` guards emit
+  their BigInt test and arm only under `Helpers::bigints`, each a local
+  `if` around the arm (no second body). The arms could only be taken by a
+  BigInt, which cannot exist (**Soundness**), so dropping them changes no
+  behavior; with them gone nothing calls the kernels and `%BigInt.prototype%`
+  is not named by any body.
+- *Data.* The BigInt-only static strings (`bigint::strings`,
+  `bigint::op_strings`, `builtins::bigint::STRINGS`) are interned only
+  with the gate open, in place in `collect_strings`'s order so a gate-open
+  program's layout is unchanged (a program using `typeof` still interns the
+  word `"bigint"` with the other seven). The static `0n`
+  (`abi::BIGINT_ZERO`), named only by the kernels, gets its data segment
+  only with the gate open (its address stays reserved).
+
+With the gate open every body, string and segment is emitted exactly as
+before.
 
 #### 6.10.10 Stages
 
@@ -4641,14 +4666,16 @@ Each item below is current behaviour of this tree.
   `TypeError`, where the spec asserts the write cannot fail.
 - The binary-data error message texts are jsc's own (V8-like; the spec
   mandates only the error types).
-- The realm image is program-independent: the binary intrinsic blocks, with
-  their key and method-name strings, are in every module's data segment,
-  also in a program that cannot reach binary data (§6.4; the binary
-  builtins' other static strings are interned only when binary data is
-  reachable). In a binary program whose
+- The realm image is program-independent: the binary intrinsic blocks and
+  the `BigInt` constructor and `%BigInt.prototype%` blocks, with their key
+  and method-name strings, are in every module's data segment, also in a
+  program that cannot reach binary data or produce a BigInt (§6.4,
+  §6.10.9; the builtins' other static strings are interned only when their
+  gate is open). In a binary program whose
   BigInt gate is closed, the BigInt typed-array and `DataView` BigInt
   builtin bodies are still emitted, although no program path reaches them
-  (every name or reflection that reaches them opens the gate).
+  (every name or reflection that reaches them opens the gate); the kernels
+  they call are stubs there (§6.10.9).
 
 **Object model**
 

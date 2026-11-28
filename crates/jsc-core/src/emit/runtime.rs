@@ -1409,12 +1409,15 @@ pub(super) fn emit_same_value_zero(helpers: Helpers<'_>, leaves: &LeafSet) -> Fu
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::Call(helpers.str_eq));
     function.instruction(&Instruction::Else);
-    bigint::emit_is_bigint(&mut function, a);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    function.instruction(&Instruction::LocalGet(a));
-    function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::Call(helpers.bigint(registry::Big::Eq)));
-    function.instruction(&Instruction::Else);
+    // Without the `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    if helpers.bigints() {
+        bigint::emit_is_bigint(&mut function, a);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        function.instruction(&Instruction::LocalGet(a));
+        function.instruction(&Instruction::LocalGet(b));
+        function.instruction(&Instruction::Call(helpers.bigint(registry::Big::Eq)));
+        function.instruction(&Instruction::Else);
+    }
     function.instruction(&Instruction::LocalGet(a));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::LocalGet(b));
@@ -1424,7 +1427,9 @@ pub(super) fn emit_same_value_zero(helpers: Helpers<'_>, leaves: &LeafSet) -> Fu
     function.instruction(&Instruction::LocalGet(b));
     function.instruction(&Instruction::I64Eq);
     function.instruction(&Instruction::I32Or);
-    function.instruction(&Instruction::End);
+    if helpers.bigints() {
+        function.instruction(&Instruction::End);
+    }
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     finish_builder(function)
@@ -1537,18 +1542,23 @@ pub(super) fn emit_loose_eq(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
     // `ToPrimitive` again; otherwise raw identity bits.
     emit_loose_eq_to_primitive(&mut function, helpers);
     // A BigInt against a primitive (DESIGN.md §6.10.6), else identity.
-    bigint::emit_is_bigint(&mut function, a);
-    bigint::emit_is_bigint(&mut function, b);
-    function.instruction(&Instruction::I32Or);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    function.instruction(&Instruction::LocalGet(a));
-    function.instruction(&Instruction::LocalGet(b));
-    function.instruction(&Instruction::Call(helpers.bigint(registry::Big::LooseEq)));
-    function.instruction(&Instruction::Else);
+    // Without the `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    if helpers.bigints() {
+        bigint::emit_is_bigint(&mut function, a);
+        bigint::emit_is_bigint(&mut function, b);
+        function.instruction(&Instruction::I32Or);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        function.instruction(&Instruction::LocalGet(a));
+        function.instruction(&Instruction::LocalGet(b));
+        function.instruction(&Instruction::Call(helpers.bigint(registry::Big::LooseEq)));
+        function.instruction(&Instruction::Else);
+    }
     function.instruction(&Instruction::LocalGet(a));
     function.instruction(&Instruction::LocalGet(b));
     function.instruction(&Instruction::I64Eq);
-    function.instruction(&Instruction::End);
+    if helpers.bigints() {
+        function.instruction(&Instruction::End);
+    }
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
@@ -1675,16 +1685,25 @@ pub(super) fn emit_map_hash(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
         LocalGet(key), I32WrapI64, Call(helpers.str_hash),
         Else,
     );
-    // Equal BigInts (static or heap blocks) share a bucket.
-    bigint::emit_is_bigint(&mut f, key);
+    // Equal BigInts (static or heap blocks) share a bucket; without the
+    // `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    if helpers.bigints() {
+        bigint::emit_is_bigint(&mut f, key);
+        wasm!(f;
+            If(BlockType::Result(ValType::I32)),
+            LocalGet(key), I32WrapI64, Call(helpers.bigint(registry::Big::Hash)),
+            Else,
+        );
+    }
     wasm!(f;
-        If(BlockType::Result(ValType::I32)),
-        LocalGet(key), I32WrapI64, Call(helpers.bigint(registry::Big::Hash)),
-        Else,
         LocalGet(key), F64ReinterpretI64, F64Const(0.0.into()), F64Eq,
         If(BlockType::Result(ValType::I64)), I64Const(0), Else, LocalGet(key), End,
         LocalTee(key), LocalGet(key), I64Const(32), I64ShrU, I64Xor, I32WrapI64,
-        End,
+    );
+    if helpers.bigints() {
+        wasm!(f; End);
+    }
+    wasm!(f;
         End,
         I32Const(0x9E37_79B1_u32.cast_signed()), I32Mul, LocalTee(h),
         LocalGet(h), I32Const(15), I32ShrU, I32Xor,

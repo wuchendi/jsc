@@ -292,12 +292,15 @@ pub(super) fn build_globals(
 /// counts code units), its `flags` already `INTERNED`, plus `TWO_BYTE` for
 /// UTF-16 data and `ARRAY_INDEX` for a canonical index spelling, in ascending
 /// offset order for deterministic output, then the intern table's u32 slots,
-/// the function data, the realm image, and the Unicode tables.
+/// the function data, the realm image, and the Unicode tables. The static
+/// `0n` is written only when `bigints` (DESIGN.md §6.10.9): otherwise only
+/// the stubbed kernels would name it.
 pub(super) fn emit_data_section(
     offsets: &StrOffsets,
     intern: &InternTable,
     functions: &[IrFunction],
     layout: FnLayout,
+    bigints: bool,
 ) -> DataSection {
     let mut segments: Vec<(&JsStr, i32)> = offsets.iter().collect();
     segments.sort_by_key(|(_, offset)| *offset);
@@ -328,11 +331,13 @@ pub(super) fn emit_data_section(
         data.active(0, &ConstExpr::i32_const(offset), str_block(text));
     }
     // The static `0n` and the BigInt literal blocks.
-    data.active(
-        0,
-        &ConstExpr::i32_const(abi::BIGINT_ZERO.cast_signed()),
-        [abi::TYPE_BIGINT],
-    );
+    if bigints {
+        data.active(
+            0,
+            &ConstExpr::i32_const(abi::BIGINT_ZERO.cast_signed()),
+            [abi::TYPE_BIGINT],
+        );
+    }
     let mut bigints: Vec<(&BigIntKey, i32)> = offsets
         .bigints
         .iter()
@@ -474,6 +479,10 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
     // Without binary data the binary-data builtins are stubs that look up no
     // strings (DESIGN.md §4.2).
     let binary = program_has_binary(program);
+    // Without the `bigints` gate (DESIGN.md §6.10.9) the `BigInt` builtins
+    // and kernels are stubs and every BigInt arm of the always-present
+    // helpers is left out, so no BigInt-only string is looked up.
+    let bigints = program_has_bigint(program);
     let fragments: Vec<IrNode> = Builtin::ALL
         .into_iter()
         .filter(|b| binary || !b.is_binary())
@@ -488,10 +497,10 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
     // `stack` key, a function object's materialized keys and every function's
     // `name`.
     let realm_strs = realm::strings()
-        .chain(builtins::strings(binary))
+        .chain(builtins::strings(binary, bigints))
         .chain(convert::strings())
-        .chain(bigint::strings())
-        .chain(bigint::op_strings())
+        .chain(bigints.then(bigint::strings).into_iter().flatten())
+        .chain(bigints.then(bigint::op_strings).into_iter().flatten())
         .chain(dtoa::STRINGS)
         .chain(render::STRINGS)
         .chain([STACK_KEY, STACK_OVERFLOW_MSG, STACK_OVERFLOW_STACK])
