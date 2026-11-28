@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 
 use jsc_test262::filter::{self, DONE_PRINT, Denylist, Mode, SkipReason};
 use jsc_test262::outcome::{self, Outcome};
+use jsc_test262::partition::Partition;
 use jsc_test262::report::{self, Report};
 use jsc_test262::{assemble, baseline, exec, frontmatter, walk};
 
 const USAGE: &str = "usage: jsc-test262 [--test262 DIR] [--jsc PATH] [--jobs N] \
-[--timeout SECS] [--check] [--update-baseline] [--history] [PATH_PREFIX...]";
+[--timeout SECS] [--check] [--update-baseline] [--history] [--partition K/N] [PATH_PREFIX...]";
 const DENYLIST: &str = "tests/test262/unsupported-features.txt";
 const BASELINE: &str = "tests/test262/baseline.txt";
 const HISTORY: &str = "tests/test262/history.tsv";
@@ -35,6 +36,7 @@ struct Args {
     check: bool,
     update_baseline: bool,
     history: bool,
+    partition: Option<Partition>,
     filters: Vec<String>,
 }
 
@@ -47,6 +49,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         check: false,
         update_baseline: false,
         history: false,
+        partition: None,
         filters: Vec::new(),
     };
     while let Some(arg) = it.next() {
@@ -66,12 +69,19 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--check" => args.check = true,
             "--update-baseline" => args.update_baseline = true,
             "--history" => args.history = true,
+            "--partition" => args.partition = Some(Partition::parse(&value(&arg)?)?),
             flag if flag.starts_with('-') => return Err(format!("unknown option `{flag}`")),
             _ => args.filters.push(arg),
         }
     }
     if args.history && !args.filters.is_empty() {
         return Err("--history records full runs only; drop the PATH_PREFIX filters".to_owned());
+    }
+    if args.partition.is_some() && (args.update_baseline || args.history) {
+        return Err(
+            "--partition runs one shard; --update-baseline and --history need a full run"
+                .to_owned(),
+        );
     }
     Ok(args)
 }
@@ -315,9 +325,34 @@ fn results_tsv(paths: &[String], records: &[Record]) -> String {
     out
 }
 
-fn check(old: &BTreeSet<String>, passing: &BTreeSet<String>, filters: &[String]) -> bool {
+/// The baseline entries a run with `partition` validates: those the shard
+/// owns among `collected` (the sorted, unpartitioned path list); all of them
+/// without a partition.
+fn scope_baseline(
+    old: BTreeSet<String>,
+    collected: &[String],
+    partition: Option<Partition>,
+) -> BTreeSet<String> {
+    match partition {
+        Some(part) => old
+            .into_iter()
+            .filter(|p| part.owns(collected, p))
+            .collect(),
+        None => old,
+    }
+}
+
+fn check(
+    old: &BTreeSet<String>,
+    passing: &BTreeSet<String>,
+    filters: &[String],
+    partition: Option<Partition>,
+) -> bool {
     let diff = baseline::diff(old, passing, filters);
-    println!("regressed: {}", diff.regressed.len());
+    match partition {
+        Some(part) => println!("regressed (partition {part}): {}", diff.regressed.len()),
+        None => println!("regressed: {}", diff.regressed.len()),
+    }
     for p in &diff.regressed {
         println!("  {p}");
     }
@@ -362,8 +397,20 @@ fn real_main() -> Result<ExitCode, String> {
     let compiling: Vec<&str> = env.compiling.iter().map(String::as_str).collect();
     println!("harness includes that compile: {}", compiling.join(", "));
     let started = Instant::now();
-    let paths = walk::collect(&env.test_root, &env.args.filters)
+    let collected = walk::collect(&env.test_root, &env.args.filters)
         .map_err(|e| format!("cannot walk {}: {e}", env.test_root.display()))?;
+    let paths = match env.args.partition {
+        Some(part) => {
+            let paths = part.select(&collected);
+            println!(
+                "partition {part}: {} of {} collected tests",
+                paths.len(),
+                collected.len()
+            );
+            paths
+        }
+        None => collected.clone(),
+    };
     let done = AtomicUsize::new(0);
     let records = exec::pool(&paths, env.args.jobs, |i, path| {
         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -383,6 +430,9 @@ fn real_main() -> Result<ExitCode, String> {
         .collect();
     let report = Report::new(&pairs);
     print!("{}", summary(&report));
+    if let Some(part) = env.args.partition {
+        println!("(OVERALL covers partition {part} only)");
+    }
     println!(
         "wall-clock: {:.1}s ({} jobs)",
         elapsed.as_secs_f64(),
@@ -400,7 +450,8 @@ fn real_main() -> Result<ExitCode, String> {
     let mut ok = true;
     if env.args.check {
         let text = read(base_path).map_err(|e| format!("{e}; create it with --update-baseline"))?;
-        ok = check(&baseline::parse(&text), &passing, &env.args.filters);
+        let old = scope_baseline(baseline::parse(&text), &collected, env.args.partition);
+        ok = check(&old, &passing, &env.args.filters, env.args.partition);
     }
     if env.args.update_baseline {
         let old = if base_path.exists() {
@@ -449,6 +500,7 @@ mod tests {
         assert!(a.jobs >= 1);
         assert_eq!(a.timeout, Duration::from_secs(10));
         assert!(!a.check && !a.update_baseline && !a.history && a.filters.is_empty());
+        assert_eq!(a.partition, None);
         Ok(())
     }
 
@@ -478,10 +530,14 @@ mod tests {
                 check: true,
                 update_baseline: true,
                 history: false,
+                partition: None,
                 filters: vec!["built-ins/Array/".to_owned(), "language/".to_owned()],
             }
         );
         assert!(parse(&["--history"])?.history);
+        let a = parse(&["--check", "--partition", "2/4", "language/"])?;
+        assert_eq!(a.partition, Some(Partition::parse("2/4")?));
+        assert!(a.check);
         Ok(())
     }
 
@@ -493,9 +549,48 @@ mod tests {
             &["--timeout", "x"],
             &["--bogus"],
             &["--history", "language/"],
+            &["--partition"],
+            &["--partition", "0/4"],
+            &["--partition", "5/4"],
+            &["--partition", "1/0"],
+            &["--partition", "x"],
+            &["--partition", "1/4", "--update-baseline"],
+            &["--history", "--partition", "1/4"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn check_scoped_to_partition() -> Result<(), String> {
+        let collected: Vec<String> = ["a.js", "b.js", "c.js", "d.js", "e.js"]
+            .map(str::to_owned)
+            .to_vec();
+        // `bb.js` was removed from the checkout but is still in the baseline.
+        let old = baseline::parse("a.js\nb.js\nbb.js\nd.js\ne.js\n");
+        let passing = baseline::parse("a.js\n");
+        assert_eq!(scope_baseline(old.clone(), &collected, None), old);
+        let mut union = BTreeSet::new();
+        let mut regressed = Vec::new();
+        for k in 1..=2 {
+            let part = Partition::parse(&format!("{k}/2"))?;
+            let scoped = scope_baseline(old.clone(), &collected, Some(part));
+            assert!(scoped.is_disjoint(&union));
+            union.extend(scoped.iter().cloned());
+            let shard_passing: BTreeSet<String> = passing
+                .iter()
+                .filter(|p| part.select(&collected).contains(p))
+                .cloned()
+                .collect();
+            regressed.extend(baseline::diff(&scoped, &shard_passing, &[]).regressed);
+        }
+        assert_eq!(union, old);
+        regressed.sort();
+        assert_eq!(regressed, baseline::diff(&old, &passing, &[]).regressed);
+        // Shard 1/2 owns indices 0, 2, 4 (a, c, e) and `bb.js` (insertion index 2).
+        let one = scope_baseline(old, &collected, Some(Partition::parse("1/2")?));
+        assert_eq!(one, baseline::parse("a.js\nbb.js\ne.js\n"));
+        Ok(())
     }
 
     #[test]
