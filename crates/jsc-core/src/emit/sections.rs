@@ -45,6 +45,7 @@ pub(super) fn build_type_and_function_sections<'a>(
     // the helpers follow in [`registry`] order.
     let first = IMPORT_FUNC_COUNT + 1 + u32::try_from(n).unwrap_or(u32::MAX);
     let core = |helper: Core| first + helper as u32;
+    let has_binary = program_has_binary(program);
     let helpers = Helpers {
         unwind,
         stack_guard: Some(abi::CALL_DEPTH_LIMIT),
@@ -106,10 +107,13 @@ pub(super) fn build_type_and_function_sections<'a>(
         max_args,
         gathers_arguments: program_any(program, |n| matches!(n, IrNode::SpreadArgsGlobal)),
         // A proxy trap runs user code at any property access, as a getter
-        // does (DESIGN.md §6.11).
-        has_accessors: program_has_accessors(program) || program_has_proxies(program),
+        // does (DESIGN.md §6.11); a BigInt typed-array element read may run
+        // out of memory, leaving a `RangeError` pending (DESIGN.md §6.3).
+        has_accessors: program_has_accessors(program)
+            || program_has_proxies(program)
+            || (has_binary && program_has_bigint(program)),
         dirty_tracking: program_tests_dirty_bits(program),
-        binary: if program_has_binary(program) {
+        binary: if has_binary {
             BinaryData::Reachable
         } else {
             BinaryData::Unreachable
@@ -1516,7 +1520,7 @@ fn program_has_accessors(program: &IrProgram) -> bool {
     })
 }
 
-/// The globals of the binary-data constructors (DESIGN.md §5.8.5).
+/// The globals of the binary-data constructors (DESIGN.md §6.4).
 const BINARY_NAMES: [&str; 14] = [
     "ArrayBuffer",
     "DataView",

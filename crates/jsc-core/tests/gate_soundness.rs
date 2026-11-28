@@ -1,4 +1,4 @@
-//! Integration tests: the binary-data gate (DESIGN.md §5.8.5) opens whenever
+//! Integration tests: the binary-data gate (DESIGN.md §6.4) opens whenever
 //! the program holds the global object, in every form it can take — an
 //! escaping `globalThis` (which lowers to a global-object lookup), an alias
 //! of it, a top-level `this` — so a binary-data constructor found by a
@@ -124,5 +124,18 @@ fn computed_global_inside_a_function() {
     prints(
         r#"function f(k) { return new globalThis[k](3); } console.log(f("Uint8" + "Array").length)"#,
         "3",
+    );
+}
+
+/// The inline forms exactly as written in the report (no spaces around `+`).
+#[test]
+fn inline_computed_global_key_unspaced() {
+    prints(
+        r#"console.log(new globalThis["Uint8"+"Array"](2).length)"#,
+        "2",
+    );
+    prints(
+        r#"console.log(new globalThis["Array"+"Buffer"](2).byteLength)"#,
+        "2",
     );
 }

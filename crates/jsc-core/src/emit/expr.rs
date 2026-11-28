@@ -3452,7 +3452,7 @@ fn emit_set_function_name<S: Sink>(
     function.instruction(&Instruction::I64Or);
     function.instruction(&Instruction::I32Const(abi::ATTR_CONFIGURABLE.cast_signed()));
     function.instruction(&Instruction::Call(helpers.define));
-    // Out of memory in `__concat` or the table growth (§5.8): no function
+    // Out of memory in `__concat` or the table growth (design/runtime-memory.md §5.8): no function
     // with a dummy `name` escapes.
     emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::LocalGet(local));

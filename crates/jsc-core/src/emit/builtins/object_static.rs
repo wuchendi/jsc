@@ -462,7 +462,7 @@ fn emit_set_level(
     return_if_pending(function);
     wasm!(function; LocalGet(r), I32Eqz, If(BlockType::Empty));
     // A refusal is a proxy's falsish trap or, in a program that can reach
-    // one, a variable-length typed array (DESIGN.md §5.8.5).
+    // one, a variable-length typed array (DESIGN.md §6.3).
     let typed_array = |function: &mut FnBuilder<'_>| {
         wasm!(function;
             LocalGet(v), I32WrapI64, I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }),

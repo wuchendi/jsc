@@ -1,4 +1,4 @@
-//! `Uint8Array` base64 / hex (DESIGN.md §5.8.7): the statics
+//! `Uint8Array` base64 / hex (DESIGN.md §7.9): the statics
 //! `Uint8Array.fromBase64` / `fromHex` and the prototype methods `toBase64`
 //! / `toHex` / `setFromBase64` / `setFromHex`.
 //!

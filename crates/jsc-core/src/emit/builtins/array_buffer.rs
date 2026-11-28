@@ -1,4 +1,4 @@
-//! `ArrayBuffer` (DESIGN.md §5.8): the constructor, `ArrayBuffer.isView`
+//! `ArrayBuffer` (DESIGN.md §7.9): the constructor, `ArrayBuffer.isView`
 //! and the `%ArrayBuffer.prototype%` getters and methods (`resize`,
 //! `slice`, `transfer`, `transferToFixedLength`).
 //!
@@ -394,7 +394,7 @@ pub(super) fn emit(
     }
 }
 
-/// `ArrayBuffer(length, options)` (DESIGN.md §5.8.7): the "requires 'new'"
+/// `ArrayBuffer(length, options)` (DESIGN.md §7.9): the "requires 'new'"
 /// `TypeError` when called; `ToIndex(length)`; `options.maxByteLength`
 /// (read only from an object; `undefined` keeps the buffer fixed) through
 /// `ToIndex`, `length > maxByteLength` a `RangeError`; then
@@ -548,7 +548,7 @@ fn emit_getter(
     }
 }
 
-/// `ArrayBuffer.prototype.resize(newLength)` (DESIGN.md §5.8.4): a
+/// `ArrayBuffer.prototype.resize(newLength)` (DESIGN.md §6.2): a
 /// resizable receiver (else the incompatible-receiver `TypeError`),
 /// `ToIndex(newLength)`, then a detached receiver throws, then a length past
 /// the maximum is a `RangeError`. Shrinking zeroes the dropped tail; growing
@@ -687,7 +687,7 @@ fn species_constructor(
     wasm!(function; End, End, End);
 }
 
-/// `ArrayBuffer.prototype.slice(start, end)` (DESIGN.md §5.8.7): a detached
+/// `ArrayBuffer.prototype.slice(start, end)` (DESIGN.md §7.9): a detached
 /// receiver throws; the relative `first` / `final` over the length; the
 /// result from `Construct(SpeciesConstructor(O, %ArrayBuffer%), [newLen])`
 /// must be a different, non-detached `ArrayBuffer` of at least `newLen`
@@ -803,7 +803,7 @@ fn emit_slice(
 
 /// `ArrayBuffer.prototype.transfer(newLength)` (`preserve`) /
 /// `transferToFixedLength(newLength)` (`ArrayBufferCopyAndDetach`, DESIGN.md
-/// §5.8.4): `newLength` is the current length when `undefined`, else
+/// §6.2): `newLength` is the current length when `undefined`, else
 /// `ToIndex`; a detached receiver throws; `transfer` keeps a resizable
 /// buffer resizable with its maximum (a longer `newLength` is a
 /// `RangeError`). The new buffer (over `%ArrayBuffer.prototype%`) takes the

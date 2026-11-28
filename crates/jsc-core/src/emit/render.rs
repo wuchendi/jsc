@@ -546,7 +546,7 @@ fn render_container(f: &mut FnBuilder<'_>, helpers: Helpers<'_>, p: u32, ty: u32
     dispatch(f, TYPE_OBJECT, helpers.render_object());
     dispatch(f, TYPE_FUNCTION, helpers.render_function());
     // A typed array lists its elements and own properties like an array
-    // (DESIGN.md §5.8.8), so it takes the cycle guard too.
+    // (DESIGN.md §6.9), so it takes the cycle guard too.
     if helpers.has_binary() {
         dispatch(f, i32::from(abi::TYPE_TYPEDARRAY), helpers.render_binary());
     }
@@ -761,7 +761,7 @@ fn render_leaf(
         LocalGet(p), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Call(helpers.date_text()),
         I32WrapI64, Call(helpers.out_str()), Return, End,
     );
-    // Binary data (DESIGN.md §5.8.8), only in a program that can reach it.
+    // Binary data (DESIGN.md §6.9), only in a program that can reach it.
     if helpers.has_binary() {
         is(f, i32::from(abi::TYPE_ARRAYBUFFER));
         wasm!(f; LocalGet(p), LocalGet(depth), Call(helpers.render_binary()), Return, End);

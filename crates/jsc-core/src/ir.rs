@@ -184,7 +184,7 @@ pub enum MathOp {
     Atanh,
     /// `Math.random()` — a host pseudo-random number in `[0, 1)`.
     Random,
-    /// `Math.f16round(x)` — nearest IEEE binary16 value (DESIGN.md §5.8.6).
+    /// `Math.f16round(x)` — nearest IEEE binary16 value (DESIGN.md §6.2).
     F16round,
 }
 
@@ -579,11 +579,11 @@ pub enum BuiltinCtor {
     WeakRef,
     /// `FinalizationRegistry`.
     FinalizationRegistry,
-    /// `ArrayBuffer` (DESIGN.md §5.8).
+    /// `ArrayBuffer` (DESIGN.md §7.9).
     ArrayBuffer,
-    /// `DataView` (DESIGN.md §5.8).
+    /// `DataView` (DESIGN.md §7.9).
     DataView,
-    /// `%TypedArray%` (DESIGN.md §5.8.7): abstract, not a global.
+    /// `%TypedArray%` (DESIGN.md §7.9): abstract, not a global.
     TypedArray,
     /// A concrete typed-array constructor (`Int8Array` .. `BigUint64Array`).
     Typed(ElementKind),
@@ -591,7 +591,7 @@ pub enum BuiltinCtor {
     BigInt,
 }
 
-/// A typed-array element kind (DESIGN.md §5.8.6), in the spec's Table 71
+/// A typed-array element kind (DESIGN.md §6.2), in the spec's Table 71
 /// order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElementKind {
@@ -689,7 +689,7 @@ impl ElementKind {
         1 << self.shift()
     }
 
-    /// Whether the kind has the `BigInt` content type (DESIGN.md §5.8.6).
+    /// Whether the kind has the `BigInt` content type (DESIGN.md §6.2).
     pub(crate) fn is_bigint(self) -> bool {
         matches!(self, Self::BigInt64 | Self::BigUint64)
     }

@@ -1,5 +1,5 @@
 //! Integration tests: the `%TypedArray.prototype%` methods of stage T3b
-//! (DESIGN.md §5.8.7): every method over each number kind, the element
+//! (DESIGN.md §7.9): every method over each number kind, the element
 //! conversions of the writing methods, `TypedArraySpeciesCreate` overrides,
 //! `set` from typed arrays (overlapping same-buffer copies of the same and of
 //! another kind) and array-likes, the default sort order and stability,

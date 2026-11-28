@@ -16,7 +16,7 @@
 //!
 //! `__gc_collect` is a precise, non-moving, stop-the-world mark-sweep run
 //! from the allocation budget step ([`emit_gc_budget`]) and once before an
-//! allocation gives up (out of memory, §5.8: [`emit_oom_reserve`] /
+//! allocation gives up (out of memory, design/runtime-memory.md §5.8: [`emit_oom_reserve`] /
 //! [`emit_oom_large`]). It bumps the epoch, marks from the roots
 //! ([`emit_collect`]) through the mark stack (`__gc_visit` / `__gc_trace` /
 //! `__gc_drain`), runs the ephemeron fixpoint of the `WeakMaps`, clears the
@@ -240,7 +240,7 @@ pub(super) fn class_sizes() -> Vec<u8> {
 /// Push the base of a fresh zeroed block of the compile-time `size`: the
 /// per-class entry `__alloc_small(class)` for a small size, else
 /// `__alloc_fixed(size)`. Neither returns `0`: out of memory hands a block
-/// from the reserve (§5.8).
+/// from the reserve (design/runtime-memory.md §5.8).
 pub(super) fn emit_alloc_const(function: &mut impl Sink, helpers: Helpers<'_>, size: i32) {
     match abi::gc_size_class(size.cast_unsigned()) {
         0 => wasm!(function; I32Const(size), Call(helpers.alloc_fixed())),
@@ -299,7 +299,7 @@ fn emit_oom_pending(function: &mut impl Sink, helpers: Helpers<'_>) {
     );
 }
 
-/// Emit the out-of-memory step of a request that must not fail (§5.8): a
+/// Emit the out-of-memory step of a request that must not fail (design/runtime-memory.md §5.8): a
 /// small one (`<= GC_SMALL_MAX`), or a constant-size large one of `k` pages
 /// (the local `k`, at most the reserve), after the collect-before-OOM retry
 /// failed. While the reserve is held, release its pages to the pool, throw
@@ -330,7 +330,7 @@ pub(super) fn emit_oom_reserve(
     emit_oom_exit(function);
 }
 
-/// Emit the out-of-memory step of a large request (`> GC_SMALL_MAX`, §5.8):
+/// Emit the out-of-memory step of a large request (`> GC_SMALL_MAX`, design/runtime-memory.md §5.8):
 /// throw `%OutOfMemoryError%` and return `0`. Every caller that can ask for
 /// a large block checks for `0` and leaves a valid dummy behind instead.
 pub(super) fn emit_oom_large(function: &mut impl Sink, helpers: Helpers<'_>) {
@@ -339,7 +339,7 @@ pub(super) fn emit_oom_large(function: &mut impl Sink, helpers: Helpers<'_>) {
 }
 
 /// Emit the fatal out-of-memory exit, taken only once the reserve is spent
-/// (§5.8): the static [`abi::OOM_LINE`] on fd 2 through its static iovec
+/// (design/runtime-memory.md §5.8): the static [`abi::OOM_LINE`] on fd 2 through its static iovec
 /// (allocating nothing), then `proc_exit(1)`.
 fn emit_oom_exit(function: &mut impl Sink) {
     wasm!(function;
@@ -646,7 +646,7 @@ const MARK_STACK_END: i32 = (abi::GC_MARK_STACK + abi::GC_MARK_STACK_SIZE).cast_
 /// ([`emit_weakref_clear`]), process the registries
 /// ([`emit_finreg_process`]), then release a paged mark stack, tombstone the intern table's unmarked heap
 /// strings (slot value `1`), `__gc_sweep`, take the out-of-memory reserve
-/// when it is not held (§5.8), and renew the budget to
+/// when it is not held (design/runtime-memory.md §5.8), and renew the budget to
 /// `max(GC_MIN_BUDGET, $__gc_live)` (under `gc_stress`, an allocation
 /// count: see [`emit_renew`]).
 ///
@@ -1100,7 +1100,7 @@ fn emit_finreg_process(f: &mut super::FnBuilder<'_>, gc: GcLayout, l: WeakLocals
 }
 
 /// Emit the end of [`emit_collect`] after the sweep: take back the
-/// out-of-memory reserve (§5.8) when an out-of-memory spent it, and renew
+/// out-of-memory reserve (design/runtime-memory.md §5.8) when an out-of-memory spent it, and renew
 /// the budget to `max(GC_MIN_BUDGET, $__gc_live)`. Under `gc_stress` the
 /// budget is an allocation count: `0` (the next allocation collects) at
 /// interval `1` and for the first [`super::GC_STRESS_PREFIX`] collections
@@ -1419,7 +1419,7 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     );
     link(&mut f, GC_WEAK_REGS_GLOBAL);
     wasm!(f; Return, End);
-    // An ArrayBuffer (DESIGN.md §5.8.3): the prefix and its byte block (a
+    // An ArrayBuffer (DESIGN.md §5.7): the prefix and its byte block (a
     // `TYPE_RAW` leaf: marked, nothing inside traced). Only a program that
     // can reach binary data carries the arms.
     if helpers.has_binary() {
@@ -1428,7 +1428,7 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         jsval(&mut f, abi::OBJ_PROTO_OFFSET);
         raw(&mut f, abi::AB_DATA_OFFSET);
         wasm!(f; Return, End);
-        // A typed array: the prefix and its buffer (DESIGN.md §5.8.3).
+        // A typed array: the prefix and its buffer (DESIGN.md §5.7).
         is(&mut f, abi::TYPE_TYPEDARRAY);
         raw(&mut f, abi::OBJ_PROPS_OFFSET);
         jsval(&mut f, abi::OBJ_PROTO_OFFSET);
