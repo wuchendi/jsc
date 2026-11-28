@@ -80,6 +80,79 @@ fn hello_world_pays_nothing_for_binary_data() {
     );
 }
 
+/// Whether the module `wasm` carries the static string `text` (a one-byte
+/// string's data is its bytes).
+fn carries(wasm: &[u8], text: &str) -> bool {
+    wasm.windows(text.len()).any(|w| w == text.as_bytes())
+}
+
+/// Binary-data texts only the binary-data builtins, helpers and render arms
+/// look up: a receiver and a detached `TypeError`, an alignment `RangeError`,
+/// a callback `TypeError`, a `DataView` and a base64 message, and the
+/// `ArrayBuffer` rendering.
+const BINARY_TEXTS: [&str; 7] = [
+    "Method ArrayBuffer.prototype.resize called on incompatible receiver",
+    "Cannot perform ArrayBuffer.prototype.slice on a detached ArrayBuffer",
+    "Start offset of Int16Array should be a multiple of 2",
+    "%TypedArray%.prototype.map callback is not a function",
+    "Cannot perform DataView.prototype.getInt8 on a detached or out-of-bounds DataView",
+    "The input must be a string",
+    "[Uint8Contents]: <",
+];
+
+/// Without binary data the binary-data builtins and string-reading helpers
+/// are stubs, so their static strings are not interned (DESIGN.md §4.2):
+/// hello world and a `Math.f16round` program carry none of them, while a
+/// program naming `ArrayBuffer` carries them all and is larger by at least
+/// their bytes.
+#[test]
+fn binary_strings_are_gated_with_the_bodies() {
+    let plain = compile_with("console.log('hi')", options(false)).expect("compiles");
+    let f16 = compile_with("Math.f16round(1.337)", options(false)).expect("compiles");
+    let named =
+        compile_with("console.log('hi', typeof ArrayBuffer)", options(false)).expect("compiles");
+    for text in BINARY_TEXTS {
+        assert!(!carries(&plain, text), "hello world carries `{text}`");
+        assert!(!carries(&f16, text), "f16round carries `{text}`");
+        assert!(
+            carries(&named, text),
+            "`ArrayBuffer` program lacks `{text}`"
+        );
+    }
+    let unshaken = compile_with("console.log('hi')", options(true)).expect("compiles");
+    for text in BINARY_TEXTS {
+        assert!(
+            !carries(&unshaken, text),
+            "full hello world carries `{text}`"
+        );
+    }
+    assert!(
+        plain.len() + 15_000 < named.len(),
+        "{} vs {}",
+        plain.len(),
+        named.len()
+    );
+}
+
+/// A program that reaches binary data still renders and throws with the
+/// gated strings.
+#[test]
+fn binary_programs_keep_their_strings() {
+    same("new Uint8Array([1, 2])", "Uint8Array(2) [ 1, 2 ]");
+    same(
+        "try { ArrayBuffer.prototype.resize.call({}, 1) } catch (e) { String(e) }",
+        "TypeError: Method ArrayBuffer.prototype.resize called on incompatible receiver",
+    );
+    same(
+        "try { new Int16Array(new ArrayBuffer(4), 1) } catch (e) { String(e) }",
+        "RangeError: Start offset of Int16Array should be a multiple of 2",
+    );
+    same(
+        "try { Uint8Array.fromBase64(1) } catch (e) { String(e) }",
+        "TypeError: The input must be a string",
+    );
+}
+
 /// `Math.f16round` does not make a program reach binary data: it keeps the
 /// two binary16 helpers and none of the typed-array runtime.
 #[test]
@@ -261,8 +334,12 @@ fn async_paths_are_kept() {
 /// with headroom for `gc_stress`. The `Reflect` merge had left every program
 /// at the full runtime (~1.2 MB): the renderer's `"constructor"` lookup keeps
 /// the `Map` constructor, its `"set"` lookup kept `Reflect.set`, and that
-/// body's run-time-key use left the module whole (DESIGN.md §6.11).
-const HELLO_BOUND: usize = 520_000;
+/// body's run-time-key use left the module whole (DESIGN.md §6.11). The
+/// binary-data builtins' strings (~340 static strings, ~23 KB of blobs, most
+/// of them binary-only) are interned only when binary data is reachable
+/// (DESIGN.md §4.2), which also brings the string count, and so possibly the
+/// intern table, back down.
+const HELLO_BOUND: usize = 480_000;
 
 #[test]
 fn hello_world_stays_near_the_base() {
