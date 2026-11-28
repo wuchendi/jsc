@@ -1,14 +1,20 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+use registry::Big;
+
+use crate::ir::GenTerm;
+
 /// Emit a binary operation, leaving its jsval result on the stack. Arithmetic
 /// unboxes to `f64` and reboxes a number; relational operators box a boolean
 /// jsval; `Eq`/`Ne` are strict equality (see [`emit_strict_eq`]).
-/// Emit an increment/decrement of `local` (`++`/`--`). The local is first
-/// replaced by its `ToNumber`, then the updated value is `old ± 1` (unboxed to
-/// `f64`, stepped, reboxed). `prefix` yields the NEW value via `local.tee`;
-/// postfix pushes the (numeric) OLD value first and then stores the update, so
-/// the old value remains on the stack as the expression's result.
+/// Emit an increment/decrement of `local` (`++`/`--`). A number is stepped
+/// inline (unboxed to `f64`, `± 1`, reboxed); anything else is first replaced
+/// by its `ToNumeric`, and a `BigInt` result is stepped by
+/// `__bigint_add_small` in the cold arm, which leaves the expression's value
+/// and branches out of the enclosing block. `prefix` yields the NEW value via
+/// `local.tee`; postfix pushes the (numeric) OLD value first and then stores
+/// the update, so the old value remains on the stack as the result.
 pub(super) fn emit_inc_dec(
     local: u32,
     inc: bool,
@@ -21,10 +27,52 @@ pub(super) fn emit_inc_dec(
     } else {
         Instruction::F64Sub
     };
-    emit_coerce_number(function, local, helpers);
-    // Two writes follow: the coercion's and the update's.
-    function.note_numeric_def(local);
-    function.note_numeric_def(local);
+    let bigints = helpers.bigints();
+    if bigints {
+        // Three writes follow: the coercion's, the `BigInt` update's and the
+        // number update's; each keeps the local numeric exactly when it already
+        // was.
+        let def = IrNode::IncDec { local, inc, prefix };
+        for _ in 0..3 {
+            function.note_def(local, &def);
+        }
+        function.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
+        enter_frame(helpers);
+        emit_is_number(function, local);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        function.instruction(&Instruction::LocalGet(local));
+        function.instruction(&Instruction::Call(helpers.bigint(Big::ToNumeric)));
+        function.instruction(&Instruction::LocalSet(local));
+        emit_propagate_if_pending(function, helpers);
+        bigint::emit_is_bigint(function, local);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        if !prefix {
+            function.instruction(&Instruction::LocalGet(local));
+        }
+        function.instruction(&Instruction::LocalGet(local));
+        function.instruction(&Instruction::I32Const(if inc { 1 } else { -1 }));
+        function.instruction(&Instruction::Call(helpers.bigint(Big::AddSmall)));
+        if prefix {
+            function.instruction(&Instruction::LocalTee(local));
+        } else {
+            function.instruction(&Instruction::LocalSet(local));
+        }
+        emit_propagate_if_pending(function, helpers);
+        function.instruction(&Instruction::Br(2));
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+    } else {
+        // No `BigInt` can exist (DESIGN.md §6.10.9): `ToNumber`, then two
+        // writes follow, the coercion's and the update's.
+        emit_coerce_number(function, local, helpers);
+        function.note_def(local, &IrNode::Num(0.0));
+        function.note_def(local, &IrNode::Num(0.0));
+    }
     if prefix {
         // new = old ± 1; store and yield the new value.
         function.instruction(&Instruction::LocalGet(local));
@@ -43,6 +91,45 @@ pub(super) fn emit_inc_dec(
         emit_box_f64(function, helpers);
         function.instruction(&Instruction::LocalSet(local));
     }
+    if bigints {
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+    }
+}
+
+/// Emit `NumericStep { arg, inc }`: `arg ± 1` of the numeric (number or
+/// `BigInt`) value of `arg`, a number inline, a `BigInt` through
+/// `__bigint_add_small`.
+pub(super) fn emit_numeric_step(
+    arg: &IrNode,
+    inc: bool,
+    function: &mut impl Sink,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let s0 = scratch + NUM_A;
+    emit_node(arg, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(s0));
+    emit_is_number(function, s0);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::F64ReinterpretI64);
+    function.instruction(&Instruction::F64Const(Ieee64::from(1.0)));
+    function.instruction(&if inc {
+        Instruction::F64Add
+    } else {
+        Instruction::F64Sub
+    });
+    emit_box_f64(function, helpers);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::I32Const(if inc { 1 } else { -1 }));
+    function.instruction(&Instruction::Call(helpers.bigint(Big::AddSmall)));
+    emit_propagate_if_pending(function, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
 }
 
 /// `ToNumber` two operands stashed in raw locals, in order. `s0` is passed by
@@ -61,7 +148,7 @@ fn emit_coerce_operands(
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
     let mark = function.temp_mark();
-    if !yields_number(rhs) {
+    if !yields_number(rhs, helpers) {
         function.instruction(&Instruction::LocalGet(s1));
         function.root_node(rhs);
         function.instruction(&Instruction::Drop);
@@ -76,87 +163,88 @@ fn emit_coerce_operands(
     emit_coerce_number(function, s1, helpers);
 }
 
-/// Emit the numeric remainder `lhs % rhs`. wasm has no `f64.rem`, so compute the
-/// JS truncated remainder `a - b * trunc(a / b)` (which takes the dividend's
-/// sign). Both operands are stashed in the scratch locals (coerced with
-/// `ToNumber`) so each can be read twice; the `f64` result is reboxed as a number
-/// jsval.
-pub(super) fn emit_mod(
-    lhs: &IrNode,
-    rhs: &IrNode,
-    function: &mut impl Sink,
-    scratch: u32,
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-) {
-    let (s0, s1) = (scratch + NUM_A, scratch + NUM_B);
-    let mark = function.temp_mark();
-    emit_operand(lhs, function, scratch, strings, helpers);
-    emit_node(rhs, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(s1));
-    function.instruction(&Instruction::LocalSet(s0));
-    function.release_temps(mark);
-    emit_coerce_operands(function, s0, s1, rhs, helpers);
-    // a
-    function.instruction(&Instruction::LocalGet(s0));
-    function.instruction(&Instruction::F64ReinterpretI64);
-    // b * trunc(a / b)
-    function.instruction(&Instruction::LocalGet(s1));
-    function.instruction(&Instruction::F64ReinterpretI64);
-    function.instruction(&Instruction::LocalGet(s0));
-    function.instruction(&Instruction::F64ReinterpretI64);
-    function.instruction(&Instruction::LocalGet(s1));
-    function.instruction(&Instruction::F64ReinterpretI64);
-    function.instruction(&Instruction::F64Div);
-    function.instruction(&Instruction::F64Trunc);
-    function.instruction(&Instruction::F64Mul);
-    // a - b * trunc(a / b)
-    function.instruction(&Instruction::F64Sub);
-    emit_box_f64(function, helpers);
+/// The `__numeric_op` code of the binary operator `op` (DESIGN.md §6.10.5).
+pub(super) fn numop_code(op: BinOp) -> i32 {
+    match op {
+        BinOp::Add => bigint::NUMOP_ADD,
+        BinOp::Sub => bigint::NUMOP_SUB,
+        BinOp::Mul => bigint::NUMOP_MUL,
+        BinOp::Div => bigint::NUMOP_DIV,
+        BinOp::Mod => bigint::NUMOP_MOD,
+        BinOp::Exp => bigint::NUMOP_EXP,
+        BinOp::BitAnd => bigint::NUMOP_AND,
+        BinOp::BitOr => bigint::NUMOP_OR,
+        BinOp::BitXor => bigint::NUMOP_XOR,
+        BinOp::Shl => bigint::NUMOP_SHL,
+        BinOp::Shr => bigint::NUMOP_SHR,
+        BinOp::UShr => bigint::NUMOP_USHR,
+        _ => unreachable!("only numeric binary operators have a numop code"),
+    }
 }
 
-/// Emit subtraction/multiplication/division: stash both operands, coerce each
-/// with `ToNumber`, unbox to `f64`, compute, rebox as a number.
-fn emit_arith(
-    op: BinOp,
-    lhs: &IrNode,
-    rhs: &IrNode,
-    function: &mut impl Sink,
-    scratch: u32,
-    strings: &StrOffsets,
-    helpers: Helpers<'_>,
-) {
-    let (s0, s1) = (scratch + NUM_A, scratch + NUM_B);
-    let mark = function.temp_mark();
-    emit_operand(lhs, function, scratch, strings, helpers);
-    emit_node(rhs, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(s1));
-    function.instruction(&Instruction::LocalSet(s0));
-    function.release_temps(mark);
-    emit_coerce_operands(function, s0, s1, rhs, helpers);
-    function.instruction(&Instruction::LocalGet(s0));
-    function.instruction(&Instruction::F64ReinterpretI64);
-    function.instruction(&Instruction::LocalGet(s1));
-    function.instruction(&Instruction::F64ReinterpretI64);
-    let arith = match op {
-        BinOp::Sub => Instruction::F64Sub,
-        BinOp::Mul => Instruction::F64Mul,
-        BinOp::Div => Instruction::F64Div,
-        _ => unreachable!("only sub/mul/div reach here"),
-    };
-    function.instruction(&arith);
-    emit_box_f64(function, helpers);
-}
-
-/// Emit a bitwise or shift operator (`& | ^ << >> >>>`) over two jsval operands,
-/// leaving a number jsval on the stack.
+/// Emit a numeric binary operator (`- * / % ** & | ^ << >> >>>`) over two
+/// jsval operands, leaving its result on the stack (DESIGN.md §6.10.5).
 ///
-/// Both operands are evaluated left to right, stashed, and coerced with
-/// `ToNumber` in order (a user `valueOf` on the left runs before the right's),
-/// then each is converted with [`emit_to_int32`]. The wasm shifts already mask
-/// the count to its low 5 bits (`ToUint32(rhs) & 31`). `>>>` reads its result
-/// as unsigned; every other operator as signed.
-fn emit_bitwise(
+/// Both operands are evaluated left to right and stashed. When both are
+/// numbers the Number result is computed inline ([`emit_number_op`]);
+/// otherwise the cold arm hands both to `__numeric_op`, which applies
+/// `ToNumeric` in order (a user `valueOf` on the left runs before the
+/// right's), computes the Number or `BigInt` result or throws the mixing
+/// `TypeError`, and branches out of the enclosing block with it.
+fn emit_numeric_binary(
+    op: BinOp,
+    lhs: &IrNode,
+    rhs: &IrNode,
+    function: &mut impl Sink,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    // No `BigInt` can exist (DESIGN.md §6.10.9): `**` is the `Math.pow` code
+    // ([`lower_number_only`] already made it a `Math.pow` call), the others
+    // [`emit_number_binary`].
+    if !helpers.bigints() {
+        if op == BinOp::Exp {
+            emit_pow(lhs, rhs, function, scratch, strings, helpers);
+        } else {
+            emit_number_binary(op, lhs, rhs, function, scratch, strings, helpers);
+        }
+        return;
+    }
+    let (s0, s1) = (scratch + NUM_A, scratch + NUM_B);
+    function.instruction(&Instruction::Block(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    let mark = function.temp_mark();
+    emit_operand(lhs, function, scratch, strings, helpers);
+    emit_node(rhs, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(s1));
+    function.instruction(&Instruction::LocalSet(s0));
+    function.release_temps(mark);
+    for local in [s0, s1] {
+        emit_is_number(function, local);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        function.instruction(&Instruction::LocalGet(s0));
+        function.instruction(&Instruction::LocalGet(s1));
+        function.instruction(&Instruction::I32Const(numop_code(op)));
+        function.instruction(&Instruction::Call(helpers.bigint(Big::NumericOp)));
+        emit_propagate_if_pending(function, helpers);
+        function.instruction(&Instruction::Br(1));
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+    }
+    emit_number_op(op, function, s0, s1, pow_scratch(scratch), helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+}
+
+/// Emit a numeric binary operator other than `+` and `**` in a program
+/// that can produce no `BigInt` (DESIGN.md §6.10.9): both operands are
+/// evaluated left to right, stashed and coerced with `ToNumber` in order (a
+/// user `valueOf` on the left runs before the right's), then the Number
+/// result is computed inline ([`emit_number_op`]).
+fn emit_number_binary(
     op: BinOp,
     lhs: &IrNode,
     rhs: &IrNode,
@@ -173,21 +261,138 @@ fn emit_bitwise(
     function.instruction(&Instruction::LocalSet(s0));
     function.release_temps(mark);
     emit_coerce_operands(function, s0, s1, rhs, helpers);
-    emit_to_int32(function, s0);
-    emit_to_int32(function, s1);
-    let (int_op, convert) = match op {
-        BinOp::BitAnd => (Instruction::I32And, Instruction::F64ConvertI32S),
-        BinOp::BitOr => (Instruction::I32Or, Instruction::F64ConvertI32S),
-        BinOp::BitXor => (Instruction::I32Xor, Instruction::F64ConvertI32S),
-        BinOp::Shl => (Instruction::I32Shl, Instruction::F64ConvertI32S),
-        BinOp::Shr => (Instruction::I32ShrS, Instruction::F64ConvertI32S),
-        BinOp::UShr => (Instruction::I32ShrU, Instruction::F64ConvertI32U),
-        _ => unreachable!("only bitwise/shift ops reach here"),
-    };
-    function.instruction(&int_op);
-    function.instruction(&convert);
-    // An integer conversion is never NaN, so it reinterprets directly.
-    function.instruction(&Instruction::I64ReinterpretF64);
+    emit_number_op(op, function, s0, s1, pow_scratch(scratch), helpers);
+}
+
+/// The five raw `i64` temporaries of [`emit_pow_body`] in a user function:
+/// the `Date` field-method slots `+24`..`+28`, idle while an operator runs.
+fn pow_scratch(scratch: u32) -> [u32; 5] {
+    [
+        scratch + 24,
+        scratch + 25,
+        scratch + 26,
+        scratch + 27,
+        scratch + 28,
+    ]
+}
+
+/// Push the Number result (a number jsval) of the numeric binary operator
+/// `op` over the number jsvals in the raw `i64` locals `s0` and `s1`.
+/// Remainder: wasm has no `f64.rem`, so it is the JS truncated remainder
+/// `a - b * trunc(a / b)` (the dividend's sign). Bitwise and shift operators
+/// convert each operand with [`emit_to_int32`]; the wasm shifts already mask
+/// the count to its low 5 bits (`ToUint32(rhs) & 31`), and `>>>` reads its
+/// result as unsigned. `**` is [`emit_pow_body`], which consumes `s0` / `s1`
+/// and uses the raw `i64` temporaries `pow`.
+pub(super) fn emit_number_op(
+    op: BinOp,
+    function: &mut impl Sink,
+    s0: u32,
+    s1: u32,
+    pow: [u32; 5],
+    helpers: Helpers<'_>,
+) {
+    fn get(function: &mut impl Sink, local: u32) {
+        function.instruction(&Instruction::LocalGet(local));
+        function.instruction(&Instruction::F64ReinterpretI64);
+    }
+    match op {
+        BinOp::Sub | BinOp::Mul | BinOp::Div => {
+            get(function, s0);
+            get(function, s1);
+            function.instruction(&match op {
+                BinOp::Sub => Instruction::F64Sub,
+                BinOp::Mul => Instruction::F64Mul,
+                _ => Instruction::F64Div,
+            });
+            emit_box_f64(function, helpers);
+        }
+        BinOp::Mod => {
+            // a - b * trunc(a / b)
+            get(function, s0);
+            get(function, s1);
+            get(function, s0);
+            get(function, s1);
+            function.instruction(&Instruction::F64Div);
+            function.instruction(&Instruction::F64Trunc);
+            function.instruction(&Instruction::F64Mul);
+            function.instruction(&Instruction::F64Sub);
+            emit_box_f64(function, helpers);
+        }
+        BinOp::Exp => emit_pow_body(function, s0, s1, pow, helpers),
+        _ => {
+            emit_to_int32(function, s0);
+            emit_to_int32(function, s1);
+            let (int_op, convert) = match op {
+                BinOp::BitAnd => (Instruction::I32And, Instruction::F64ConvertI32S),
+                BinOp::BitOr => (Instruction::I32Or, Instruction::F64ConvertI32S),
+                BinOp::BitXor => (Instruction::I32Xor, Instruction::F64ConvertI32S),
+                BinOp::Shl => (Instruction::I32Shl, Instruction::F64ConvertI32S),
+                BinOp::Shr => (Instruction::I32ShrS, Instruction::F64ConvertI32S),
+                BinOp::UShr => (Instruction::I32ShrU, Instruction::F64ConvertI32U),
+                _ => unreachable!("only numeric binary operators reach here"),
+            };
+            function.instruction(&int_op);
+            function.instruction(&convert);
+            // An integer conversion is never NaN, so it reinterprets directly.
+            function.instruction(&Instruction::I64ReinterpretF64);
+        }
+    }
+}
+
+/// Emit unary `-` ([`IrNode::Negate`]) or `~` ([`IrNode::BitNot`]) over
+/// `arg`: a number computes inline (`-0 - x`, `ToInt32(x) ^ -1`); anything
+/// else goes through `__numeric_unary` (`ToNumeric`, then the Number or
+/// `BigInt` result).
+pub(super) fn emit_numeric_unary(
+    negate: bool,
+    arg: &IrNode,
+    function: &mut impl Sink,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let s0 = scratch + NUM_A;
+    emit_node(arg, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(s0));
+    emit_is_number(function, s0);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
+    enter_frame(helpers);
+    emit_number_unary(negate, function, s0, helpers);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::I32Const(if negate {
+        bigint::NUMOP_NEG
+    } else {
+        bigint::NUMOP_NOT
+    }));
+    function.instruction(&Instruction::Call(helpers.bigint(Big::NumericUnary)));
+    emit_propagate_if_pending(function, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+}
+
+/// Push `-x` (as `-0 - x`) or `~ToInt32(x)` of the number jsval in the raw
+/// `i64` local `s0`, as a number jsval.
+pub(super) fn emit_number_unary(
+    negate: bool,
+    function: &mut impl Sink,
+    s0: u32,
+    helpers: Helpers<'_>,
+) {
+    if negate {
+        function.instruction(&Instruction::F64Const(Ieee64::from(-0.0)));
+        function.instruction(&Instruction::LocalGet(s0));
+        function.instruction(&Instruction::F64ReinterpretI64);
+        function.instruction(&Instruction::F64Sub);
+        emit_box_f64(function, helpers);
+    } else {
+        emit_to_int32(function, s0);
+        function.instruction(&Instruction::I32Const(-1));
+        function.instruction(&Instruction::I32Xor);
+        function.instruction(&Instruction::F64ConvertI32S);
+        function.instruction(&Instruction::I64ReinterpretF64);
+    }
 }
 
 /// Push the 32-bit pattern of `ToInt32` (equivalently `ToUint32`) of the number
@@ -291,10 +496,11 @@ pub(super) fn emit_math_call<S: Sink>(
             emit_node(&args[0], function, scratch, strings, helpers);
             // A single-use number operand stays on the stack.
             let s0 = scratch + NUM_A;
-            let stashed = !(yields_number(&args[0]) && (native.is_some() || op == MathOp::Fround));
+            let stashed =
+                !(yields_number(&args[0], helpers) && (native.is_some() || op == MathOp::Fround));
             if stashed {
                 function.instruction(&Instruction::LocalSet(s0));
-                if !yields_number(&args[0]) {
+                if !yields_number(&args[0], helpers) {
                     emit_coerce_number(function, s0, helpers);
                 }
             }
@@ -418,7 +624,7 @@ fn emit_min_max(
     for (i, arg) in args.iter().enumerate() {
         let local = if interleaved {
             emit_node(arg, function, scratch, strings, helpers);
-            if yields_number(arg) {
+            if yields_number(arg, helpers) {
                 function.instruction(&Instruction::F64ReinterpretI64);
                 function.instruction(&fold);
                 continue;
@@ -428,7 +634,7 @@ fn emit_min_max(
         } else {
             stash_slot(scratch, i)
         };
-        if !yields_number(arg) {
+        if !yields_number(arg, helpers) {
             emit_coerce_number(function, local, helpers);
         }
         function.instruction(&Instruction::LocalGet(local));
@@ -459,29 +665,36 @@ fn is_inert(node: &IrNode) -> bool {
 }
 
 /// Whether `node` always evaluates to a number jsval, so `ToNumber` of it is
-/// the identity.
-fn yields_number(node: &IrNode) -> bool {
+/// the identity. The other arithmetic operators may yield a `BigInt`
+/// (DESIGN.md §6.10.5), so they are coerced (and throw) like any operand —
+/// unless the program can produce no `BigInt` (§6.10.9).
+fn yields_number(node: &IrNode, helpers: Helpers<'_>) -> bool {
     match node {
         IrNode::Num(_)
         | IrNode::MathCall { .. }
         | IrNode::MathSpread { .. }
         | IrNode::ConvertCall {
-            op: ConvertOp::ToNumber,
+            op: ConvertOp::ToNumber | ConvertOp::NumberCall,
             ..
+        }
+        | IrNode::Binary {
+            op: BinOp::UShr, ..
         } => true,
-        IrNode::Binary { op, .. } => matches!(
-            op,
-            BinOp::Sub
-                | BinOp::Mul
-                | BinOp::Div
-                | BinOp::Mod
-                | BinOp::BitAnd
-                | BinOp::BitOr
-                | BinOp::BitXor
-                | BinOp::Shl
-                | BinOp::Shr
-                | BinOp::UShr
-        ),
+        IrNode::Binary { op, .. } => {
+            !helpers.bigints()
+                && matches!(
+                    op,
+                    BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Mod
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::Shl
+                        | BinOp::Shr
+                )
+        }
         _ => false,
     }
 }
@@ -718,14 +931,39 @@ fn emit_hypot_step<S: Sink>(function: &mut S, x: u32, scale: u32, ssq: u32, flag
 /// The base and exponent are each fully evaluated and stashed BEFORE the loop
 /// touches any scratch local, so nested `Math` calls (which reuse the same scratch
 /// locals) cannot clobber them — the same evaluate-then-store discipline as
-/// [`emit_mod`].
-#[allow(clippy::too_many_lines)]
-pub(super) fn emit_pow<S: Sink>(
+/// the other numeric operators.
+pub(super) fn emit_pow(
     base: &IrNode,
     exp: &IrNode,
-    function: &mut S,
+    function: &mut impl Sink,
     scratch: u32,
     strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (s_base, s_cnt) = (scratch + NUM_A, scratch + NUM_B);
+    // Evaluate both operands onto the stack FIRST, then stash (exp is on top), so a
+    // nested `**`/`Math.pow` inside `exp` finishes before any scratch local is set
+    // and cannot clobber the stashed base — the same discipline as the other
+    // numeric operators.
+    let mark = function.temp_mark();
+    emit_operand(base, function, scratch, strings, helpers);
+    emit_node(exp, function, scratch, strings, helpers);
+    function.instruction(&Instruction::LocalSet(s_cnt));
+    function.instruction(&Instruction::LocalSet(s_base));
+    function.release_temps(mark);
+    emit_coerce_operands(function, s_base, s_cnt, exp, helpers);
+    emit_pow_body(function, s_base, s_cnt, pow_scratch(scratch), helpers);
+}
+
+/// Push `Number::exponentiate` (see [`emit_pow`]) of the number jsvals in the
+/// raw `i64` locals `s_base` and `s_cnt` (both consumed) as a number jsval,
+/// using the five raw `i64` temporaries `tmp`.
+#[allow(clippy::too_many_lines)]
+pub(super) fn emit_pow_body<S: Sink>(
+    function: &mut S,
+    s_base: u32,
+    s_cnt: u32,
+    [s_orig, s_cnt0, s_res, s_frac, s_neg]: [u32; 5],
     helpers: Helpers<'_>,
 ) {
     /// Push the f64 held (as bits) in i64 local `local`.
@@ -784,28 +1022,9 @@ pub(super) fn emit_pow<S: Sink>(
         function.instruction(&Instruction::F64Const(Ieee64::from(v)));
     };
 
-    // All raw i64 (never rooted): the operands are numbers once coerced and
-    // nothing else here is a jsval. The locals hold f64 bit patterns, except
-    // `s_neg`, the negative-exponent flag as 0/1. `+24`..`+28` are the `Date`
-    // field-method slots; no child sub-expression is live while pow runs.
-    let s_base = scratch + NUM_A;
-    let s_cnt = scratch + NUM_B;
-    let s_orig = scratch + 24;
-    let s_cnt0 = scratch + 25;
-    let s_res = scratch + 26;
-    let s_frac = scratch + 27;
-    let s_neg = scratch + 28;
-
-    // Evaluate both operands onto the stack FIRST, then stash (exp is on top), so a
-    // nested `**`/`Math.pow` inside `exp` finishes before any scratch local is set
-    // and cannot clobber the stashed base — the same discipline as [`emit_mod`].
-    let mark = function.temp_mark();
-    emit_operand(base, function, scratch, strings, helpers);
-    emit_node(exp, function, scratch, strings, helpers);
-    function.instruction(&Instruction::LocalSet(s_cnt));
-    function.instruction(&Instruction::LocalSet(s_base));
-    function.release_temps(mark);
-    emit_coerce_operands(function, s_base, s_cnt, exp, helpers);
+    // All raw i64 (never rooted): the operands are numbers and nothing else
+    // here is a jsval. The locals hold f64 bit patterns, except `s_neg`, the
+    // negative-exponent flag as 0/1.
 
     // The whole computation leaves its answer in `res`; special cases branch out.
     function.instruction(&Instruction::Block(BlockType::Empty));
@@ -981,8 +1200,10 @@ pub(super) fn emit_pow<S: Sink>(
 /// Emit a conversion built-in call, leaving its result jsval on the stack.
 ///
 /// `Boolean(x)` is emitted inline: JS truthiness (via [`emit_cond`]) selects
-/// between the boxed `true`/`false` jsvals, no host call. `Number(x)` is the
-/// shared `ToNumber`, `String(x)` the guest `__to_string`; `parseInt` /
+/// between the boxed `true`/`false` jsvals, no host call. `ToNumber` is the
+/// shared coercion, `Number(x)` the same number fast path with
+/// `__number_value` (`ToNumeric`, `BigInt` to Number) behind it, `String(x)`
+/// the guest `__to_string`; `parseInt` /
 /// `parseFloat` convert their argument with `__to_string` and parse it with
 /// the guest `__parse_int` / `__parse_float`.
 pub(super) fn emit_convert_call(
@@ -1003,12 +1224,51 @@ pub(super) fn emit_convert_call(
         function.instruction(&Instruction::Select);
         return;
     }
-    if matches!(op, ConvertOp::ToNumber) {
+    if matches!(op, ConvertOp::ToNumber)
+        || (!helpers.bigints() && matches!(op, ConvertOp::ToNumeric | ConvertOp::NumberCall))
+    {
         // The shared ToNumber: a number passes through, anything else is
-        // converted by `__to_number`.
+        // converted by `__to_number`. Without a reachable `BigInt` (DESIGN.md
+        // §6.10.9) `ToNumeric` and `Number(x)` are this same conversion.
         emit_node(arg, function, scratch, strings, helpers);
         function.instruction(&Instruction::LocalSet(scratch));
         emit_coerce_number(function, scratch, helpers);
+        function.instruction(&Instruction::LocalGet(scratch));
+        return;
+    }
+    if matches!(op, ConvertOp::ToNumeric) {
+        // ToNumeric: a number passes through, anything else is converted by
+        // `__to_numeric` (a `BigInt` is kept).
+        emit_node(arg, function, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_is_number(function, scratch);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        function.instruction(&Instruction::LocalGet(scratch));
+        function.instruction(&Instruction::Call(helpers.bigint(Big::ToNumeric)));
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_propagate_if_pending(function, helpers);
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::LocalGet(scratch));
+        return;
+    }
+    if matches!(op, ConvertOp::NumberCall) {
+        // `Number(x)`: a number passes through, anything else is converted
+        // by `__number_value` (`ToNumeric`, a `BigInt` to its Number value).
+        emit_node(arg, function, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_is_number(function, scratch);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        function.instruction(&Instruction::LocalGet(scratch));
+        function.instruction(&Instruction::Call(helpers.bigint(Big::NumberValue)));
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_propagate_if_pending(function, helpers);
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
         function.instruction(&Instruction::LocalGet(scratch));
         return;
     }
@@ -1182,15 +1442,19 @@ pub(super) fn emit_binary(
         // `+` is a runtime type dispatch (string concat vs numeric add); see
         // [`emit_add`].
         BinOp::Add => emit_add(lhs, rhs, function, scratch, strings, helpers),
-        // Subtraction/multiplication/division: see [`emit_arith`].
-        BinOp::Sub | BinOp::Mul | BinOp::Div => {
-            emit_arith(op, lhs, rhs, function, scratch, strings, helpers);
-        }
-        // Remainder: wasm has no `f64.rem`; delegate to the dedicated emitter.
-        BinOp::Mod => emit_mod(lhs, rhs, function, scratch, strings, helpers),
-        // Bitwise/shift: see [`emit_bitwise`].
-        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::UShr => {
-            emit_bitwise(op, lhs, rhs, function, scratch, strings, helpers);
+        // The other numeric operators: see [`emit_numeric_binary`].
+        BinOp::Sub
+        | BinOp::Mul
+        | BinOp::Div
+        | BinOp::Mod
+        | BinOp::Exp
+        | BinOp::BitAnd
+        | BinOp::BitOr
+        | BinOp::BitXor
+        | BinOp::Shl
+        | BinOp::Shr
+        | BinOp::UShr => {
+            emit_numeric_binary(op, lhs, rhs, function, scratch, strings, helpers);
         }
         // Relational: a runtime type dispatch. Two heap strings compare
         // lexicographically by bytes (`__str_cmp`); two numbers compare as
@@ -1327,26 +1591,38 @@ pub(super) fn emit_strict_eq(
     //   shares tag 0b101, "both strings" reads each operand's TYPE BYTE; two
     //   arrays/objects fall to the identity (i64 bits) compare — reference
     //   equality, matching JS (`[1] === [1]` is `false`).
-    emit_is_str_or_bigint(function, s0);
-    emit_is_str_or_bigint(function, s1);
+    // Without a reachable `BigInt` (DESIGN.md §6.10.9) the THEN arm is the
+    // string compare alone.
+    let bigints = helpers.bigints();
+    let is_str = if bigints {
+        emit_is_str_or_bigint
+    } else {
+        emit_is_string
+    };
+    is_str(function, s0);
+    is_str(function, s1);
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     // THEN: two BigInts compare by value (a BigInt against a string is
     // unequal: `__bigint_eq` checks both kinds), two heap strings by content.
-    emit_load_type_byte(function, s0);
-    emit_load_type_byte(function, s1);
-    function.instruction(&Instruction::I32Or);
-    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    function.instruction(&Instruction::LocalGet(s0));
-    function.instruction(&Instruction::LocalGet(s1));
-    function.instruction(&Instruction::Call(helpers.bigint(registry::Big::Eq)));
-    function.instruction(&Instruction::Else);
+    if bigints {
+        emit_load_type_byte(function, s0);
+        emit_load_type_byte(function, s1);
+        function.instruction(&Instruction::I32Or);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        function.instruction(&Instruction::LocalGet(s0));
+        function.instruction(&Instruction::LocalGet(s1));
+        function.instruction(&Instruction::Call(helpers.bigint(registry::Big::Eq)));
+        function.instruction(&Instruction::Else);
+    }
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalGet(s1));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::Call(helpers.str_eq));
-    function.instruction(&Instruction::End);
+    if bigints {
+        function.instruction(&Instruction::End);
+    }
     function.instruction(&Instruction::Else);
     // ELSE: both_numbers ? f64_eq(s0, s1) : bits_eq(s0, s1).
     // val1 = numeric equality (f64 compare).
@@ -1574,4 +1850,104 @@ fn emit_rng_step(f: &mut FnBuilder<'_>, s1: u32, s0: u32) {
     ] {
         f.instruction(&op);
     }
+}
+
+/// `program` with its numeric operators in their Number-only IR shapes, for
+/// a program that can produce no `BigInt` (DESIGN.md §6.10.9): `a ** b` is
+/// `Math.pow(a, b)`, `-x` is `-0 - x`, `~x` is `x ^ -1`, `ToNumeric` and
+/// `Number(x)` are `ToNumber`, and an update step is `x + ±1` (a postfix
+/// update's old value `store - ±1`).
+pub(super) fn lower_number_only(program: &IrProgram) -> IrProgram {
+    let mut program = program.clone();
+    lower_stmts(&mut program.stmts);
+    for function in &mut program.functions {
+        lower_stmts(&mut function.body);
+        for segment in function.machine.iter_mut().flatten() {
+            lower_stmts(&mut segment.stmts);
+            match &mut segment.term {
+                GenTerm::Yield { value, .. }
+                | GenTerm::Branch { cond: value, .. }
+                | GenTerm::Return(Some(value)) => lower_node(value),
+                GenTerm::Return(None) | GenTerm::Jump(_) => {}
+            }
+        }
+    }
+    program
+}
+
+/// [`lower_number_only`] over a statement list (as the body of a block, so
+/// [`IrNode::children_mut`] reaches every nested expression).
+fn lower_stmts(stmts: &mut Vec<IrStmt>) {
+    let mut block = IrNode::Block {
+        stmts: std::mem::take(stmts),
+        value: Box::new(IrNode::Undefined),
+    };
+    lower_node(&mut block);
+    if let IrNode::Block { stmts: lowered, .. } = block {
+        *stmts = lowered;
+    }
+}
+
+/// [`lower_number_only`] over `node` and its sub-expressions.
+fn lower_node(node: &mut IrNode) {
+    for child in node.children_mut() {
+        lower_node(child);
+    }
+    if !matches!(
+        node,
+        IrNode::Binary { op: BinOp::Exp, .. }
+            | IrNode::Negate(_)
+            | IrNode::BitNot(_)
+            | IrNode::NumericStep { .. }
+            | IrNode::ConvertCall {
+                op: ConvertOp::ToNumeric | ConvertOp::NumberCall,
+                ..
+            }
+    ) {
+        return;
+    }
+    let step = |up: bool| Box::new(IrNode::Num(if up { 1.0 } else { -1.0 }));
+    *node = match std::mem::replace(node, IrNode::Undefined) {
+        IrNode::Binary { lhs, rhs, .. } => IrNode::MathCall {
+            op: MathOp::Pow,
+            args: vec![*lhs, *rhs],
+        },
+        IrNode::Negate(arg) => IrNode::Binary {
+            op: BinOp::Sub,
+            lhs: Box::new(IrNode::Num(-0.0)),
+            rhs: arg,
+        },
+        IrNode::BitNot(arg) => IrNode::Binary {
+            op: BinOp::BitXor,
+            lhs: arg,
+            rhs: step(false),
+        },
+        // The old value of a postfix update steps back from the store that
+        // yields the new one (codegen's `NumericStep { store, !inc }`); every
+        // other step reads a value (`ToNumeric(read)` or a local) and adds.
+        IrNode::NumericStep { arg, inc } => {
+            if matches!(
+                *arg,
+                IrNode::Assign { .. } | IrNode::CellSet { .. } | IrNode::GlobalSet { .. }
+            ) {
+                IrNode::Binary {
+                    op: BinOp::Sub,
+                    lhs: arg,
+                    rhs: step(!inc),
+                }
+            } else {
+                IrNode::Binary {
+                    op: BinOp::Add,
+                    lhs: arg,
+                    rhs: step(inc),
+                }
+            }
+        }
+        IrNode::ConvertCall { arg, radix, .. } => IrNode::ConvertCall {
+            op: ConvertOp::ToNumber,
+            arg,
+            radix,
+        },
+        other => other,
+    };
 }
