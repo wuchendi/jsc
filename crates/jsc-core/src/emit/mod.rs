@@ -1383,6 +1383,21 @@ impl Helpers<'_> {
         self.group(registry::Group::Binary) + 1
     }
 
+    /// `__dv_length(view) -> i32` (see [`binary`]).
+    fn dv_length(self) -> u32 {
+        self.group(registry::Group::Binary) + 2
+    }
+
+    /// `__dv_get(addr, kind, swap) -> i64` (see [`binary`]).
+    fn dv_get(self) -> u32 {
+        self.group(registry::Group::Binary) + 3
+    }
+
+    /// `__dv_set(addr, kind, n, swap)` (see [`binary`]).
+    fn dv_set(self) -> u32 {
+        self.group(registry::Group::Binary) + 4
+    }
+
     /// `__super_get(home, key, recv) -> i64` (see [`props::emit_super_get`]).
     fn super_get(self) -> u32 {
         self.conv(registry::Conv::SuperGet)
