@@ -224,7 +224,9 @@ pub(crate) const ARRAY_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 8;
 /// [`TYPE_ARRAY`] header `flags` bit: the array is sparse. Its store keeps
 /// elements `0..cap` (holes past `length`); every element at or past `cap` is
 /// an array-index key in its `props` table, so `length` may exceed the store.
-/// Set by a store or `length` write past the dense-growth bound; never cleared.
+/// Set by a store or `length` write past the dense-growth bound; cleared again
+/// (outside dictionary mode) once the store covers `length` — after
+/// contiguous stores at the store's end or a `length` shrink into it.
 pub(crate) const ARRAY_FLAG_SPARSE: u8 = 4;
 
 /// [`TYPE_ARRAY`] header `flags` bit: the array is being joined (`join`,

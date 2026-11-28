@@ -1650,7 +1650,7 @@ impl Helpers<'_> {
 
     /// `__array_reserve(base, need)`: grow the array handle's element store to
     /// hold at least `need` elements (`cap' = max(need, 4, 2 * cap)`), copying
-    /// the `len` live slots and repointing `elems`; the handle never moves. It
+    /// the `min(len, cap)` live slots and repointing `elems`; the handle never moves. It
     /// is the helper right before `__array_push`.
     fn array_reserve(self) -> u32 {
         self.core(registry::Core::ArrayReserve)
