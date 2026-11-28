@@ -2159,5 +2159,229 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         (big(Big::CmpNum), vec![]),
         (big(Big::Hash), vec![]),
         (big(Big::ToF64), vec![]),
+        (big(Big::ToI64), vec![]),
     ]
+}
+
+// --- B3: the `BigInt` builtins' kernels and the Number / 64-bit boundaries ---
+
+/// `__number_value(v: i64) -> i64`: the `Number(v)` conversion
+/// (DESIGN.md §6.10.7): `ToNumeric(v)`, then a `BigInt` becomes its Number
+/// value (`__bigint_to_f64`, exact round-half-even) and a number is returned.
+/// A throw stays pending (`NaN`).
+pub(super) fn emit_number_value(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let v = 0;
+    let mut f = helper_builder(leaves, &[ROOT_JS], &[]);
+    wasm!(f;
+        LocalGet(v), Call(helpers.bigint(Big::ToNumeric)), LocalSet(v),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I64Const(QNAN_BITS), Return, End,
+    );
+    emit_is_bigint(&mut f, v);
+    wasm!(f;
+        If(BlockType::Empty),
+        LocalGet(v), I32WrapI64, Call(helpers.bigint(Big::ToF64)), I64ReinterpretF64, Return,
+        End,
+        LocalGet(v),
+        End,
+    );
+    finish_builder(f)
+}
+
+/// The locals of `__bigint_as_n`: the parameters `bits` (f64), `v` (the
+/// `BigInt` jsval) and `signed`, then the source block, its `len`, the result
+/// width `w` and block, the limb index, the source sign, the top limb's bit
+/// count, the current limb, the carry and `ceil(bits / 32)`.
+mod as_n {
+    pub(super) const BITS: u32 = 0;
+    pub(super) const V: u32 = 1;
+    pub(super) const SIGNED: u32 = 2;
+    pub(super) const SRC: u32 = 3;
+    pub(super) const LEN: u32 = 4;
+    pub(super) const WIDTH: u32 = 5;
+    pub(super) const DST: u32 = 6;
+    pub(super) const IDX: u32 = 7;
+    pub(super) const NEG: u32 = 8;
+    pub(super) const TOP_BITS: u32 = 9;
+    pub(super) const LIMB: u32 = 10;
+    pub(super) const CARRY: u32 = 11;
+    pub(super) const WIDTH_F: u32 = 12;
+}
+
+/// `limb = (limb ^ 0xFFFF_FFFF) + carry`, `carry = limb >> 32`, `limb &=
+/// 0xFFFF_FFFF`: one step of a two's-complement negation (`__bigint_as_n`).
+fn as_n_complement(f: &mut FnBuilder<'_>) {
+    use as_n::{CARRY, LIMB};
+    wasm!(f;
+        LocalGet(LIMB), I64Const(0xFFFF_FFFF), I64Xor, LocalGet(CARRY), I64Add, LocalTee(LIMB),
+        I64Const(32), I64ShrU, LocalSet(CARRY),
+        LocalGet(LIMB), I64Const(0xFFFF_FFFF), I64And, LocalSet(LIMB),
+    );
+}
+
+/// Store the low 32 bits of `limb` as limb `idx` of the result block.
+fn as_n_store(f: &mut FnBuilder<'_>) {
+    use as_n::{DST, IDX, LIMB};
+    limb_addr(f, DST, IDX);
+    wasm!(f; LocalGet(LIMB), I64Store32(m32(DATA)));
+}
+
+/// Run `body` for `idx` in `0..width` (`__bigint_as_n`).
+fn as_n_each_limb(f: &mut FnBuilder<'_>, body: impl Fn(&mut FnBuilder<'_>)) {
+    use as_n::{IDX, WIDTH};
+    wasm!(f;
+        I32Const(0), LocalSet(IDX),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(IDX), LocalGet(WIDTH), I32GeU, BrIf(1),
+    );
+    body(f);
+    wasm!(f;
+        LocalGet(IDX), I32Const(1), I32Add, LocalSet(IDX),
+        Br(0),
+        End, End,
+    );
+}
+
+/// Mask the result's top limb (`width - 1`) to its low `top_bits` bits,
+/// leaving it in `limb`.
+fn as_n_mask_top(f: &mut FnBuilder<'_>) {
+    use as_n::{DST, IDX, LIMB, TOP_BITS, WIDTH};
+    wasm!(f; LocalGet(WIDTH), I32Const(1), I32Sub, LocalSet(IDX));
+    load_limb64(f, DST, IDX);
+    wasm!(f;
+        I64Const(1), LocalGet(TOP_BITS), I64ExtendI32U, I64Shl, I64Const(1), I64Sub,
+        I64And, LocalSet(LIMB),
+    );
+    as_n_store(f);
+}
+
+/// `__bigint_as_n(bits: f64, v: i64, signed: i32) -> i64`: `BigInt.asUintN`
+/// (`signed = 0`) / `BigInt.asIntN` of the `BigInt` `v` and the integral
+/// `bits` (`0 ..= 2^53 - 1`, already `ToIndex`ed): the low `bits` bits of
+/// `v`'s infinite two's complement, read unsigned, minus `2^bits` for
+/// `asIntN` when bit `bits - 1` is set. The result spans `w = ceil(bits /
+/// 32)` limbs; when `w` exceeds `len + 1` every result but `asUintN` of a
+/// negative value is `v` itself, and that one is size-checked by
+/// `__bigint_new` (`RangeError` past the limit).
+pub(super) fn emit_as_n(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    use as_n::{
+        BITS, CARRY, DST, IDX, LEN as SRC_LEN, LIMB, NEG as SRC_NEG, SIGNED, SRC, TOP_BITS, V,
+        WIDTH, WIDTH_F,
+    };
+    let mut f = helper_builder(
+        leaves,
+        &[RAW_F64, ROOT_JS, RAW_I32],
+        &[
+            RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I64, RAW_I64,
+            RAW_F64,
+        ],
+    );
+    wasm!(f;
+        LocalGet(BITS), F64Const(0.0.into()), F64Eq,
+        If(BlockType::Empty), I64Const(ZERO_BITS), Return, End,
+        LocalGet(V), I32WrapI64, LocalTee(SRC), I32Load(m32(LEN)), LocalTee(SRC_LEN),
+        I32Eqz, If(BlockType::Empty), I64Const(ZERO_BITS), Return, End,
+        LocalGet(SRC), I32Load8U(m8(FLAGS)), I32Const(NEG), I32And, I32Const(0), I32Ne,
+        LocalSet(SRC_NEG),
+        LocalGet(BITS), F64Const(32.0.into()), F64Div, F64Ceil, LocalTee(WIDTH_F),
+        LocalGet(SRC_LEN), I32Const(1), I32Add, F64ConvertI32U, F64Gt,
+        If(BlockType::Empty),
+        // Wider than `v`: only `asUintN` of a negative value changes it.
+        LocalGet(SRC_NEG), LocalGet(SIGNED), I32Eqz, I32And, I32Eqz,
+        If(BlockType::Empty), LocalGet(V), Return, End,
+        I32Const(abi::BIGINT_MAX_LIMBS.cast_signed() + 1),
+        LocalGet(WIDTH_F), I32TruncSatF64U,
+        LocalGet(WIDTH_F), F64Const(f64::from(abi::BIGINT_MAX_LIMBS).into()), F64Gt,
+        Select, LocalSet(WIDTH),
+        Else,
+        LocalGet(WIDTH_F), I32TruncSatF64U, LocalSet(WIDTH),
+        End,
+        LocalGet(WIDTH), I32Const(0), Call(helpers.bigint(Big::New)), LocalSet(DST),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I64Const(ZERO_BITS), Return, End,
+        LocalGet(V), I32WrapI64, LocalSet(SRC),
+        // The bits of the top limb, `1 ..= 32`.
+        LocalGet(BITS), LocalGet(WIDTH), I32Const(1), I32Sub, F64ConvertI32U,
+        F64Const(32.0.into()), F64Mul, F64Sub, I32TruncSatF64U, LocalSet(TOP_BITS),
+        I64Const(1), LocalSet(CARRY),
+    );
+    // The result = `v mod 2^(32w)`: the magnitude, two's-complemented when
+    // negative.
+    as_n_each_limb(&mut f, |f| {
+        wasm!(f;
+            LocalGet(IDX), LocalGet(SRC_LEN), I32LtU,
+            If(BlockType::Result(ValType::I64)),
+        );
+        load_limb64(f, SRC, IDX);
+        wasm!(f;
+            Else, I64Const(0), End, LocalSet(LIMB),
+            LocalGet(SRC_NEG), If(BlockType::Empty),
+        );
+        as_n_complement(f);
+        wasm!(f; End);
+        as_n_store(f);
+    });
+    as_n_mask_top(&mut f);
+    // `asIntN` with bit `bits - 1` set: the value is `-(2^bits - result)`.
+    wasm!(f;
+        LocalGet(SIGNED),
+        LocalGet(LIMB), LocalGet(TOP_BITS), I32Const(1), I32Sub, I64ExtendI32U, I64ShrU,
+        I32WrapI64, I32Const(1), I32And, I32And,
+        If(BlockType::Empty),
+        I64Const(1), LocalSet(CARRY),
+    );
+    as_n_each_limb(&mut f, |f| {
+        load_limb64(f, DST, IDX);
+        wasm!(f; LocalSet(LIMB));
+        as_n_complement(f);
+        as_n_store(f);
+    });
+    as_n_mask_top(&mut f);
+    wasm!(f;
+        LocalGet(DST), I32Const(NEG), I32Store8(m8(FLAGS)),
+        End,
+        LocalGet(DST), Call(helpers.bigint(Big::Trim)),
+        End,
+    );
+    finish_builder(f)
+}
+
+/// `__bigint_to_i64(p: i32) -> i64`: the low 64 bits of the two's-complement
+/// value of the `BigInt` block `p` (`ToBigInt64` / `ToBigUint64` read as
+/// `i64` / `u64`). Leaf.
+pub(super) fn emit_to_i64(leaves: &LeafSet) -> Function {
+    let (p, len, x) = (0, 1, 2);
+    let mut f = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I64]);
+    wasm!(f;
+        LocalGet(p), I32Load(m32(LEN)), LocalTee(len),
+        If(BlockType::Empty),
+        LocalGet(p), I64Load32U(m32(DATA)), LocalSet(x),
+        End,
+        LocalGet(len), I32Const(1), I32GtU,
+        If(BlockType::Empty),
+        LocalGet(x), LocalGet(p), I64Load32U(m32(DATA + 4)), I64Const(32), I64Shl, I64Or,
+        LocalSet(x),
+        End,
+        I64Const(0), LocalGet(x), I64Sub, LocalGet(x),
+        LocalGet(p), I32Load8U(m8(FLAGS)), I32Const(NEG), I32And,
+        Select,
+        End,
+    );
+    finish_builder(f)
+}
+
+/// `__bigint_from_i64(v: i64, signed: i32) -> i64`: the `BigInt` of the 64
+/// bits `v`, read as `i64` when `signed`, else as `u64`.
+pub(super) fn emit_from_i64(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let (v, signed, neg, p) = (0, 1, 2, 3);
+    let mut f = helper_builder(leaves, &[RAW_I64, RAW_I32], &[RAW_I32, RAW_I32]);
+    wasm!(f;
+        LocalGet(v), I64Eqz, If(BlockType::Empty), I64Const(ZERO_BITS), Return, End,
+        LocalGet(signed), LocalGet(v), I64Const(0), I64LtS, I32And, LocalTee(neg),
+        If(BlockType::Empty), I64Const(0), LocalGet(v), I64Sub, LocalSet(v), End,
+        I32Const(2), LocalGet(neg), Call(helpers.bigint(Big::New)), LocalSet(p),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I64Const(ZERO_BITS), Return, End,
+        LocalGet(p), LocalGet(v), I64Store(MemArg { offset: DATA, align: 2, memory_index: 0 }),
+        LocalGet(p), Call(helpers.bigint(Big::Trim)),
+        End,
+    );
+    finish_builder(f)
 }

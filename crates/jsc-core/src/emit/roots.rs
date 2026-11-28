@@ -232,7 +232,7 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
         | IrNode::MathCall { .. }
         | IrNode::MathSpread { .. }
         | IrNode::ConvertCall {
-            op: ConvertOp::ToNumber,
+            op: ConvertOp::ToNumber | ConvertOp::NumberCall,
             ..
         } => ValueClass::numeric(),
         // `>>>`, the relational and the equality operators never yield a
