@@ -31,12 +31,8 @@ Float32Array
 Float64Array
 uint8array-base64
 stable-typedarray-sort
-ArrayBuffer
-arraybuffer-transfer
-resizable-arraybuffer
 immutable-arraybuffer
 align-detached-buffer-semantics-with-web-reality
-DataView*
 SharedArrayBuffer
 Atomics*
 

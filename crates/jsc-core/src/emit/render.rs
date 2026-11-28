@@ -206,10 +206,12 @@ impl Helpers<'_> {
     fn out_cp(self) -> u32 {
         self.render_base() + 4
     }
-    fn out_str(self) -> u32 {
+    /// `__out_str(s)`.
+    pub(super) fn out_str(self) -> u32 {
         self.render_base() + 5
     }
-    fn out_uint(self) -> u32 {
+    /// `__out_uint(n)`.
+    pub(super) fn out_uint(self) -> u32 {
         self.render_base() + 6
     }
     /// `__out_flush(fd)`: write the whole buffer to `fd` and reset it.
@@ -662,7 +664,7 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet
         Return,
         End,
     );
-    render_leaf(&mut f, strings, helpers, p, ty, i);
+    render_leaf(&mut f, strings, helpers, [p, depth, ty, i]);
     wasm!(f; End);
     finish_builder(f)
 }
@@ -673,9 +675,7 @@ fn render_leaf(
     f: &mut FnBuilder<'_>,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
-    p: u32,
-    ty: u32,
-    tmp: u32,
+    [p, depth, ty, tmp]: [u32; 4],
 ) {
     let is = |f: &mut FnBuilder<'_>, kind: i32| {
         wasm!(f; LocalGet(ty), I32Const(kind), I32Eq, If(BlockType::Empty));
@@ -718,6 +718,13 @@ fn render_leaf(
         LocalGet(p), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Call(helpers.date_text()),
         I32WrapI64, Call(helpers.out_str()), Return, End,
     );
+    // Binary data (DESIGN.md §5.8.8), only in a program that can reach it.
+    if helpers.has_binary() {
+        is(f, i32::from(abi::TYPE_ARRAYBUFFER));
+        wasm!(f; LocalGet(p), LocalGet(depth), Call(helpers.render_binary()), Return, End);
+        is(f, i32::from(abi::TYPE_DATAVIEW));
+        wasm!(f; LocalGet(p), LocalGet(depth), Call(helpers.render_binary()), Return, End);
+    }
     lit(f, strings, helpers, "undefined");
 }
 
