@@ -90,6 +90,14 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(ReflectFn::ALL.into_iter().flat_map(non_object))
 }
 
+impl Helpers<'_> {
+    /// Whether the program can hold `%Reflect%` (the §6.11 reachability
+    /// gate).
+    pub(in crate::emit) fn reflect(self) -> bool {
+        self.reflect_gate == ReflectGate::Open
+    }
+}
+
 /// Emit the body of the `Reflect` function `op`.
 pub(super) fn emit(
     op: ReflectFn,
@@ -347,7 +355,12 @@ fn emit_keyed(
     let t = target(function, frame, op, strings, helpers);
     let insert = i32::from(op == ReflectFn::Set);
     wasm!(function; LocalGet(kv), I32Const(insert), Call(helpers.to_key), LocalSet(key));
-    shake::note_runtime_key();
+    // `get` and `getOwnPropertyDescriptor` hand out the value under a
+    // run-time key (a builtin no body names); `has`, `deleteProperty` and
+    // `set` only answer a boolean or store the program's own value.
+    if matches!(op, ReflectFn::Get | ReflectFn::GetOwnPropertyDescriptor) {
+        shake::note_runtime_key();
+    }
     return_if_pending(function);
     match op {
         ReflectFn::DeleteProperty => {

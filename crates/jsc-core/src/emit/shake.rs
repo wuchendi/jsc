@@ -19,7 +19,12 @@
 //! may be a string to a property key (a computed member access), or when it
 //! keeps a runtime body that reads or redefines a property chosen by a
 //! run-time key ([`note_runtime_key`]): either can reach a builtin by a name
-//! no body mentions.
+//! no body mentions. The registry match above is by key text alone, so a
+//! `Reflect` function sharing a common name (`get`, `set`, ...) is kept
+//! whenever any kept body looks that name up; its run-time-key use counts
+//! only when the program's own code names it ([`unnamed_reflect`]), and
+//! without a way to reach `%Reflect%` its body is a stub that records no use
+//! at all (DESIGN.md §6.11).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -27,7 +32,7 @@ use std::collections::HashSet;
 use wasm_encoder::{Encode, Function, Instruction};
 use wasmparser::{BinaryReader, FunctionBody, Operator};
 
-use super::realm::{self, Builtin, Intrinsic, Key, Value};
+use super::realm::{self, Builtin, Intrinsic, Key, ReflectFn, Value};
 use super::roots::{classify_is_numeric, never_string};
 use super::{Helpers, IMPORT_FUNC_COUNT, IrNode, StrOffsets};
 
@@ -207,6 +212,40 @@ impl Shaker<'_> {
     }
 }
 
+/// The body slots of the `Reflect` functions the program's own code never
+/// names (no `main` / user body looks up the function's name or references
+/// it). Such a function is kept only because some runtime body looks up a
+/// property of that common name (`__proxy_*` trap names, a `Map`
+/// constructor's `"set"`, the descriptor fields `"get"` / `"set"`) on an
+/// object of its own: the key it would be handed then comes from the
+/// program's own (already recorded) keys, so its run-time-key use does not
+/// leave the module whole (DESIGN.md §6.11).
+fn unnamed_reflect(
+    uses: &[Uses],
+    user_count: usize,
+    helpers: Helpers<'_>,
+    strings: &StrOffsets,
+) -> Vec<usize> {
+    let own = &uses[..uses.len().min(user_count + 1)];
+    ReflectFn::ALL
+        .into_iter()
+        .filter(|op| {
+            let builtin = Builtin::Reflect(*op);
+            let name = strings.peek(op.name());
+            !own.iter().any(|uses| {
+                uses.builtins.contains(&builtin)
+                    || name.is_some_and(|offset| uses.strings.contains(&offset))
+            })
+        })
+        .filter_map(|op| {
+            let index = helpers.builtin_index(Builtin::Reflect(op));
+            index
+                .checked_sub(IMPORT_FUNC_COUNT)
+                .map(|slot| slot as usize)
+        })
+        .collect()
+}
+
 /// Replace the body of every unreachable runtime function in `bodies` by a
 /// stub. `bodies[0]` is `main`, followed by the `user_count` user functions and
 /// the helpers in function-index order; `uses[i]` is what `bodies[i]` used.
@@ -273,10 +312,12 @@ pub(super) fn shake(
         }
     }
     let kept = shaker.kept;
+    let unnamed = unnamed_reflect(uses, user_count, helpers, strings);
     if kept
         .iter()
         .zip(uses)
-        .any(|(kept, uses)| *kept && uses.runtime_key)
+        .enumerate()
+        .any(|(slot, (kept, uses))| *kept && uses.runtime_key && !unnamed.contains(&slot))
     {
         return;
     }

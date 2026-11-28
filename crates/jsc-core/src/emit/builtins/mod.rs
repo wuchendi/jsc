@@ -352,10 +352,29 @@ pub(super) fn emit_builtin(
     helpers: Helpers<'_>,
     leaves: &LeafSet,
 ) -> Function {
+    if gated_off(builtin, helpers) {
+        let mut stub = Function::new([]);
+        stub.instruction(&Instruction::Unreachable);
+        stub.instruction(&Instruction::End);
+        return stub;
+    }
     let (mut f, frame) = Frame::begin(helpers, leaves);
     emit_builtin_body(builtin, &mut f, frame, strings, helpers);
     wasm!(f; End);
     finish_builder(f)
+}
+
+/// Whether `builtin` belongs to a family the program cannot reach (DESIGN.md
+/// §6.11): a `Proxy` builtin while no proxy can exist, a `Reflect` function
+/// while `%Reflect%` cannot be held. Its body is then an `unreachable` stub
+/// that records no shake uses, so a name-only registry match (`"get"`,
+/// `"set"`, `"apply"`, ...) keeps nothing behind it.
+fn gated_off(builtin: Builtin, helpers: Helpers<'_>) -> bool {
+    match builtin {
+        Builtin::Proxy(_) => !helpers.proxies(),
+        Builtin::Reflect(_) => !helpers.reflect(),
+        _ => false,
+    }
 }
 
 /// Emit the instructions of `builtin` into `f`, its frame's builder.
