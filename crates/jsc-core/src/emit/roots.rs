@@ -145,12 +145,22 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
             vec![CLOCK_TIME_GET_IMPORT, RANDOM_GET_IMPORT],
         ),
     ];
-    graph.extend(unicode::helper_graph(helpers));
-    graph.extend(libm::helper_graph(helpers));
-    graph.extend(promise_engine::helper_graph(helpers));
-    graph.extend(gc::helper_graph(helpers));
-    graph.extend(super::bigint::helper_graph(helpers));
+    graph.extend(module_graphs(helpers));
     graph
+}
+
+/// The leaf-graph declarations of the runtime modules, in group order.
+fn module_graphs(helpers: Helpers<'_>) -> impl Iterator<Item = (u32, Vec<u32>)> {
+    [
+        unicode::helper_graph(helpers),
+        libm::helper_graph(helpers),
+        promise_engine::helper_graph(helpers),
+        gc::helper_graph(helpers),
+        binary::helper_graph(helpers),
+        super::bigint::helper_graph(helpers),
+    ]
+    .into_iter()
+    .flatten()
 }
 
 /// Solve [`helper_graph`]: a declared helper is a leaf iff every callee is.

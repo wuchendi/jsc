@@ -9,7 +9,7 @@ use jsc_core::emit::CompileOptions;
 /// program pays for, the `BigInt` paths (literal, `typeof`, `===`, `==`, a
 /// `Map` key, rendering, error messages), a dynamic key (which disables
 /// shaking) and binary data (whose collector and renderer arms are gated).
-const PROGRAMS: [&str; 11] = [
+const PROGRAMS: [&str; 12] = [
     "1",
     "console.log(1)",
     "1n",
@@ -21,6 +21,7 @@ const PROGRAMS: [&str; 11] = [
     "try { +1n } catch (e) { console.log(e.message) }",
     "const o = { a: 1 }; const k = 'a'; console.log(o[k])",
     "console.log(new ArrayBuffer(8).byteLength)",
+    "const v = new DataView(new ArrayBuffer(8)); v.setFloat64(0, 1.5); console.log(v.getFloat64(0), v)",
 ];
 
 fn validate(src: &str, full_runtime: bool, gc_stress: u32) {
