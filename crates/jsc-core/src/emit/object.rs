@@ -2519,8 +2519,9 @@ fn emit_get_dynamic(function: &mut impl Sink, s0: u32, s1: u32, helpers: Helpers
 /// Emit a member assignment `obj[index] = value`, leaving `value` on the
 /// stack as the expression's result.
 ///
-/// A primitive receiver (number/boolean, or a heap string) throws the
-/// strict-mode create-property `TypeError` before any heap access. An array
+/// A primitive receiver (number/boolean, or a heap string) is
+/// [`emit_primitive_set`]: its realm prototype chain decides (an inherited
+/// setter runs), else the strict-mode create-property `TypeError`. An array
 /// stores an in-range integer index inline and hands any other key to
 /// `__array_set` (growth by index, canonical index strings, `length`, named
 /// properties). Every other receiver — and any receiver under a static key
@@ -2572,19 +2573,71 @@ pub(super) fn emit_index_set_node(
             helpers,
         );
     }
-    // A primitive receiver (number/boolean, or a heap string or symbol) takes
-    // no property: throw the strict-mode create-property error before any heap
-    // access.
+    // The store, in a block a primitive receiver leaves early.
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    enter_frame(helpers);
     if !never_primitive(obj) {
-        emit_is_object(function, s0);
-        function.instruction(&Instruction::I32Eqz);
-        function.instruction(&Instruction::If(BlockType::Empty));
-        enter_frame(helpers);
-        emit_prop_throw_call(function, s0, s1, PROP_THROW_PRIMITIVE, helpers);
-        leave_frame(helpers);
-        function.instruction(&Instruction::End);
+        emit_primitive_set(function, s0, index, s1, sval, strings, helpers);
     }
+    emit_index_set_object(function, s0, index, s1, sval, strings, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
 
+    // The assignment expression yields the stored value.
+    function.instruction(&Instruction::LocalGet(sval));
+}
+
+/// The strict `PutValue` of a primitive base in `s0` (number, boolean, or a
+/// heap string, symbol or `BigInt`), inside [`emit_index_set_node`]'s block:
+/// `ToObject(base).[[Set]](ToPropertyKey(key), v, base)` through
+/// `__set_bool` (the key kept boxed in `s1`), so an inherited setter runs
+/// with `this` = the primitive and a proxy on the chain runs its `set`
+/// trap; a refusal (no setter, a non-writable data property, or the
+/// primitive receiver itself) throws `Cannot create property 'k' on ..`.
+/// Success branches out of the block.
+fn emit_primitive_set(
+    function: &mut impl Sink,
+    s0: u32,
+    index: &IrNode,
+    s1: u32,
+    sval: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    emit_is_object(function, s0);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    emit_prop_key(function, index, s1, true, strings, helpers);
+    function.instruction(&Instruction::I64ExtendI32U);
+    function.instruction(&Instruction::I64Const(HEAP_BITS));
+    function.instruction(&Instruction::I64Or);
+    function.instruction(&Instruction::LocalSet(s1));
+    emit_propagate_if_pending(function, helpers);
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::Call(helpers.to_object()));
+    function.instruction(&Instruction::LocalGet(s1));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::LocalGet(sval));
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::Call(helpers.set_bool()));
+    emit_propagate_if_pending(function, helpers);
+    function.instruction(&Instruction::BrIf(1));
+    emit_prop_throw_call(function, s0, s1, PROP_THROW_PRIMITIVE, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+}
+
+/// The object half of [`emit_index_set_node`] for the object in `s0`.
+fn emit_index_set_object(
+    function: &mut impl Sink,
+    s0: u32,
+    index: &IrNode,
+    s1: u32,
+    sval: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     // A static named key (not an array index, not `length`) is an ordinary
     // property on every receiver, arrays included.
     if let IrNode::Str(name) = index
@@ -2592,7 +2645,6 @@ pub(super) fn emit_index_set_node(
         && !is_array_index(name.as_units())
     {
         emit_set_call(function, s0, index, s1, sval, strings, helpers);
-        function.instruction(&Instruction::LocalGet(sval));
         return;
     }
     // `obj` is a heap pointer here (the guard above threw otherwise), so reading
@@ -2626,9 +2678,6 @@ pub(super) fn emit_index_set_node(
     }
     leave_frame(helpers);
     function.instruction(&Instruction::End);
-
-    // The assignment expression yields the stored value.
-    function.instruction(&Instruction::LocalGet(sval));
 }
 
 /// Emit a [`IrNode::SuperGet`]: `this`, `key` and `home` are evaluated in

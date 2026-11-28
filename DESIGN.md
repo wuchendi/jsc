@@ -900,8 +900,10 @@ aliases, captured bindings, and member receivers all observe `push`.
 - **`length`** is an own, non-enumerable, non-configurable exotic property,
   writable unless `LENGTH_READONLY`. Writes go through `__array_set_length`
   (`ArraySetLength`): a read-only `length` throws `Cannot assign to read only
-  property 'length'`; `ToUint32(v)` must equal `ToNumber(v)`, else
-  `RangeError: Invalid array length`; shrinking turns `n..len` into holes
+  property 'length'` before any conversion; `ToUint32(v)` must equal
+  `ToNumber(v)` (two conversions of a non-number), else
+  `RangeError: Invalid array length`; a `length` a conversion made read-only
+  then throws the same `TypeError`; shrinking turns `n..len` into holes
   (keeping the store) and drops a sparse array's index keys `≥ n`, stopping at
   the highest non-configurable element `k ≥ n` (then `length = k + 1` and
   `Cannot delete property 'k'` is thrown); growing fills holes densely within
@@ -1434,9 +1436,12 @@ hands the operation to its traps.
   a non-writable data property throws, an own writable one is overwritten;
   otherwise a `0b0111` own data property is added (a non-extensible object
   throws). An array element the array does not own consults the chain
-  through `__proto_set` first (§5.4). Member stores on a primitive (a symbol included) throw (`Cannot create
-  property 'k' on string 'abc'`); on `null`/`undefined` they throw `Cannot set properties of
-  undefined (setting 'k')`.
+  through `__proto_set` first (§5.4). A member store on a primitive (a symbol included) is
+  `ToObject(base).[[Set]](k, v, base)` through `__set_bool`: an inherited setter
+  runs with `this` = the primitive and a proxy on the chain runs its `set`
+  trap; any refusal (no setter, a non-writable property, or the primitive
+  receiver itself) throws `Cannot create property 'k' on string 'abc'`. On
+  `null`/`undefined` they throw `Cannot set properties of undefined (setting 'k')`.
 - **`__super_get(home, key, recv)` / `__super_set(home, key, v, recv)`** —
   `home.[[Get]](key, recv)` / `home.[[Set]](key, v, recv)` for a `super`
   reference (§7.6): the walk of `__get` / `__set` starts at the super base
@@ -1970,8 +1975,10 @@ promise operation calls the host.
   `__promise_then` that settle the capability, and `finally` (also on any
   non-promise object) calls `this.then(thenFinally, catchFinally)`. Both
   paths use the spec's closures (`PromiseResolve(C, onFinally())` then a
-  value / thrower thunk); for `%Promise%`, `__promise_finally` registers them
-  through `__promise_then`. `Promise.resolve` / `Promise.reject` construct
+  value / thrower thunk); for `%Promise%` and a promise whose `then` is
+  provably the builtin one (no own properties, `proto` a clean
+  `%Promise.prototype%`; never without dirty tracking), `__promise_finally`
+  registers them through `__promise_then`. `Promise.resolve` / `Promise.reject` construct
   from `this`: `PromiseResolve(C, x)` (a promise whose `constructor` is `C`
   is returned as is) / `NewPromiseCapability(C)`; `C === %Promise%` takes
   `__promise_resolve` / `__promise_reject`, and so does the inline
@@ -1987,7 +1994,8 @@ promise operation calls the host.
   %Promise%` with its builtin `resolve`, its and `%Promise.prototype%`'s
   dirty bits clear and a `%Promise%` instance without own properties skips
   the `resolve` call and registers the reactions through `__promise_then`.
-- **`new Promise(executor)`** allocates a pending promise `P`
+- **`new Promise(executor)`** throws a `TypeError` for a non-callable
+  executor (before `GetPrototypeFromConstructor`), then allocates a pending promise `P`
   (`__promise_new`) and its resolving `env` (`__promise_resolving`), then
   passes the executor the two settler function values over that `env`. A
   throwing executor calls `reject` with the thrown value (a no-op once
@@ -3258,7 +3266,9 @@ the constructor — the newTarget's realm is the only realm). So nothing in the
 constructor bodies changes: `Reflect.construct` sets `$__new_target` like any
 `new` with an explicit `new_target`. Per family: user classes and plain
 functions allocate `this` from `Get(newTarget, "prototype")` at the construct
-site (`emit_construct`), derived classes pass `newTarget` on through
+site (`emit_construct`; when that is not an object, `GetFunctionRealm(newTarget)`
+walks its proxy chain and a revoked proxy throws `Cannot perform 'construct'
+on a proxy that has been revoked`), derived classes pass `newTarget` on through
 `super(..)`; the Error family (`AggregateError` included), `Array`,
 `Promise`, `Map` / `Set`, `WeakMap` / `WeakSet` / `WeakRef` /
 `FinalizationRegistry`, `Date`, and `Boolean` / `Number` / `String` (their
@@ -3272,7 +3282,14 @@ with `newTarget` per §5.5; a constructor proxy forwards `newTarget` to its
 "prototype")` (Error, AggregateError, Array, Date, Promise) already snapshot
 `$__spread_args` (`Body::snapshotted`); `Reflect.construct` always passes its
 arguments as a spread array, so these snapshots become reachable with a
-user-code `prototype` read — the case P3 tests (below).
+user-code `prototype` read — the case P3 tests (below). The argument checks
+the spec orders before `GetPrototypeFromConstructor` stay before it:
+`Promise`'s `IsCallable(executor)`, `Date`'s time-value conversions (the
+Date is allocated first and its `proto` replaced), `WeakRef`'s
+`CanBeHeldWeakly(target)`, `FinalizationRegistry`'s
+`IsCallable(cleanupCallback)`; the builtin bodies' realm fallback runs no
+`GetFunctionRealm` check (a revoked proxy `newTarget` whose `prototype`
+read returns a non-object falls back silently).
 
 **Realm entries** (`emit/realm.rs`, appended after `%OutOfMemoryError%` in
 image order; no watch bit; not inline namespaces):
