@@ -29,6 +29,7 @@ impl LowerCtx<'_> {
         match expr {
             Expr::Lit(Lit::Num(n)) => Ok(IrNode::Num(n.value)),
             Expr::Lit(Lit::Str(s)) => Ok(IrNode::Str(lit_str(s))),
+            Expr::Lit(Lit::BigInt(b)) => Ok(bigint_literal(&b.value)),
             Expr::Lit(Lit::Bool(b)) => Ok(IrNode::Bool(b.value)),
             Expr::Lit(Lit::Null(_)) => Ok(IrNode::Null),
             // A declared local shadows a function of the same name and the
@@ -182,7 +183,8 @@ impl LowerCtx<'_> {
             },
             Expr::Unary(u) => match u.op {
                 // Unary minus is constant-folded when the operand lowers to a
-                // literal (`-5` becomes `Num(-5.0)`); otherwise it is
+                // literal (`-5` becomes `Num(-5.0)`, `-1n` a negative BigInt
+                // literal, `-0n` is `0n`); otherwise it is
                 // represented as `-0 - operand`, which flips the sign of zero
                 // (`-0 - +0` is `-0`, `-0 - -0` is `+0`) and negates any other
                 // number.
@@ -190,6 +192,10 @@ impl LowerCtx<'_> {
                     let operand = self.lower_expr(&u.arg)?;
                     match operand {
                         IrNode::Num(v) => Ok(IrNode::Num(-v)),
+                        IrNode::BigInt { neg, limbs } => Ok(IrNode::BigInt {
+                            neg: !neg && !limbs.is_empty(),
+                            limbs,
+                        }),
                         other => Ok(IrNode::Binary {
                             op: BinOp::Sub,
                             lhs: Box::new(IrNode::Num(-0.0)),
@@ -2488,11 +2494,7 @@ impl LowerCtx<'_> {
             PropName::Str(s) => Ok(PropKey::Static(lit_str(s))),
             PropName::Num(n) => Ok(PropKey::Computed(IrNode::Num(n.value))),
             PropName::Computed(c) => Ok(PropKey::Computed(self.lower_expr(&c.expr)?)),
-            PropName::BigInt(_) => Err(CompileError::spanned(
-                name.span(),
-                "unsupported object key: BigInt keys are not supported",
-            )
-            .into()),
+            PropName::BigInt(b) => Ok(PropKey::Static(b.value.to_string().as_str().into())),
         }
     }
 
@@ -3204,8 +3206,21 @@ fn unsupported_expr_msg(expr: &Expr) -> &'static str {
     match expr {
         Expr::This(_) => "`this` is not supported",
         Expr::Lit(Lit::Regex(_)) => "regular expression literals are not supported",
-        Expr::Lit(Lit::BigInt(_)) => "BigInt literals are not supported",
         _ => "this expression is not supported",
+    }
+}
+
+/// The canonical [`IrNode::BigInt`] of a `BigInt` literal's value (never
+/// negative: a leading `-` is a unary operator): its magnitude limbs, with
+/// no high zero limb and none for `0n`.
+fn bigint_literal(value: &swc_ecma_ast::BigIntValue) -> IrNode {
+    let (_, mut limbs) = value.to_u32_digits();
+    while limbs.last() == Some(&0) {
+        limbs.pop();
+    }
+    IrNode::BigInt {
+        neg: false,
+        limbs: limbs.into_boxed_slice(),
     }
 }
 
