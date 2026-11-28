@@ -980,7 +980,7 @@ pub(super) fn emit_to_locale_string(
             LocalSet(f),
         );
         return_if_pending(function);
-        emit_is_function(function, f);
+        emit_is_function(function, f, helpers);
         wasm!(function; I32Eqz, If(BlockType::Empty));
         throw_type_error(
             function,
@@ -1104,7 +1104,7 @@ pub(super) fn emit_to_string(
     object::require_object_coercible(function, frame, this, strings, helpers);
     wasm!(function; LocalGet(this), I32Const(static_key(strings, JOIN)), Call(helpers.get), LocalSet(join));
     return_if_pending(function);
-    emit_is_function(function, join);
+    emit_is_function(function, join, helpers);
     wasm!(function; If(BlockType::Result(ValType::I64)));
     emit_accessor_call(function, join, this, None, base, helpers);
     wasm!(function; Else);
@@ -1232,7 +1232,7 @@ fn construct(frame: Frame, c: u32, len: Option<u32>, what: &str) -> IrNode {
 
 /// One argument of a [`call_fn`] call.
 #[derive(Clone, Copy)]
-pub(super) enum CallArg {
+pub(in crate::emit) enum CallArg {
     /// The jsval in an i64 local.
     Val(u32),
     /// The i32 index in a local, as a number.
@@ -1262,7 +1262,7 @@ pub(super) fn push_call(
 /// for the callee; when that allocation runs out of memory the callee is
 /// not called and `undefined` is left with the `RangeError` pending. With at
 /// most `k`, only the positional slots are pushed.
-pub(super) fn call_spilling(
+pub(in crate::emit) fn call_spilling(
     function: &mut FnBuilder<'_>,
     k: u32,
     spread: u32,
@@ -1338,7 +1338,7 @@ fn require_callable(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    emit_is_function(function, local);
+    emit_is_function(function, local, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, text, strings, helpers);
     wasm!(function; End);
@@ -1376,7 +1376,7 @@ fn construct_or_create(
 ) {
     let array = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Array), helpers);
     wasm!(function; LocalGet(c), I64Const(array), I64Ne);
-    emit_is_constructor(function, c);
+    emit_is_constructor(function, c, helpers);
     wasm!(function; I32Const(0), I32Ne, I32And, If(BlockType::Empty));
     let node = construct(frame, c, len, THIS_NOT_CTOR);
     emit_node(&node, function, frame.scratch(), strings, helpers);
@@ -1411,12 +1411,20 @@ fn species_ctor(
 ) {
     let array = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Array), helpers);
     wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(c));
-    emit_is_pointer(function, o);
-    wasm!(function; If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, o);
+    if helpers.proxies() {
+        // `IsArray(o)`: a proxy answers for its target; a revoked one throws.
+        wasm!(function; LocalGet(o), Call(helpers.is_array()));
+        return_if_pending(function);
+    } else {
+        emit_is_pointer(function, o);
+        wasm!(function; If(BlockType::Result(ValType::I32)));
+        emit_load_type_byte(function, o);
+        wasm!(function;
+            I32Const(TYPE_ARRAY), I32Eq,
+            Else, I32Const(0), End,
+        );
+    }
     wasm!(function;
-        I32Const(TYPE_ARRAY), I32Eq,
-        Else, I32Const(0), End,
         If(BlockType::Empty),
         LocalGet(o), I32Const(static_key(strings, CONSTRUCTOR)), Call(helpers.get), LocalSet(c),
     );
@@ -1512,6 +1520,31 @@ fn create_data_property(
     wasm!(function;
         Else,
         LocalGet(key), I32Const(1), Call(helpers.to_key), LocalSet(k),
+    );
+    // A proxy defines through its `defineProperty` trap (DESIGN.md §6.11).
+    let proxies = helpers.proxies();
+    if proxies {
+        wasm!(function;
+            LocalGet(a), I32WrapI64, I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }),
+            I32Const(TYPE_PROXY), I32Eq,
+            If(BlockType::Empty),
+            LocalGet(a), I32WrapI64, LocalGet(k), I32Const(DESC_DATA_DEFAULT), LocalGet(v),
+            I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS), Call(helpers.define_own()),
+            LocalSet(entry),
+        );
+        enter_frame(helpers);
+        enter_frame(helpers);
+        emit_propagate_if_pending(function, helpers);
+        wasm!(function; LocalGet(entry), I32Const(DEFINE_OK), I32Ne, If(BlockType::Empty));
+        enter_frame(helpers);
+        throw_type_error(function, frame, CANNOT_DEFINE, strings, helpers);
+        leave_frame(helpers);
+        leave_frame(helpers);
+        leave_frame(helpers);
+        wasm!(function; End, Else);
+        enter_frame(helpers);
+    }
+    wasm!(function;
         LocalGet(a), I32WrapI64, LocalGet(k), Call(helpers.prop_find), LocalTee(entry),
         If(BlockType::Result(ValType::I32)),
         LocalGet(entry),
@@ -1534,8 +1567,12 @@ fn create_data_property(
         End,
         LocalGet(a), I32WrapI64, LocalGet(k), LocalGet(v),
         I32Const(abi::ATTRS_DEFAULT.cast_signed()), Call(helpers.define),
-        End,
     );
+    if proxies {
+        leave_frame(helpers);
+        wasm!(function; End);
+    }
+    wasm!(function; End);
 }
 
 /// `Set(a, "length", len, true)` over i64 locals.
@@ -2234,7 +2271,7 @@ impl<'a> Run<'a> {
     fn start_iterator(self, function: &mut FnBuilder<'_>) {
         let (frame, strings, helpers) = (self.frame, self.strings, self.helpers);
         let (method, result, next) = (self.method, self.result, self.next);
-        emit_is_function(function, method);
+        emit_is_function(function, method, helpers);
         wasm!(function; I32Eqz, If(BlockType::Empty));
         let error = iter::not_a_function(method, result);
         iter::throw_and_return(function, frame, &error, strings, helpers);
@@ -2661,8 +2698,14 @@ pub(super) fn emit_concat(
     );
     return_if_pending(function);
     wasm!(function; LocalGet(v), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty));
-    emit_load_type_byte(function, item);
-    wasm!(function; I32Const(TYPE_ARRAY), I32Eq, LocalSet(len), Else);
+    if helpers.proxies() {
+        wasm!(function; LocalGet(item), Call(helpers.is_array()), LocalSet(len));
+        return_if_pending(function);
+    } else {
+        emit_load_type_byte(function, item);
+        wasm!(function; I32Const(TYPE_ARRAY), I32Eq, LocalSet(len));
+    }
+    wasm!(function; Else);
     emit_cond(
         &IrNode::Local(v),
         function,
@@ -2793,10 +2836,22 @@ pub(super) fn emit_flat(
         call_fn(function, frame, mapper, this_arg, &args, el, helpers);
         wasm!(function; End);
     }
-    wasm!(function; LocalGet(depth), F64Const(Ieee64::from(0.0)), F64Gt);
-    is_array(function, el);
+    if helpers.proxies() {
+        // `depth > 0` and `IsArray(element)` (only then: a revoked proxy
+        // element throws).
+        wasm!(function;
+            LocalGet(depth), F64Const(Ieee64::from(0.0)), F64Gt,
+            If(BlockType::Result(ValType::I32)),
+            LocalGet(el), Call(helpers.is_array()),
+            Else, I32Const(0), End,
+        );
+        return_if_pending(function);
+    } else {
+        wasm!(function; LocalGet(depth), F64Const(Ieee64::from(0.0)), F64Gt);
+        is_array(function, el);
+        wasm!(function; I32And);
+    }
     wasm!(function;
-        I32And,
         If(BlockType::Empty),
         LocalGet(stack), LocalGet(cur), Call(helpers.array_push), Drop,
         LocalGet(stack),

@@ -9,8 +9,9 @@ use jsc_core::emit::CompileOptions;
 /// program pays for, the `BigInt` paths (literal, `typeof`, `===`, `==`, a
 /// `Map` key, rendering, error messages), a dynamic key (which disables
 /// shaking), binary data (whose collector and renderer arms are gated),
-/// the numeric operators on `BigInts` and numbers, and the `BigInt` built-ins.
-const PROGRAMS: [&str; 17] = [
+/// the numeric operators on `BigInts` and numbers, the `BigInt` built-ins, and
+/// `BigInt` keys and values through a proxy.
+const PROGRAMS: [&str; 18] = [
     "1",
     "console.log(1)",
     "1n",
@@ -28,6 +29,7 @@ const PROGRAMS: [&str; 17] = [
     "const o = { v: 1n }; o.v **= 3n; o.v--; globalThis.g = 1n; g++; let c = 1n; (() => c++)(); console.log(o.v, g, c)",
     "console.log(BigInt('0x1F').toString(36), BigInt.asIntN(8, 255n), BigInt.asUintN(65, -1n), Number(2n))",
     "try { new BigInt(1) } catch (e) { console.log(e.message, BigInt(1.5)) }",
+    "const p = new Proxy({}, {}); p[1n] = 2n; console.log(p[1n], typeof p, delete p[1n])",
 ];
 
 fn validate(src: &str, full_runtime: bool, gc_stress: u32) {

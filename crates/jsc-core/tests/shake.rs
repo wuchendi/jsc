@@ -39,6 +39,17 @@ fn unreachable_bodies_are_dropped() {
     assert!(size(src, false) * 3 < size(src, true) * 2);
 }
 
+/// A program that cannot create a proxy keeps no `__proxy_*` body and no
+/// proxy arm (DESIGN.md §6.11): naming `Proxy` grows the shaken module.
+#[test]
+fn proxy_helpers_are_dropped_without_proxy() {
+    let plain = "const o = { a: 1 }; o.b = 2; o.a + o.b";
+    let named = "const o = { a: 1 }; o.b = 2; typeof Proxy === 'function' ? o.a + o.b : 0";
+    assert!(size(plain, false) + 1000 < size(named, false));
+    same(plain, "3");
+    same(named, "3");
+}
+
 /// A key built at run time can name any builtin: the module stays whole.
 #[test]
 fn dynamic_string_keys_keep_the_runtime() {

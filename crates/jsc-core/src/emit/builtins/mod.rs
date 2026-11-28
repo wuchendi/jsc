@@ -41,12 +41,13 @@ mod number;
 mod object;
 mod object_static;
 mod promise;
+mod proxy;
 mod string;
 mod symbol;
 mod weak;
 
 use crate::emit::realm::{ArrayCopyOp, DateBodyOp, DateSetOp};
-pub(super) use array::emit_array_search;
+pub(super) use array::{CallArg, call_spilling, emit_array_search};
 pub(super) use async_iter::{
     emit_async_iterator_complete, emit_async_iterator_next, emit_async_iterator_return,
     emit_iterator_result_check, emit_open_async_iterator,
@@ -333,6 +334,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(iterator::STRINGS)
         .chain(array_buffer::strings())
         .chain(data_view::strings())
+        .chain(proxy::strings())
         .chain(bigint::STRINGS)
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
@@ -443,6 +445,8 @@ fn emit_builtin_body(
         | Builtin::AsyncGeneratorStep
         | Builtin::AsyncGeneratorReaction(_)
         | Builtin::Species(_)
+        | Builtin::WeakOp { .. }
+        | Builtin::WeakCell(_)
         | Builtin::DateBody(_) => emit_object_family(builtin, f, frame, strings, helpers),
         Builtin::JsonStringify => json::emit_stringify(f, frame, strings, helpers),
         Builtin::JsonParse => json::emit_parse(f, frame, strings, helpers),
@@ -454,14 +458,15 @@ fn emit_builtin_body(
         | Builtin::ObjectStatic(_)
         | Builtin::IsArray
         | Builtin::DateNow => emit_fragment(builtin, f, frame, strings, helpers),
-        // `WeakOp`, `WeakCell`, `ArrayBuffer`, `DataView`.
+        // `WeakOp`, `WeakCell`, `ArrayBuffer`, `DataView`, `Proxy`.
         _ => emit_handle_family(builtin, f, frame, strings, helpers),
     }
 }
 
 /// Emit the body of a weak-collection ([`weak::emit`]), `ArrayBuffer`
-/// ([`array_buffer::emit`]) or `DataView` ([`data_view::emit`]) method into
-/// `f`: the families with a type byte of their own.
+/// ([`array_buffer::emit`]), `DataView` ([`data_view::emit`]) or `Proxy`
+/// ([`proxy::emit`]) builtin into `f`: the families with a type byte of their
+/// own.
 fn emit_handle_family(
     builtin: Builtin,
     f: &mut FnBuilder<'_>,
@@ -472,6 +477,7 @@ fn emit_handle_family(
     match builtin {
         Builtin::ArrayBuffer(_) => array_buffer::emit(builtin, f, frame, strings, helpers),
         Builtin::DataView(_) => data_view::emit(builtin, f, frame, strings, helpers),
+        Builtin::Proxy(op) => proxy::emit(op, f, frame, strings, helpers),
         _ => weak::emit(builtin, f, frame, strings, helpers),
     }
 }
@@ -569,6 +575,9 @@ fn emit_object_family(
     helpers: Helpers<'_>,
 ) {
     match builtin {
+        Builtin::WeakOp { .. } | Builtin::WeakCell(_) => {
+            weak::emit(builtin, f, frame, strings, helpers);
+        }
         Builtin::PropertyIsEnumerable => {
             object::emit_property_is_enumerable(f, frame, strings, helpers);
         }

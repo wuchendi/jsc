@@ -154,6 +154,32 @@ fn weakref_finreg_layout_matches_design() {
     assert_eq!(FINREG_BLOCK_SIZE % BLOCK_ALIGN, 0);
 }
 
+/// Pins the proxy layout to DESIGN.md §6.11: type byte 20, 48 B, the call
+/// fields where a function keeps them, `target` @32, `handler` @40, the
+/// constructor flags shared with functions, class byte `1` = callable.
+#[test]
+fn proxy_layout_matches_design() {
+    use super::{
+        BLOCK_ALIGN, FUNC_ENV_OFFSET, FUNC_FLAG_CONSTRUCTOR, FUNC_FLAG_SELF_ALLOC,
+        FUNC_INDEX_OFFSET, PROXY_BLOCK_SIZE, PROXY_CLASS_CALLABLE, PROXY_HANDLER_OFFSET,
+        PROXY_TARGET_OFFSET, TYPE_PROXY,
+    };
+    assert_eq!(TYPE_PROXY, 20);
+    assert_eq!(
+        [
+            FUNC_INDEX_OFFSET,
+            FUNC_ENV_OFFSET,
+            PROXY_TARGET_OFFSET,
+            PROXY_HANDLER_OFFSET,
+            PROXY_BLOCK_SIZE
+        ],
+        [16, 24, 32, 40, 48]
+    );
+    assert_eq!((FUNC_FLAG_CONSTRUCTOR, FUNC_FLAG_SELF_ALLOC), (8, 32));
+    assert_eq!(PROXY_CLASS_CALLABLE, 1);
+    assert_eq!(PROXY_BLOCK_SIZE % BLOCK_ALIGN, 0);
+}
+
 /// Pins the `TYPE_PROPS` table layout, attribute bits, and flag bits to
 /// `DESIGN.md` sections 5.1-5.3.
 #[test]
@@ -313,7 +339,7 @@ fn bigint_layout_matches_design() {
 }
 
 /// Pins the binary-data type bytes and the `ArrayBuffer` layout to
-/// `DESIGN.md` §5.8: type bytes 24 / 25 / 26 (21 is `BigInt`, 20 / 22 / 23 reserved); a
+/// `DESIGN.md` §5.8: type bytes 24 / 25 / 26 (20 is `Proxy`, 21 `BigInt`, 22 / 23 spare); a
 /// 32 B buffer with `data` @16, `byte_length` @20, `max_byte_length` @24;
 /// flags `RESIZABLE` = 2, `DETACHED` = 4; byte lengths up to 2^29.
 #[test]

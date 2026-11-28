@@ -412,6 +412,23 @@ pub(super) enum Extra {
     StackOverflow,
     MapHash,
     MapReindex,
+    ProxyTrap,
+    GetProto,
+    OwnProp,
+    DescCompatible,
+    SetBool,
+    ProxyGetProto,
+    ProxySetProto,
+    ProxyIsExtensible,
+    ProxyPreventExt,
+    ProxyOwnProp,
+    ProxyDefineOwn,
+    ProxyHas,
+    ProxyGet,
+    ProxySet,
+    ProxyDelete,
+    ProxyOwnKeys,
+    IsArray,
 }
 
 /// The `BigInt` runtime ([`bigint`]), after the extra helpers.
@@ -508,7 +525,7 @@ const CORE: [Row<Core>; 59] = [
     (Core::Has, (&[I32, I64], &[I32]), |cx| {
         emit_has(cx.strings, cx.helpers, cx.leaves)
     }),
-    (Core::Delete, (&[I64, I32], &[]), |cx| {
+    (Core::Delete, (&[I64, I32, I32], &[I32]), |cx| {
         emit_delete(cx.strings, cx.helpers, cx.leaves)
     }),
     (Core::OwnKeys, (&[I64, I32], &[I64]), |cx| {
@@ -551,7 +568,7 @@ const CORE: [Row<Core>; 59] = [
         emit_sparse_set(cx.helpers, false, cx.leaves)
     }),
     (Core::ProtosIndexless, (&[I32], &[I32]), |cx| {
-        emit_protos_indexless(cx.leaves)
+        emit_protos_indexless(cx.helpers, cx.leaves)
     }),
     (Core::ProtoElem, (&[I32, I32], &[I64]), |cx| {
         emit_proto_elem(cx.helpers, cx.leaves)
@@ -761,7 +778,7 @@ const CONV: [Row<Conv>; 26] = [
         builtins::emit_json_indent(cx.helpers, cx.leaves)
     }),
     (Conv::JsonRevive, (&[I64, I32, I64], &[I64]), |cx| {
-        builtins::emit_json_revive(cx.helpers, cx.leaves)
+        builtins::emit_json_revive(cx.strings, cx.helpers, cx.leaves)
     }),
     (
         Conv::DefineOwn,
@@ -774,11 +791,11 @@ const CONV: [Row<Conv>; 26] = [
     (Conv::OwnDesc, (&[I64, I32], &[I64]), |cx| {
         emit_own_desc(cx.strings, cx.helpers, cx.leaves)
     }),
-    (Conv::SetIntegrity, (&[I64, I32], &[]), |cx| {
+    (Conv::SetIntegrity, (&[I64, I32], &[I32]), |cx| {
         emit_set_integrity(cx.helpers, cx.leaves)
     }),
     (Conv::TestIntegrity, (&[I64, I32], &[I32]), |cx| {
-        emit_test_integrity(cx.leaves)
+        emit_test_integrity(cx.helpers, cx.leaves)
     }),
     (Conv::OwnEnum, (&[I64, I32], &[I32]), |cx| {
         emit_own_enum(cx.strings, cx.helpers, cx.leaves)
@@ -820,7 +837,7 @@ const CONV: [Row<Conv>; 26] = [
     }),
 ];
 
-const EXTRA: [Row<Extra>; 3] = [
+const EXTRA: [Row<Extra>; 20] = [
     (Extra::StackOverflow, (&[], &[]), |cx| {
         emit_stack_overflow(cx.strings, cx.helpers, cx.leaves)
     }),
@@ -829,6 +846,59 @@ const EXTRA: [Row<Extra>; 3] = [
     }),
     (Extra::MapReindex, (&[I32], &[]), |cx| {
         emit_map_reindex(cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyTrap, (&[I32, I32], &[I64]), |cx| {
+        emit_proxy_trap(cx.helpers, cx.leaves)
+    }),
+    (Extra::GetProto, (&[I64], &[I64]), |cx| {
+        emit_get_proto(cx.helpers, cx.leaves)
+    }),
+    (Extra::OwnProp, (&[I64, I32, I32], &[I32]), |cx| {
+        emit_own_prop(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::DescCompatible, (&[I32, I32, I32], &[I32]), |cx| {
+        emit_desc_compatible(cx.helpers, cx.leaves)
+    }),
+    (Extra::SetBool, (&[I64, I32, I64, I64], &[I32]), |cx| {
+        emit_set_bool(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyGetProto, (&[I32], &[I64]), |cx| {
+        emit_proxy_get_proto(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxySetProto, (&[I32, I64], &[I32]), |cx| {
+        emit_proxy_set_proto(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyIsExtensible, (&[I32], &[I32]), |cx| {
+        emit_proxy_is_extensible(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyPreventExt, (&[I32], &[I32]), |cx| {
+        emit_proxy_prevent_ext(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyOwnProp, (&[I32, I32, I32], &[I32]), |cx| {
+        emit_proxy_own_prop(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (
+        Extra::ProxyDefineOwn,
+        (&[I32, I32, I32, I64, I64, I64], &[I32]),
+        |cx| emit_proxy_define_own(cx.strings, cx.helpers, cx.leaves),
+    ),
+    (Extra::ProxyHas, (&[I32, I32], &[I32]), |cx| {
+        emit_proxy_has(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyGet, (&[I32, I32, I64], &[I64]), |cx| {
+        emit_proxy_get(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxySet, (&[I32, I32, I64, I64], &[I32]), |cx| {
+        emit_proxy_set(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyDelete, (&[I32, I32], &[I32]), |cx| {
+        emit_proxy_delete(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyOwnKeys, (&[I32, I32], &[I64]), |cx| {
+        emit_proxy_own_keys(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::IsArray, (&[I64], &[I32]), |cx| {
+        emit_is_array(cx.strings, cx.helpers, cx.leaves)
     }),
 ];
 

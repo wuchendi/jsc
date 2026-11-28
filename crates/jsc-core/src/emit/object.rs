@@ -362,12 +362,16 @@ pub(super) fn emit_object_builtin_node(
         ObjectBuiltinOp::Entries => OWN_ENTRIES,
         ObjectBuiltinOp::ForInKeys => {
             function.instruction(&Instruction::Call(helpers.for_in_keys));
+            // A proxy trap may throw (DESIGN.md §6.11).
+            if helpers.proxies() {
+                emit_propagate_if_pending(function, helpers);
+            }
             return;
         }
     };
     function.instruction(&Instruction::I32Const(mode));
     function.instruction(&Instruction::Call(helpers.own_keys));
-    if helpers.has_accessors && mode != OWN_KEYS {
+    if helpers.has_accessors && (mode != OWN_KEYS || helpers.proxies()) {
         emit_propagate_if_pending(function, helpers);
     }
 }
@@ -466,7 +470,9 @@ pub(super) fn emit_instanceof_node(
     function.instruction(&Instruction::LocalSet(tgt));
     emit_is_object(function, cur);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
-    emit_proto_chain_match(function, cur, tgt);
+    enter_frame(helpers);
+    emit_proto_chain_match(function, cur, tgt, helpers);
+    leave_frame(helpers);
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I64Const(FALSE_BITS));
     function.instruction(&Instruction::End);
@@ -579,7 +585,7 @@ pub(super) fn emit_instanceof_operator(
     function.instruction(&Instruction::Block(BlockType::Empty));
     enter_frame(helpers);
     if ordinary {
-        emit_is_function(function, tgt);
+        emit_is_function(function, tgt, helpers);
         function.instruction(&Instruction::I32Eqz);
         function.instruction(&Instruction::If(BlockType::Empty));
         function.instruction(&Instruction::I64Const(FALSE_BITS));
@@ -618,7 +624,7 @@ pub(super) fn emit_instanceof_operator(
     function.instruction(&Instruction::I64Eq);
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
-    emit_is_function(function, tgt);
+    emit_is_function(function, tgt, helpers);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::I64Const(FALSE_BITS));
@@ -712,7 +718,7 @@ fn emit_ordinary_chain(
     );
     leave_frame(helpers);
     function.instruction(&Instruction::End);
-    emit_proto_chain_match(function, cur, tgt);
+    emit_proto_chain_match(function, cur, tgt, helpers);
     leave_frame(helpers);
     function.instruction(&Instruction::Else);
     // A non-object operand is never an instance.
@@ -720,20 +726,33 @@ fn emit_ordinary_chain(
     function.instruction(&Instruction::End);
 }
 
-/// Walk the `proto` chain of the object in i64 local `cur` for pointer
-/// identity with the object in i64 local `tgt`, leaving `true` iff some link
-/// is the SAME block (a chain ends at `null`). Clobbers `cur`.
-fn emit_proto_chain_match(function: &mut impl Sink, cur: u32, tgt: u32) {
+/// Walk the `[[GetPrototypeOf]]` chain of the object in i64 local `cur` for
+/// pointer identity with the object in i64 local `tgt`, leaving `true` iff
+/// some link is the SAME block (a chain ends at `null`). When the program can
+/// hold proxies each step is `__get_proto` (a proxy link runs its
+/// `getPrototypeOf` trap, DESIGN.md §6.11) and a thrown trap propagates;
+/// otherwise it loads `proto`. Clobbers `cur`.
+fn emit_proto_chain_match<S: Sink>(function: &mut S, cur: u32, tgt: u32, helpers: Helpers<'_>) {
     let proto_slot = MemArg {
         offset: OBJ_PROTO_OFFSET,
         align: 3,
         memory_index: 0,
     };
-    // cur = recv.proto.
-    function.instruction(&Instruction::LocalGet(cur));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::I64Load(proto_slot));
-    function.instruction(&Instruction::LocalSet(cur));
+    // cur = cur.[[GetPrototypeOf]]().
+    let step = |function: &mut S| {
+        function.instruction(&Instruction::LocalGet(cur));
+        if helpers.proxies() {
+            function.instruction(&Instruction::Call(helpers.get_proto()));
+        } else {
+            function.instruction(&Instruction::I32WrapI64);
+            function.instruction(&Instruction::I64Load(proto_slot));
+        }
+        function.instruction(&Instruction::LocalSet(cur));
+    };
+    step(function);
+    if helpers.proxies() {
+        emit_propagate_if_pending(function, helpers);
+    }
     // Loop: 1 iff `cur` reaches `tgt`, 0 iff the chain runs out.
     function.instruction(&Instruction::Block(BlockType::Result(ValType::I32)));
     function.instruction(&Instruction::Loop(BlockType::Empty));
@@ -750,15 +769,22 @@ fn emit_proto_chain_match(function: &mut impl Sink, cur: u32, tgt: u32) {
     function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::Br(2)); // -> block result: match
     function.instruction(&Instruction::End);
-    // cur = cur.proto — the next link up the chain.
-    function.instruction(&Instruction::LocalGet(cur));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::I64Load(proto_slot));
-    function.instruction(&Instruction::LocalSet(cur));
+    // The next link up the chain.
+    step(function);
+    if helpers.proxies() {
+        // A thrown trap leaves the walk (propagated below).
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::GlobalGet(EXC_PENDING_GLOBAL));
+        function.instruction(&Instruction::BrIf(1));
+        function.instruction(&Instruction::Drop);
+    }
     function.instruction(&Instruction::Br(0)); // continue the loop
     function.instruction(&Instruction::End); // loop
     function.instruction(&Instruction::I32Const(0)); // unreachable fall-through
     function.instruction(&Instruction::End); // block -> i32 on the stack
+    if helpers.proxies() {
+        emit_propagate_if_pending(function, helpers);
+    }
     // Box the i32 `1`/`0` into a TRUE/FALSE jsval (`FALSE_BITS | bit`).
     function.instruction(&Instruction::I64ExtendI32U);
     function.instruction(&Instruction::I64Const(FALSE_BITS));
@@ -809,8 +835,9 @@ fn emit_bound_restart(function: &mut impl Sink, f: u32) {
 /// stack. `obj` and the key are evaluated (stashed in the high scratch slots
 /// `+14` / `+15`); a `null` / `undefined` `obj` throws the nullish `TypeError`
 /// (`ToObject` of the base); then the key is converted with `ToPropertyKey` (a
-/// lookup: a never-interned key is absent) and `__delete` tombstones the own
-/// property; a non-configurable one throws.
+/// lookup: a never-interned key is absent) and strict `__delete` tombstones
+/// the own property; a non-configurable one throws (a proxy's
+/// `deleteProperty` trap decides, DESIGN.md §6.11).
 pub(super) fn emit_object_delete_node(
     obj: &IrNode,
     key: &IrNode,
@@ -832,7 +859,9 @@ pub(super) fn emit_object_delete_node(
     }
     function.instruction(&Instruction::LocalGet(s_obj));
     emit_prop_key(function, key, s_key, false, strings, helpers);
+    function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::Call(helpers.delete));
+    function.instruction(&Instruction::Drop);
     emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::I64Const(TRUE_BITS));
 }
