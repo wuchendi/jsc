@@ -1407,17 +1407,35 @@ fn collect_entries<'a>(entries: &'a [(PropKey, IrNode)], strs: &mut Strs<'a>) {
 /// well-known symbol reads go through `__symbol_get`, which calls a getter
 /// regardless — the realm's `get [@@species]` and `%Iterator.prototype%`'s
 /// `get [@@toStringTag]` are reached that way.)
+/// Whether `node` makes the global object a value of the program, which can
+/// then find any global by a run-time key (DESIGN.md §4.2): a top-level
+/// `this` or a `globalThis` read while `globalThis` is sealed (the intrinsic
+/// [`GlobalIntrinsic::Global`]), or a `globalThis` read once the global object
+/// is open (`globalThis[k]`, `const g = globalThis`, a top-level `this`
+/// anywhere: a global-object lookup, [`IrNode::GlobalGet`]). Strict code has
+/// no other path to the global object and no read of a global by a run-time
+/// name. Every compile-time gate that stubs a family whose constructor is a
+/// global must open on it.
+fn holds_global(node: &IrNode) -> bool {
+    match node {
+        IrNode::Intrinsic(GlobalIntrinsic::Global) => true,
+        IrNode::GlobalGet { global, .. } => global.name == "globalThis",
+        _ => false,
+    }
+}
+
 /// Whether the program can create a proxy (DESIGN.md §6.11): it names
 /// `Proxy` as a global, a member or property key or a string literal, or it
-/// holds the global object (which can find `Proxy` by a run-time key).
+/// [`holds_global`] (which can find `Proxy` by a run-time key).
 fn program_has_proxies(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
         IrNode::Str(s) => s == "Proxy",
-        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
-            global.name == "Proxy"
+        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. }
+            if global.name == "Proxy" =>
+        {
+            true
         }
-        IrNode::Intrinsic(GlobalIntrinsic::Global) => true,
-        _ => false,
+        n => holds_global(n),
     })
 }
 
@@ -1441,15 +1459,16 @@ fn reflect_gate(program: &IrProgram) -> ReflectGate {
 
 /// Whether the program can hold `%Reflect%` (DESIGN.md §6.11): it names
 /// `Reflect` as a global, a member or property key or a string literal, or
-/// it holds the global object (which can find `Reflect` by a run-time key).
+/// it [`holds_global`] (which can find `Reflect` by a run-time key).
 fn program_has_reflect(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
         IrNode::Str(s) => s == "Reflect",
-        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
-            global.name == "Reflect"
+        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. }
+            if global.name == "Reflect" =>
+        {
+            true
         }
-        IrNode::Intrinsic(GlobalIntrinsic::Global) => true,
-        _ => false,
+        n => holds_global(n),
     })
 }
 
@@ -1515,26 +1534,14 @@ const BINARY_NAMES: [&str; 14] = [
     "BigUint64Array",
 ];
 
-/// Whether `n` yields the global object as a value: its constant address
-/// (top-level `this`, a sealed `globalThis`) or a global-object lookup of
-/// `globalThis` (an escaping `globalThis` unseals every global, so
-/// `globalThis` itself lowers to a [`IrNode::GlobalGet`]).
-fn reaches_global_object(n: &IrNode) -> bool {
-    match n {
-        IrNode::Intrinsic(GlobalIntrinsic::Global) => true,
-        IrNode::GlobalGet { global, .. } => global.name == "globalThis",
-        _ => false,
-    }
-}
-
-/// Whether `program` can reach binary data (DESIGN.md §5.8.5): it names a
+/// Whether `program` can reach binary data (DESIGN.md §6.4): it names a
 /// binary-data constructor (the intrinsic, a global reference, or a string
 /// such as a static `globalThis.ArrayBuffer` key), or holds the global
-/// object ([`reaches_global_object`]), which could reach one by a computed
+/// object ([`holds_global`]), which could reach one by a computed
 /// name. Then the collector and the renderer carry their binary-data arms.
 pub(super) fn program_has_binary(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
-        _ if reaches_global_object(n) => true,
+        _ if holds_global(n) => true,
         IrNode::Intrinsic(GlobalIntrinsic::Ctor(
             BuiltinCtor::ArrayBuffer | BuiltinCtor::DataView | BuiltinCtor::Typed(_),
         )) => true,

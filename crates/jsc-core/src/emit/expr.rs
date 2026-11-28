@@ -959,9 +959,7 @@ pub(super) fn emit_method_call_user(
         function.instruction(&Instruction::LocalSet(callee_val));
     };
     // `Reflect.get(o, 'x')` and its kin: a constant key names no builtin.
-    let constant_key = matches!(&**key, IrNode::Str(name) if shake::KEY_SECOND.iter().any(|m| name == m))
-        && args.get(1).is_some_and(shake::constant_key);
-    if constant_key {
+    if matches!(&**key, IrNode::Str(name) if shake::constant_key_call(name, args)) {
         shake::constant_key_callee(callee);
     } else {
         callee();
@@ -1557,7 +1555,14 @@ pub(super) fn emit_proto_guard<S: Sink>(
     // builtin for a string receiver.
     let generic = Builtin::MethodCall;
     let message = static_key(strings, &not_callable.message).cast_unsigned();
-    let env = (i64::from(message) << 32) | i64::from(static_key(strings, key).cast_unsigned());
+    // `Reflect.get(o, 'x')` lowers here (`get` has a `Map` fast path): a
+    // constant key names no builtin.
+    let name = if shake::constant_key_call(key, args) {
+        shake::constant_key_callee(|| static_key(strings, key))
+    } else {
+        static_key(strings, key)
+    };
+    let env = (i64::from(message) << 32) | i64::from(name.cast_unsigned());
     emit_call_args(args, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::GlobalSet(THIS_GLOBAL));
@@ -1677,6 +1682,7 @@ pub(super) fn emit_proto_method<S: Sink>(
         recv,
         key,
         kinds,
+        constant_key,
     } = node
     else {
         unreachable!("emit_proto_method is only called with a ProtoMethod node")
@@ -1704,15 +1710,30 @@ pub(super) fn emit_proto_method<S: Sink>(
         emit_proto_kind_test(function, local, kind, *sealed, scratch + KIND_TMP, helpers);
         open(function, slot);
     }
-    emit_index_node(
-        &IrNode::Local(local),
-        &IrNode::Str(key.as_str().into()),
-        false,
-        function,
-        scratch,
-        strings,
-        helpers,
-    );
+    let mut read = || {
+        if *constant_key {
+            // Codegen left the receiver unchecked: it throws here, before any
+            // argument runs, naming `key`.
+            let name = IrNode::Str(key.as_str().into());
+            emit_nullish_guard(function, local, &name, false, scratch, strings, helpers);
+        }
+        emit_index_node(
+            &IrNode::Local(local),
+            &IrNode::Str(key.as_str().into()),
+            false,
+            function,
+            scratch,
+            strings,
+            helpers,
+        );
+    };
+    // `Reflect.get(o, 'x')` with an argument that has side effects: a
+    // constant key names no builtin.
+    if *constant_key {
+        shake::constant_key_callee(read);
+    } else {
+        read();
+    }
     for _ in 0..opened {
         leave_frame(helpers);
         function.instruction(&Instruction::End);

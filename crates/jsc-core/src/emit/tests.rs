@@ -1452,7 +1452,7 @@ fn builtin_bodies_validate() {
 #[test]
 fn array_buffer_bodies_validate() {
     // A program naming `ArrayBuffer` carries the binary-data collector and
-    // renderer arms (DESIGN.md §5.8.5); every body must stay valid wasm.
+    // renderer arms (DESIGN.md §6.3); every body must stay valid wasm.
     validate(&compile(
         "const b = new ArrayBuffer(8, { maxByteLength: 16 });
         b.resize(12);
@@ -1464,7 +1464,7 @@ fn array_buffer_bodies_validate() {
 
 #[test]
 fn typed_array_bodies_validate() {
-    // A program naming a typed-array constructor carries the §5.8.5 hooks in
+    // A program naming a typed-array constructor carries the §6.3 hooks in
     // the property helpers, the inline `ta[k]` arms, the iterator arm and
     // the collector and renderer arms; every body must stay valid wasm.
     validate(&compile(
@@ -1483,7 +1483,7 @@ fn typed_array_bodies_validate() {
 
 #[test]
 fn typed_array_method_bodies_validate() {
-    // The `%TypedArray.prototype%` methods of stage T3b (DESIGN.md §5.8.7),
+    // The `%TypedArray.prototype%` methods of stage T3b (DESIGN.md §7.9),
     // under a small and a large arity `K` (arguments past `K` take the
     // spread path); every body must stay valid wasm.
     let methods = "const t = new Int16Array([3, 1, 2]), u = new Float64Array(4);
@@ -1504,7 +1504,7 @@ fn typed_array_method_bodies_validate() {
 #[test]
 fn data_view_bodies_validate() {
     // A program naming `DataView` carries the binary-data collector and
-    // renderer arms and the `DataView` helpers (DESIGN.md §5.8); every body
+    // renderer arms and the `DataView` helpers (DESIGN.md §6.2); every body
     // must stay valid wasm.
     validate(&compile(
         "const b = new ArrayBuffer(8, { maxByteLength: 16 });
@@ -1519,7 +1519,7 @@ fn data_view_bodies_validate() {
 
 #[test]
 fn bigint_typed_array_bodies_validate() {
-    // The `BigInt` kinds (DESIGN.md §5.8.6, stage T5b): the element arms of
+    // The `BigInt` kinds (DESIGN.md §6.2, stage T5b): the element arms of
     // `__raw_load` / `__raw_store` and `TypedArraySetElement`'s `ToBigInt`,
     // the content-type checks, the methods' `BigInt` comparisons and the
     // `DataView` `BigInt` accessors; every body must stay valid wasm.
@@ -1532,6 +1532,25 @@ fn bigint_typed_array_bodies_validate() {
             t.with(0, 7n), t.map((x) => x * 2n), t.filter((x) => x > 0n), t.slice(1), t.join(),
             new BigInt64Array(u), BigInt64Array.from([1n]), v.getBigInt64(0), v.getBigUint64(8, true));
         try { new BigInt64Array(new Int8Array(1)); } catch (e) { console.log(e.message); }",
+    ));
+}
+
+#[test]
+fn bigint_element_pending_checks_validate() {
+    // Every `BigInt` element reader checks the pending flag after the
+    // allocating read (DESIGN.md §6.2): the inline `ta[k]` and
+    // `Object.values` / `entries` sites, `__own_keys`, `__own_desc` /
+    // `__own_prop`, the iterator step, the constructor's typed-array
+    // overload, the methods' element reads and cross-kind copies, and the
+    // renderer's allocation-free digits; every body must stay valid wasm.
+    validate(&compile(
+        "const t = new BigInt64Array([1n, -2n]), u = new BigUint64Array(2), k = 0;
+        u.set(t); t.set(u, 0); new BigUint64Array(t.buffer, 0, 1).set(t.subarray(1));
+        const w = new BigUint64Array(t);
+        console.log(t[k], t['1'], Object.values(t), Object.entries(u), Object.getOwnPropertyDescriptor(t, 0),
+            Object.getOwnPropertyDescriptors(u), [...t], t.at(-1), t.reverse(), t.reduce((a, b) => a + b),
+            t.toReversed(), t.find((x) => x < 0n), w, u.slice(0, 1), t.toLocaleString());
+        for (const x of u) console.log(x);",
     ));
 }
 

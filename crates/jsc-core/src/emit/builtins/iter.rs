@@ -475,7 +475,7 @@ fn emit_next(
 /// An Array Iterator step into `value`: `LengthOfArrayLike` re-read per
 /// step, then the index (keys), `Get(target, index)` (values) or both. A
 /// typed-array target (only in a program that can reach one, DESIGN.md
-/// §5.8.7) takes its length from the buffer witness instead (out of bounds
+/// §7.9) takes its length from the buffer witness instead (out of bounds
 /// or detached throws, exhausting the iterator) and its elements from
 /// `__ta_get`.
 fn step_array(function: &mut FnBuilder<'_>, st: Step, strings: &StrOffsets, helpers: Helpers<'_>) {
@@ -500,6 +500,14 @@ fn step_array(function: &mut FnBuilder<'_>, st: Step, strings: &StrOffsets, help
         wasm!(function;
             LocalGet(st.i), F64ConvertI32U, I64ReinterpretF64, LocalSet(st.item),
             LocalGet(st.target), I32WrapI64, LocalGet(st.i), Call(helpers.ta_get()), LocalSet(st.value),
+        );
+        // A `BigInt` element read allocates; out of memory leaves the
+        // `RangeError` pending, which exhausts the iterator as any throw
+        // while stepping does.
+        if helpers.bigints() {
+            st.bail_if_pending(function);
+        }
+        wasm!(function;
             LocalGet(st.i), I32Const(1), I32Add, LocalSet(st.i),
         );
         st.store_index(function);
