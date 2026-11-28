@@ -3106,13 +3106,34 @@ fn emit_end_line(function: &mut impl Sink, helpers: Helpers<'_>) {
     function.instruction(&Instruction::Call(helpers.out_flush()));
 }
 
+/// Whether evaluating `node` can neither throw, run user code, nor allocate:
+/// a literal, a static block, or a plain local read.
+fn is_inert(node: &IrNode) -> bool {
+    matches!(
+        node,
+        IrNode::Num(_)
+            | IrNode::Bool(_)
+            | IrNode::Null
+            | IrNode::Undefined
+            | IrNode::Str(_)
+            | IrNode::BigInt { .. }
+            | IrNode::Local(_)
+            | IrNode::Intrinsic(_)
+            | IrNode::DeclFunc(_)
+    )
+}
+
 /// Emit a `console.log(a0, .., a_{n-1})` expression, leaving the
 /// `undefined` jsval (its expression value) on the stack.
 ///
-/// Each argument is evaluated left-to-right and appended to the output buffer
-/// by the guest renderer, separated by a single space; the line is written
-/// with one `fd_write` after the last argument (for no arguments, just a
-/// newline).
+/// Every argument is evaluated left-to-right before anything is printed, so
+/// a throwing argument leaves no partial line and each value renders in its
+/// state after the last argument ran. When every argument past the first is
+/// inert ([`is_inert`]) the arguments are streamed: each is evaluated and
+/// appended to the output buffer by the guest renderer, separated by a single
+/// space, and the line is written with one `fd_write` after the last argument
+/// (for no arguments, just a newline). Otherwise the arguments are collected
+/// into a rooted array literal and printed by [`emit_console_log_spread`].
 pub(super) fn emit_console_log(
     args: &[IrNode],
     function: &mut impl Sink,
@@ -3120,6 +3141,11 @@ pub(super) fn emit_console_log(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    if args.iter().skip(1).any(|arg| !is_inert(arg)) {
+        let array = IrNode::Array(args.to_vec());
+        emit_console_log_spread(&array, function, scratch, strings, helpers);
+        return;
+    }
     // An allocation that ran out of memory earlier (a valid block from the
     // reserve, design/runtime-memory.md §5.8) throws before any output.
     emit_propagate_if_pending(function, helpers);
@@ -3138,9 +3164,10 @@ pub(super) fn emit_console_log(
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
 }
 
-/// Emit a `console.log(...)` spread call: build the argument array, then
-/// render each element (a hole as `undefined`) like [`emit_console_log`]
-/// renders its arguments — a bare newline for none — and push `undefined`.
+/// Emit a `console.log(...)` spread call: build the argument array (every
+/// argument evaluated before anything is printed), then render each element
+/// (a hole as `undefined`) like [`emit_console_log`] renders its arguments — a
+/// bare newline for none — and push `undefined`.
 pub(super) fn emit_console_log_spread(
     args: &IrNode,
     function: &mut impl Sink,
@@ -3187,6 +3214,8 @@ pub(super) fn emit_console_log_spread(
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     emit_end_line(function, helpers);
+    // The render buffers may have taken the out-of-memory reserve.
+    emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
 }
 

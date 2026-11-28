@@ -2348,7 +2348,12 @@ jsvals. Layout knowledge lives in the emitter and `abi.rs` alone.
 
 The guest renderer (`emit/render.rs`) appends the Node-console form of a value
 to the output buffer (`$__out_buf`) as UTF-8. It runs no user code and never
-throws. `console.log` joins its arguments with one space and ends the line with
+throws. `console.log` evaluates every argument before printing anything (a
+throwing argument prints nothing; each value renders in its state after the
+last argument ran): with every argument past the first a literal, static block
+or plain local read, they stream straight into the buffer; otherwise they are
+first collected into an array literal and printed like the spread form. It
+joins its arguments with one space and ends the line with
 one `fd_write` to fd 1; `__report` writes one
 `prefix + value + "\n"` line to its fd (the `Uncaught …` reports and the `-p`
 completion, §4.2). A failed or stalled write ends the program with
