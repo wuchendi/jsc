@@ -399,6 +399,8 @@ const DATE_BLOCK_SIZE: i32 = abi::DATE_BLOCK_SIZE.cast_signed();
 /// The TYPE BYTE of a Symbol primitive block. Maps to `typeof` "symbol". See
 /// [`abi::TYPE_SYMBOL`] for the full layout.
 const TYPE_SYMBOL: i32 = abi::TYPE_SYMBOL as i32;
+/// TYPE BYTE of a `BigInt` primitive; see [`abi::TYPE_BIGINT`].
+const TYPE_BIGINT: i32 = abi::TYPE_BIGINT as i32;
 const SYMBOL_DESCRIPTION_OFFSET: u64 = abi::SYMBOL_DESCRIPTION_OFFSET as u64;
 
 /// `%Symbol.prototype%` (DESIGN.md §7.9): where a property read
@@ -532,7 +534,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 30] = [
+const PROP_KEYED_MSGS: [(i32, &str, &str); 35] = [
     (
         PROP_THROW_READ_ONLY,
         "Cannot assign to read only property '",
@@ -637,6 +639,27 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 30] = [
         PROP_THROW_PRIVATE_IN,
         "Cannot use 'in' operator to search for '",
         "",
+    ),
+    (
+        PROP_THROW_PROXY_REVOKED,
+        "Cannot perform '",
+        "' on a proxy that has been revoked",
+    ),
+    (PROP_THROW_PROXY_TRAP, "proxy trap '", "' is not a function"),
+    (
+        PROP_THROW_PROXY_FALSISH,
+        "proxy trap returned falsish for property '",
+        "'",
+    ),
+    (
+        PROP_THROW_PROXY_INVARIANT,
+        "proxy trap result for '",
+        "' violates an invariant",
+    ),
+    (
+        PROP_THROW_PROXY_FALSISH_OP,
+        "'",
+        "' on proxy: trap returned falsish",
     ),
     (
         PROP_THROW_TA_INCOMPATIBLE,
@@ -762,6 +785,24 @@ const PROP_THROW_PRIVATE_METHOD_WRITE: i32 = 26;
 /// `__prop_throw`'s `mode` argument: `#x in o` on a non-object `o` (the `key`
 /// is `"#x' in " + String(o)`, built by `__private_in`).
 const PROP_THROW_PRIVATE_IN: i32 = 27;
+/// `__prop_throw`'s `mode` argument: a trap of a revoked proxy (the `key` is
+/// the trap name, DESIGN.md §6.11).
+const PROP_THROW_PROXY_REVOKED: i32 = 28;
+/// `__prop_throw`'s `mode` argument: a proxy trap that is neither callable
+/// nor `undefined` / `null` (the `key` is the trap name).
+const PROP_THROW_PROXY_TRAP: i32 = 29;
+/// `__prop_throw`'s `mode` argument: a falsish `set` / `defineProperty` /
+/// `deleteProperty` trap result where the operation must throw (the `key` is
+/// the property key).
+const PROP_THROW_PROXY_FALSISH: i32 = 30;
+/// `__prop_throw`'s `mode` argument: a proxy trap result that violates an
+/// invariant of ECMA-262 §10.5 (the `key` is the property key, or the trap
+/// name for a trap without one).
+const PROP_THROW_PROXY_INVARIANT: i32 = 31;
+/// `__prop_throw`'s `mode` argument: a falsish `setPrototypeOf` /
+/// `preventExtensions` trap result where the operation must throw (the `key`
+/// is the trap name).
+const PROP_THROW_PROXY_FALSISH_OP: i32 = 32;
 /// `__prop_throw`'s `mode` argument: a typed-array method or getter (the
 /// `key`, its name) on a receiver that is not a typed array (DESIGN.md
 /// §5.8.4). Modes `44..=51` belong to the binary-data workstream.
@@ -944,6 +985,18 @@ enum BinaryData {
     Unreachable,
     /// The program names a binary-data constructor or the global object.
     Reachable,
+}
+
+/// The DESIGN.md §6.11 reachability gate: whether the program can create a
+/// proxy — it names `Proxy` (an identifier, a member or property name, a
+/// string) or reaches the global object. When closed, the property helpers
+/// emit no proxy arm and `__to_key` keeps its lookup-only mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProxyGate {
+    /// No proxy can exist.
+    Closed,
+    /// A proxy may exist.
+    Open,
 }
 
 #[derive(Clone, Copy)]
@@ -1142,6 +1195,9 @@ struct Helpers<'a> {
     /// Whether the program can reach binary data (DESIGN.md §5.8.5). When
     /// not, the collector and the renderer leave out their binary-data arms.
     binary: BinaryData,
+    /// Whether the program can create a proxy (DESIGN.md §6.11 reachability
+    /// gate; see [`Helpers::proxies`]).
+    proxy_gate: ProxyGate,
     /// Base address of the Unicode tables (see [`unicode`]).
     unicode: i32,
     /// Base address of the `__fn_info` table (see [`FnLayout`]). The static
@@ -1422,59 +1478,64 @@ impl Helpers<'_> {
         self.group(registry::Group::Binary) + 1
     }
 
+    /// `__dv_length(view) -> i32` (see [`binary`]).
+    fn dv_length(self) -> u32 {
+        self.group(registry::Group::Binary) + 2
+    }
+
     /// `__ta_length(o) -> i32` (see [`binary`]).
     fn ta_length(self) -> u32 {
-        self.group(registry::Group::Binary) + 2
+        self.group(registry::Group::Binary) + 3
     }
 
     /// `__ta_oob(o) -> i32` (see [`binary`]).
     fn ta_oob(self) -> u32 {
-        self.group(registry::Group::Binary) + 3
+        self.group(registry::Group::Binary) + 4
     }
 
     /// `__ta_validate(o, name) -> i32` (see [`binary`]).
     fn ta_validate(self) -> u32 {
-        self.group(registry::Group::Binary) + 4
+        self.group(registry::Group::Binary) + 5
     }
 
     /// `__ta_canonical(key) -> i32` (see [`binary`]).
     fn ta_canonical(self) -> u32 {
-        self.group(registry::Group::Binary) + 5
+        self.group(registry::Group::Binary) + 6
     }
 
     /// `__ta_get(o, i) -> i64` (see [`binary`]).
     fn ta_get(self) -> u32 {
-        self.group(registry::Group::Binary) + 6
+        self.group(registry::Group::Binary) + 7
     }
 
     /// `__ta_set(o, i, n)` (see [`binary`]).
     fn ta_set(self) -> u32 {
-        self.group(registry::Group::Binary) + 7
+        self.group(registry::Group::Binary) + 8
     }
 
     /// `__ta_set_value(o, i, v)` (see [`binary`]).
     fn ta_set_value(self) -> u32 {
-        self.group(registry::Group::Binary) + 8
+        self.group(registry::Group::Binary) + 9
     }
 
     /// `__ta_index_get(o, k) -> i64` (see [`binary`]).
     fn ta_index_get(self) -> u32 {
-        self.group(registry::Group::Binary) + 9
+        self.group(registry::Group::Binary) + 10
     }
 
     /// `__ta_index_set(o, k, v)` (see [`binary`]).
     fn ta_index_set(self) -> u32 {
-        self.group(registry::Group::Binary) + 10
+        self.group(registry::Group::Binary) + 11
     }
 
     /// `__raw_load(addr, kind, swap) -> i64` (see [`binary`]).
     fn raw_load(self) -> u32 {
-        self.group(registry::Group::Binary) + 11
+        self.group(registry::Group::Binary) + 12
     }
 
     /// `__raw_store(addr, kind, n, swap)` (see [`binary`]).
     fn raw_store(self) -> u32 {
-        self.group(registry::Group::Binary) + 12
+        self.group(registry::Group::Binary) + 13
     }
 
     /// `__super_get(home, key, recv) -> i64` (see [`props::emit_super_get`]).
@@ -1658,6 +1719,7 @@ struct FnLayout {
 }
 
 mod array;
+mod bigint;
 mod binary;
 mod builder;
 mod builtins;

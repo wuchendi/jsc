@@ -1,11 +1,11 @@
 //! The binary-data helpers (DESIGN.md §5.8): the byte-block allocator
-//! `__ab_alloc`, the console renderer arm `__render_binary`, and the
-//! typed-array helpers (the buffer witness `__ta_length` / `__ta_oob`,
+//! `__ab_alloc`, the console renderer arm `__render_binary`, the `DataView`
+//! view length `__dv_length`, and the typed-array helpers (the buffer witness `__ta_length` / `__ta_oob`,
 //! `__ta_validate`, `CanonicalNumericIndexString` `__ta_canonical`, the
 //! element accessors `__ta_get` / `__ta_set` / `__ta_set_value`, the inline
-//! fast-path halves `__ta_index_get` / `__ta_index_set`, and the shared
-//! `__raw_load` / `__raw_store`), a helper group of their own after every
-//! other ([`super::registry::Group::Binary`]).
+//! fast-path halves `__ta_index_get` / `__ta_index_set`), and the element
+//! accessors `__raw_load` / `__raw_store` that typed arrays and `DataView`
+//! share, a helper group of their own ([`super::registry::Group::Binary`]).
 
 use wasm_encoder::{BlockType, Function, Ieee64, Instruction, MemArg, ValType};
 
@@ -29,9 +29,10 @@ macro_rules! wasm {
 use ValType::{I32, I64};
 
 /// The `(params, results)` of the binary helpers, in function-index order.
-pub(super) const TYPES: [(&[ValType], &[ValType]); 13] = [
+pub(super) const TYPES: [(&[ValType], &[ValType]); 14] = [
     (&[I32], &[I32]),             // __ab_alloc(size) -> block
     (&[I32, I32], &[]),           // __render_binary(p, depth)
+    (&[I32], &[I32]),             // __dv_length(view) -> byte length | -1
     (&[I32], &[I32]),             // __ta_length(o) -> length
     (&[I32], &[I32]),             // __ta_oob(o) -> out of bounds
     (&[I64, I32], &[I32]),        // __ta_validate(o, name) -> length
@@ -104,9 +105,11 @@ fn m32(offset: u32) -> MemArg {
 }
 
 /// The leaf declarations of the binary-data witness and element helpers
-/// (see [`super::roots::helper_graph`]).
+/// (see [`super::roots::helper_graph`]): they only read and write the
+/// buffers' bytes.
 pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
     vec![
+        (helpers.dv_length(), vec![]),
         (helpers.ta_length(), vec![]),
         (helpers.ta_oob(), vec![]),
         (helpers.raw_load(), vec![helpers.box_f64]),
@@ -143,6 +146,7 @@ pub(super) fn emit_helpers(
     vec![
         emit_ab_alloc(helpers, leaves),
         emit_render_binary(strings, helpers, leaves),
+        emit_dv_length(leaves),
         emit_ta_length(false, leaves),
         emit_ta_length(true, leaves),
         emit_ta_validate(helpers, leaves),
@@ -191,8 +195,9 @@ fn hex_digit(f: &mut FnBuilder<'_>, helpers: Helpers<'_>, d: u32) {
 }
 
 /// `__render_binary(p, depth)` (DESIGN.md §5.8.8): the console form of the
-/// binary-data block `p`, read directly (no getter runs): a typed array by
-/// [`render_typed_array`], else `ArrayBuffer { [Uint8Contents]: <01 02 ff>,
+/// binary-data block `p`, read directly (no getter runs): a `DataView` by
+/// [`render_data_view`], a typed array by [`render_typed_array`], else
+/// `ArrayBuffer { [Uint8Contents]: <01 02 ff>,
 /// byteLength: 3 }`, or `ArrayBuffer { (detached), byteLength: 0 }`. Allocates only through the output buffer
 /// and never throws; `p` stays rooted, so its byte block does too.
 fn emit_render_binary(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
@@ -203,6 +208,12 @@ fn emit_render_binary(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafS
     );
     let (block, at, count, nibble) = (0, 2, 3, 4);
     let (depth, first) = (1, 5);
+    render_data_view(
+        &mut function,
+        strings,
+        helpers,
+        [block, depth, count, nibble],
+    );
     wasm!(function;
         LocalGet(block), I32Load8U(m8(0)), I32Const(i32::from(abi::TYPE_TYPEDARRAY)), I32Eq,
         If(BlockType::Empty),
@@ -305,6 +316,131 @@ fn render_typed_array(
     lit(f, strings, helpers, TA_CLOSE);
     wasm!(f; Else);
     lit(f, strings, helpers, TA_EMPTY);
+    wasm!(f; End);
+}
+
+// The `DataView` helpers (DESIGN.md §5.8.4, §5.8.8): the view length, the
+// rendering arm, and the byte swaps of [`emit_raw_load`] / [`emit_raw_store`].
+
+/// The `DataView` rendering's static strings (DESIGN.md §5.8.8).
+const DV_OPEN: &str = "DataView { byteLength: ";
+const DV_BYTE_OFFSET: &str = ", byteOffset: ";
+const DV_BUFFER: &str = ", buffer: ";
+
+/// The static strings the `DataView` helpers write.
+pub(super) const DV_STRINGS: [&str; 3] = [DV_OPEN, DV_BYTE_OFFSET, DV_BUFFER];
+
+/// The `DataView` arm of `__render_binary` for the block in i32 local `block`
+/// (the i32 locals `count` and `off` are temps): `DataView { byteLength: 2,
+/// byteOffset: 0, buffer: ArrayBuffer { .. } }`, both numbers `0` when the
+/// view is out of bounds or detached, then returns.
+fn render_data_view(
+    function: &mut FnBuilder<'_>,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    [block, depth, count, off]: [u32; 4],
+) {
+    wasm!(function;
+        LocalGet(block), I32Load8U(m8(0)), I32Const(i32::from(abi::TYPE_DATAVIEW)), I32Eq,
+        If(BlockType::Empty),
+        LocalGet(block), Call(helpers.dv_length()), LocalTee(count),
+        I32Const(0), I32LtS,
+        If(BlockType::Empty),
+        I32Const(0), LocalSet(count), I32Const(0), LocalSet(off),
+        Else,
+        LocalGet(block), I32Load(m32(abi::DV_BYTE_OFFSET_OFFSET)), LocalSet(off),
+        End,
+    );
+    lit(function, strings, helpers, DV_OPEN);
+    wasm!(function; LocalGet(count), Call(helpers.out_uint()));
+    lit(function, strings, helpers, DV_BYTE_OFFSET);
+    wasm!(function; LocalGet(off), Call(helpers.out_uint()));
+    lit(function, strings, helpers, DV_BUFFER);
+    wasm!(function;
+        LocalGet(block), I32Load(m32(abi::DV_BUFFER_OFFSET)),
+        LocalGet(depth), I32Const(1), I32Add,
+        Call(helpers.render_binary()),
+    );
+    lit(function, strings, helpers, CLOSE);
+    wasm!(function; Return, End);
+}
+
+/// Push the header flags of the block in i32 local `block` masked by `flag`.
+fn block_flag(function: &mut FnBuilder<'_>, block: u32, flag: u8) {
+    wasm!(function;
+        LocalGet(block), I32Load8U(m8(abi::HEADER_FLAGS_OFFSET)),
+        I32Const(i32::from(flag)), I32And,
+    );
+}
+
+/// `__dv_length(view) -> i32` (DESIGN.md §5.8.4): `GetViewByteLength` of the
+/// `DataView` block `view`, `-1` when `IsViewOutOfBounds` (a detached buffer
+/// included). A length-tracking view spans `byte_length - byte_offset` of
+/// its buffer; a fixed one is out of bounds when it ends past the buffer.
+/// A non-allocating leaf.
+fn emit_dv_length(leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I32, RAW_I32]);
+    let (view, buffer, len, off) = (0, 1, 2, 3);
+    wasm!(f; LocalGet(view), I32Load(m32(abi::DV_BUFFER_OFFSET)), LocalSet(buffer));
+    block_flag(&mut f, buffer, abi::AB_FLAG_DETACHED);
+    wasm!(f;
+        If(BlockType::Empty), I32Const(-1), Return, End,
+        LocalGet(buffer), I32Load(m32(abi::AB_BYTE_LENGTH_OFFSET)), LocalSet(len),
+        LocalGet(view), I32Load(m32(abi::DV_BYTE_OFFSET_OFFSET)), LocalSet(off),
+    );
+    block_flag(&mut f, view, abi::DV_FLAG_LENGTH_TRACKING);
+    wasm!(f;
+        If(BlockType::Empty),
+        LocalGet(off), LocalGet(len), I32GtU, If(BlockType::Empty), I32Const(-1), Return, End,
+        LocalGet(len), LocalGet(off), I32Sub, Return,
+        End,
+        // Offsets and lengths are at most 2^29, so the sum cannot wrap.
+        LocalGet(off), LocalGet(view), I32Load(m32(abi::DV_BYTE_LENGTH_OFFSET)), I32Add,
+        LocalGet(len), I32GtU, If(BlockType::Empty), I32Const(-1), Return, End,
+        LocalGet(view), I32Load(m32(abi::DV_BYTE_LENGTH_OFFSET)),
+        End,
+    );
+    finish_builder(f)
+}
+
+/// Byte-swap the low 16 bits of the i32 local `x` (the high bits are zero).
+fn swap16(f: &mut FnBuilder<'_>, x: u32) {
+    wasm!(f;
+        LocalGet(x), I32Const(0xff), I32And, I32Const(8), I32Shl,
+        LocalGet(x), I32Const(8), I32ShrU, I32Const(0xff), I32And,
+        I32Or, LocalSet(x),
+    );
+}
+
+/// Byte-swap the i32 local `x`.
+fn swap32(f: &mut FnBuilder<'_>, x: u32) {
+    wasm!(f;
+        LocalGet(x), I32Const(8), I32Rotl, I32Const(0x00ff_00ff), I32And,
+        LocalGet(x), I32Const(8), I32Rotr, I32Const(0xff00_ff00_u32.cast_signed()), I32And,
+        I32Or, LocalSet(x),
+    );
+}
+
+/// Byte-swap the i64 local `y`: swap the bytes of each 16-bit lane, then the
+/// lanes of each 32-bit half, then the halves.
+fn swap64(f: &mut FnBuilder<'_>, y: u32) {
+    for (mask, shift) in [
+        (0x00ff_00ff_00ff_00ff_i64, 8),
+        (0x0000_ffff_0000_ffff_i64, 16),
+    ] {
+        wasm!(f;
+            LocalGet(y), I64Const(mask), I64And, I64Const(shift), I64Shl,
+            LocalGet(y), I64Const(shift), I64ShrU, I64Const(mask), I64And,
+            I64Or, LocalSet(y),
+        );
+    }
+    wasm!(f; LocalGet(y), I64Const(32), I64Rotl, LocalSet(y));
+}
+
+/// `if (swap) <swap the local>` for the i32 local `swap`.
+fn when_swap(f: &mut FnBuilder<'_>, swap: u32, body: impl FnOnce(&mut FnBuilder<'_>)) {
+    wasm!(f; LocalGet(swap), If(BlockType::Empty));
+    body(f);
     wasm!(f; End);
 }
 
@@ -575,35 +711,58 @@ fn kind_switch<S: Sink>(f: &mut S, kind: u32, result: BlockType, mut arm: impl F
 }
 
 /// `__raw_load(addr, kind, swap) -> i64` (DESIGN.md §5.8.6): the kind's
-/// width loaded at `addr` (unaligned) and read as a number by the kind's
-/// rule; a float goes through `__box_f64`, so a stored NaN of any payload
-/// reads as the canonical `NaN`. `swap` (a big-endian `DataView` access) is
-/// reserved for the `DataView` stage; typed arrays pass `0`. The reserved
-/// kinds (`Float16`, the `BigInt` kinds) are never stored in a typed array
-/// yet and read `undefined`. A non-allocating leaf.
+/// width loaded at `addr` (unaligned) as integer bits, byte-swapped when
+/// `swap` (a big-endian `DataView` read; typed arrays pass `0`), and read as
+/// a number by the kind's rule; a float goes through `__box_f64`, so a
+/// stored NaN of any payload reads as the canonical `NaN`. The reserved
+/// kinds (`Float16`, the `BigInt` kinds) are never stored yet and read
+/// `undefined`. A non-allocating leaf.
 fn emit_raw_load(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[RAW_I32, RAW_I32, RAW_I32], &[]);
-    let (addr, kind) = (0, 1);
+    let mut f = helper_builder(leaves, &[RAW_I32, RAW_I32, RAW_I32], &[RAW_I32, RAW_I64]);
+    let (addr, kind, swap, x, y) = (0, 1, 2, 3, 4);
     kind_switch(&mut f, kind, BlockType::Result(I64), |f, k| {
-        let int = |f: &mut FnBuilder<'_>, load: Instruction<'static>, signed: bool| {
+        // Load the width into `x` (swapped when asked).
+        let load = |f: &mut FnBuilder<'_>, op: Instruction<'static>, wide: bool| {
             f.instruction(&Instruction::LocalGet(addr));
-            f.instruction(&load);
-            f.instruction(&if signed {
-                Instruction::F64ConvertI32S
-            } else {
-                Instruction::F64ConvertI32U
+            f.instruction(&op);
+            f.instruction(&Instruction::LocalSet(x));
+            when_swap(f, swap, |f| {
+                if wide {
+                    swap32(f, x);
+                } else {
+                    swap16(f, x);
+                }
             });
-            f.instruction(&Instruction::I64ReinterpretF64);
+            f.instruction(&Instruction::LocalGet(x));
         };
         match k {
-            0 => int(f, Instruction::I32Load8S(ma(0)), true),
-            1 | 2 => int(f, Instruction::I32Load8U(ma(0)), false),
-            3 => int(f, Instruction::I32Load16S(ma(0)), true),
-            4 => int(f, Instruction::I32Load16U(ma(0)), false),
-            5 => int(f, Instruction::I32Load(ma(0)), true),
-            6 => int(f, Instruction::I32Load(ma(0)), false),
-            8 => wasm!(f; LocalGet(addr), F32Load(ma(0)), F64PromoteF32, Call(helpers.box_f64)),
-            9 => wasm!(f; LocalGet(addr), F64Load(ma(0)), Call(helpers.box_f64)),
+            0 => wasm!(f; LocalGet(addr), I32Load8S(ma(0)), F64ConvertI32S, I64ReinterpretF64),
+            1 | 2 => wasm!(f; LocalGet(addr), I32Load8U(ma(0)), F64ConvertI32U, I64ReinterpretF64),
+            3 => {
+                load(f, Instruction::I32Load16U(ma(0)), false);
+                wasm!(f; I32Extend16S, F64ConvertI32S, I64ReinterpretF64);
+            }
+            4 => {
+                load(f, Instruction::I32Load16U(ma(0)), false);
+                wasm!(f; F64ConvertI32U, I64ReinterpretF64);
+            }
+            5 => {
+                load(f, Instruction::I32Load(ma(0)), true);
+                wasm!(f; F64ConvertI32S, I64ReinterpretF64);
+            }
+            6 => {
+                load(f, Instruction::I32Load(ma(0)), true);
+                wasm!(f; F64ConvertI32U, I64ReinterpretF64);
+            }
+            8 => {
+                load(f, Instruction::I32Load(ma(0)), true);
+                wasm!(f; F32ReinterpretI32, F64PromoteF32, Call(helpers.box_f64));
+            }
+            9 => {
+                wasm!(f; LocalGet(addr), I64Load(ma(0)), LocalSet(y));
+                when_swap(f, swap, |f| swap64(f, y));
+                wasm!(f; LocalGet(y), F64ReinterpretI64, Call(helpers.box_f64));
+            }
             _ => wasm!(f; I64Const(UNDEFINED_BITS)),
         }
     });
@@ -612,35 +771,64 @@ fn emit_raw_load(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 }
 
 /// `__raw_store(addr, kind, n, swap)` (DESIGN.md §5.8.6): the number `n`
-/// converted by the kind's rule and stored at `addr` (unaligned): the
-/// integer kinds keep the low bits of the `ToInt32` pattern (`ToInt8` ..
-/// `ToUint32`), `Uint8Clamped` rounds half to even after clamping to `0 ..
-/// 255` (`NaN` is `0`), `Float32` demotes, `Float64` stores the bits. `swap`
-/// is reserved for the `DataView` stage; the reserved kinds store nothing.
-/// A non-allocating leaf.
+/// converted to the kind's bits — the low bits of the `ToInt32` pattern for
+/// the integer kinds (`ToInt8` .. `ToUint32`), `Uint8Clamped` rounding half
+/// to even after clamping to `0 .. 255` (`NaN` is `0`), `Float32` demoted,
+/// `Float64` its own bits — byte-swapped when `swap` (a big-endian
+/// `DataView` write; typed arrays pass `0`), and stored at `addr`
+/// (unaligned). The reserved kinds store nothing. A non-allocating leaf.
 fn emit_raw_store(leaves: &LeafSet) -> Function {
-    let mut f = helper_builder(leaves, &[RAW_I32, RAW_I32, RAW_I64, RAW_I32], &[]);
-    let (addr, kind, n) = (0, 1, 2);
+    let mut f = helper_builder(
+        leaves,
+        &[RAW_I32, RAW_I32, RAW_I64, RAW_I32],
+        &[RAW_I32, RAW_I64],
+    );
+    let (addr, kind, n, swap, x, y) = (0, 1, 2, 3, 4, 5);
     kind_switch(&mut f, kind, BlockType::Empty, |f, k| {
-        let int = |f: &mut FnBuilder<'_>, store: Instruction<'static>| {
+        // Store the bits in `x` at the width (swapped when asked).
+        let store = |f: &mut FnBuilder<'_>, op: Instruction<'static>, wide: bool| {
+            when_swap(f, swap, |f| {
+                if wide {
+                    swap32(f, x);
+                } else {
+                    swap16(f, x);
+                }
+            });
             f.instruction(&Instruction::LocalGet(addr));
-            emit_to_int32(f, n);
-            f.instruction(&store);
+            f.instruction(&Instruction::LocalGet(x));
+            f.instruction(&op);
         };
         match k {
-            0 | 1 => int(f, Instruction::I32Store8(ma(0))),
-            3 | 4 => int(f, Instruction::I32Store16(ma(0))),
-            5 | 6 => int(f, Instruction::I32Store(ma(0))),
+            0 | 1 => {
+                wasm!(f; LocalGet(addr));
+                emit_to_int32(f, n);
+                wasm!(f; I32Store8(ma(0)));
+            }
             2 => wasm!(f;
                 LocalGet(addr),
                 LocalGet(n), F64ReinterpretI64, F64Const(Ieee64::from(0.0)), F64Max,
                 F64Const(Ieee64::from(255.0)), F64Min, F64Nearest, I32TruncSatF64U,
                 I32Store8(ma(0)),
             ),
-            8 => {
-                wasm!(f; LocalGet(addr), LocalGet(n), F64ReinterpretI64, F32DemoteF64, F32Store(ma(0)));
+            3 | 4 => {
+                emit_to_int32(f, n);
+                wasm!(f; I32Const(0xffff), I32And, LocalSet(x));
+                store(f, Instruction::I32Store16(ma(0)), false);
             }
-            9 => wasm!(f; LocalGet(addr), LocalGet(n), I64Store(ma(0))),
+            5 | 6 => {
+                emit_to_int32(f, n);
+                wasm!(f; LocalSet(x));
+                store(f, Instruction::I32Store(ma(0)), true);
+            }
+            8 => {
+                wasm!(f; LocalGet(n), F64ReinterpretI64, F32DemoteF64, I32ReinterpretF32, LocalSet(x));
+                store(f, Instruction::I32Store(ma(0)), true);
+            }
+            9 => {
+                wasm!(f; LocalGet(n), LocalSet(y));
+                when_swap(f, swap, |f| swap64(f, y));
+                wasm!(f; LocalGet(addr), LocalGet(y), I64Store(ma(0)));
+            }
             _ => {}
         }
     });

@@ -91,7 +91,7 @@ const OPEN_TRAILING: &str = " { ";
 const CLOSE_OBJECT: &str = " }";
 
 /// The static strings the renderer writes or looks properties up by.
-pub(super) const STRINGS: [&str; 60] = [
+pub(super) const STRINGS: [&str; 62] = [
     "",
     "true",
     "false",
@@ -130,6 +130,7 @@ pub(super) const STRINGS: [&str; 60] = [
     "[Number: ",
     "[Boolean: ",
     "[Symbol: ",
+    "[BigInt: ",
     "Promise { <pending> }",
     "Promise { ",
     "Promise { <rejected> ",
@@ -140,6 +141,7 @@ pub(super) const STRINGS: [&str; 60] = [
     "WeakSet { <items unknown> }",
     "WeakRef {}",
     "FinalizationRegistry {}",
+    REVOKED_PROXY,
     "Uncaught ",
     "Uncaught (in promise) ",
     INVALID_DATE,
@@ -584,9 +586,31 @@ fn render_promise(
     wasm!(f; End, End, End);
 }
 
+/// Push whether the block in i32 `p` (its type byte into i32 `ty`) is one of
+/// the container kinds `__render_heap` guards against cycles: an array, an
+/// object, a promise, a function, and a typed array in a program that can
+/// reach one.
+fn is_container(f: &mut FnBuilder<'_>, p: u32, ty: u32, helpers: Helpers<'_>) {
+    wasm!(f;
+        LocalGet(p), I32Load8U(m8(0)), LocalTee(ty), I32Const(TYPE_ARRAY), I32Eq,
+        LocalGet(ty), I32Const(TYPE_OBJECT), I32Eq, I32Or,
+        LocalGet(ty), I32Const(TYPE_PROMISE), I32Eq, I32Or,
+        LocalGet(ty), I32Const(TYPE_FUNCTION), I32Eq, I32Or,
+    );
+    if helpers.has_binary() {
+        wasm!(f; LocalGet(ty), I32Const(i32::from(abi::TYPE_TYPEDARRAY)), I32Eq, I32Or);
+    }
+}
+
+/// How a revoked proxy renders (DESIGN.md §6.11).
+const REVOKED_PROXY: &str = "<Revoked Proxy>";
+
 /// `__render_heap(p, depth)`: the cycle guard over the four container kinds
-/// (and typed arrays, in a program that can reach them), and the leaf kinds. A cycle target's `<ref *N> ` prefix is inserted at the
-/// container's start offset once its children have been rendered.
+/// (and typed arrays, in a program that can reach them), and the leaf kinds.
+/// A cycle target's `<ref *N> ` prefix is inserted at the container's start
+/// offset once its children have been rendered. A proxy renders as its
+/// target (unwrapped through proxy chains, no trap runs); a revoked one as
+/// `<Revoked Proxy>`.
 fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(
         leaves,
@@ -610,15 +634,23 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet
             Br(0), End, End,
         );
     };
-    wasm!(f;
-        LocalGet(p), I32Load8U(m8(0)), LocalTee(ty), I32Const(TYPE_ARRAY), I32Eq,
-        LocalGet(ty), I32Const(TYPE_OBJECT), I32Eq, I32Or,
-        LocalGet(ty), I32Const(TYPE_PROMISE), I32Eq, I32Or,
-        LocalGet(ty), I32Const(TYPE_FUNCTION), I32Eq, I32Or,
-    );
-    if helpers.has_binary() {
-        wasm!(f; LocalGet(ty), I32Const(i32::from(abi::TYPE_TYPEDARRAY)), I32Eq, I32Or);
+    if helpers.proxies() {
+        wasm!(f;
+            Block(BlockType::Empty), Loop(BlockType::Empty),
+            LocalGet(p), I32Load8U(m8(0)), I32Const(i32::from(abi::TYPE_PROXY)), I32Ne, BrIf(1),
+            LocalGet(p), I64Load(m64(abi::PROXY_TARGET_OFFSET)), I64Const(abi::NULL.cast_signed()), I64Eq,
+            If(BlockType::Empty),
+        );
+        lit(&mut f, strings, helpers, REVOKED_PROXY);
+        wasm!(f;
+            Return,
+            End,
+            LocalGet(p), I64Load(m64(abi::PROXY_TARGET_OFFSET)), I32WrapI64, LocalSet(p),
+            Br(0),
+            End, End,
+        );
     }
+    is_container(&mut f, p, ty, helpers);
     wasm!(f;
         LocalSet(cond),
         LocalGet(cond), If(BlockType::Empty),
@@ -696,6 +728,14 @@ fn render_leaf(
     is(f, TYPE_SYMBOL);
     render_symbol(f, strings, helpers, p, tmp);
     wasm!(f; Return, End);
+    // A BigInt: its decimal digits and `n` (DESIGN.md §6.10.2).
+    is(f, i32::from(abi::TYPE_BIGINT));
+    box_heap(f, p);
+    wasm!(f;
+        I32Const(10), Call(helpers.bigint(super::registry::Big::ToString)), Call(helpers.out_str()),
+    );
+    lit(f, strings, helpers, super::bigint::SUFFIX);
+    wasm!(f; Return, End);
     for (kind, open) in [(TYPE_MAP, "Map("), (TYPE_SET, "Set(")] {
         is(f, kind);
         lit(f, strings, helpers, open);
@@ -724,6 +764,8 @@ fn render_leaf(
     // Binary data (DESIGN.md §5.8.8), only in a program that can reach it.
     if helpers.has_binary() {
         is(f, i32::from(abi::TYPE_ARRAYBUFFER));
+        wasm!(f; LocalGet(p), LocalGet(depth), Call(helpers.render_binary()), Return, End);
+        is(f, i32::from(abi::TYPE_DATAVIEW));
         wasm!(f; LocalGet(p), LocalGet(depth), Call(helpers.render_binary()), Return, End);
     }
     lit(f, strings, helpers, "undefined");
@@ -1004,8 +1046,12 @@ fn render_wrapper(
     wasm!(f; If(BlockType::Empty));
     bracketed(f, "[Symbol: ");
     wasm!(f; Else);
+    class_is(f, abi::CLASS_BIGINT);
+    wasm!(f; If(BlockType::Empty));
+    bracketed(f, "[BigInt: ");
+    wasm!(f; Else);
     bracketed(f, "[Boolean: ");
-    wasm!(f; End, End, End);
+    wasm!(f; End, End, End, End);
     props_call(f, strings, helpers, (p, depth, first), 0, OPEN_TRAILING);
     wasm!(f; LocalGet(first), I32Eqz, If(BlockType::Empty));
     lit(f, strings, helpers, CLOSE_OBJECT);
@@ -1040,10 +1086,11 @@ fn emit_render_object(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafS
     props_call(&mut f, strings, helpers, (p, depth, first), 1, OPEN_OBJECT);
     close_list(&mut f, strings, helpers, first, "{}", CLOSE_OBJECT);
     wasm!(f; Return, End);
-    // The four wrapper classes: `BOOLEAN`/`NUMBER`/`STRING` are consecutive.
+    // The five wrapper classes: `BOOLEAN`/`NUMBER`/`STRING` are consecutive.
     wasm!(f;
         LocalGet(class), I32Const(i32::from(abi::CLASS_BOOLEAN)), I32Sub, I32Const(3), I32LtU,
         LocalGet(class), I32Const(i32::from(abi::CLASS_SYMBOL)), I32Eq, I32Or,
+        LocalGet(class), I32Const(i32::from(abi::CLASS_BIGINT)), I32Eq, I32Or,
         If(BlockType::Empty),
     );
     render_wrapper(&mut f, strings, helpers, (p, depth, class, first, prim));
@@ -1366,7 +1413,7 @@ fn emit_render_lookup(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 }
 
 /// `__heap_object(v) -> p`: the base of an object-family heap value that
-/// carries a `props` slot (not a string, array or symbol), or `0`.
+/// carries a `props` slot (not a string, array, symbol or `BigInt`), or `0`.
 fn emit_heap_object(leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_JS], &[RAW_I32]);
     let (v, ty) = (0, 1);
@@ -1376,6 +1423,7 @@ fn emit_heap_object(leaves: &LeafSet) -> Function {
         LocalGet(v), I32WrapI64, I32Load8U(m8(0)), LocalTee(ty), I32Const(TYPE_STRING), I32Ne,
         LocalGet(ty), I32Const(TYPE_ARRAY), I32Ne, I32And,
         LocalGet(ty), I32Const(TYPE_SYMBOL), I32Ne, I32And,
+        LocalGet(ty), I32Const(i32::from(abi::TYPE_BIGINT)), I32Ne, I32And,
         If(BlockType::Empty), LocalGet(v), I32WrapI64, Return, End,
         End,
         I32Const(0),

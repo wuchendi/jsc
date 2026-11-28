@@ -693,8 +693,8 @@ pub(super) fn emit_cond(
     emit_tag_eq(function, value, 0b101);
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    // HEAP: dispatch on the type byte — STRING reads its length, everything else
-    // (array/object/function) is unconditionally truthy.
+    // HEAP: dispatch on the type byte — STRING reads its length, a BIGINT its
+    // limb count, everything else (array/object/function) is truthy.
     emit_load_type_byte(function, value);
     function.instruction(&Instruction::I32Const(TYPE_STRING));
     function.instruction(&Instruction::I32Eq);
@@ -706,8 +706,17 @@ pub(super) fn emit_cond(
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::I32Ne);
     function.instruction(&Instruction::Else);
-    // ARRAY / OBJECT / FUNCTION: unconditionally truthy.
-    function.instruction(&Instruction::I32Const(1));
+    // ARRAY / OBJECT / FUNCTION: unconditionally truthy; a BigInt iff
+    // nonzero (its `len` shares the string's offset): type != BIGINT | len != 0.
+    emit_load_type_byte(function, value);
+    function.instruction(&Instruction::I32Const(TYPE_BIGINT));
+    function.instruction(&Instruction::I32Ne);
+    function.instruction(&Instruction::LocalGet(value));
+    function.instruction(&Instruction::I32WrapI64);
+    emit_load_str_len(function);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::I32Ne);
+    function.instruction(&Instruction::I32Or);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
     // NON-HEAP boxed: is_boolean ? (bits & 1) : 0.

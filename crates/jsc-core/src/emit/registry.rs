@@ -63,11 +63,13 @@ pub(super) enum Group {
     Extra,
     /// The binary-data helpers ([`binary::TYPES`]).
     Binary,
+    /// [`Big`].
+    Bigint,
 }
 
 impl Group {
     /// Every group, in function-index order.
-    const ALL: [Group; 14] = [
+    const ALL: [Group; 15] = [
         Self::Core,
         Self::Dtoa,
         Self::Tail,
@@ -82,6 +84,7 @@ impl Group {
         Self::Gc,
         Self::Extra,
         Self::Binary,
+        Self::Bigint,
     ];
 
     /// The number of functions in the group.
@@ -101,6 +104,7 @@ impl Group {
             Self::Gc => gc::TYPES.len(),
             Self::Extra => EXTRA.len(),
             Self::Binary => binary::TYPES.len(),
+            Self::Bigint => BIGINT.len(),
         }
     }
 
@@ -123,6 +127,7 @@ impl Group {
             Self::Gc => gc::TYPES.to_vec(),
             Self::Extra => of(&EXTRA),
             Self::Binary => binary::TYPES.to_vec(),
+            Self::Bigint => of(&BIGINT),
             Self::Settlers | Self::Builtins => return None,
         })
     }
@@ -170,6 +175,7 @@ impl Group {
             Self::Gc => sink(gc::emit_helpers(helpers, leaves, gc)),
             Self::Extra => of(&EXTRA, cx, sink),
             Self::Binary => sink(binary::emit_helpers(strings, helpers, leaves)),
+            Self::Bigint => of(&BIGINT, cx, sink),
         }
     }
 
@@ -266,6 +272,11 @@ impl Helpers<'_> {
     /// The function index of `helper`.
     pub(super) fn extra(self, helper: Extra) -> u32 {
         self.group(Group::Extra) + helper as u32
+    }
+
+    /// The function index of `helper`.
+    pub(super) fn bigint(self, helper: Big) -> u32 {
+        self.group(Group::Bigint) + helper as u32
     }
 }
 
@@ -401,6 +412,41 @@ pub(super) enum Extra {
     StackOverflow,
     MapHash,
     MapReindex,
+    ProxyTrap,
+    GetProto,
+    OwnProp,
+    DescCompatible,
+    SetBool,
+    ProxyGetProto,
+    ProxySetProto,
+    ProxyIsExtensible,
+    ProxyPreventExt,
+    ProxyOwnProp,
+    ProxyDefineOwn,
+    ProxyHas,
+    ProxyGet,
+    ProxySet,
+    ProxyDelete,
+    ProxyOwnKeys,
+}
+
+/// The `BigInt` runtime ([`bigint`]), after the extra helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Big {
+    New,
+    Trim,
+    Eq,
+    CmpMag,
+    Cmp,
+    CmpNum,
+    Hash,
+    ToString,
+    FromString,
+    ToF64,
+    FromF64,
+    ToNumeric,
+    ToBigInt,
+    LooseEq,
 }
 
 const CORE: [Row<Core>; 59] = [
@@ -461,7 +507,7 @@ const CORE: [Row<Core>; 59] = [
     (Core::Has, (&[I32, I64], &[I32]), |cx| {
         emit_has(cx.strings, cx.helpers, cx.leaves)
     }),
-    (Core::Delete, (&[I64, I32], &[]), |cx| {
+    (Core::Delete, (&[I64, I32, I32], &[I32]), |cx| {
         emit_delete(cx.strings, cx.helpers, cx.leaves)
     }),
     (Core::OwnKeys, (&[I64, I32], &[I64]), |cx| {
@@ -530,7 +576,7 @@ const CORE: [Row<Core>; 59] = [
         )
     }),
     (Core::SameValueZero, (&[I64, I64], &[I32]), |cx| {
-        emit_same_value_zero(cx.helpers.str_eq, cx.leaves)
+        emit_same_value_zero(cx.helpers, cx.leaves)
     }),
     (Core::ArraySearch, (&[I64, I64, I32], &[I64]), |cx| {
         builtins::emit_array_search(cx.helpers, cx.leaves)
@@ -727,7 +773,7 @@ const CONV: [Row<Conv>; 26] = [
     (Conv::OwnDesc, (&[I64, I32], &[I64]), |cx| {
         emit_own_desc(cx.strings, cx.helpers, cx.leaves)
     }),
-    (Conv::SetIntegrity, (&[I64, I32], &[]), |cx| {
+    (Conv::SetIntegrity, (&[I64, I32], &[I32]), |cx| {
         emit_set_integrity(cx.strings, cx.helpers, cx.leaves)
     }),
     (Conv::TestIntegrity, (&[I64, I32], &[I32]), |cx| {
@@ -773,7 +819,7 @@ const CONV: [Row<Conv>; 26] = [
     }),
 ];
 
-const EXTRA: [Row<Extra>; 3] = [
+const EXTRA: [Row<Extra>; 19] = [
     (Extra::StackOverflow, (&[], &[]), |cx| {
         emit_stack_overflow(cx.strings, cx.helpers, cx.leaves)
     }),
@@ -782,6 +828,101 @@ const EXTRA: [Row<Extra>; 3] = [
     }),
     (Extra::MapReindex, (&[I32], &[]), |cx| {
         emit_map_reindex(cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyTrap, (&[I32, I32], &[I64]), |cx| {
+        emit_proxy_trap(cx.helpers, cx.leaves)
+    }),
+    (Extra::GetProto, (&[I64], &[I64]), |cx| {
+        emit_get_proto(cx.helpers, cx.leaves)
+    }),
+    (Extra::OwnProp, (&[I64, I32, I32], &[I32]), |cx| {
+        emit_own_prop(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::DescCompatible, (&[I32, I32, I32], &[I32]), |cx| {
+        emit_desc_compatible(cx.helpers, cx.leaves)
+    }),
+    (Extra::SetBool, (&[I64, I32, I64, I64], &[I32]), |cx| {
+        emit_set_bool(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyGetProto, (&[I32], &[I64]), |cx| {
+        emit_proxy_get_proto(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxySetProto, (&[I32, I64], &[I32]), |cx| {
+        emit_proxy_set_proto(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyIsExtensible, (&[I32], &[I32]), |cx| {
+        emit_proxy_is_extensible(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyPreventExt, (&[I32], &[I32]), |cx| {
+        emit_proxy_prevent_ext(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyOwnProp, (&[I32, I32, I32], &[I32]), |cx| {
+        emit_proxy_own_prop(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (
+        Extra::ProxyDefineOwn,
+        (&[I32, I32, I32, I64, I64, I64], &[I32]),
+        |cx| emit_proxy_define_own(cx.strings, cx.helpers, cx.leaves),
+    ),
+    (Extra::ProxyHas, (&[I32, I32], &[I32]), |cx| {
+        emit_proxy_has(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyGet, (&[I32, I32, I64], &[I64]), |cx| {
+        emit_proxy_get(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxySet, (&[I32, I32, I64, I64], &[I32]), |cx| {
+        emit_proxy_set(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyDelete, (&[I32, I32], &[I32]), |cx| {
+        emit_proxy_delete(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::ProxyOwnKeys, (&[I32, I32], &[I64]), |cx| {
+        emit_proxy_own_keys(cx.strings, cx.helpers, cx.leaves)
+    }),
+];
+
+const BIGINT: [Row<Big>; 14] = [
+    (Big::New, (&[I32, I32], &[I32]), |cx| {
+        bigint::emit_new(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Big::Trim, (&[I32], &[I64]), |cx| {
+        bigint::emit_trim(cx.leaves)
+    }),
+    (Big::Eq, (&[I64, I64], &[I32]), |cx| {
+        bigint::emit_eq(cx.leaves)
+    }),
+    (Big::CmpMag, (&[I32, I32], &[I32]), |cx| {
+        bigint::emit_cmp_mag(cx.leaves)
+    }),
+    (Big::Cmp, (&[I32, I32], &[I32]), |cx| {
+        bigint::emit_cmp(cx.helpers, cx.leaves)
+    }),
+    (Big::CmpNum, (&[I32, F64], &[I32]), |cx| {
+        bigint::emit_cmp_num(cx.leaves)
+    }),
+    (Big::Hash, (&[I32], &[I32]), |cx| {
+        bigint::emit_hash(cx.leaves)
+    }),
+    (Big::ToString, (&[I64, I32], &[I32]), |cx| {
+        bigint::emit_to_string(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Big::FromString, (&[I32], &[I64]), |cx| {
+        bigint::emit_from_string(cx.helpers, cx.leaves)
+    }),
+    (Big::ToF64, (&[I32], &[F64]), |cx| {
+        bigint::emit_to_f64(cx.leaves)
+    }),
+    (Big::FromF64, (&[F64], &[I64]), |cx| {
+        bigint::emit_from_f64(cx.helpers, cx.leaves)
+    }),
+    (Big::ToNumeric, (&[I64], &[I64]), |cx| {
+        bigint::emit_to_numeric(cx.helpers, cx.leaves)
+    }),
+    (Big::ToBigInt, (&[I64], &[I64]), |cx| {
+        bigint::emit_to_bigint(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Big::LooseEq, (&[I64, I64], &[I32]), |cx| {
+        bigint::emit_loose_eq(cx.helpers, cx.leaves)
     }),
 ];
 
@@ -802,5 +943,6 @@ mod tests {
         check(&CTOR, |member| member as usize);
         check(&CONV, |member| member as usize);
         check(&EXTRA, |member| member as usize);
+        check(&BIGINT, |member| member as usize);
     }
 }

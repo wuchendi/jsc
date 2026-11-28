@@ -1318,7 +1318,7 @@ pub(super) fn emit_strict_eq(
     function.instruction(&Instruction::I64Const(FALSE_BITS));
 
     // eq is a 3-way runtime dispatch on the two stashed operands:
-    //   both strings -> __str_eq (byte content);
+    //   both strings or BigInts -> __str_eq (byte content) / __bigint_eq;
     //   else both numbers -> f64 equality (so NaN !== NaN, +0 === -0);
     //   else identity — raw i64 bits equal (different types differ in tag, so
     //   they compare unequal). The string path is guarded by an `if` (not a
@@ -1327,16 +1327,26 @@ pub(super) fn emit_strict_eq(
     //   shares tag 0b101, "both strings" reads each operand's TYPE BYTE; two
     //   arrays/objects fall to the identity (i64 bits) compare — reference
     //   equality, matching JS (`[1] === [1]` is `false`).
-    emit_is_string(function, s0);
-    emit_is_string(function, s1);
+    emit_is_str_or_bigint(function, s0);
+    emit_is_str_or_bigint(function, s1);
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
-    // THEN: byte-content equality of the two heap strings.
+    // THEN: two BigInts compare by value (a BigInt against a string is
+    // unequal: `__bigint_eq` checks both kinds), two heap strings by content.
+    emit_load_type_byte(function, s0);
+    emit_load_type_byte(function, s1);
+    function.instruction(&Instruction::I32Or);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(s0));
+    function.instruction(&Instruction::LocalGet(s1));
+    function.instruction(&Instruction::Call(helpers.bigint(registry::Big::Eq)));
+    function.instruction(&Instruction::Else);
     function.instruction(&Instruction::LocalGet(s0));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalGet(s1));
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::Call(helpers.str_eq));
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::Else);
     // ELSE: both_numbers ? f64_eq(s0, s1) : bits_eq(s0, s1).
     // val1 = numeric equality (f64 compare).

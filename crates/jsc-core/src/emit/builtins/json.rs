@@ -76,16 +76,22 @@ fn box_heap(function: &mut FnBuilder<'_>) {
 }
 
 /// Push `1` when the jsval in `local` is a wrapper object (`TYPE_OBJECT`
-/// class `BOOLEAN`, `NUMBER` or `STRING`).
+/// class `BOOLEAN`, `NUMBER`, `STRING` or `BIGINT`).
 fn is_any_wrapper(function: &mut FnBuilder<'_>, local: u32) {
+    let class = MemArg {
+        offset: u64::from(abi::HEADER_CLASS_OFFSET),
+        align: 0,
+        memory_index: 0,
+    };
     emit_is_pointer(function, local);
     wasm!(function;
         If(BlockType::Result(ValType::I32)),
         LocalGet(local), I32WrapI64, I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }),
         I32Const(TYPE_OBJECT), I32Eq,
-        LocalGet(local), I32WrapI64,
-        I32Load8U(MemArg { offset: u64::from(abi::HEADER_CLASS_OFFSET), align: 0, memory_index: 0 }),
+        LocalGet(local), I32WrapI64, I32Load8U(class),
         I32Const(i32::from(abi::CLASS_BOOLEAN)), I32Sub, I32Const(3), I32LtU,
+        LocalGet(local), I32WrapI64, I32Load8U(class),
+        I32Const(i32::from(abi::CLASS_BIGINT)), I32Eq, I32Or,
         I32And,
         Else, I32Const(0), End,
     );
@@ -413,8 +419,12 @@ pub(in crate::emit) fn emit_json_rep(
         box_heap(f);
         wasm!(f; LocalSet(key), End);
     };
+    // `GetV(value, "toJSON")` of an object or a BigInt (through
+    // `%BigInt.prototype%`).
     emit_is_object(&mut f, value);
+    bigint::emit_is_bigint(&mut f, value);
     wasm!(f;
+        I32Or,
         If(BlockType::Empty),
         LocalGet(value), I32Const(tok("toJSON")), Call(helpers.get), LocalSet(to_json),
     );
@@ -433,6 +443,17 @@ pub(in crate::emit) fn emit_json_rep(
     return_if_pending(&mut f);
     wasm!(f; End);
     unwrap_primitive(&mut f, value);
+    // A BigInt left after `toJSON` and the replacer cannot be serialized.
+    bigint::emit_is_bigint(&mut f, value);
+    wasm!(f; If(BlockType::Empty));
+    emit_throw_error(
+        &callee_type_error(bigint::BIGINT_JSON),
+        &mut f,
+        scratch,
+        strings,
+        helpers,
+    );
+    wasm!(f; End);
     wasm!(f; LocalGet(value), I64Const(UNDEFINED_BITS), I64Eq);
     emit_is_function(&mut f, value);
     wasm!(f; I32Or);
@@ -491,7 +512,16 @@ pub(in crate::emit) fn emit_json_rep(
         Else,
         LocalGet(value), I32Const(OWN_KEYS), Call(helpers.own_keys), I32WrapI64,
         End,
-        LocalTee(keys), I32Load(ARR_LEN), LocalSet(n),
+        LocalTee(keys),
+    );
+    if helpers.proxies() {
+        // A proxy's traps may throw (DESIGN.md §6.11).
+        wasm!(f;
+            GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+        );
+    }
+    wasm!(f;
+        I32Load(ARR_LEN), LocalSet(n),
         I32Const(tok("{")), LocalSet(acc),
         I32Const(1), LocalSet(first),
         I32Const(0), LocalSet(i),
@@ -687,7 +717,7 @@ pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>, leaves: &LeafSet) 
     let ptr = f.local(Base);
     let [n, i] = [(); 2].map(|()| f.local(int));
     let k = f.local(Base);
-    let [array, e] = [(); 2].map(|()| f.local(int));
+    let array = f.local(int);
     let spread = f.local(Jsval);
     wasm!(f; LocalGet(holder), LocalGet(key), Call(helpers.get), LocalSet(val));
     return_if_pending(&mut f);
@@ -726,13 +756,7 @@ pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>, leaves: &LeafSet) 
         LocalGet(result), I64Const(UNDEFINED_BITS), I64Eq,
         If(BlockType::Empty),
         // `[[Delete]]`: a non-configurable property stays (no throw).
-        LocalGet(val), I32WrapI64, LocalGet(k), Call(helpers.prop_find), LocalTee(e),
-        If(BlockType::Result(ValType::I32)),
-        LocalGet(e), I32Load(MemArg { offset: u64::from(abi::PROP_ATTRS_OFFSET), align: 2, memory_index: 0 }),
-        I32Const(abi::ATTR_CONFIGURABLE.cast_signed()), I32And,
-        Else, I32Const(1),
-        End,
-        If(BlockType::Empty), LocalGet(val), LocalGet(k), Call(helpers.delete), End,
+        LocalGet(val), LocalGet(k), I32Const(0), Call(helpers.delete), Drop,
         Else,
         // `CreateDataProperty` (an array index included): a rejection is
         // ignored.

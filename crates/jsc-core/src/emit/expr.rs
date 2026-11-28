@@ -57,6 +57,11 @@ fn emit_node_inner(
             let offset = strings.get_str(text).copied().unwrap_or(HEAP_BASE);
             function.instruction(&Instruction::I64Const(HEAP_BITS | i64::from(offset)));
         }
+        IrNode::BigInt { neg, limbs } => {
+            // A BigInt literal is a heap jsval of its static block
+            // (`collect_strings` laid every nonzero literal out).
+            function.instruction(&Instruction::I64Const(strings.bigint_bits(*neg, limbs)));
+        }
         IrNode::Bool(value) => {
             // A boolean jsval is the boxed TRUE/FALSE immediate.
             function.instruction(&Instruction::I64Const(if *value {
@@ -561,6 +566,7 @@ fn emit_node_inner(
             function.instruction(&Instruction::LocalTee(scratch + 22));
             function.instruction(&Instruction::I32Const(INTEGRITY_FROZEN));
             function.instruction(&Instruction::Call(helpers.set_integrity()));
+            function.instruction(&Instruction::Drop);
             function.instruction(&Instruction::LocalGet(scratch + 22));
         }
         IrNode::ToPropertyKey(operand) => {
@@ -1936,6 +1942,10 @@ pub(super) fn emit_is_object(function: &mut impl Sink, local: u32) {
     function.instruction(&Instruction::I32Const(TYPE_SYMBOL));
     function.instruction(&Instruction::I32Ne);
     function.instruction(&Instruction::I32And);
+    emit_load_type_byte(function, local);
+    function.instruction(&Instruction::I32Const(TYPE_BIGINT));
+    function.instruction(&Instruction::I32Ne);
+    function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
@@ -3160,8 +3170,9 @@ pub(super) fn emit_console_log_spread(
 /// `typeof` splits on whether the value is a heap pointer (single tag `0b101`):
 ///
 /// - **Heap pointer** — read the type byte and map it to the `TYPEOF_STRINGS`
-///   index: `TYPE_STRING` -> 4 ("string"), `TYPE_FUNCTION` -> 5 ("function"),
-///   `TYPE_SYMBOL` -> 6 ("symbol"), every other kind -> 3 ("object").
+///   index: `TYPE_STRING` -> 4 ("string"), `TYPE_FUNCTION` and a callable
+///   proxy -> 5 ("function"), `TYPE_SYMBOL` -> 6 ("symbol"), `TYPE_BIGINT`
+///   -> 7 ("bigint"), every other kind -> 3 ("object").
 /// - **Immediate** — the NaN-box tag orders boolean(1), null(2), undefined(3),
 ///   while `TYPEOF_STRINGS` orders boolean(1), undefined(2), object(3); booleans
 ///   line up but null/undefined are swapped, so `boxed index = tag ^ ((tag >> 1)
@@ -3188,15 +3199,38 @@ pub(super) fn emit_typeof_node(
     function.instruction(&Instruction::I32And);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     // HEAP: map the type byte -> typeof index. Base is 3 ("object", array/object);
-    // override string -> 4, function -> 5 and symbol -> 6 with layered selects.
+    // override string -> 4, function -> 5, symbol -> 6 and bigint -> 7 with
+    // layered selects.
     function.instruction(&Instruction::I64Const(4)); // val1: "string"
     function.instruction(&Instruction::I64Const(6)); // val1: "symbol"
+    function.instruction(&Instruction::I64Const(7)); // val1: "bigint"
     function.instruction(&Instruction::I64Const(5)); // val1: "function"
     function.instruction(&Instruction::I64Const(3)); // val2: base "object"
     emit_load_type_byte(function, scratch);
     function.instruction(&Instruction::I32Const(TYPE_FUNCTION));
     function.instruction(&Instruction::I32Eq);
+    if helpers.proxies() {
+        // A callable proxy is a function too (DESIGN.md §6.11).
+        let mask = 0xFF | (0xFF << 24);
+        let callable = TYPE_PROXY | (i32::from(abi::PROXY_CLASS_CALLABLE) << 24);
+        function.instruction(&Instruction::LocalGet(scratch));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::I32Load(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        function.instruction(&Instruction::I32Const(mask));
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::I32Const(callable));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::I32Or);
+    }
     function.instruction(&Instruction::Select); // function ? 5 : 3
+    emit_load_type_byte(function, scratch);
+    function.instruction(&Instruction::I32Const(TYPE_BIGINT));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::Select); // bigint ? 7 : (function ? 5 : 3)
     emit_load_type_byte(function, scratch);
     function.instruction(&Instruction::I32Const(TYPE_SYMBOL));
     function.instruction(&Instruction::I32Eq);
@@ -3232,7 +3266,7 @@ pub(super) fn emit_typeof_node(
     // pointer for that word: stash the index, then a branchless nested-`select` fold
     // picks `HEAP_BITS | <offset>` for the matching entry (each step keeps the
     // accumulator as the deeper operand, testing `index != k`). `collect_node`
-    // interns all seven words when the program uses `typeof`; the `HEAP_BASE` fallback
+    // interns all eight words when the program uses `typeof`; the `HEAP_BASE` fallback
     // keeps it valid regardless.
     function.instruction(&Instruction::LocalSet(scratch));
     let word_ptr = |k: usize| {

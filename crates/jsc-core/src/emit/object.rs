@@ -362,12 +362,16 @@ pub(super) fn emit_object_builtin_node(
         ObjectBuiltinOp::Entries => OWN_ENTRIES,
         ObjectBuiltinOp::ForInKeys => {
             function.instruction(&Instruction::Call(helpers.for_in_keys));
+            // A proxy trap may throw (DESIGN.md §6.11).
+            if helpers.proxies() {
+                emit_propagate_if_pending(function, helpers);
+            }
             return;
         }
     };
     function.instruction(&Instruction::I32Const(mode));
     function.instruction(&Instruction::Call(helpers.own_keys));
-    if helpers.has_accessors && mode != OWN_KEYS {
+    if helpers.has_accessors && (mode != OWN_KEYS || helpers.proxies()) {
         emit_propagate_if_pending(function, helpers);
     }
 }
@@ -809,8 +813,9 @@ fn emit_bound_restart(function: &mut impl Sink, f: u32) {
 /// stack. `obj` and the key are evaluated (stashed in the high scratch slots
 /// `+14` / `+15`); a `null` / `undefined` `obj` throws the nullish `TypeError`
 /// (`ToObject` of the base); then the key is converted with `ToPropertyKey` (a
-/// lookup: a never-interned key is absent) and `__delete` tombstones the own
-/// property; a non-configurable one throws.
+/// lookup: a never-interned key is absent) and strict `__delete` tombstones
+/// the own property; a non-configurable one throws (a proxy's
+/// `deleteProperty` trap decides, DESIGN.md §6.11).
 pub(super) fn emit_object_delete_node(
     obj: &IrNode,
     key: &IrNode,
@@ -832,7 +837,9 @@ pub(super) fn emit_object_delete_node(
     }
     function.instruction(&Instruction::LocalGet(s_obj));
     emit_prop_key(function, key, s_key, false, strings, helpers);
+    function.instruction(&Instruction::I32Const(1));
     function.instruction(&Instruction::Call(helpers.delete));
+    function.instruction(&Instruction::Drop);
     emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::I64Const(TRUE_BITS));
 }
@@ -3093,16 +3100,20 @@ pub(super) fn emit_prop_throw(
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     // prefix + String(key) + "' on " + kind + " '" + String(recv) + "'", where
-    // kind is number / symbol / string (the heap primitives) / boolean.
+    // kind is number / symbol / bigint / string (the heap primitives) /
+    // boolean.
     function.instruction(&Instruction::I32Const(at(PRIM_CREATE_PREFIX)));
     to_string(&mut function, key);
     concat(&mut function);
     function.instruction(&Instruction::I32Const(at(PRIM_CREATE_MID)));
     concat(&mut function);
     function.instruction(&Instruction::I32Const(at("number")));
+    function.instruction(&Instruction::I32Const(at("bigint")));
     function.instruction(&Instruction::I32Const(at("symbol")));
     function.instruction(&Instruction::I32Const(at("string")));
     emit_is_symbol(&mut function, recv);
+    function.instruction(&Instruction::Select);
+    bigint::emit_is_bigint(&mut function, recv);
     function.instruction(&Instruction::Select);
     function.instruction(&Instruction::I32Const(at("boolean")));
     emit_is_pointer(&mut function, recv);

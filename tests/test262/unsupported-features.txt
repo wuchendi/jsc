@@ -23,7 +23,6 @@ uint8array-base64
 stable-typedarray-sort
 immutable-arraybuffer
 align-detached-buffer-semantics-with-web-reality
-DataView*
 SharedArrayBuffer
 Atomics*
 

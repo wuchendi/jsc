@@ -243,10 +243,11 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
         | BuiltinCtor::WeakSet
         | BuiltinCtor::WeakRef
         | BuiltinCtor::FinalizationRegistry => body.requires_new(ctor, body.proto(ctor)),
-        // The "requires 'new'" check only: `array_buffer::emit_ctor` converts
-        // the arguments before it reads the prototype, `typed_array::emit_ctor`
-        // runs the overloads (DESIGN.md §5.8.7).
-        BuiltinCtor::ArrayBuffer | BuiltinCtor::Typed(_) => {
+        // The "requires 'new'" check only: `array_buffer::emit_ctor` and
+        // `data_view::emit_ctor` convert the arguments before they read the
+        // prototype, `typed_array::emit_ctor` runs the overloads (DESIGN.md
+        // §5.8.7).
+        BuiltinCtor::ArrayBuffer | BuiltinCtor::DataView | BuiltinCtor::Typed(_) => {
             body.requires_new(ctor, IrNode::Undefined)
         }
         // Abstract: calling or constructing it always throws.

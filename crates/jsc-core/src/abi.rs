@@ -70,7 +70,7 @@ pub(crate) const HOLE: u64 = UNDEFINED | 1;
 /// `emit_typeof_node` interns and selects between; the decoder reads them back as
 /// ordinary strings. Keeping them a single source shared by the emitter and the
 /// runtime prevents the index/word tables from drifting apart.
-pub(crate) const TYPEOF_STRINGS: [&str; 7] = [
+pub(crate) const TYPEOF_STRINGS: [&str; 8] = [
     "number",
     "boolean",
     "undefined",
@@ -78,6 +78,7 @@ pub(crate) const TYPEOF_STRINGS: [&str; 7] = [
     "string",
     "function",
     "symbol",
+    "bigint",
 ];
 
 /// The NaN-boxed heap-pointer header: [`QNAN`] plus tag `0b101` — the SINGLE tag
@@ -148,6 +149,11 @@ pub(crate) const CLASS_SYMBOL: u8 = 7;
 /// holds the iterated value, the next index and the iterator kind past the
 /// object-family prefix; no host reads the payload.
 pub(crate) const CLASS_ITERATOR: u8 = 8;
+
+/// [`TYPE_OBJECT`] `class` byte: a `BigInt` wrapper object (created only by
+/// `ToObject`), its `[[BigIntData]]` (the [`TYPE_BIGINT`] jsval) at
+/// [`WRAPPER_VALUE_OFFSET`].
+pub(crate) const CLASS_BIGINT: u8 = 9;
 
 /// Offset of a wrapper object's `[[PrimitiveValue]]` jsval (an `i64`) from
 /// its base, right after the object-family prefix.
@@ -711,11 +717,65 @@ pub(crate) const ELEMS_DATA_OFFSET: u32 = 8;
 /// symbols are static blocks in the realm image.
 pub(crate) const TYPE_SYMBOL: u8 = 14;
 
+/// TYPE BYTE of a `BigInt` primitive (DESIGN.md §6.10.1): a heap block under
+/// the single [`HEAP`] tag, `[type=21][gc][flags][class=0][len:u32][limbs]`:
+/// the magnitude as `len` little-endian `u32` limbs from
+/// [`BIGINT_DATA_OFFSET`], the sign in [`BIGINT_FLAG_NEG`]. Every reachable
+/// block is canonical (nonzero top limb; `0n` is `len = 0`, sign clear) and
+/// immutable. A collector leaf. `typeof` is `"bigint"`.
+pub(crate) const TYPE_BIGINT: u8 = 21;
+
+/// [`TYPE_BIGINT`] header `flags` bit: the value is negative.
+pub(crate) const BIGINT_FLAG_NEG: u8 = 1;
+
+/// Byte offset (from a [`TYPE_BIGINT`] block base) of the u32 limb count; the
+/// same offset as [`STR_LEN_OFFSET`], so `len != 0` is `ToBoolean` for both.
+pub(crate) const BIGINT_LEN_OFFSET: u32 = 4;
+
+/// Byte offset (from a [`TYPE_BIGINT`] block base) of limb 0.
+pub(crate) const BIGINT_DATA_OFFSET: u32 = 8;
+
+/// The most limbs a `BigInt` may have (2^24 bits): a larger result throws
+/// `RangeError: Maximum BigInt size exceeded`.
+pub(crate) const BIGINT_MAX_LIMBS: u32 = 1 << 19;
+
+const _: () = assert!(BIGINT_LEN_OFFSET == STR_LEN_OFFSET);
+
 /// TYPE BYTE of an internal raw buffer: `[type=19][pad×3][len:u32][data]`,
 /// a collector leaf whose `len` bytes from offset `8` hold no references (the
 /// grown intern table, the `Math.sumPrecise` accumulator, the console render
 /// output, path and ref buffers). Never a user value.
 pub(crate) const TYPE_RAW: u8 = 19;
+
+/// TYPE BYTE of a Proxy exotic object (DESIGN.md §6.11): `[type=20][gc]
+/// [flags][class][props:u32 @4][proto:i64 @8 = null][func_idx:u32 @16]
+/// [reserved:u32][env:i64 @24][target:i64 @32][handler:i64 @40]`. The
+/// flags are [`FUNC_FLAG_CONSTRUCTOR`] and [`FUNC_FLAG_SELF_ALLOC`] when the
+/// target is a constructor; the class byte is [`PROXY_CLASS_CALLABLE`] when
+/// it is callable. `props` holds private-name entries only; `target` and
+/// `handler` are `null` once revoked. Not in the object family: every
+/// property helper takes its proxy path first. Maps to `typeof` "object"
+/// ("function" when callable).
+pub(crate) const TYPE_PROXY: u8 = 20;
+
+/// Byte offset (from a [`TYPE_PROXY`] block base) of the `[[ProxyTarget]]`
+/// jsval.
+pub(crate) const PROXY_TARGET_OFFSET: u32 = 32;
+
+/// Byte offset (from a [`TYPE_PROXY`] block base) of the `[[ProxyHandler]]`
+/// jsval.
+pub(crate) const PROXY_HANDLER_OFFSET: u32 = 40;
+
+/// The byte size of a [`TYPE_PROXY`] block.
+pub(crate) const PROXY_BLOCK_SIZE: u32 = 48;
+
+/// [`TYPE_PROXY`] class byte (offset [`HEADER_CLASS_OFFSET`]): the target was
+/// callable at creation.
+pub(crate) const PROXY_CLASS_CALLABLE: u8 = 1;
+
+// A proxy keeps a function's call fields where `call_indirect` reads them.
+const _: () = assert!(FUNC_INDEX_OFFSET == 16 && FUNC_ENV_OFFSET == 24);
+const _: () = assert!(PROXY_HANDLER_OFFSET + 8 == PROXY_BLOCK_SIZE);
 
 /// TYPE BYTE of a `WeakMap` handle (design/runtime-memory.md §6.2): the
 /// object-family prefix, then `[weak_next:u32 @16][entries:u32 @20]
@@ -877,6 +937,29 @@ pub(crate) const TA_FLAG_LENGTH_TRACKING: u8 = 2;
 /// construction (`IsTypedArrayFixedLength` is false); never cleared.
 pub(crate) const TA_FLAG_RESIZABLE_BUFFER: u8 = 4;
 
+/// Byte offset (from a [`TYPE_DATAVIEW`] block base) of the u32 raw ref to
+/// the viewed [`TYPE_ARRAYBUFFER`] block (DESIGN.md §5.8.3).
+pub(crate) const DV_BUFFER_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_DATAVIEW`] block base) of the u32 byte offset
+/// into the buffer.
+pub(crate) const DV_BYTE_OFFSET_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
+/// Byte offset (from a [`TYPE_DATAVIEW`] block base) of the u32 byte length
+/// (`0`, ignored, when length-tracking).
+pub(crate) const DV_BYTE_LENGTH_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_DATAVIEW`] block.
+pub(crate) const DV_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// [`TYPE_DATAVIEW`] header `flags` bit: the view tracks its buffer's length
+/// (`[[ByteLength]]` is `auto`).
+pub(crate) const DV_FLAG_LENGTH_TRACKING: u8 = 2;
+
+/// [`TYPE_DATAVIEW`] header `flags` bit: the buffer was resizable at
+/// construction (never cleared).
+pub(crate) const DV_FLAG_RESIZABLE_BUFFER: u8 = 4;
+
 /// Byte offset (from a [`TYPE_SYMBOL`] block base) of the `description` jsval
 /// (an `i64`: a string jsval or `undefined`).
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]
@@ -1017,6 +1100,14 @@ pub(crate) const DEC_POW5_LEN: u32 = 1440;
 
 /// Address of the 19-entry table of decimal-conversion shift steps.
 pub(crate) const DEC_POWERS: u32 = DEC_POW5 + DEC_POW5_LEN;
+
+/// Address of the static `0n` block (8 bytes: the [`TYPE_BIGINT`] type byte,
+/// `len = 0`), in the alignment slack between [`DEC_POWERS`] and
+/// [`NUM_SCRATCH_ADDR`]: every zero `BigInt` result, and the dummy result of a
+/// `BigInt` helper that throws.
+pub(crate) const BIGINT_ZERO: u32 = align_up(DEC_POWERS + 19, BLOCK_ALIGN);
+
+const _: () = assert!(BIGINT_ZERO + 8 <= NUM_SCRATCH_ADDR);
 
 /// The first address after the fixed static area, where the string blocks begin.
 pub(crate) const STATIC_AREA_END: u32 = GC_MARK_STACK + GC_MARK_STACK_SIZE;

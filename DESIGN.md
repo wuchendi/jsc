@@ -256,17 +256,16 @@ reinterpret directly. Consequently NaN tests compare bits directly, and a
 computed NaN can never alias a boolean, `null`, `undefined`, or pointer.
 
 **`typeof`.** `typeof` yields an interned heap string: the type index
-(`number`, `boolean`, `undefined`, `object`, `string`, `function`, `symbol`
-— `abi::TYPEOF_STRINGS`) selects the data-segment offset of the matching word,
+(`number`, `boolean`, `undefined`, `object`, `string`, `function`, `symbol`,
+`bigint` — `abi::TYPEOF_STRINGS`) selects the data-segment offset of the matching word,
 so `typeof x === "number"`, concatenation, and `.length` all go through
 ordinary string machinery. `TYPE_FUNCTION` blocks report `"function"`, strings
-`"string"`, `TYPE_SYMBOL` blocks `"symbol"`, every other heap kind `"object"`. `typeof` of an unresolvable
-global name is `"undefined"` and never throws. BigInt design (§6.10, lands in B2a): `TYPE_BIGINT`
-blocks report `"bigint"`, the eighth `TYPEOF_STRINGS` entry, and `0n` joins
-the falsy values below.
+`"string"`, `TYPE_SYMBOL` blocks `"symbol"`, `TYPE_BIGINT` blocks `"bigint"`
+(§6.10), every other heap kind `"object"`. `typeof` of an unresolvable
+global name is `"undefined"` and never throws.
 
-**Truthiness.** Falsy is exactly `false`, `null`, `undefined`, `±0`, `NaN`, and
-the empty string; every other value — including `[]`, `{}`, wrapper objects, and
+**Truthiness.** Falsy is exactly `false`, `null`, `undefined`, `±0`, `NaN`,
+`0n`, and the empty string; every other value — including `[]`, `{}`, wrapper objects, and
 every function — is truthy.
 
 ### 4.2 Module layout
@@ -533,6 +532,9 @@ Arrays additionally: `4` `SPARSE`, `8` `JOINING` (set while `join` runs, so a
 cyclic element joins as `""`), `16` `LENGTH_READONLY` (`length` is
 non-writable; only on a `DICTIONARY` array), `32` `DICTIONARY` (§5.4). None of
 the array bits is ever cleared (except `JOINING`).
+Proxies (`TYPE_PROXY`, phase 5b, planned, §6.11) keep the prefix shape but
+are not in the object family; their flags reuse `CONSTRUCTOR` (`8`) and
+`SELF_ALLOC` (`32`), and header byte 3 holds `1` `PROXY_CLASS_CALLABLE`.
 
 ### 5.2 Block layouts
 
@@ -557,8 +559,9 @@ the array bits is ever cleared (except `JOINING`).
 | `17` `TYPE_WEAKREF` | `WeakRef` | prefix, `weak_next: u32 @16`, pad, `target: i64 @24` (weak; `undefined` once collected) | 32 | `object` |
 | `18` `TYPE_FINREG` | `FinalizationRegistry` | prefix, `weak_next: u32 @16`, `cells: u32 @20` → weak `TYPE_ELEMS` of `(target, held, token)` triples, `cleanup: i64 @24`, `flags: u32 @32` (`1` `FINREG_FLAG_JOB_QUEUED`), `job_next: u32 @36` (the `$__fin_jobs` link) | 40 | `object` |
 | `19` `TYPE_RAW` | internal raw buffer | header, `len: u32 @4`, `len` bytes from `@8`, no references (the grown intern table, `Math.sumPrecise` accumulator) | 8 + `len` | — |
+| `20` `TYPE_PROXY` | Proxy exotic object (phase 5b, planned, §6.11) | header (flags `8` `CONSTRUCTOR`, `32` `SELF_ALLOC`; byte 3 `1` `PROXY_CLASS_CALLABLE`), `props: u32 @4` (private entries only), `proto: i64 @8` (always `null`), `func_idx: u32 @16` (the `ProxyCall` slot when callable), reserved `u32 @20`, `env: i64 @24` (itself when callable), `target: i64 @32`, `handler: i64 @40` (both `null` once revoked) | 48 | `function` when callable, else `object` |
 | `14` `TYPE_SYMBOL` | Symbol primitive | header (flags: `4` `SYMBOL_FLAG_REGISTERED`, `8` `SYMBOL_FLAG_PRIVATE` (a private name, §7.6, phase 5a); bits `1`/`2` always clear), reserved `u32 @4` = 0, `description: i64 @8` (string or `undefined`) | 16 | `symbol` |
-| `21` `TYPE_BIGINT` | BigInt primitive (design, lands in B2a: §6.10) | header (flags: `1` `BIGINT_FLAG_NEG`), `len: u32 @4` (limb count), `u32` limbs × `len` @8, little-endian, canonical | `8 + 4·len`, rounded | `bigint` |
+| `21` `TYPE_BIGINT` | BigInt primitive (§6.10) | header (flags: `1` `BIGINT_FLAG_NEG`), `len: u32 @4` (limb count), `u32` limbs × `len` @8, little-endian, canonical | `8 + 4·len`, rounded | `bigint` |
 
 **`TYPE_OBJECT` classes** (header byte 3): `0` `CLASS_ORDINARY`, `1`
 `CLASS_ERROR` (an Error instance: its kind is its prototype, §7.7), `2`
@@ -581,7 +584,9 @@ holds the generator state `0` suspended-start, `1` suspended-yield, `2`
 running, `3` completed; the underlying iterator at `32`, its `next` at
 `40`, the counter or remaining limit (`f64`) at `48`, the callback at `56`,
 a `flatMap`'s inner iterator at `64` (`undefined` while none is open) and
-its `next` at `72`); no host reads the payload).
+its `next` at `72`); no host reads the payload), `9` `CLASS_BIGINT` (a BigInt
+wrapper, created only by `ToObject`, `[[BigIntData]]` at
+`WRAPPER_VALUE_OFFSET`).
 
 Notes per kind:
 
@@ -1037,11 +1042,11 @@ and never nests (`$__gc_busy`).
 
   | type | references traced (offsets from the base) |
   |---|---|
-  | `0` `TYPE_STRING`, `19` `TYPE_RAW`, `0xFF` `TYPE_FREE` | none (leaves) |
+  | `0` `TYPE_STRING`, `19` `TYPE_RAW`, `21` `TYPE_BIGINT`, `0xFF` `TYPE_FREE` | none (leaves) |
   | object family (`1`–`3`, `6`–`10`, `15`–`18`) | prefix: raw `props @4`, jsval `proto @8`; then per kind below |
   | `1` `TYPE_ARRAY` | raw `elems @20` |
   | `2` `TYPE_OBJECT` classes `0` ordinary, `1` error, `2` arguments, `6` global | prefix only (an inline table is reached through `props`) |
-  | `2` classes `3` / `4` / `5` / `7` wrappers | jsval `@16` |
+  | `2` classes `3` / `4` / `5` / `7` / `9` wrappers | jsval `@16` |
   | `2` class `8` iterators | jsval `@16`; kinds `>= 16` (the `Iterator.from` wrapper `16`, the lazy helpers `17..=21`, the async-from-sync iterator `32`) also jsvals `@32`, `@40`; helpers also `@56`, `@64`, `@72` (`@24`, `@28` and a helper's `f64 @48` are not references) |
   | `3` `TYPE_FUNCTION` | jsval `env @24` (a bound function's `[target, boundThis, ...args]` array, a settler's resolving record) |
   | `4` `TYPE_ENV` | jsval slots `@8 + 8k`, `k < count @4`: closure envs, generator frames, async-generator request records, promise reaction / job / thenable-job records, resolving-function records, `Array.fromAsync` state |
@@ -1054,6 +1059,7 @@ and never nests (`$__gc_busy`).
   | `12` `TYPE_PROPS` | entries `k < count @4` at `16 + 16k`: raw key `@+0` (`0` = tombstone), jsval value `@+8` |
   | `13` `TYPE_ELEMS` | jsval slots `@8 + 8i` for every `i < cap @4` (not `len`, so a stale slot can only retain); a store flagged `ELEMS_FLAG_WEAK` is marked but none of its slots is traced |
   | `14` `TYPE_SYMBOL` | jsval `description @8` |
+  | `20` `TYPE_PROXY` (phase 5b, planned, §6.11) | raw `props @4`, jsvals `proto @8`, `env @24`, `target @32`, `handler @40` |
   | `15` `TYPE_WEAKMAP`, `16` `TYPE_WEAKSET` | raw `entries @20` (the weak store: marked, not traced); the handle is linked into `$__gc_weak` through `weak_next` unless already linked this cycle |
   | `17` `TYPE_WEAKREF` | nothing past the prefix (`target @24` is weak); linked into `$__gc_weak_refs` |
   | `18` `TYPE_FINREG` | jsval `cleanup @24`, raw `cells @20` (the weak store: marked, not traced) and each cell's `held` value (slot `3i + 1`; targets and tokens are weak); linked into `$__gc_weak_regs` |
@@ -1093,38 +1099,45 @@ and never nests (`$__gc_busy`).
 
 ### 5.8 Binary data: `ArrayBuffer`, typed arrays, `DataView` (target design)
 
-**Status: stages T2 (`ArrayBuffer`) and T3a (typed-array core)
-implemented, the rest is design.** This
+**Status: stages T2 (`ArrayBuffer`), T3a (typed-array core) and T4
+(`DataView`) implemented, the rest is design.** This
 section is the target of the phase-5b binary-data workstream (§14, stages
-T2–T6 in §5.8.10). In the tree now: the three type constants and the
-`ArrayBuffer` and typed-array layouts (`abi::TYPE_*`, `AB_*`, `TA_*`,
-`BYTE_LENGTH_MAX`), the `TYPE_ARRAYBUFFER` and `TYPE_TYPEDARRAY` parts of
-§5.8.2–§5.8.4 (byte blocks from `__ab_alloc`, `resize`, `transfer` /
-`transferToFixedLength` and detaching, the buffer witness `__ta_length` /
-`__ta_oob` and `__ta_validate`), their collector arms (§5.8.3), every
-§5.8.5 hook with `__ta_canonical`, the element helpers and the inline
-`ta[k]` arms, the number kinds of §5.8.6 (`__raw_load` / `__raw_store`
-with `swap` reserved for `DataView`), the `%ArrayBuffer%` /
-`%ArrayBuffer.prototype%` part of §5.8.7 (`emit/builtins/array_buffer.rs`)
-and its `%TypedArray%` part except the T3b methods: the nine
-constructors `Int8Array` .. `Float64Array` (each `Builtin::Ctor(BuiltinCtor::
-Typed(kind))`), `from`, `of`, `get [@@species]`, the prototype getters,
-`get [@@toStringTag]`, `keys` / `values` / `entries` / `[@@iterator]` and
-the Array Iterator `next` arm (`emit/builtins/typed_array.rs`;
-`TypedArrayCreateFromConstructor` is there, `TypedArraySpeciesCreate`
-lands with its first user in T3b), the rendering of both (§5.8.8,
-`emit/binary.rs`, the `Group::Binary` helpers), and the test262 `$262`
-prelude. A byte block's `len` (its capacity) is exactly the size requested
-from `__ab_alloc`, not rounded up to the size class. The `has_binary` gate of
+T2–T6 in §5.8.10). In the tree now: the three type constants and the three
+layouts (`abi::TYPE_*`, `AB_*`, `TA_*`, `DV_*`, `BYTE_LENGTH_MAX`), the
+§5.8.2–§5.8.4 byte blocks from `__ab_alloc`, `resize`, `transfer` /
+`transferToFixedLength` and detaching, the buffer witnesses `__ta_length`
+/ `__ta_oob` / `__dv_length` and `__ta_validate`, the collector arms
+(§5.8.3), every §5.8.5 hook with `__ta_canonical`, the element helpers and
+the inline `ta[k]` arms, the number kinds of §5.8.6 through the shared
+element accessors `__raw_load(addr, kind, swap)` / `__raw_store(addr, kind,
+n, swap)` (both typed arrays, with `swap = 0`, and `DataView`, with `swap
+= !littleEndian`, call them; the byte swap is implemented), the
+`%ArrayBuffer%` / `%ArrayBuffer.prototype%` part of §5.8.7
+(`emit/builtins/array_buffer.rs`), its `%TypedArray%` part except the T3b
+methods — the nine constructors `Int8Array` .. `Float64Array` (each
+`Builtin::Ctor(BuiltinCtor::Typed(kind))`), `from`, `of`, `get
+[@@species]`, the prototype getters, `get [@@toStringTag]`, `keys` /
+`values` / `entries` / `[@@iterator]` and the Array Iterator `next` arm
+(`emit/builtins/typed_array.rs`; `TypedArrayCreateFromConstructor` is there,
+`TypedArraySpeciesCreate` lands with its first user in T3b) — and its
+`%DataView%` part except `Float16` and the BigInt pairs
+(`emit/builtins/data_view.rs`; the get / set bodies are
+`Builtin::DataView(DataViewOp::Get(kind) | DataViewOp::Set(kind))` over
+`ir::ElementKind`), the rendering of all three (§5.8.8, `emit/binary.rs`,
+the `Group::Binary` helpers), and the test262 `$262` prelude. A byte
+block's `len` (its capacity) is exactly the size requested from
+`__ab_alloc`, not rounded up to the size class. The `has_binary` gate of
 §5.8.5 exists (`Helpers::has_binary`, `sections.rs::program_has_binary`,
-naming `ArrayBuffer`, the nine typed-array constructors and the global
-object so far) and keeps every binary arm out of a program that cannot
-reach binary data; the same names are `program_has_accessors`' too. The
-typed-array `__prop_throw` modes are `44` (incompatible receiver), `45`
+naming `ArrayBuffer`, `DataView`, the nine typed-array constructors and the
+global object so far) and keeps every binary arm out of a program that
+cannot reach binary data; the same names are `program_has_accessors`' too.
+The typed-array `__prop_throw` modes are `44` (incompatible receiver), `45`
 (out of bounds or detached), `46` (`[[PreventExtensions]]` of a
-variable-length view), `47` / `48` (`seal` / `freeze` with elements).
-`DataView`, `Float16Array`, the BigInt kinds and the `%TypedArray%.prototype`
-methods of T3b do not exist yet:
+variable-length view; `__set_integrity` itself returns status `0` without
+throwing, `Object.preventExtensions` / `seal` / `freeze` raise mode `46`),
+`47` / `48` (`seal` / `freeze` with elements, left pending by
+`__set_integrity`). `Float16Array`, the BigInt kinds and the
+`%TypedArray%.prototype` methods of T3b do not exist yet:
 every stage implements its part against this text and,
 as it lands, moves the landed facts into the sections that describe the
 current tree (§5.1 family list, §5.2 table, §5.7 tracing table, §6.2 helpers,
@@ -1757,6 +1770,7 @@ function-index order:
 | number to string (§6.5) | `__umul128`, `__ryu_pow5`, `__ryu_mul_shift`, `__ryu_mp5`, `__ryu_d2d(bits)` (Ryu shortest digits), `__scratch_str(ptr, len)`, `__num_to_str(bits)` (`Number::toString`), `__prim_str(v)` (`ToString` of a primitive), `__msg_str(v)` (the text of any value in an error message), `__dec_expand(bits)` (the exact decimal expansion), `__num_format(bits, mode, f)` (`toFixed` / `toExponential` / `toPrecision`), `__num_radix(bits, radix)` |
 | string to number (§6.5) | `__num_unit`, `__str_ws`, `__dec_parse(data, start, end)`, `__dec_slow`, `__dec_round`, `__dec_left`, `__dec_right`, `__digit_span`, `__radix_pow2`, `__radix_fold`, `__string_to_number(s)`, `__to_number_prim(v)`, `__parse_float(v)`, `__parse_int(v, radix)` |
 | clock, random | `__now()`, `__random()` (§6.5) |
+| BigInt (§6.10) | `__bigint_new(len, neg)`, `__bigint_trim(p)`, `__bigint_eq(a, b)`, `__bigint_cmp_mag(a, b)`, `__bigint_cmp(a, b)`, `__bigint_cmp_num(a, x)`, `__bigint_hash(p)`, `__bigint_to_string(v, radix)`, `__string_to_bigint(s)`, `__bigint_to_f64(p)`, `__bigint_from_f64(x)`, `__to_numeric(v)`, `__to_bigint(v)`, `__bigint_loose_eq(a, b)` (the last group, after the extra helpers) |
 | misc | `__gen_to_array(gen)`, `__nullish_throw(recv, key, set)`, `__prop_throw(recv, key, mode)`, `__box_f64(x)`, `__to_number(v)` |
 | trampolines | `__invoke1(fn, arg)` (the promise jobs' callback trampoline), `__async_step(gen, sent)` (the `async` driver's step trampoline), the two `new Promise` settlers |
 | constructors | `new_string(len, two_byte)`, `__new_array(len)` |
@@ -1767,6 +1781,7 @@ function-index order:
 | promises (§6.7) | the self-resolution `TypeError` constructor `() -> i64` that `__promise_settle` rejects with |
 | well-known symbols | `__symbol_get(v, sym)` — `Get(v, sym)`, looking only in the tables on `v`'s chain that have `HAS_SYMBOL_KEYS` (`undefined` when none does; the well-known symbol consult sites, §6.4); an accessor hit always calls its getter, even in a program compiled without the accessor dispatch of `__get`, since builtins alone read the realm's `get [@@species]` and `%Iterator.prototype%`'s `get [@@toStringTag]` |
 | `super` references (§6.3) | `__super_get(home, key, recv)`, `__super_set(home, key, v, recv)` |
+| proxies (§6.11, phase 5b, planned), appended after the collector's | `__proxy_trap(p, name)`, `__proxy_get_proto`, `__proxy_set_proto`, `__proxy_is_extensible`, `__proxy_prevent_ext`, `__proxy_own_prop`, `__proxy_define_own`, `__proxy_has`, `__proxy_get`, `__proxy_set`, `__proxy_delete`, `__proxy_own_keys`; the generic `__get_proto(v)`, `__own_prop(obj, key, list)`, `__desc_compatible(ext, d, cur)`, `__is_array(v)`, `__set_bool(target, key, v, recv)` |
 | private names (§7.6) | `__private_find(o, key)`, `__private_add(o, key, v, attrs, name)`, `__private_get(o, key, name)`, `__private_set(o, key, v, name)`, `__private_brand(o, v, brand, name, mode)`, `__private_in(o, brand, name)` |
 | output (§6.9) | `__out_reserve(need)`, `__path_reserve(need)`, `__refs_reserve(need)`, `__out_byte(b)`, `__out_cp(cp)`, `__out_str(s)`, `__out_uint(n)`, `__out_flush(fd)`, `__report(fd, prefix, v)` |
 | renderer (§6.9) | `__render_top(v)`, `__render(v, depth)`, `__render_heap(p, depth)`, `__render_array(p, depth)`, `__render_object(p, depth)`, `__render_function(p, depth)`, `__render_props(..)`, `__render_entry(e, quote, first, open, depth)`, `__render_key(key, quote)`, `__render_lookup(o, key)`, `__heap_object(v)`, `__str_of(v)`, `__fn_name(v)`, `__date_text(v)` |
@@ -1802,7 +1817,9 @@ object unchanged.
 `__get`, `__set`, `__has`, `__delete`, `__define`, `__own_keys`,
 `__for_in_keys`, `__copy_data`, and the descriptor helpers (`emit/props.rs`,
 `emit/props/descriptor.rs`) are the only code that reads or writes property
-tables. Keys are interned `u32`s.
+tables. Keys are interned `u32`s. Phase 5b adds a proxy arm to each of them
+(§6.11, planned): a proxy as the object or anywhere on a prototype chain
+hands the operation to its traps.
 
 - **`__get(recv, key)`** — `OrdinaryGet`. Each object on the chain (`recv`,
   then each `proto`) answers from its exotic own keys first when it is a
@@ -2084,6 +2101,9 @@ then a call with `this = recv`; it also throws for a nullish receiver. Its
 `call_indirect`. Array fast paths keep the `props == 0` and `proto` checks
 even when the program is intrinsics-sealed: the sealed analysis does not cover
 an own property shadowing a builtin (`a.push = f` is honoured).
+§6.11 (phase 5b, planned) lists which guards stay correct when a proxy is a
+receiver or sits on a prototype chain, and the two (`__protos_indexless`,
+`__symbol_get`) plus the `instanceof` walk that need a proxy test.
 
 **Opcount gate.** `crates/jsc-core/tests/opcount.rs` compiles every program in
 `tests/opcount/*.js` and compares, per program, the static operator count of
@@ -2340,6 +2360,7 @@ call site's check (§5.6). The rules:
   (shortest round-trip digits, exponential form at `>= 1e21` and `< 1e-6`,
   `-0` prints `0`); strings unquoted, also inside containers, with a lone
   surrogate written as U+FFFD (what Node writes); symbols `Symbol(a)` / `Symbol()`;
+  BigInts as their decimal digits and `n` (`-12n`, §6.10.2);
 - arrays `[ 1, <1 empty item>, 3, foo: 1 ]` (holes as runs, then own named
   properties); objects `{ a: 1, b: 2 }` from their own enumerable properties
   in own-key order (enumerable symbol keys last, as `[Symbol(a)]: 1`),
@@ -2351,7 +2372,7 @@ call site's check (§5.6). The rules:
 - `CLASS_ERROR` objects as `Name: message` (name and message looked up along the
   prototype chain without running getters);
 - wrappers as `[Number: 1]` / `[String: 'ab']` / `[Boolean: true]` /
-  `[Symbol: Symbol(a)]`, from their `[[PrimitiveValue]]` (a String wrapper's
+  `[Symbol: Symbol(a)]` / `[BigInt: 1n]`, from their `[[PrimitiveValue]]` (a String wrapper's
   virtual indices are not listed);
 - `Map(N)` / `Set(N)`, `Promise { 42 }` / `Promise { <pending> }` /
   `Promise { <rejected> r }`, dates as ISO 8601 UTC (`Invalid Date` for a
@@ -2359,17 +2380,22 @@ call site's check (§5.6). The rules:
 - `WeakMap { <items unknown> }` / `WeakSet { <items unknown> }`, `WeakRef {}`,
   `FinalizationRegistry {}` (contents never listed; a subclass instance
   renders the same form);
-- cycles as `<ref *1> { self: [Circular *1] }`.
+- cycles as `<ref *1> { self: [Circular *1] }`;
+- (phase 5b, planned, §6.11) a proxy as its target, without running a trap;
+  a revoked one as `<Revoked Proxy>`.
 
 Private-name entries (§7.6) are never enumerable, so the renderer does not list
 them.
 
 ### 6.10 BigInt
 
-> **Design, not yet implemented** (phase 5b, workstream L2-B). This section
-> is the contract for stages B2a / B2b / B3 / B4 (table at the end); each
-> stage turns its part of this text into a description of the implementation
-> and drops the "lands in" notes it fulfils. ECMA-262 §6.1.6.2 (the BigInt
+> **Partly implemented** (phase 5b, workstream L2-B). Stage B2a (the value,
+> literals, conversions, equality, hashing, property keys, JSON, the wrapper
+> and the empty `%BigInt.prototype%`) is implemented as described; the
+> operators (B2b), the `BigInt` builtins (B3) and the closeout (B4) are still
+> the design (table at the end). Each stage turns its part of this text into
+> a description of the implementation and drops the "lands in" notes it
+> fulfils. ECMA-262 §6.1.6.2 (the BigInt
 > type), §7.1 (conversions), §13 (operators), §21.2 (the BigInt object).
 
 #### 6.10.1 Value and block layout
@@ -2392,19 +2418,24 @@ is ToBoolean for both strings and BigInts (§6.10.2).
 
 - **Canonical form**, an invariant of every block a jsval can reach: the top
   limb is nonzero, zero is `len = 0` with the sign flag clear (there is no
-  `-0n`). Every producer finishes with `__bigint_trim(p)` (lower `len` past
-  high zero limbs, clear the sign of a zero), so equality, hashing and
-  comparison can work on the stored words directly.
+  `-0n`). Every producer finishes with `__bigint_trim(p) -> i64` (lower `len`
+  past high zero limbs and return the jsval, `BIGINT_ZERO` for a zero), so
+  equality, hashing and comparison can work on the stored words directly.
 - **Immutable.** A block is written only between its allocation and the
   moment its jsval is first published (returned from the producing helper);
   afterwards it is shared freely (operands are never reused as results,
   scratch work happens in unpublished blocks).
 - **Static blocks.** Literals are static data-segment blobs in the same
-  layout (`emit/sections.rs` lays them out next to the string literals,
-  deduplicated by value through a `BigIntOffsets` table keyed on
-  `(neg, limbs)`, as `StrOffsets` is for strings). `abi::BIGINT_ZERO` is a
-  static `0n` that every zero result returns without allocating, and the
-  dummy result of a helper that throws (`RangeError`, out of memory).
+  layout: `collect_strings` (`emit/sections.rs`) lays every distinct nonzero
+  literal out after the string blobs, deduplicated by value in the
+  `bigints` table of `StrOffsets` (keyed on `(neg, limbs)`;
+  `StrOffsets::bigint_bits` is the literal's jsval), so a program without a
+  BigInt literal keeps its layout. `abi::BIGINT_ZERO` is the static `0n`
+  (also every `0n` literal): an 8-byte block at a fixed address in the
+  alignment slack between `DEC_POWERS` and `NUM_SCRATCH_ADDR`, its type byte
+  written by a one-byte data segment in every module, returned by every zero
+  result without allocating and as the dummy result of a helper that throws
+  (`RangeError`, out of memory).
 - **Maximum size.** `abi::BIGINT_MAX_LIMBS = 1 << 19` (2^24 bits, a 2 MiB
   block, well under the 512 MiB memory cap). `__bigint_new(len, neg) -> i32`
   (the only allocator of BigInt blocks; `__alloc`, zeroed) throws
@@ -2416,8 +2447,8 @@ is ToBoolean for both strings and BigInts (§6.10.2).
   computing.
 - **GC.** No outgoing references: `__gc_trace` already returns early for
   every type byte above `TYPE_DATE` (the leaf rule shared with strings and
-  `TYPE_RAW`), so tracing needs no code; B2a adds `21` to the leaf row of
-  the §5.7 table. The sweeper reclaims by slot class / span (§5.6) and never
+  `TYPE_RAW`), so tracing needs no code; `21` is in the leaf row of the
+  §5.7 table. The sweeper reclaims by slot class / span (§5.6) and never
   reads `len`, so no size function is needed.
 - **No small-value fast path.** The free NaN-box tags (`0b100`, `0b110`,
   `0b111`) could hold an inline small BigInt, but every hot path that today
@@ -2428,52 +2459,54 @@ is ToBoolean for both strings and BigInts (§6.10.2).
   BigInt to the paths that already handle heap values; BigInt arithmetic
   speed is not a phase-5b goal, and literals cost no allocation.
 
-**Wrapper objects.** `Object(1n)` / `ToObject(1n)` is a `TYPE_OBJECT`
-of the new class `CLASS_BIGINT = 9` (24 bytes, `[[BigIntData]]` at
+**Wrapper objects.** `Object(1n)` / `ToObject(1n)` (`__to_object`) is a
+`TYPE_OBJECT` of class `CLASS_BIGINT = 9` (24 bytes, `[[BigIntData]]` at
 `WRAPPER_VALUE_OFFSET`, proto `%BigInt.prototype%`), traced like the other
-wrapper classes (jsval `@16`; `__gc_trace`'s wrapper class list gains `9`).
-No other new heap kind is needed.
+wrapper classes (jsval `@16`), rendered `[BigInt: 1n]`, unwrapped by
+`JSON.stringify`. `%BigInt.prototype%` is `Intrinsic::BigIntPrototype`, an
+ordinary object over `%Object.prototype%`, empty until B3. No other new
+heap kind is needed.
 
 #### 6.10.2 Type tests, `typeof`, ToBoolean, rendering
 
 - **Primitive, not object.** Every site that tells a symbol (a heap
-  primitive) from an object must also tell a BigInt: today these are the
-  `TYPE_SYMBOL` / `emit_is_symbol` sites (≈ 40 across `emit/props.rs`,
-  `emit/expr.rs` (`emit_is_object`), `emit/render.rs`, `emit/realm.rs`,
-  `emit/value.rs`, `emit/convert.rs`, `emit/numeric.rs`, `emit/object.rs`,
-  `emit/mod.rs`, `emit/gc.rs`, `emit/builtins/{json,mod,symbol,weak}.rs`).
-  B2a audits each one; a BigInt joins the primitive side everywhere (it is
-  never `CanBeHeldWeakly`, `IsObject` is false, `instanceof` is false, it has
-  no own properties). Add `emit_is_bigint(local)` next to `emit_is_symbol`
-  in `emit/value.rs` (same shape).
+  primitive) from an object also tells a BigInt (`emit_is_bigint(local)` in
+  `emit/bigint.rs`, the shape of `emit_is_symbol`): `emit_is_object` tests
+  the type byte against `TYPE_BIGINT` too, so `IsObject`, `instanceof`,
+  `ToPrimitive` and the store guards treat it as a primitive; it is never
+  `CanBeHeldWeakly`. Unlike a symbol (whose reserved word `@4` reads as "no
+  own properties"), a BigInt's `len` sits where an object keeps `props`, so
+  the helpers that walk any non-string heap value test for it first:
+  `__heap_object` (renderer), `__own_keys` (empty), `__has_own` (`false`),
+  `__delete` (no-op) and `__for_in_keys` (no keys).
 - **Primitive receivers.** `__get` / `__set` / `__has`-style lookups with a
   BigInt receiver start at `%BigInt.prototype%` (the two primitive-receiver
   dispatch blocks of `emit/props.rs` that pick `%Symbol.prototype%` /
-  `%Number.prototype%`); a write to a BigInt receiver is the strict-mode
-  `TypeError` that numbers get. `__to_object` (`emit/builtins/mod.rs`)
-  wraps a BigInt in a `CLASS_BIGINT` wrapper.
-- **`typeof`** is `"bigint"`: `abi::TYPEOF_STRINGS` gains an eighth entry
-  `"bigint"` (index 7), and the heap arm of `emit_typeof_node`
-  (`emit/expr.rs`) one more layered `select` (`type == TYPE_BIGINT ? 7`).
+  `%Number.prototype%`, and `__symbol_get`); a write to a BigInt receiver is
+  the strict-mode `TypeError` that numbers get (`Cannot create property 'x'
+  on bigint '1n'`). `__to_object` (`emit/builtins/mod.rs`) wraps a BigInt
+  in a `CLASS_BIGINT` wrapper.
+- **`typeof`** is `"bigint"`: `abi::TYPEOF_STRINGS[7]`, picked by one more
+  layered `select` (`type == TYPE_BIGINT ? 7`) in the heap arm of
+  `emit_typeof_node` (`emit/expr.rs`).
 - **ToBoolean**: `0n` is falsy, every other BigInt truthy. In `emit_cond`
-  (`emit/stmt.rs`) the heap arm's non-string branch, today the constant `1`,
-  becomes `type != TYPE_BIGINT | len @4 != 0`; the number and string
-  paths are unchanged. Every other ToBoolean site (`__json_rep`, filter /
-  find callbacks, `Boolean(v)`) goes through `emit_cond` or must get the same
-  test (B2a greps for `emit_load_str_len` truthiness sites).
+  (`emit/stmt.rs`) the heap arm's non-string branch is
+  `type != TYPE_BIGINT | len @4 != 0`; the number and string paths are
+  unchanged. Every ToBoolean site (`!`, `&&` / `||`, conditions, `Boolean(v)`,
+  the array callbacks) goes through `emit_cond`.
 - **Rendering** (`emit/render.rs`, `__render_heap`): a BigInt prints as its
   decimal digits plus `n` (`1n`, `-12n`), the same at top level, inside
   arrays / objects / Map and Set entries (`[ 1n, 2n ]`, `{ a: 1n }`,
   `Map(1) { 1n => 1 }`); a wrapper as `[BigInt: 1n]`. The digits come from
   `__bigint_to_string(v, 10)` followed by `__out_str`; its allocation may
   run out of memory like the render buffers (§6.9). `__msg_str` (error
-  message text) renders `1n` the same way; `__prim_str` (ToString) has no
-  `n`.
+  message text) appends the `n` too; `__prim_str` (ToString) has no `n`.
 
 #### 6.10.3 Conversions
 
-All conversion helpers live in a new `emit/bigint.rs` (registered in
-`emit/registry.rs` and tree-shaken by `emit/shake.rs` like every helper: a
+All conversion helpers live in `emit/bigint.rs` (the `Big` group of
+`emit/registry.rs`, the last helper group, tree-shaken by `emit/shake.rs`
+like every helper: a
 program with no BigInt literal, no `BigInt` reference and no
 `TYPE_BIGINT`-producing builtin emits none of them; the shared conversion
 helpers (`__to_string`, `__loose_eq`, ..) call them only behind a type-byte
@@ -2482,10 +2515,10 @@ test, so a program without BigInts keeps them out of its module).
 | operation | helper / site | rule |
 |---|---|---|
 | ToPrimitive | `__to_primitive` | a BigInt is a primitive (returned as is); a `CLASS_BIGINT` wrapper unwraps through `%BigInt.prototype%.valueOf` like any object |
-| ToNumeric | `__to_numeric(v) -> i64` | `ToPrimitive(v, number)`; a BigInt is returned, anything else goes through `__to_number_prim` |
-| ToNumber | `__to_number_prim` | a BigInt throws `TypeError: Cannot convert a BigInt value to a number` (so unary `+`, `Math.*`, `isNaN`, `isFinite`, `Date` arguments, `ToIntegerOrInfinity` all throw) |
+| ToNumeric | `__to_numeric(v) -> i64` | `ToPrimitive(v, number)`; a BigInt is returned, anything else goes through `__to_number` |
+| ToNumber | `__to_number` | after `ToPrimitive`, a BigInt throws `TypeError: Cannot convert a BigInt value to a number` next to the symbol check (so unary `+`, `Math.*`, `isNaN`, `isFinite`, `Date` arguments, `ToIntegerOrInfinity` all throw); `__to_number_prim` is only reached with a non-BigInt primitive |
 | ToString | `__prim_str` | decimal digits, no `n`, sign `-`: `__bigint_to_string(v, 10)`. Covers `String(v)`, template literals, `+` with a string, `join`, the default `sort` comparison, `ToPropertyKey` |
-| ToBigInt | `__to_bigint(v) -> i64` | `ToPrimitive(v, number)`, then: BigInt itself; `true` / `false` → `1n` / `0n`; string → `StringToBigInt`, failure `SyntaxError: Cannot convert <s> to a BigInt`; `undefined`, `null`, number, symbol → `TypeError` |
+| ToBigInt | `__to_bigint(v) -> i64` | `ToPrimitive(v, number)`, then: BigInt itself; `true` / `false` → `1n` / `0n`; string → `StringToBigInt`, failure `SyntaxError: Cannot convert <s> to a BigInt`; `undefined`, `null`, number, symbol → `TypeError: Cannot convert <x> to a BigInt` (`<x>` the `__msg_str` text) |
 | StringToBigInt | `__string_to_bigint(s) -> i64` | below; returns `UNDEFINED_BITS` on failure (callers map it to `SyntaxError` / `false`) |
 | NumberToBigInt | `__bigint_from_f64(x: f64) -> i64` | the caller has checked `IsIntegralNumber` (else `RangeError: The number <x> cannot be converted to a BigInt because it is not an integer`, also for `NaN` / `±Infinity`); `|x| < 2^64` via `i64.trunc_f64_u`, else the 53-bit mantissa shifted by `exponent - 52` |
 | BigInt → Number | `__bigint_to_f64(p) -> f64` | exact round-half-even: bit length `L`; `L <= 64` → `f64.convert_i64_u` of the low 64 bits (wasm rounds to nearest, ties to even); else the top 64 bits with bit 0 OR-ed with "any lower bit set" (sticky; the rounding position is bit 10, so the result is correctly rounded), converted, times `2^(L-64)` (built from its exponent bits; `L > 1024` → `Infinity`); negate for the sign |
@@ -2497,21 +2530,23 @@ remainder is `0n`. Then either `0x`/`0X`, `0o`/`0O`, `0b`/`0B` followed by at
 least one digit of that radix and nothing else (no sign), or an optional `+`
 / `-` followed by at least one decimal digit and nothing else. No numeric
 separators, no `n` suffix, no `.`, exponent, `Infinity`; any two-byte unit
-fails. Power-of-two radices pack bits directly into a block of
-`ceil(digits·log2(r) / 32)` limbs (O(n)); decimal allocates
-`ceil(digits / 9) + 1` limbs (10^9 < 2^30) and folds 9-digit chunks with an
-in-place multiply-add `acc = acc·10^k + chunk` over the limbs written so far
-(O(n²) limb steps: about 1.2·10^5 for a 10 000-digit string), then trims.
+fails. Every radix allocates `digits / 8 + 2` limbs (at most 4 bits per
+digit) and folds `k`-digit chunks (`r^k <= 2^32 - 1`: 9 decimal, 8 hex, 10
+octal, 31 binary digits) with an in-place multiply-add
+`acc = acc·r^k + chunk` over the limbs written so far (O(n²) limb steps:
+about 1.2·10^5 for a 10 000-digit decimal string), then trims; a separate
+O(n) bit packing for the power-of-two radices was not worth its code.
 
-**ToString(radix)** (`__bigint_to_string(v, radix: i32) -> i64`, radix
-`2..=36`, lowercase digits): `0n` is `"0"`; a magnitude of at most two limbs
-formats from one `u64` (`i64.div_u` / `rem_u`). Power-of-two radices emit
-bit groups from the top (O(n)). Any other radix copies the magnitude into an
-unpublished scratch block and repeatedly divides it in place by the largest
-`r^k <= 2^32 - 1` (`10^9` for decimal; one-limb division with an `i64`
-dividend, O(n) per step), collecting `k`-digit chunks in a `TYPE_RAW`
-buffer; then one Latin-1 string of the exact length is filled from the most
-significant chunk (unpadded) down (padded to `k` digits). O(n²) overall.
+**ToString(radix)** (`__bigint_to_string(v, radix: i32) -> i32`, a string
+base; radix `2..=36`, lowercase digits): `0n` is `"0"`. Every radix copies
+the magnitude into an unpublished `TYPE_RAW` scratch block and repeatedly
+divides it in place by the largest `r^k <= 2^32 - 1` (`10^9` for decimal;
+one-limb division with an `i64` dividend, O(n) per step), collecting
+`k`-digit chunks in a second `TYPE_RAW` buffer (at most `2·len + 1`: `r^k >
+2^26`); then one Latin-1 string of the exact length is filled from the least
+significant chunk (padded to `k` digits) up to the most significant one
+(unpadded), and the sign. O(n²) overall; out of memory returns the static
+empty string with the `RangeError` pending.
 
 #### 6.10.4 Arithmetic kernels
 
@@ -2637,29 +2672,31 @@ argument (`Math.floor(a - b)` with BigInts must throw).
 
 #### 6.10.6 Equality, comparison, hashing
 
-- **Strict equality** (`emit_strict_eq`): the then-condition `is_string(s0)
-  & is_string(s1)` becomes `is_str_or_big(s0) & is_str_or_big(s1)` (type
-  byte `TYPE_STRING` or `TYPE_BIGINT`; a non-pointer takes the same three
-  instructions as today), and the then-branch calls `__bigint_eq` when
-  either type byte is `TYPE_BIGINT`, else `__str_eq` (a string and a BigInt
-  are unequal: `__bigint_eq` returns `0`). The number / identity `select`
-  is unchanged. `switch` cases use the same emitter.
-- **SameValue / SameValueZero** (`emit_same_value` in
-  `emit/props/descriptor.rs`, `__same_value_zero` in `emit/runtime.rs`,
-  `__array_search` for `includes` / `indexOf` (strict equality), and every
-  other `__str_eq` caller that implements an equality — about 30 call sites
-  in `emit/{runtime,mod,object,numeric,props}.rs`,
-  `emit/builtins/{array,date}.rs`): two BigInts compare by value
-  (`__bigint_eq`). `Object.is(1n, 1n)` is `true`; `[1n].includes(1n)` is
-  `true`.
+- **Strict equality** (`emit_strict_eq`): the then-condition is
+  `emit_is_str_or_bigint(s0) & emit_is_str_or_bigint(s1)` (type byte
+  `TYPE_STRING` or `TYPE_BIGINT`; a non-pointer takes the same three
+  instructions as before), and the then-branch calls `__bigint_eq` when
+  either type byte is nonzero (`TYPE_BIGINT`), else `__str_eq` (a string
+  and a BigInt are unequal: `__bigint_eq` returns `0`). The number /
+  identity `select` is unchanged. `switch` cases and `Array.prototype.indexOf`
+  use the same emitter.
+- **SameValue / SameValueZero**: `__same_value_zero` (`emit/runtime.rs`)
+  calls `__bigint_eq` when its first operand is a BigInt; `emit_same_value`
+  (`Object.is`, `defineProperty` value checks), `includes` and the Map / Set
+  probes all reach it. The remaining `__str_eq` callers compare against a
+  static string, not two values. `Object.is(1n, 1n)` is `true`;
+  `[1n].includes(1n)` is `true`.
 - **Map / Set keys**: `__same_value_zero` as above; `__map_hash` hashes a
   BigInt with `__bigint_hash`, so equal values share a bucket.
-- **Loose equality** (`__loose_eq`, after booleans became numbers): two
+- **Loose equality** (`__loose_eq`, after booleans became numbers and an
+  object against a primitive became its `ToPrimitive`; the BigInt arm is
+  `__bigint_loose_eq`, before the identity fallback): two
   BigInts → `__bigint_eq`; BigInt and number → `__bigint_cmp_num == 0`
   (`NaN` / infinities unequal, `1n == 1.5` false, no rounding); BigInt and
-  string → `StringToBigInt`, failure → `false`; an object against a BigInt
-  → `ToPrimitive` and retry (the BigInt counts as a primitive); BigInt
-  against `null` / `undefined` / symbol → `false`.
+  string → `StringToBigInt`, failure (or the size `RangeError` of a huge
+  string, cleared) → `false`; an object against a BigInt → `ToPrimitive`
+  and retry (the BigInt counts as a primitive); BigInt against `null` /
+  `undefined` / symbol → `false`.
 - **Relational** (`__compare`, reached when the operands are not two strings
   or two numbers): after `ToPrimitive` (hint number), BigInt / BigInt →
   `__bigint_cmp`; BigInt / string → `StringToBigInt` of the string
@@ -2673,19 +2710,19 @@ argument (`Math.floor(a - b)` with BigInts must throw).
 
 - **Property keys.** `{1n: v}`, `class { 1n() {} }`, `{1n: a} = o` key on
   the decimal string, computed at compile time from the literal
-  (`value.to_string()`): `codegen/expr.rs` (~2491, object literals and class
-  members) and `codegen/stmt.rs` (~2316, patterns) map
-  `PropName::BigInt` to the same path as a string key instead of the
-  compile error. `o[1n]`, `1n in o`, `delete o[1n]` and every runtime key
-  go through `__to_key` (`emit/props.rs`), which gains a BigInt branch:
-  `__bigint_to_string(v, 10)`, then intern (so `o[1n]` and `o["1"]` and
+  (`value.to_string()`): `lower_prop_key` (`codegen/expr.rs`, object
+  literals) and `prop_key_name` (`codegen/stmt.rs`, class members and
+  patterns) map `PropName::BigInt` to a static string key. `o[1n]`,
+  `1n in o`, `delete o[1n]` and every runtime key go through `__to_key`
+  (`emit/props.rs`), whose `__to_string` fallback reaches `__prim_str`, so a
+  BigInt key is `__bigint_to_string(v, 10)`, interned (`o[1n]`, `o["1"]` and
   `a[1]` are the same key; an array-index string keeps the index path).
 - **JSON.stringify** (`__json_rep`, `emit/builtins/json.rs`): a BigInt
-  value, or a `CLASS_BIGINT` wrapper after unwrapping, first consults
-  `toJSON` (`GetV`, i.e. through `%BigInt.prototype%`, so a user-installed
-  `BigInt.prototype.toJSON` works) and the replacer as for objects; a
-  BigInt still left throws `TypeError: Do not know how to serialize a
-  BigInt`, at any nesting depth. `__json_str` never sees one.
+  value consults `toJSON` (`GetV`, i.e. through `%BigInt.prototype%`, so a
+  user-installed `BigInt.prototype.toJSON` works) and the replacer as an
+  object does; a `CLASS_BIGINT` wrapper is then unwrapped like the other
+  wrappers; a BigInt still left throws `TypeError: Do not know how to
+  serialize a BigInt`, at any nesting depth. `__json_str` never sees one.
 - **`BigInt`** (`BuiltinCtor::BigInt` in `ir.rs`, the realm entries in
   `emit/realm.rs` appended after the existing constructors, bodies in a new
   `emit/builtins/bigint.rs` following `emit/builtins/number.rs`): `BigInt(v)`
@@ -2732,18 +2769,20 @@ moved row gets a reason cell in the stage that moves it:
 3. B2a: `typeof` (one more `select`, every `typeof` site), `IsObject` (one
    more type-byte test on heap values), ToBoolean of a non-string heap value
    (the `len` test), strict equality of two strings (the BigInt type test
-   before `__str_eq`).
+   before `__str_eq`); in the guest, the BigInt tests of
+   `__same_value_zero`, `__map_hash`, `__loose_eq`'s fallback, `__to_number`,
+   `__prim_str`, `__msg_str`, `__to_object`, `__json_rep`, the primitive
+   receiver dispatch of `__get` and the `__own_keys` / `__has_own` /
+   `__delete` / `__for_in_keys` guards, and the realm image growing by
+   `%BigInt.prototype%` (later static addresses and intern slots shift).
 4. B2b: the non-local update forms (`NumericStep` replaces the `__add`-based
    desugaring of `o.x++`, `cell++`, `global++`).
 
-**Diagnostics** (§8). Gone with B2a: `BigInt literals are not supported`
-(`codegen/expr.rs` ~3207), `unsupported object key: BigInt keys are not
-supported`, `unsupported property key: BigInt keys are not supported`, and
-the tests asserting them (`tests/pattern_keys.rs`
-`bigint_pattern_key_is_rejected`, `bigint_class_member_key_is_rejected`,
-and any BigInt case in `tests/unsupported.rs`) — rewritten as passing
-tests. Nothing BigInt-specific remains a compile error; every BigInt error is
-a run-time `TypeError` / `RangeError` / `SyntaxError` as listed above.
+**Diagnostics** (§8). Nothing BigInt-specific is a compile error (the
+literal and literal-key diagnostics are gone; their `tests/pattern_keys.rs`
+cases are positive tests); every BigInt error is a run-time `TypeError` /
+`RangeError` / `SyntaxError` as listed above. Until B2b an operator on a
+BigInt throws the `ToNumber` `TypeError` rather than computing.
 
 **Conformance.** `BigInt` leaves `tests/test262/unsupported-features.txt`
 in B4. Of the ≈ 1 500 tests tagged `BigInt`, about 325 become eligible on
@@ -2766,6 +2805,668 @@ very large exponent / shift tests that hit the 2^24-bit cap where V8 allows
 | **B2b** operators | `BinOp::Exp`, `Negate`, `BitNot`, `ToNumeric`, `NumericStep`; `emit_numeric_operands`, `__numeric_op`, `__numeric_unary`, `__numeric_step`; every kernel of §6.10.4 except `as_n`; `__add` BigInt path; relational `__compare`; `emit_inc_dec`; root classification and `yields_number`; opcount reasons | `ir.rs`, `codegen/{expr,generator}.rs`, `emit/{numeric,bigint,convert,expr,roots}.rs`, `tests/opcount/snapshot.tsv` | new `tests/bigint_ops.rs` (every operator and compound form, relational operators vs number / string incl. `NaN`, `±Infinity`, non-integral numbers and unparsable strings, mixed-type `TypeError`s, `>>>` / unary `+` `TypeError`, division / remainder signs and `RangeError`, `**` negative exponent, bitwise and shifts on negatives across limb boundaries, huge shift counts, `++`/`--` on locals, cells, globals, members, generator slots, multi-limb `*` and `/` cross-checked against known products); a `gc_stress` variant module in the same file (`CompileOptions::gc_stress = 1`) over multi-limb loops (factorial of 200, a Fibonacci accumulator, divmod round trips) so every allocation collects while operands are live |
 | **B3** built-ins | `BigInt` ctor, `asIntN` / `asUintN` (`__bigint_as_n`), `%BigInt.prototype%` methods and `@@toStringTag`, `toString(radix)`, `Number(1n)` (`ConvertOp::NumberCall`), `__bigint_to_i64` / `__bigint_from_i64` | `ir.rs`, `codegen/*` (the `Number(..)` inline call), `emit/realm.rs`, new `emit/builtins/bigint.rs`, `emit/builtins/{mod,number}.rs`, `emit/bigint.rs` | new `tests/bigint_builtins.rs` (constructor coercions incl. strings in every radix, whitespace, syntax errors, `new BigInt` `TypeError`, `RangeError` for non-integers, `asIntN` / `asUintN` edge widths 0 / 1 / 64 / 65 and negative inputs, `toString` radices 2..36 on multi-limb values, `thisBigIntValue` errors, `Number(2n**1024n)` = `Infinity`, round-half-even at `2^53 + 1`), with a `gc_stress` variant for the radix conversions |
 | **B4** closeout | remove `BigInt` from `unsupported-features.txt`; delete the §13 BigInt lines (the `RegExp, BigInt, ..` "not available" line, the limitation-table row, the BigInt property-key line, the §14 roadmap mention); test262 baseline / history from CI; fold this section's design notes into present-tense text | `tests/test262/*`, `DESIGN.md` | test262 delta recorded (target ≈ +300 of the 325 newly eligible) |
+### 6.11 Proxy and Reflect (phase 5b, in progress)
+
+**Status: P2a implemented** (the proxy block, `%Proxy%`, `Proxy.revocable`
+and the eleven object internal methods with their invariants, below); P2b,
+P3 and P4 are still design. Until P4 the test262 runner keeps skipping the
+`Proxy`, `proxy-missing-checks` and `Reflect*` features (§10). The
+subsection names the code that changes so an implementer does not have to
+re-derive it; "Stages" records where P2a departed from the plan.
+
+**Scope.** ECMA-262 Proxy exotic objects (§10.5: all thirteen internal
+methods with every invariant check, `ProxyCreate`, `Proxy.revocable`) and the
+`Reflect` namespace (§28.1: all thirteen functions). P4 drops all three
+feature flags: `proxy-missing-checks` names the invariant checks that
+ES2020-ES2022 added (`deleteProperty` on a non-extensible target,
+`getOwnPropertyDescriptor` / `defineProperty` reporting a non-writable view of
+a writable non-configurable target property; three tests). They are part of
+the current spec and this design implements them, so the flag goes with the
+other two.
+
+**Block.** A proxy is a `TYPE_PROXY = 20` block of 48 bytes
+(`abi::PROXY_BLOCK_SIZE`, size class 3):
+
+| offset | size | field |
+|---|---|---|
+| 0 | 4 | header: kind `20`; flags (byte 2) `8` `CONSTRUCTOR` and `32` `SELF_ALLOC`, both set iff `IsConstructor(target)` at creation (the same bit values as `FUNC_FLAG_CONSTRUCTOR` / `FUNC_FLAG_SELF_ALLOC`, `const`-asserted, so `emit_is_constructor` and the `SELF_ALLOC` test of `emit_construct` read them unchanged); byte 3 `1` `PROXY_CLASS_CALLABLE` iff `IsCallable(target)` at creation |
+| 4 | 4 | `props: u32` — the proxy's own table, holding **private-name entries only** (below); `0` until the first one |
+| 8 | 8 | `proto: i64` — always `null`, never read as a prototype |
+| 16 | 4 | `func_idx: u32` (`= FUNC_INDEX_OFFSET`) — the funcref slot of the `ProxyCall` trampoline when callable, else `0` |
+| 20 | 4 | reserved, `0` |
+| 24 | 8 | `env: i64` (`= FUNC_ENV_OFFSET`) — the proxy itself when callable, else `undefined` |
+| 32 | 8 | `target: i64` (`abi::PROXY_TARGET_OFFSET`) — `[[ProxyTarget]]`, `null` once revoked |
+| 40 | 8 | `handler: i64` (`abi::PROXY_HANDLER_OFFSET`) — `[[ProxyHandler]]`, `null` once revoked |
+
+A proxy is not in the object family (§5.1): it keeps the 16-byte prefix shape
+so an accidental prefix read sees "no table, `null` prototype", but every
+property helper tests the kind first and takes the proxy path (below). The
+call fields sit where a `TYPE_FUNCTION` keeps them, so every existing
+`call_indirect` sequence (`env` @24, `func_idx` @16, §4.3) dispatches a
+callable proxy to its trampoline without change. Revocation writes `null` to
+`target` and `handler`; the flags, the class byte, `func_idx` and `env` stay,
+so a revoked callable proxy is still callable for `typeof` and `IsCallable`
+(its call then throws), as the spec requires.
+
+- **`typeof`** (`emit_typeof_node`, `emit/expr.rs`): `"function"` for a
+  `TYPE_PROXY` with `PROXY_CLASS_CALLABLE`, else `"object"`.
+- **`IsCallable`**: `emit_is_function` (`emit/value.rs`) becomes the
+  `IsCallable` test: kind `TYPE_FUNCTION`, or kind `TYPE_PROXY` with
+  `PROXY_CLASS_CALLABLE`. Its 53 call sites (P2b audits each) are
+  `IsCallable` uses followed by a call through `func_idx` / `env`, which is
+  valid on a callable proxy; the sites that read other `TYPE_FUNCTION`
+  internals switch to a new `emit_is_function_block` (kind test only): `Function.prototype.toString`
+  (the info-table name), `bind` (flags and `proto`), `__fn_name` and
+  `__render_function` (§6.9). The `BOUND` test of `instanceof` and the
+  `env` identity test of `BoundCall` stay as they are: a proxy never carries
+  flag `64`, and its `env` is itself.
+- **`IsConstructor`**: `emit_is_constructor` (`emit/expr.rs`) accepts kind
+  `TYPE_FUNCTION` or `TYPE_PROXY` with flag `8`.
+- **`emit_is_object`**: a proxy is an object (not a string or symbol)
+  already.
+- **GC** (`__gc_trace`, `emit/gc.rs`): a new arm for kind `20` traces raw
+  `props @4` (the private entries' table), jsvals `proto @8` (always
+  `null`), `env @24` (itself or `undefined`), `target @32`, `handler @40`.
+  A revoked proxy traces two `null`s, so its target and handler can be
+  collected. A proxy can be a `WeakMap` key, `WeakRef` target or registry
+  target like any object (identity).
+
+**Reachability gate.** A proxy exists only after `new Proxy` or
+`Proxy.revocable` ran, so every proxy arm below is emitted only under a new
+compile-time fact (`Helpers::proxies()`, the `ProxyGate` field set by
+`emit/sections.rs::program_has_proxies` from the IR): the program names
+`Proxy` (a global read or write, or the string `"Proxy"`, which covers a
+member or property name and a string literal) or holds the global object at
+all (`IrNode::Intrinsic(Global)`: `globalThis` or a top-level `this`, which
+can find `Proxy` by a run-time key; a superset of `GlobalUse::Open`, kept
+simple because no opcount program uses `globalThis`). Without it the emitted
+code is byte-for-byte what it is today (no opcount change), and the
+`__proxy_*` helpers are never called, so runtime shaking (§4.2) stubs them.
+With it `has_accessors` is forced on: a trap runs user code at any property
+access, so every member access keeps its post-call exception check.
+
+**Keys reach traps intact.** Today a lookup-only key conversion
+(`__to_key(v, 0)`) returns `0` for a string no table ever used, and `__get`,
+`__has`, `__delete`, `__own_desc` and `__own_enum` answer "absent
+everywhere" for key `0`. A trap must receive the real key, so under
+`proxies` `emit_to_key` treats `insert = 0` as `1` (the conversion always
+interns; the weak intern table reclaims such keys, §5.3), and every
+`__intern_find` whose result can reach a property helper on a user object
+interns instead. Keys handed to a trap are the interned string block or the
+symbol block, boxed as `HEAP | key`.
+
+**The trap protocol.** New file `emit/props/proxy.rs`; its helpers are rows
+appended to the end of `registry::Extra` (no other group moves). Each
+`__proxy_<m>(p, ..)` helper:
+
+1. reads `target` (`@32`) into a rooted local **before** anything else (the
+   spec reads `[[ProxyTarget]]` before `GetMethod`, and a handler getter may
+   revoke the proxy);
+2. calls `__proxy_trap(p: i32, name: i32) -> i64`
+   (`ValidateNonRevokedProxy` + `GetMethod(handler, name)`): `handler ==
+   null` throws `TypeError: Cannot perform '<name>' on a proxy that has been
+   revoked`; else `__get(handler, name)` (the handler may itself be a
+   proxy); `undefined` / `null` yields `undefined`, a non-callable value
+   throws `TypeError: proxy trap '<name>' is not a function`;
+3. on `undefined` forwards to the target's internal method (the generic
+   helper, which is itself proxy-aware, so proxy chains recurse);
+4. otherwise calls the trap with `this = handler` through `call_spilling`
+   (`emit/builtins/array.rs`, `push_call`'s core), passing **every**
+   argument (up to four:
+   `target, key, value, receiver`), so under a small `K` the surplus goes in
+   a fresh spread argument array, never dropped (the phase-4 args-past-`K`
+   bug class);
+5. checks the invariants below, each failure a `TypeError`.
+
+The messages are five keyed `__prop_throw` modes (`emit/mod.rs`
+`PROP_KEYED_MSGS`; L1 allotted `28`..`35` to this workstream):
+`28` `PROP_THROW_PROXY_REVOKED` (key = the trap name: `Cannot perform
+'<trap>' on a proxy that has been revoked`), `29` `PROP_THROW_PROXY_TRAP`
+(key = the trap name: `proxy trap '<trap>' is not a function`), `30`
+`PROP_THROW_PROXY_FALSISH` (key = the property: `proxy trap returned
+falsish for property '<key>'`, a refusing `set` / `defineProperty` /
+`deleteProperty` in a throwing context), `31` `PROP_THROW_PROXY_INVARIANT`
+(`proxy trap result for '<key>' violates an invariant`; the traps without a
+key, `ownKeys` included, pass the trap name), `32`
+`PROP_THROW_PROXY_FALSISH_OP` (key = the trap name: `'<trap>' on proxy:
+trap returned falsish`, a refusing `setPrototypeOf` / `preventExtensions`;
+one fragment pair cannot hold both a trap and a key, hence two falsish
+modes). Every helper here
+is a safepoint (it runs user code and allocates): its locals follow the
+`FnBuilder` root classes (§5.7), and `emit/roots.rs::helper_graph` declares
+`__test_integrity` a leaf only without the gate (with it, its callee
+`__proxy_is_extensible` is undeclared, so it is a safepoint);
+`__protos_indexless` stays a leaf (its proxy arm only returns `0`). A helper
+returning `i32` returns `0`, one returning `i64` `undefined`, with an
+exception pending; callers test `$exc_pending`.
+
+**New generic helpers** (`emit/props.rs` / `emit/props/descriptor.rs`; each
+answers for any object and takes the proxy path on kind `20`):
+
+| helper | meaning | users |
+|---|---|---|
+| `__get_proto(v: i64) -> i64` | `O.[[GetPrototypeOf]]()`: `proto @8`, or `__proxy_get_proto` | `Object.getPrototypeOf`, `Reflect.getPrototypeOf`, the `__proto__` getter, `isPrototypeOf`, `__lookupGetter__` / `__lookupSetter__`, `bind` (`function.rs`, the target's `proto`), the `instanceof` walks, `__for_in_keys` |
+| `__own_prop(obj: i64, key: i32, list: i32) -> i32` | `O.[[GetOwnProperty]](P)` as a complete record `[desc, value, get, set]` (§6.3) appended to the array `list`; `1` present, `0` absent | the proxy invariant checks, `__has_own`'s and `__own_enum`'s proxy arms, the receiver step of `OrdinarySet`, `TestIntegrityLevel` and `SetIntegrityLevel` over a proxy |
+| `__desc_compatible(ext: i32, d: i32, cur: i32) -> i32` | `IsCompatiblePropertyDescriptor(Extensible, Desc, Current)` (`ValidateAndApplyPropertyDescriptor` with `O = undefined`); `d` / `cur` are the element addresses of two four-slot records (the caller keeps their array rooted); `cur = 0` is "absent" | `__proxy_own_prop`, `__proxy_define_own` |
+| `__is_array(v: i64) -> i32` | `IsArray`: kind `TYPE_ARRAY`; a proxy recurses into its target, a revoked one throws `PROXY_REVOKED` (key `"IsArray"`) | `Array.isArray`, `Object.prototype.toString`, `JSON.stringify` (value and replacer list), the `JSON.parse` reviver, `ArraySpeciesCreate`, `IsConcatSpreadable`, `FlattenIntoArray` |
+| `__set_bool(target: i64, key: i32, v: i64, recv: i64) -> i32` | `target.[[Set]](P, V, Receiver)` returning the boolean: a third body of `emit_set_from` (the `__super_set` shape) in a non-throwing mode, where each failure of the receiver step (`emit_receiver_set`: a primitive receiver, an own accessor or read-only property, a rejected define) returns `0` | `Reflect.set`, the trap-less `[[Set]]` of a proxy |
+
+`__own_prop`'s ordinary arm reads the same state as `__own_desc` (one
+emitter, `descriptor.rs::emit_own_lookup`, shared by both). `__desc_compatible`
+(`descriptor.rs`, an `Extra` row, `__get_proto` / `__own_prop` / `__set_bool`
+too) restates `__define_own`'s non-configurable rejection rules over two
+records: a record argument is the address `x` whose fields sit at `x +
+ELEMS_DATA_OFFSET + 8k` (element store base plus `32 * index`). Factoring
+`__define_own`'s validation block, which works on a table entry and
+interleaves the array `length` and dictionary-mode paths, was not worth the
+churn in a shared helper. Records follow the descriptor encoding of §6.3;
+"complete" means all three presence bits plus value or `get` / `set`
+(`CompletePropertyDescriptor`).
+
+**Internal methods.** For each, the proxy helper, the existing helpers that
+hand off to it, the trap-less forward, and the invariant checks (each a
+`TypeError`, `PROXY_INVARIANT` unless noted):
+
+- **[[GetPrototypeOf]]** — `__proxy_get_proto(p) -> i64`; forward
+  `__get_proto(target)`. The result must be an object or `null`; when
+  `IsExtensible(target)` is false it must be `SameValue` with
+  `target.[[GetPrototypeOf]]()`.
+- **[[SetPrototypeOf]]** — `__proxy_set_proto(p, v) -> i32`; hook: the entry of
+  `__set_proto` (whose result becomes `PROP_THROW_PROXY_FALSISH` for a
+  falsish proxy result; `0` stays success), and its cycle walk stops (no
+  cycle) at a proxy link (`OrdinarySetPrototypeOf` step 8.c.i); forward
+  `__set_proto(target, v) == 0`. `ToBoolean(trap result)`; false returns
+  false; when `IsExtensible(target)` is false, `v` must be `SameValue` with
+  `target.[[GetPrototypeOf]]()`. Callers of `__set_proto`
+  (`Object.setPrototypeOf`, the `__proto__` setter, `Reflect.setPrototypeOf`)
+  now check `$exc_pending` after it.
+- **[[IsExtensible]]** — `__proxy_is_extensible(p) -> i32`; hook: the entry of
+  `__test_integrity` at level `0`; forward `__test_integrity(target, 0)`.
+  `ToBoolean(trap result)` must equal `IsExtensible(target)`. Levels `1` /
+  `2` on a proxy run the generic `TestIntegrityLevel`: `IsExtensible` (true
+  → false), then `__own_keys(p, OWN_ALL_KEYS)` and one `__own_prop` per key.
+- **[[PreventExtensions]]** — `__proxy_prevent_ext(p) -> i32`; hook: the entry
+  of `__set_integrity`, which now returns `i32` status (`1`, or `0` when a
+  proxy refuses); forward `__set_integrity(target, 0)`. A true result with
+  `IsExtensible(target)` still true throws. Levels `1` / `2` on a proxy run
+  the generic `SetIntegrityLevel`: `PreventExtensions` (false → status `0`),
+  `__own_keys(p, OWN_ALL_KEYS)`, then per key `__define_own` of
+  `{configurable: false}` (sealed) or, after `__own_prop`, `{configurable:
+  false}` for an accessor / `{configurable: false, writable: false}` for data
+  (frozen); a rejection throws (`DefinePropertyOrThrow`).
+  `Object.preventExtensions` / `seal` / `freeze` throw `PROXY_FALSISH` on
+  status `0`; `Reflect.preventExtensions` returns it.
+- **[[GetOwnProperty]]** — `__proxy_own_prop(p, key, list) -> i32`; hooks:
+  `__own_prop`, `__own_desc` (which builds `FromPropertyDescriptor` from the
+  record), `__has_own`, `__own_enum`; forward `__own_prop(target, ..)`. The
+  trap result must be an object or `undefined`. `undefined`: absent target
+  property → absent; a non-configurable target property, or a present one
+  on a non-extensible target, throws. Otherwise `__to_desc` (ToPropertyDescriptor)
+  then completed in place; `__desc_compatible(IsExtensible(target), result,
+  target)` must hold; a non-configurable result needs a present,
+  non-configurable target property, and a non-configurable non-writable
+  result needs a non-writable target property (`proxy-missing-checks`).
+- **[[DefineOwnProperty]]** — `__proxy_define_own(p, key, desc, value, get,
+  set) -> i32` (`DEFINE_OK` / `DEFINE_REJECT`); hooks: the entry of
+  `__define_own`, and the entry of `__define` for a non-private key (the
+  complete record built from `attrs`, an `ACCESSOR` value split into
+  `get` / `set`; `DEFINE_REJECT` throws `PROXY_FALSISH`); forward
+  `__define_own(target, ..)`. The trap receives `FromPropertyDescriptor(Desc)`
+  with only the present fields (a fresh object). `ToBoolean` false →
+  `DEFINE_REJECT`. Then with `targetDesc = __own_prop(target)`: absent and
+  target not extensible throws; absent and `configurable: false` requested
+  throws; present and not `__desc_compatible(ext, Desc, targetDesc)` throws;
+  `configurable: false` requested over a configurable target property throws;
+  a non-configurable writable target data property with `writable: false`
+  requested throws (`proxy-missing-checks`). `__define_own` may now leave an
+  exception pending on any object (until now only an array's `length`), so
+  every caller that can receive a user object checks `$exc_pending`:
+  `Object.defineProperty` / `defineProperties` / `create`
+  (`object_static.rs::emit_apply`), `emit_receiver_set`,
+  `json.rs`'s reviver `CreateDataProperty`, and the `CreateDataPropertyOrThrow`
+  arm in `array.rs` (the non-array branch at the `__prop_find` probe, which
+  takes `__define_own` on a proxy instead of reading a table).
+- **[[HasProperty]]** — `__proxy_has(p, key) -> i32`; hook: every level of the
+  `__has` walk; forward `__has(key, target)`. On a false result, a present
+  target property that is non-configurable, or present on a non-extensible
+  target, throws.
+- **[[Get]]** — `__proxy_get(p, key, recv) -> i64`; hooks: every level of
+  `emit_get_from` (`__get` and `__super_get`) and of `__symbol_get` (a proxy
+  level is tested before the `HAS_SYMBOL_KEYS` shortcut); forward
+  `__super_get(target, key, recv)` (that is `[[Get]]` with an explicit
+  receiver). With a non-configurable target property: a non-writable data
+  property needs `SameValue(result, value)`; an accessor without a getter
+  needs `undefined`.
+- **[[Set]]** — `__proxy_set(p, key, v, recv) -> i32`; hooks: every level of
+  `emit_set_from` (`__set`, `__super_set`, `__set_bool`; in the throwing
+  forms a `0` throws `PROXY_FALSISH`) and of `__proto_set` (the element-store
+  chain walk of §5.4: a proxy owner consumes the store, a `0` throws);
+  forward `__set_bool(target, key, v, recv)`. `ToBoolean` false → `0`. With a
+  non-configurable target property: a non-writable data property needs
+  `SameValue(v, value)`; an accessor without a setter throws.
+- **[[Delete]]** — `__proxy_delete(p, key) -> i32`; hook: the entry of
+  `__delete`, which gains a `strict: i32` parameter and an `i32` result
+  (`strict = 1`: the `delete` operator and `DeletePropertyOrThrow` in the
+  `Array.prototype` bodies, throwing as today, a falsish proxy
+  `PROXY_FALSISH`; `strict = 0`: `Reflect.deleteProperty` and the
+  `JSON.parse` reviver, which return the boolean); forward `__delete(target,
+  key, 0)`. On a true result, a non-configurable target property throws, and
+  so does a present one on a non-extensible target (`proxy-missing-checks`).
+- **[[OwnPropertyKeys]]** — `__proxy_own_keys(p, mode) -> i64` (a fresh dense
+  array, already filtered by the `__own_keys` `mode` below); hook: the entry
+  of `__own_keys`; forward `__own_keys(target, OWN_ALL_KEYS)`. `CreateListFromArrayLike(trapResult, « String, Symbol »)`: a
+  non-object throws; `ToLength(Get(r, "length"))` then `Get(r, i)` per index;
+  an element that is neither a string nor a symbol throws; strings are
+  interned (`__intern`), so the keys compare by address and the array is a
+  key array like every `__own_keys` result; a duplicate throws (a quadratic
+  scan; key lists are short). Then `IsExtensible(target)` and the target's
+  keys split by `__own_prop` into configurable / non-configurable: an
+  extensible target with no non-configurable key returns the list; every
+  non-configurable key must be in it; for a non-extensible target every
+  target key must be in it and nothing else may be.
+  `__proxy_own_keys` then filters by `mode`: `OWN_ALL` the strings, `OWN_SYMBOLS`
+  the symbols, `OWN_ALL_KEYS` everything (trap order, not sorted);
+  `OWN_KEYS` / `OWN_VALUES` / `OWN_ENTRIES` are `EnumerableOwnProperties`:
+  per string key one `__proxy_own_prop` (kept when present and enumerable)
+  immediately followed, for values and entries, by `__proxy_get(p, k, p)`.
+- **[[Call]] / [[Construct]]** — below.
+
+**Ordinary walks meeting a proxy.** A prototype chain may contain a proxy at
+any level (`Object.setPrototypeOf(o, p)`, `Object.create(p)`, a class whose
+`prototype`'s `[[Prototype]]` is a proxy, a proxy installed in a realm
+prototype's chain). Each loop tests the kind at the top of every iteration,
+the first included, and hands the rest of the operation to the proxy with the
+original receiver: `__get` / `__super_get` / `__symbol_get` →
+`__proxy_get(q, key, recv)`; `__set` / `__super_set` / `__set_bool` /
+`__proto_set` → `__proxy_set(q, key, v, recv)`; `__has` →
+`__proxy_has(q, key)`; `__for_in_keys` → the proxy level enumerates through
+traps (below); `__protos_indexless` → `0` (a proxy may answer any index, so
+holes take `__proto_elem`, whose `__has` / `__get` reach the traps). The
+receiver step of `OrdinarySet` (`emit_receiver_set`, used by `__super_set`
+and `__set_bool`) meets a proxy **receiver** when a trap-less proxy forwards
+`[[Set]]` to an ordinary target: it then runs `OrdinarySetWithOwnDescriptor`
+steps 2.c-e through the proxy — `__own_prop(recv)` (the
+`getOwnPropertyDescriptor` trap), an accessor or non-writable result fails,
+a present one is `__define_own(recv, key, {value})`, an absent one
+`CreateDataProperty` (`__define_own` with `DESC_DATA_DEFAULT`), both the
+`defineProperty` trap. The other single-object helpers (`__delete`,
+`__define`, `__define_own`, `__own_desc`, `__own_keys`, `__own_enum`,
+`__has_own`, `__set_proto`, `__set_integrity`, `__test_integrity`,
+`__copy_data`'s source) test the kind once at entry. `__prop_find` stays a raw
+table probe and is never called on a proxy except for a private key
+(`__private_find`); its three other non-intrinsic callers get a proxy arm:
+`json.rs` (the reviver's configurable probe: on a proxy, `__delete(.., 0)`
+with the result ignored), `iterator.rs` (`SetterThatIgnoresPrototypeProperties`:
+`__own_prop` on a proxy `this`), and `array.rs` (above).
+
+- **`for-in`** (`__for_in_keys`): at a proxy level, `__proxy_own_keys`, then
+  for each string key not yet seen one `__proxy_own_prop` (an enumerable
+  present key is added; every key is marked seen), then the next level is
+  `__proxy_get_proto(p)`. The snapshot rule is unchanged.
+- **`CopyDataProperties`** (`__copy_data`, object spread and rest): a proxy
+  source takes the generic order — `__own_keys(src, OWN_ALL_KEYS)`, then per
+  key not excluded `__own_prop` (enumerable?) and `__get(src, k)`.
+- **`Object.assign`, `defineProperties` / `create`,
+  `getOwnPropertyDescriptors`, object rest**: already `__own_keys(..,
+  OWN_ALL_KEYS)` followed by per-key `__own_enum` / `__own_desc` / `__get`,
+  which become trap calls on a proxy in spec order.
+
+**Callable and constructor proxies.** `new Proxy(target, handler)` with a
+callable target stores the funcref slot of the new internal builtin
+`Builtin::Proxy(ProxyOp::Call)` (a trampoline like `BoundCall`, `emit/builtins/proxy.rs`)
+in `func_idx` and the proxy in `env`. Every call site kind reaches it through
+the unchanged `call_indirect` sequence once its callability test accepts the
+proxy: direct-value and method calls (`emit_call_indirect`, the method call
+paths, the shared `MethodCall` builtin), `new` and `super(..)`
+(`emit_construct`: `IsConstructor` reads flag `8`, and flag `32` skips the
+`this` allocation, since a proxy's `[[Construct]]` never runs
+`OrdinaryCreateFromConstructor` itself), spread calls (`emit_call_spread`,
+`$__spread_args`), builtin-to-user calls (`call_spilling` / `push_call`:
+array callbacks, `forEach`, replacers, `then` reactions through `__invoke1`,
+accessors through `emit_accessor_call`, `@@toPrimitive`, `@@hasInstance`,
+iterator methods), bound functions (`BoundCall` calls or constructs its
+target), and `Function.prototype.call` / `apply`. The trampoline:
+
+1. decodes `argc` (the construct marker, §7.6) and, before any user code
+   runs, copies the `n` arguments (`K` slots, then `$__spread_args` past
+   `K`; `store_args` of `emit/builtins/function.rs`) into a fresh array, so
+   no `$__spread_args` snapshot is needed later; it snapshots `$__this` and
+   `$__new_target` at entry;
+2. reads `target`; `__proxy_trap(p, "apply" | "construct")`;
+3. **call**, trap absent: `call_with_array(target, this, args)`; trap present:
+   `Call(trap, handler, «target, this, argsArray»)` through `push_call`;
+4. **construct** (only reachable with flag `8`, so the target is a
+   constructor), trap absent: an `IrNode::Construct { callee: target, spread:
+   argsArray, new_target: Some(newTarget) }` exactly like `bound_construct`
+   (so a non-`SELF_ALLOC` target allocates `this` from `Get(newTarget,
+   "prototype")`, which is the `get` trap when `newTarget` is the proxy
+   itself); trap present: `Call(trap, handler, «target, argsArray,
+   newTarget»)` whose result must be an object (else `TypeError: proxy
+   [[Construct]] must return an object`).
+
+`new.target` is whatever the construct site set: the proxy for `new P()`,
+the derived class for `super(..)` in `class B extends P`, the explicit one
+for `Reflect.construct`. `class B extends P` needs nothing new: the heritage
+check is `emit_is_constructor`, `Get(P, "prototype")` is the `get` trap, and
+`GetSuperConstructor` reads `B`'s ordinary `proto`.
+
+**Private names** act on the proxy object itself and never trap (§7.6): the
+proxy's own `props` table holds its private entries, so `__private_find`,
+`__private_get`, `__private_set`, `__private_brand` and `__private_in` work
+unchanged; `__private_add` reaches `__define`, whose private-key test runs
+before its proxy test (raw append, no not-extensible check). No other walk
+reads a proxy's table: they all take the proxy path first, so the entries
+stay invisible. A base constructor returning a proxy lets a derived class
+install fields: public ones through `__define` (the `defineProperty` trap),
+private ones on the proxy's table.
+
+**Revocation.** `Proxy.revocable(target, handler)`
+(`Builtin::Proxy(ProxyOp::Revocable)`) runs `ProxyCreate`, makes the revoke
+function — a `TYPE_FUNCTION` with the funcref slot of the internal
+`Builtin::Proxy(ProxyOp::Revoke)` and `env` = the proxy
+(`emit_settler_value`, as the promise combinators make their element
+functions), info name `""`, `length` 0, not a constructor — and returns a
+fresh ordinary object with own `proxy` then `revoke` (`CreateDataProperty`).
+The revoke function writes `null` into the proxy's `target` and `handler` and
+returns `undefined`; a second call writes them again (idempotent; the spec
+clears `[[RevocableProxy]]`, which only frees the 48-byte block earlier).
+Every trap on a revoked proxy throws `PROXY_REVOKED` from `__proxy_trap`,
+`IsArray` of one throws, and the renderer prints it as `<Revoked Proxy>`.
+
+**`ProxyCreate`** (`Builtin::Proxy(ProxyOp::Ctor)`, `SELF_ALLOC`): called without `new`
+throws `TypeError: Constructor Proxy requires 'new'`; a non-object target or
+handler throws `TypeError: Cannot create proxy with a non-object as target or
+handler` (a revoked proxy is an acceptable target or handler); then the block
+above (`gc::emit_alloc_const`, 48 bytes), callable / constructor bits from
+`emit_is_function` / `emit_is_constructor` of the target, or the same bits
+of a proxy target (`builtins/proxy.rs::proxy_bits`, until P2b widens those
+tests). Both arguments are
+read before any user code runs (there is none), so no snapshot.
+
+**Integration paths.**
+
+- **`Array.isArray`** (`IrNode::IsArray`, `emit/expr.rs`): the inline
+  `TYPE_ARRAY` test, then `__is_array` for a `TYPE_PROXY` operand.
+- **`instanceof`**: `GetMethod(C, @@hasInstance)` is `__symbol_get` (the `get`
+  trap on a proxy `C`); `IsCallable(C)` accepts a callable proxy;
+  `OrdinaryHasInstance` reads `Get(C, "prototype")` (trap) and its chain walk
+  (`emit_proto_chain_match`, `emit/object.rs`, used by the generic tail and
+  by the sealed fast arm) calls `__get_proto` on a `TYPE_PROXY` link instead
+  of loading `proto @8` (the `getPrototypeOf` trap, exceptions propagated).
+  `isPrototypeOf` walks the same way.
+- **`Object.prototype.toString`** (`builtins/object.rs::emit_to_string`): for a
+  proxy, the builtin tag comes first (spec order): `__is_array` (may throw) →
+  `"Array"`, else `PROXY_CLASS_CALLABLE` → `"Function"`, else `"Object"`;
+  then `Get(O, @@toStringTag)` (the trap) overrides it when a string.
+- **`JSON.stringify`** (`builtins/json.rs`, `__json_rep`): a callable proxy is
+  omitted like a function; `__is_array` decides the array form, whose
+  elements of a proxy come from `Get(value, "length")` and `Get(value, i)`
+  (no store read); an object proxy's keys are `__own_keys(value, OWN_KEYS)`
+  (one `getOwnPropertyDescriptor` trap per key) and its values `__get`; the
+  replacer's property list uses `__is_array` too. A proxy is never a
+  wrapper (it has no `[[NumberData]]` etc.), so no unwrapping. The
+  `JSON.parse` reviver (`__json_revive`) likewise uses `__is_array`, `Get`
+  of `length`, `__own_keys(.., OWN_KEYS)`, `__delete(.., 0)` and
+  `__define_own`.
+- **`Object.keys` / `values` / `entries`, `getOwnPropertyNames` /
+  `Symbols`, `Reflect.ownKeys`, object spread / rest, `for-in`**: the
+  `__own_keys` / `__copy_data` / `__for_in_keys` arms above.
+- **`Array.prototype.concat`**: `IsConcatSpreadable` is `__symbol_get(O,
+  @@isConcatSpreadable)` (trap), then `__is_array`; a proxy element always
+  takes the generic `LengthOfArrayLike` + per-index `HasProperty` / `Get`
+  path, as every `Array.prototype` body does for a proxy receiver (`is_array`
+  and `indexless_array` in `builtins/array.rs` stay `TYPE_ARRAY` only, so no
+  store fast path ever sees a proxy). `ArraySpeciesCreate` uses `__is_array`
+  before `Get(O, "constructor")`.
+- **`Function.prototype.toString`** of a callable proxy:
+  `function () { [native code] }` (the `NativeFunction` form without a name);
+  a non-callable proxy throws the existing `TypeError`.
+- **`Function.prototype.bind`** of a callable proxy: `proto` from
+  `__get_proto(target)` (the `getPrototypeOf` trap, then the `length` / `name`
+  reads, in spec order), `CONSTRUCTOR | SELF_ALLOC` from flag `8`.
+- **Renderer** (§6.9, `emit/render.rs`): no trap ever runs. `__render_heap`
+  unwraps a `TYPE_PROXY` to its target (repeatedly, for proxy chains) and
+  renders the target as Node does without `showProxy`
+  (`{ a: 1 }`, `[Function: f]`); a revoked proxy prints `<Revoked Proxy>`.
+- **`ToPrimitive`, `ToPropertyKey`, `GetIterator`, promise thenables,
+  `Symbol.iterator` / `asyncIterator` / `species` / `match` reads**: all go
+  through `__get` / `__symbol_get`, hence through the traps.
+
+**Fast paths and guards** (§6.4). Proxies cannot be watched intrinsics and
+are rejected by every receiver test, so most guards are already safe:
+
+- `ProtoGuard`, the `GetIterator` fast paths, `.length`, the
+  `ArraySpeciesCreate` / `SpeciesConstructor` identity tests and the
+  `NamespaceGuard` match a kind byte or an intrinsic identity a proxy never
+  has: a proxy receiver takes the generic path (`MethodCall`, the protocol,
+  `__get`). Safe, no change.
+- A proxy installed **behind** a realm prototype (`Object.setPrototypeOf(
+  Array.prototype, p)`) goes through `__set_proto` on a watched table and sets
+  its dirty bit; writes through a trap-less proxy whose target is a realm
+  prototype land in `__set` / `__define` / `__define_own` / `__delete` on the
+  watched table and set its bit; `%Object.prototype%` cannot take a new
+  prototype at all. Safe, no change.
+- `__protos_indexless`: **needs the proxy arm** (`0` on a proxy link);
+  without it a proxy prototype reads as "no index keys" and an array hole
+  would skip its `get` trap. This is the only fast-path guard that needs a
+  new test; no new dirty bit is needed.
+- `__symbol_get`: **needs the proxy arm** before its `HAS_SYMBOL_KEYS`
+  shortcut (a proxy's `props` is `0`).
+- The `instanceof` fast arm: **needs** the `__get_proto` step in
+  `emit_proto_chain_match` (above); its intact test reads only static realm
+  constructors and stays.
+- There are no inline caches and no shape assumptions on objects that are
+  not freshly allocated literals or class instances (§13), and member access
+  always calls `__get` / `__set` except the kind-tested `.length`.
+- The global object is a static ordinary block and is never a proxy. Its
+  prototype chain may hold one (`Object.setPrototypeOf(globalThis, p)`); an
+  unresolved name is then `HasProperty` + `Get` on the global object (§6.4),
+  so the `has` and `get` traps run through the ordinary hand-off. Sealed
+  names never consult the global object (escaping `globalThis` unseals
+  them).
+- Runtime shaking: the proxy arms exist only under `proxies` (above);
+  `Proxy` and `Reflect` are realm entries kept by their key lookups like
+  every global.
+
+**Reflect** (`emit/builtins/reflect.rs`, a new `ReflectFn` enum of thirteen
+variants in `emit/realm.rs` — distinct from the existing `ReflectOp`, which
+names the `Object` statics). Every function throws `TypeError: Reflect.<f>
+called on non-object` for a non-object target, and reads all its arguments
+into locals at entry, before `ToPropertyKey` or any other user code runs
+(else it would read a clobbered `$__spread_args` past `K`):
+
+| function | `length` | steps |
+|---|---|---|
+| `apply(f, thisArg, args)` | 3 | `IsCallable(f)` else `TypeError`; `CreateListFromArrayLike(args)` (a non-object, `undefined` included, throws); `call_with_array` |
+| `construct(F, args, newTarget = F)` | 2 | `IsConstructor(F)`, `IsConstructor(newTarget)` else `TypeError`; the list; `IrNode::Construct { callee: F, spread: list, new_target: Some(newTarget) }` |
+| `defineProperty(t, k, attrs)` | 3 | `__to_key`, `__to_desc`, `__define_own == DEFINE_OK` (no throw on rejection) |
+| `deleteProperty(t, k)` | 2 | `__delete(t, k, 0)` |
+| `get(t, k, receiver = t)` | 2 | `__super_get(t, k, receiver)` |
+| `getOwnPropertyDescriptor(t, k)` | 2 | `__own_desc` |
+| `getPrototypeOf(t)` | 1 | `__get_proto` |
+| `has(t, k)` | 2 | `__has` |
+| `isExtensible(t)` | 1 | `__test_integrity(t, 0)` |
+| `ownKeys(t)` | 1 | `__own_keys(t, OWN_ALL_KEYS)`: integer keys ascending, then strings, then symbols, each in insertion order (a proxy: the checked trap list) |
+| `preventExtensions(t)` | 1 | `__set_integrity(t, 0)` status |
+| `set(t, k, v, receiver = t)` | 3 | `__set_bool(t, k, v, receiver)` |
+| `setPrototypeOf(t, proto)` | 2 | `proto` an object or `null` else `TypeError`; `__set_proto(t, proto) == 0` |
+
+`CreateListFromArrayLike` for `apply` / `construct` is the list-building part
+of `Function.prototype.apply` (`builtins/function.rs::emit_apply`), factored
+into a shared function in that file (`apply` itself keeps accepting
+`undefined` / `null` as "no arguments").
+
+**`Reflect.construct` and builtin constructors.** Builtin constructors
+already receive `newTarget` through `$__new_target` and compute
+`GetPrototypeFromConstructor` from it (`ctor.rs::Body::proto`: `Get(new.target,
+"prototype")` when constructing and an object, else the realm prototype of
+the constructor — the newTarget's realm is the only realm). So nothing in the
+constructor bodies changes: `Reflect.construct` sets `$__new_target` like any
+`new` with an explicit `new_target`. Per family: user classes and plain
+functions allocate `this` from `Get(newTarget, "prototype")` at the construct
+site (`emit_construct`), derived classes pass `newTarget` on through
+`super(..)`; the Error family (`AggregateError` included), `Array`,
+`Promise`, `Map` / `Set`, `WeakMap` / `WeakSet` / `WeakRef` /
+`FinalizationRegistry`, `Date`, and `Boolean` / `Number` / `String` (their
+wrapper under `new`) use `Body::proto`; `Object` with a `newTarget` other
+than `%Object%` returns the allocated `this` (`ctor.rs::object`); `Symbol`
+throws (`new` is refused); `Function` throws (unsupported); `Iterator` is
+abstract unless `newTarget` differs; a bound function constructs its target
+with `newTarget` per §5.5; a constructor proxy forwards `newTarget` to its
+`construct` trap or target. The bodies that read arguments after `Get(newTarget,
+"prototype")` (Error, AggregateError, Array, Date, Promise) already snapshot
+`$__spread_args` (`Body::snapshotted`); `Reflect.construct` always passes its
+arguments as a spread array, so these snapshots become reachable with a
+user-code `prototype` read — the case P3 tests (below).
+
+**Realm entries** (`emit/realm.rs`, appended after `%OutOfMemoryError%` in
+image order; no watch bit; not inline namespaces):
+
+- `%Proxy%` — a new `Intrinsic::Proxy`, not a `BuiltinCtor` (it has no
+  `prototype`): a static `TYPE_FUNCTION` block, `CONSTRUCTOR | SELF_ALLOC`,
+  `func_idx` = the `Builtin::Proxy(ProxyOp::Ctor)` slot, `proto`
+  `%Function.prototype%`; own `length` 2, `name` `"Proxy"` (configurable
+  only), `revocable` (`Builtin::Proxy(ProxyOp::Revocable)`, `length` 2, a
+  method).
+- `%Reflect%` — a new `Intrinsic::Reflect`, `CLASS_ORDINARY`, `proto`
+  `%Object.prototype%`; the thirteen methods (`Builtin::Reflect(ReflectFn)`)
+  and `@@toStringTag` `"Reflect"` (`{writable: false, enumerable: false,
+  configurable: true}`).
+- Global object: `Proxy` and `Reflect`, writable, configurable, not
+  enumerable.
+- The proxy builtins are one variant `Builtin::Proxy(ProxyOp)` (`Ctor`,
+  `Revocable`, `Revoke`; P2b adds the call trampoline as another `ProxyOp`)
+  dispatched by `builtins/proxy.rs::emit`. The revoke function and the
+  trampoline are internal (installed nowhere, so shaking keeps them). The
+  `ReflectFn` bodies dispatch from `builtins/mod.rs`.
+
+**Stages** (files in scope per stage; each adds, never reorganizes, in the
+shared files):
+
+- **P2a — proxy block and object internal methods.** `abi.rs`
+  (`TYPE_PROXY = 20`, the offsets, `PROXY_CLASS_CALLABLE`, the `const`
+  asserts), `emit/props/proxy.rs` (new: `__proxy_trap` and the eleven
+  object `__proxy_*` helpers), `emit/props.rs` and
+  `emit/props/descriptor.rs` (the hand-offs, `__get_proto`, `__own_prop`,
+  `__desc_compatible`, `__set_bool`, `__delete` / `__set_integrity`
+  signatures, `__to_key` interning), `emit/registry.rs` (rows), `emit/mod.rs`
+  (`Helpers::proxies`, accessors, `PROP_THROW_PROXY_*`), `emit/roots.rs`,
+  `codegen/globals.rs` (the `proxies` fact), `emit/gc.rs` (trace arm),
+  `emit/render.rs` (unwrap / `<Revoked Proxy>`), `emit/realm.rs` +
+  `emit/builtins/proxy.rs` (new) + `builtins/mod.rs` (`%Proxy%`,
+  `ProxyOp::{Ctor, Revocable, Revoke}`; a callable target already
+  sets the class byte but calls throw until P2b), the `Object` statics and
+  `Object.prototype` methods that switch to the new helpers
+  (`builtins/object_static.rs`, `builtins/object.rs`), the three
+  `__prop_find` callers, and `emit/expr.rs` for `typeof`.
+  **Delivered**, with these departures: the gate is computed in
+  `emit/sections.rs` (not `codegen/globals.rs`) and also forces
+  `has_accessors`; the builtins are `Builtin::Proxy(ProxyOp)`;
+  `__proxy_own_keys` takes the `mode` and filters; `__desc_compatible`
+  restates the rejection rules instead of sharing `__define_own`'s block;
+  five `__prop_throw` modes (`28`..`32`) instead of four. The `__prop_find`
+  callers: `json.rs`'s reviver probe became `__delete(.., 0)` (no probe
+  left), `iterator.rs`'s ignoring setter asks `__own_prop` under the gate,
+  `array.rs`'s `CreateDataPropertyOrThrow` takes `__define_own` on a proxy.
+  Callers of helpers that a trap can now make throw test `$exc_pending`
+  under the gate (`for-in`, `Object.keys`, `defineProperties`,
+  `getOwnPropertyDescriptors`, `assign`, `JSON.stringify`'s object branch,
+  `__copy_data`, whose exclusion test also moves before the
+  `[[GetOwnProperty]]` under the gate). An object proxy in
+  `JSON.stringify` already serializes through `__own_keys` and `__get`
+  (traps); `Object.prototype.toString`, `Array.isArray`, `instanceof` and
+  calls still see the raw block until P2b. `src/abi_drift_tests.rs`,
+  `tests/proxy.rs`, `tests/shake.rs` and `tests/wasi_shell.rs` carry the
+  tests.
+- **P2b — callable / constructor proxies and integration paths.**
+  the call trampoline (`Builtin::Proxy(ProxyOp::Call)`, `builtins/proxy.rs`), `emit_is_function` /
+  `emit_is_function_block` / `emit_is_constructor` (`emit/value.rs`,
+  `emit/expr.rs`) and the five internals-reading sites, `__is_array` and its
+  users (`emit/expr.rs` `IsArray`, `builtins/array.rs`, `builtins/json.rs`,
+  `builtins/object.rs` `toString`), `emit/object.rs` (`instanceof` walk,
+  `isPrototypeOf`), `builtins/function.rs` (`toString`, `bind`).
+- **P3 — Reflect.** `emit/builtins/reflect.rs` (new), `ReflectFn` and
+  `%Reflect%` in `emit/realm.rs`, `builtins/mod.rs`, the
+  `CreateListFromArrayLike` factoring in `builtins/function.rs`. No
+  constructor body changes (above).
+- **P4 — closeout.** Remove `Proxy`, `proxy-missing-checks` and `Reflect*`
+  from `tests/test262/unsupported-features.txt`; refresh the baseline from CI;
+  rewrite this subsection in the present tense (dropping "planned"); update
+  §5.1 / §5.2 / §5.7 / §6.2 / §7.6, §13 (the new limitations below, and the
+  per-family failure table) and §14.
+
+A different split would not be materially better: P2a is the largest stage
+(every property helper), but its arms share one protocol helper and one test
+file, and callable proxies only need the call-site test change plus one
+trampoline, so they review well on their own.
+
+**Tests** (written failing-first; `common::assert_output` /
+`assert_uncaught` / `assert_same_under_gc_stress`):
+
+- P2a — `crates/jsc-core/tests/proxy.rs` (new): one test per trap (forward
+  when absent, trap result, every invariant `TypeError`, the three
+  `proxy-missing-checks` cases), traps reached through a prototype chain
+  (`Object.create(p)` get / set / has, an array hole over a proxy prototype,
+  `super.x` over a proxy, `for-in` over a proxy level), the receiver step
+  (`set` through a proxy without a `set` trap over an ordinary
+  target firing its `getOwnPropertyDescriptor` and `defineProperty` traps
+  on the proxy as receiver), `Object.keys` / `assign` / spread / rest trap order, freeze /
+  seal / `isFrozen` over traps, ownKeys result checks (non-array, wrong
+  element type, duplicates, missing non-configurable key), never-interned
+  computed keys reaching a trap, revocation (each trap throws, `revoke`
+  idempotent, `Proxy.revocable` result shape), `Proxy` without `new`,
+  non-object arguments, `Proxy.length` / `name` / no `prototype`, private
+  fields and methods on a proxy returned by a base constructor (no trap
+  fires), and `console.log` of proxies (`crates/jsc-core/tests/console.rs`).
+  `gc_stress` variants for the trap-calling paths that allocate (descriptor
+  objects, key lists, `push_call` spill arrays, `for-in` snapshots).
+  `crates/jsc-core/tests/shake.rs`: a program without `Proxy` keeps no
+  `__proxy_*` body.
+- P2b — `proxy.rs`: `apply` / `construct` traps and their absence, `typeof`,
+  calls from every call-site kind (plain, method, spread with more than `K`
+  arguments, `new`, `super(..)` from `class B extends P`, `Array.prototype.map`
+  callback, `Function.prototype.call` / `apply`, `bind` of a proxy, accessor
+  and `@@toPrimitive` proxies), `new.target` inside the target, a construct
+  trap returning a primitive, revoked callable proxies (`typeof` still
+  `"function"`, calls throw); `Array.isArray`, `Object.prototype.toString`,
+  `JSON.stringify` (arrays, objects, revoked, replacer list), `instanceof`
+  with a `getPrototypeOf` trap, `concat` spreading a proxy of an array,
+  `Function.prototype.toString`. `gc_stress` for the trampoline's argument
+  array and the construct path.
+- P3 — `crates/jsc-core/tests/reflect.rs` (new): every function (argument
+  checks, return values where the `Object` twin throws), `Reflect.ownKeys`
+  order, `Reflect.construct` with a `newTarget` for a user class, a derived
+  class, each builtin constructor family, a bound function and a proxy, and
+  `Reflect` itself (`@@toStringTag`, not callable, not a constructor). The
+  phase-4 leftover lives here as
+  `construct_new_target_prototype_getter_keeps_args`: `newTarget` is a
+  proxy over a function whose `get` trap, for `"prototype"`, first makes a
+  nested spread call with more than `K` arguments, then returns the realm
+  prototype; `Reflect.construct(Date, [7 fields], nt)`,
+  `Reflect.construct(Error, [msg, {cause}], nt)`, `AggregateError`, `Array`
+  with more than `K` elements and `Promise` must see their own arguments,
+  not the nested call's (`Body::snapshotted`); with an `assert_same_under_gc_stress`
+  twin.
+- P4 — no new tests; the test262 run is the gate. No opcount row should
+  move (the arms are compiled out without `proxies`); a row that moves needs
+  its `reason` cell.
+
+**Expected test262 effect.** 1555 tests carry a `Proxy`, `Reflect*` or
+`proxy-missing-checks` feature; 989 of them carry no other skipped feature
+and are strict-compatible (built-ins/Proxy 261, Reflect 153, Object 89,
+Array 77, Date 49, String 38, Math 36, Promise 35, JSON 24, Function 22, ...).
+While the flags stay (P2a-P3) only untagged tests that happen to use a proxy
+or `Reflect` move (about 380 files mention either; harness files
+`deepEqual.js` and `wellKnownIntrinsicObjects.js` use `Reflect.ownKeys` /
+name `%Proxy%`): roughly +20..60 after P2a, +10..30 after P2b, +60..120
+after P3. P4 adds the 989 to the eligible set; at the 85-90 % pass rate of
+comparable families that is about +850 passes. Known remaining failure
+classes: tests whose other half needs `RegExp`, `eval` or the `Function`
+constructor without a feature tag; `Array.prototype` methods whose generic
+loops clamp lengths to `2^32 - 1` (§13) observed through a proxy `length`;
+`Object.defineProperties` reading its keys before its descriptors (§13), which
+a proxy makes observable; and deep proxy chains (each level a nested helper
+call, unguarded like the renderer, §13).
 
 ---
 
@@ -2822,16 +3523,18 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   `**` and `Math.pow` share one inline implementation.
 - **Bitwise and shift** `& | ^ ~ << >> >>>` and their compound forms, with
   ToInt32 / ToUint32 on the operands.
-- **BigInt** (design, §6.10.5–6.10.6; lands in B2a / B2b): every operator
-  above applies ToNumeric instead of ToNumber on its non-number path; two
-  BigInts use the BigInt kernels, a BigInt mixed with a number throws
-  `TypeError` (except `+` with a string, and the comparisons, which are
-  exact), unary `+` and `>>>` throw for a BigInt, and `**` leaves the
-  `Math.pow` lowering for its own `BinOp::Exp`. Equality and
-  SameValue(Zero) compare BigInts by value.
+- **BigInt** (§6.10.5–6.10.6): equality, SameValue(Zero) and `+` with a
+  string are implemented (B2a); every other operator still applies
+  ToNumber, which throws a `TypeError` for a BigInt. Design (lands in B2b):
+  every operator above applies ToNumeric instead of ToNumber on its
+  non-number path; two BigInts use the BigInt kernels, a BigInt mixed with a
+  number throws `TypeError` (except `+` with a string, and the comparisons,
+  which are exact), unary `+` and `>>>` throw for a BigInt, and `**` leaves
+  the `Math.pow` lowering for its own `BinOp::Exp`.
 - **Relational** `< > <= >=` (§6.5).
 - **Strict equality** `===` / `!==`: numbers numerically (`NaN !== NaN`,
-  `+0 === -0`), strings by byte content, everything else by identity bits.
+  `+0 === -0`), strings by byte content, BigInts by value, everything else
+  by identity bits.
 - **Loose equality** `==` / `!=` (`__loose_eq`): booleans are first normalized
   to numbers; `null` and `undefined` equal each other and nothing else; two
   numbers compare as `f64`; two strings by content; number vs. string converts
@@ -3337,8 +4040,9 @@ invisibility and the early errors — and static blocks.
   entries' attrs untouched and `__test_integrity` (`isFrozen` /
   `isSealed`) ignores them. The renderer (`emit/render.rs`) lists
   only `ENUMERABLE` entries, so it never shows one. A private key appended to a watched intrinsic's table only
-  sets its dirty bit. There is no `Proxy`; when it lands, private operations
-  act on the proxy's own table and never trap.
+  sets its dirty bit. There is no `Proxy` yet; the phase-5b design (§6.11)
+  keeps private entries in the proxy's own table, so private operations act
+  on the proxy and never trap.
 
 **Static blocks** (phase 5a, built in P4). `static { .. }` lowers to a lifted
 zero-parameter method function (`lower_lifted_function`, method kind, not
@@ -3628,9 +4332,9 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | errors | §7.7 |
 | generators | `%GeneratorPrototype%` `next`, `return`, `throw` |
 | iterators | `%IteratorPrototype%[@@iterator]`, `%AsyncIteratorPrototype%[@@asyncIterator]` (both return `this`); the `next` of the Array, String, Map and Set Iterator prototypes (a receiver that is not an iterator of the family throws `TypeError: next method called on incompatible receiver`); `Iterator` (abstract: calling it, or `new` with `new.target === Iterator`, throws `TypeError`; a subclass constructs), `Iterator.prototype` (`%IteratorPrototype%`, non-writable) with `constructor` (`%Iterator%`) and `@@toStringTag` (`"Iterator"`) accessors whose setters are `SetterThatIgnoresPrototypeProperties` (a `TypeError` on a non-object or on `Iterator.prototype` itself; an own data property on any other receiver); `Iterator.from(O)` (`GetIteratorFlattenable`: strings are iterated, other primitives throw `TypeError`; an iterator inheriting `Iterator.prototype` is returned as is, any other is wrapped in a `CLASS_ITERATOR` object of kind `16` over `%WrapForValidIteratorPrototype%`, whose `next` / `return` forward to the wrapped record, `next` read once); the lazy helpers `Iterator.prototype.map` / `filter` / `take` / `drop` / `flatMap` (`this` must be an object; the argument is validated first — a non-callable callback is a `TypeError`, a `take` / `drop` limit goes through `ToNumber` and `NaN` or a negative integer is a `RangeError` — closing `this` on failure; then `next` is read once and a helper object is returned without stepping). A helper's `next` steps the underlying iterator only on demand; a throwing callback, or a `flatMap` result that is not an object (a string included) or not iterable, closes the underlying iterator; `take` closes it once the limit is reached; a `next` / `return` while the helper runs throws `TypeError`; `return()` closes the underlying iterator (and a `flatMap`'s open inner one first) and completes the helper. The eager helpers `reduce` / `toArray` / `forEach` / `some` / `every` / `find` validate `this` and the callback the same way, read `next` once and consume the iterator, passing a counter as the callback's last argument (`reduce` without an initial value starts from the first value with counter `1`, and throws `TypeError` on an empty iterator); a throwing callback closes the iterator under its throw, `some` / `every` / `find` close it on an early result, and a throw from `next` or a result's `value` propagates without closing. A program that names `Iterator`, `constructor`, `getPrototypeOf` or `setPrototypeOf` compiles the accessor dispatch of `__get` / `__set` |
-| `ArrayBuffer` | §5.8.7: `new ArrayBuffer(length, { maxByteLength })` (calling it without `new` is a `TypeError`; `ToIndex` `RangeError`s, a length or maximum past `2^29` is `RangeError: Array buffer allocation failed`; subclassable through `new.target`), `ArrayBuffer.isView` (`true` only for a typed array or `DataView`; `DataView` does not exist yet), `get [@@species]`; prototype getters `byteLength`, `maxByteLength`, `resizable`, `detached`; `resize`, `slice` (through `SpeciesConstructor`), `transfer`, `transferToFixedLength` (both detach the receiver), `@@toStringTag`; rendered as `ArrayBuffer { [Uint8Contents]: <..>, byteLength: n }` (§5.8.8). No immutable buffers, no `SharedArrayBuffer` (§5.8.9) |
+| `ArrayBuffer` | §5.8.7: `new ArrayBuffer(length, { maxByteLength })` (calling it without `new` is a `TypeError`; `ToIndex` `RangeError`s, a length or maximum past `2^29` is `RangeError: Array buffer allocation failed`; subclassable through `new.target`), `ArrayBuffer.isView` (`true` only for a typed array or `DataView`), `get [@@species]`; prototype getters `byteLength`, `maxByteLength`, `resizable`, `detached`; `resize`, `slice` (through `SpeciesConstructor`), `transfer`, `transferToFixedLength` (both detach the receiver), `@@toStringTag`; rendered as `ArrayBuffer { [Uint8Contents]: <..>, byteLength: n }` (§5.8.8). No immutable buffers, no `SharedArrayBuffer` (§5.8.9) |
 | typed arrays | §5.8.7, stage T3a: `%TypedArray%` (abstract: calling or constructing it is a `TypeError`) with `from`, `of`, `get [@@species]`; `Int8Array`, `Uint8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array` (every constructor overload incl. length-tracking views over resizable buffers, `BYTES_PER_ELEMENT`, subclassable through `new.target`); `%TypedArray.prototype%` getters `buffer`, `byteLength`, `byteOffset`, `length`, `get [@@toStringTag]`, and `keys` / `values` / `entries` / `[@@iterator]`; the integer-indexed exotic hooks (§5.8.5); rendered as `Uint8Array(3) [ 1, 2, 3 ]` (§5.8.8). **Target, not yet available** (stages T3b / T5a / T5b): every other `%TypedArray.prototype%` method, `Float16Array`, `BigInt64Array`, `BigUint64Array`, `Uint8Array.fromBase64`, `fromHex`, `Uint8Array.prototype.toBase64`, `toHex`, `setFromBase64`, `setFromHex`; `Math.f16round` |
-| `DataView` | **target, not yet available** (§5.8.7, stages T4 / T5a / T5b): `new DataView(buffer, byteOffset, byteLength)`; getters `buffer`, `byteLength`, `byteOffset`; `get` / `set` of `Int8`, `Uint8`, `Int16`, `Uint16`, `Int32`, `Uint32`, `Float16`, `Float32`, `Float64`, `BigInt64`, `BigUint64`; `@@toStringTag` |
+| `DataView` | §5.8.7: `new DataView(buffer, byteOffset, byteLength)` (calling it without `new` is a `TypeError`; a non-`ArrayBuffer` `buffer` or a detached one is a `TypeError`, an offset or length outside the buffer a `RangeError`, re-checked after `GetPrototypeFromConstructor`; an `undefined` `byteLength` over a resizable buffer makes a length-tracking view; subclassable through `new.target`); getters `buffer`, `byteLength`, `byteOffset` (the last two throw `TypeError` on an out-of-bounds or detached view); `get` / `set` of `Int8`, `Uint8`, `Int16`, `Uint16`, `Int32`, `Uint32`, `Float32`, `Float64` (big-endian unless `littleEndian` is truthy; `ToIndex(byteOffset)`, the setter's `ToNumber(value)`, `ToBoolean(littleEndian)`, then the out-of-bounds `TypeError` and the range `RangeError`; a NaN reads as the canonical NaN); `@@toStringTag`; rendered as `DataView { byteLength: n, byteOffset: n, buffer: ArrayBuffer { .. } }` (§5.8.8). `getFloat16` / `setFloat16` arrive with stage T5a, the BigInt pairs with T5b (§5.8.9) |
 
 No input produces an invalid wasm module.
 
@@ -3660,8 +4364,7 @@ without its `\r`. A span-less error prints its bare message. Because
 is recovered with `downcast_ref`.
 
 Representative messages: `cannot assign to constant binding: c`,
-`regular expression literals are not supported`, `BigInt literals are not
-supported`, `with statements are not supported`,
+`regular expression literals are not supported`, `with statements are not supported`,
 `async generator functions are unsupported`, `Invalid left-hand side in
 assignment`, `private name #x is not defined`.
 
@@ -3946,7 +4649,9 @@ Each item below is current behaviour of this tree.
   member is an ordinary `__get` on it.
 - Not available: `RegExp` (literals and constructor), `BigInt`, `Proxy`, `Reflect`,
   the `%TypedArray%.prototype` methods other than the getters and iterators,
-  `Float16Array`, the BigInt typed arrays, `DataView`, `Intl`, `eval`.
+  `Float16Array`, the BigInt typed arrays, `Intl`, `eval`. `Proxy` and
+  `Reflect` are phase 5b work in progress: designed (§6.11), not
+  implemented, and their test262 features are still skipped.
   The `Function` constructor throws `TypeError`.
 - The builtin library is exactly §7.9.
 - Binary data has no `SharedArrayBuffer`, `Atomics` or immutable buffers
@@ -3954,7 +4659,8 @@ Each item below is current behaviour of this tree.
   the test262 runner's `$262.detachArrayBuffer` (a program detaches an
   `ArrayBuffer` only with `transfer` / `transferToFixedLength`); once the
   rest of the §5.8 target lands, still no `BigInt64Array` /
-  `BigUint64Array` / `DataView` BigInt methods before stage T5b; §5.8.9.
+  `BigUint64Array` / `DataView` BigInt methods before stage T5b; `DataView`
+  has no `getFloat16` / `setFloat16` before stage T5a; §5.8.9.
 
 **Object model**
 
@@ -4000,8 +4706,6 @@ Each item below is current behaviour of this tree.
 - An `arguments` object has no own `callee` (the strict-mode
   `%ThrowTypeError%` accessor is absent): `arguments.callee` reads
   `undefined`.
-- A BigInt literal property key (`{1n: v}`, `class { 1n() {} }`, `{1n: a} =
-  o`) is a compile error (`BigInt` is not available).
 - `super` outside a class body (an object-literal method) is a compile
   error.
 
@@ -4144,6 +4848,8 @@ steps.
   in §5.8 (type tags `24`..`26`; `20`..`23` reserved for the Proxy and BigInt
   workstreams), implemented in stages T2, T3a, T4, T3b, T5a, T5b, T6
   (§5.8.10).
+  `Reflect` (phase 5b; the `Proxy` / `Reflect` design is §6.11, stages
+  P2a-P4).
 
 ### Phase 6 — Performance
 
@@ -4170,3 +4876,4 @@ steps.
 - Sloppy mode: strict mode only, permanently or not.
 - `RegExp` engine: written for the guest, or an existing engine compiled in
   (decide before phase 5).
+  Proposed design: `design/regexp.md` (a guest engine, awaiting approval).

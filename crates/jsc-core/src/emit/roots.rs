@@ -73,7 +73,7 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         // entry, so that call never materializes, but the graph is static).
         (helpers.private_find(), vec![helpers.prop_find]),
         (helpers.json_ws, vec![]),
-        (helpers.test_integrity(), binary::integrity_callees(helpers)),
+        (helpers.test_integrity(), integrity_callees(helpers)),
         (helpers.heap_object(), vec![]),
         (helpers.str_of(), vec![]),
         (helpers.fn_name(), vec![helpers.heap_object()]),
@@ -145,12 +145,33 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
             vec![CLOCK_TIME_GET_IMPORT, RANDOM_GET_IMPORT],
         ),
     ];
-    graph.extend(unicode::helper_graph(helpers));
-    graph.extend(libm::helper_graph(helpers));
-    graph.extend(promise_engine::helper_graph(helpers));
-    graph.extend(gc::helper_graph(helpers));
-    graph.extend(binary::helper_graph(helpers));
+    graph.extend(module_graphs(helpers));
     graph
+}
+
+/// The callees of `__test_integrity` the leaf solver must see: none, or the
+/// proxy trap helper (not itself declared, so a safepoint) when the program
+/// can hold proxies (DESIGN.md §6.11).
+fn integrity_callees(helpers: Helpers<'_>) -> Vec<u32> {
+    let mut callees = binary::integrity_callees(helpers);
+    if helpers.proxies() {
+        callees.push(helpers.proxy_is_extensible());
+    }
+    callees
+}
+
+/// The leaf-graph declarations of the runtime modules, in group order.
+fn module_graphs(helpers: Helpers<'_>) -> impl Iterator<Item = (u32, Vec<u32>)> {
+    [
+        unicode::helper_graph(helpers),
+        libm::helper_graph(helpers),
+        promise_engine::helper_graph(helpers),
+        gc::helper_graph(helpers),
+        binary::helper_graph(helpers),
+        super::bigint::helper_graph(helpers),
+    ]
+    .into_iter()
+    .flatten()
 }
 
 /// Solve [`helper_graph`]: a declared helper is a leaf iff every callee is.
@@ -231,9 +252,11 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
         {
             ValueClass::numeric()
         }
-        IrNode::Str(_) | IrNode::TypeOf(_) | IrNode::DeclFunc(_) | IrNode::Intrinsic(_) => {
-            ValueClass::static_block()
-        }
+        IrNode::Str(_)
+        | IrNode::BigInt { .. }
+        | IrNode::TypeOf(_)
+        | IrNode::DeclFunc(_)
+        | IrNode::Intrinsic(_) => ValueClass::static_block(),
         IrNode::Local(local) => ValueClass {
             numeric: Some(vec![*local]),
             noroot: Some((vec![], vec![*local])),
