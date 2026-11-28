@@ -1606,13 +1606,22 @@ fn leaf_set_matches_the_call_graph() {
             Big::CmpNum,
             Big::Hash,
             Big::ToF64,
+            Big::ToI64,
         ] {
             assert!(
                 leaves.is_leaf(helpers.bigint(helper)),
                 "{helper:?} must be a leaf"
             );
         }
-        for helper in [Big::New, Big::ToString, Big::FromString, Big::FromF64] {
+        for helper in [
+            Big::New,
+            Big::ToString,
+            Big::FromString,
+            Big::FromF64,
+            Big::NumberValue,
+            Big::AsN,
+            Big::FromI64,
+        ] {
             assert!(
                 !leaves.is_leaf(helpers.bigint(helper)),
                 "{helper:?} must be a safepoint"
@@ -1957,5 +1966,148 @@ fn ir_calls_past_k_pass_every_argument() {
     ];
     for (src, pick) in cases {
         assert_eq!(run_widened(&src, pick), "33", "{src}");
+    }
+}
+
+/// Whether each defined function of the shaken module of `src` is an
+/// `unreachable` stub, with the `BigInt` gate and the helper indices.
+fn shaken_stubs<R>(src: &str, check: impl FnOnce(bool, super::Helpers<'_>, &[bool]) -> R) -> R {
+    use wasmparser::{Operator, Parser, Payload};
+    let program = lower_js(src);
+    let (_, strings_end) = collect_strings(&program);
+    let layout = super::FnLayout {
+        info: strings_end,
+        blocks: strings_end,
+        realm: strings_end,
+        unicode: strings_end,
+    };
+    let unwind = std::cell::RefCell::new(super::Unwind::default());
+    let (.., helpers, _) =
+        super::sections::build_type_and_function_sections(&program, &unwind, layout);
+    let bytes = super::emit(
+        &program,
+        CompileOptions {
+            print_completion: true,
+            gc_stress: 0,
+            no_stack_guard: false,
+            full_runtime: false,
+        },
+    );
+    validate(&bytes);
+    let stubs: Vec<bool> = Parser::new(0)
+        .parse_all(&bytes)
+        .filter_map(|payload| match payload.expect("valid module") {
+            Payload::CodeSectionEntry(body) => Some(body),
+            _ => None,
+        })
+        .map(|body| {
+            let ops: Vec<Operator<'_>> = body
+                .get_operators_reader()
+                .expect("operators")
+                .into_iter()
+                .collect::<Result<_, _>>()
+                .expect("operator");
+            matches!(ops.as_slice(), [Operator::Unreachable, Operator::End])
+        })
+        .collect();
+    check(
+        super::sections::program_has_bigint(&program),
+        helpers,
+        &stubs,
+    )
+}
+
+/// The `BigInt` kernels only the numeric operators, `ToNumeric` and
+/// `Number(x)` reference (DESIGN.md §6.10.9).
+const OPERATOR_KERNELS: [super::registry::Big; 5] = [
+    super::registry::Big::NumericOp,
+    super::registry::Big::NumericUnary,
+    super::registry::Big::AddSmall,
+    super::registry::Big::ToNumeric,
+    super::registry::Big::NumberValue,
+];
+
+/// Every gated operator site in a program that can produce no `BigInt`.
+const NUMBER_ONLY_ARITHMETIC: &str = "let a = 1, b = '2'; const o = { n: 1 }; let c = 3;
+    (() => c++)(); o.n++; --o['n']; o.n **= 2; a = -a; a = ~a; a++; --a;
+    a = a ** 2 - b * 3 / 4 % 5; a = (a & 1) | (a ^ 2) << 1 >> 1 >>> 0;
+    class K { #p = 1; inc() { return this.#p++; } }
+    function* g() { let i = 0; i++; yield i; }
+    console.log(a < b, a >= 1, a + b, Number(b), typeof a, !!b, a === b, c, o.n,
+        new K().inc(), [...g()]);";
+
+/// A program that can produce no `BigInt` shakes the operator kernels out;
+/// a `BigInt` literal or a dynamic global access keeps them.
+#[test]
+fn bigint_gate_shakes_out_the_operator_kernels() {
+    shaken_stubs(NUMBER_ONLY_ARITHMETIC, |bigints, helpers, stubs| {
+        assert!(!bigints, "no BigInt source");
+        for kernel in OPERATOR_KERNELS {
+            let index = (helpers.bigint(kernel) - super::IMPORT_FUNC_COUNT) as usize;
+            assert!(stubs[index], "{kernel:?} must be shaken out");
+        }
+    });
+    for trigger in ["1n;", "const k = 'Big' + 'Int'; globalThis[k];"] {
+        let src = format!("{trigger} {NUMBER_ONLY_ARITHMETIC}");
+        shaken_stubs(&src, |bigints, helpers, stubs| {
+            assert!(bigints, "`{trigger}` opens the gate");
+            for kernel in OPERATOR_KERNELS {
+                let index = (helpers.bigint(kernel) - super::IMPORT_FUNC_COUNT) as usize;
+                assert!(!stubs[index], "{kernel:?} must be kept with `{trigger}`");
+            }
+        });
+    }
+    let size = |src: &str| {
+        super::emit(
+            &lower_js(src),
+            CompileOptions {
+                print_completion: true,
+                gc_stress: 0,
+                no_stack_guard: false,
+                full_runtime: false,
+            },
+        )
+        .len()
+    };
+    assert!(size(NUMBER_ONLY_ARITHMETIC) < size(&format!("1n; {NUMBER_ONLY_ARITHMETIC}")));
+    assert_eq!(
+        completion(&compile(NUMBER_ONLY_ARITHMETIC)),
+        completion(&compile(&format!("1n; {NUMBER_ONLY_ARITHMETIC}")))
+    );
+}
+
+/// Each `BigInt` source opens the gate (DESIGN.md §6.10.9); Number-only
+/// programs, binary data without the `BigInt` accessors and look-alike
+/// names do not.
+#[test]
+fn bigint_gate_triggers() {
+    let gate = |src: &str| super::sections::program_has_bigint(&lower_js(src));
+    for src in [
+        "1n",
+        "-1n",
+        "BigInt(1)",
+        "BigInt.asIntN",
+        "typeof BigInt64Array",
+        "typeof BigUint64Array",
+        "const o = {}; o['BigInt']",
+        "const k = 'BigInt'",
+        "globalThis",
+        "const k = 'x'; globalThis[k]",
+        "function f(v) { return v.getBigInt64(0); }",
+        "function f(v) { return v.getBigUint64(0); }",
+        "function f(v) { v.setBigInt64(0, 0); }",
+        "function f(v) { v.setBigUint64(0, 0); }",
+    ] {
+        assert!(gate(src), "`{src}` must open the BigInt gate");
+    }
+    for src in [
+        "1 + 2",
+        "let a = 1; a++; (-a) ** 2",
+        "Number('1')",
+        "new DataView(new ArrayBuffer(8)).getFloat64(0)",
+        "const o = { Big: 1 }; o.Big",
+        "const k = 'bigint'",
+    ] {
+        assert!(!gate(src), "`{src}` must keep the BigInt gate closed");
     }
 }

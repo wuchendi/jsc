@@ -339,7 +339,7 @@ fn bigint_layout_matches_design() {
 }
 
 /// Pins the binary-data type bytes and the `ArrayBuffer` layout to
-/// `DESIGN.md` §5.8: type bytes 24 / 25 / 26 (20..=23 stay reserved); a
+/// `DESIGN.md` §5.8: type bytes 24 / 25 / 26 (20 is `Proxy`, 21 `BigInt`, 22 / 23 spare); a
 /// 32 B buffer with `data` @16, `byte_length` @20, `max_byte_length` @24;
 /// flags `RESIZABLE` = 2, `DETACHED` = 4; byte lengths up to 2^29.
 #[test]
