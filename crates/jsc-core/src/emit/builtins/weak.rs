@@ -666,7 +666,7 @@ fn emit_finreg_ctor(
     let (proto, cleanup, base) = (frame.y64(0), frame.y64(1), frame.base(0));
     frame.arg(function, 0);
     wasm!(function; LocalSet(cleanup));
-    let valid = |f: &mut FnBuilder<'_>| emit_is_function(f, cleanup);
+    let valid = |f: &mut FnBuilder<'_>| emit_is_function(f, cleanup, helpers);
     check_construct_arg(function, frame, FINREG_CLEANUP, valid, strings, helpers);
     ctor_proto(
         BuiltinCtor::FinalizationRegistry,

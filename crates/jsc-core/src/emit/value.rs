@@ -199,13 +199,43 @@ pub(super) fn emit_is_symbol(function: &mut impl Sink, local: u32) {
     function.instruction(&Instruction::End);
 }
 
-/// Push `1` if the jsval in `local` is a heap FUNCTION value, else `0`.
-/// Like [`emit_is_string`], this is `is_pointer(local) & (type_byte ==
-/// TYPE_FUNCTION)`, with the type-byte read gated behind an `if` on
-/// [`emit_is_pointer`] so it never runs for a non-pointer. Used by `JSON.stringify`
-/// to omit function values (as object values) or render them as `null` (as array
-/// elements / at the top level).
-pub(super) fn emit_is_function(function: &mut impl Sink, local: u32) {
+/// Push `1` if the jsval in `local` is callable (`IsCallable`), else `0`: a
+/// heap FUNCTION value, or (when the program can hold proxies, DESIGN.md
+/// §6.11) a proxy whose class byte has [`abi::PROXY_CLASS_CALLABLE`]. Both
+/// keep `env` @24 / `func_idx` @16, so a call through them is valid. The
+/// type-byte read is gated behind [`emit_is_pointer`].
+pub(super) fn emit_is_function(function: &mut impl Sink, local: u32, helpers: Helpers<'_>) {
+    if !helpers.proxies() {
+        emit_is_function_block(function, local);
+        return;
+    }
+    let callable = TYPE_PROXY | (i32::from(abi::PROXY_CLASS_CALLABLE) << 24);
+    emit_is_pointer(function, local);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(function, local);
+    function.instruction(&Instruction::I32Const(TYPE_FUNCTION));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::LocalGet(local));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(0xFF | (0xFF << 24)));
+    function.instruction(&Instruction::I32And);
+    function.instruction(&Instruction::I32Const(callable));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::I32Or);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+}
+
+/// Push `1` if the jsval in `local` is a heap `TYPE_FUNCTION` block, else
+/// `0` (the kind test only, never a proxy): for the sites that read other
+/// function internals (the info-table name, `BOUND`, `env` identity).
+pub(super) fn emit_is_function_block(function: &mut impl Sink, local: u32) {
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
@@ -218,7 +248,7 @@ pub(super) fn emit_is_function(function: &mut impl Sink, local: u32) {
 
 /// Push `1` if the jsval in `local` is a heap GENERATOR handle (type byte `9`)
 /// that is not an async generator, else `0`. Same shape as
-/// [`emit_is_function`], guarding the type-byte read behind
+/// [`emit_is_function_block`], guarding the type-byte read behind
 /// [`emit_is_pointer`]. Used by `gen.next(v)` to reject a non-generator
 /// receiver with a `TypeError`, and by `for-of` / spread to step a generator.
 pub(super) fn emit_is_generator(function: &mut impl Sink, local: u32) {

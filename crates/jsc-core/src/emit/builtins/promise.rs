@@ -309,7 +309,7 @@ fn species_constructor(
     return_if_pending(function);
     emit_is_nullish(function, c);
     wasm!(function; If(BlockType::Empty), I64Const(UNDEFINED_BITS), LocalSet(c), Else);
-    emit_is_constructor(function, c);
+    emit_is_constructor(function, c, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, SPECIES_NOT_CTOR, strings, helpers);
     wasm!(function;
@@ -345,7 +345,7 @@ fn new_capability(
     for (i, out) in [(0, resolve), (1, reject)] {
         element(function, rec, i);
         wasm!(function; LocalSet(out));
-        emit_is_function(function, out);
+        emit_is_function(function, out, helpers);
         wasm!(function; I32Eqz, If(BlockType::Empty));
         throw_type_error(function, frame, NOT_CALLABLE_SETTLERS, strings, helpers);
         wasm!(function; End);
@@ -466,7 +466,7 @@ pub(super) fn emit_finally(
         LocalGet(a0), LocalSet(then_finally),
         LocalGet(a0), LocalSet(catch_finally),
     );
-    emit_is_function(function, a0);
+    emit_is_function(function, a0, helpers);
     wasm!(function; If(BlockType::Empty));
     record(function, &[a0, c], env, frame.i32(0), helpers);
     for (reject, out) in [(false, then_finally), (true, catch_finally)] {
@@ -491,7 +491,7 @@ fn require_constructor(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    emit_is_constructor(function, c);
+    emit_is_constructor(function, c, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     enter_frame(helpers);
     throw_type_error(function, frame, NOT_CONSTRUCTOR, strings, helpers);
@@ -757,7 +757,7 @@ fn emit_combinator(
             LocalSet(cb.promise_resolve),
         );
         emit_propagate_if_pending(function, helpers);
-        emit_is_function(function, cb.promise_resolve);
+        emit_is_function(function, cb.promise_resolve, helpers);
         wasm!(function; I32Eqz, If(BlockType::Empty));
         enter_frame(helpers);
         throw_type_error(function, frame, RESOLVE_NOT_CALLABLE, strings, helpers);
@@ -1018,7 +1018,7 @@ pub(super) fn emit_species(
             let target = frame.x64(0);
             element(function, env, 0);
             wasm!(function; LocalSet(v));
-            emit_is_function(function, v);
+            emit_is_function(function, v, helpers);
             wasm!(function; If(BlockType::Empty));
             call(function, frame, v, Some(a0), undef, helpers);
             wasm!(function;

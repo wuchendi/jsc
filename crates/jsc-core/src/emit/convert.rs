@@ -179,7 +179,7 @@ pub(super) fn emit_to_primitive(
         I32Const(HINT_STRING), LocalGet(hint), LocalGet(hint), I32Eqz, Select, LocalSet(hint),
         Else,
     );
-    emit_is_function(&mut f, method);
+    emit_is_function(&mut f, method, helpers);
     wasm!(f; I32Eqz, If(BlockType::Empty));
     emit_throw_not_a_function(&mut f, TO_PRIMITIVE_NOT_CALLABLE, scratch, strings, helpers);
     wasm!(f;
@@ -212,7 +212,7 @@ pub(super) fn emit_to_primitive(
         }
         wasm!(f; LocalGet(v), LocalGet(key), Call(helpers.get), LocalSet(method));
         return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
-        emit_is_function(&mut f, method);
+        emit_is_function(&mut f, method, helpers);
         wasm!(f; If(BlockType::Empty));
         emit_accessor_call(&mut f, method, v, None, base, helpers);
         wasm!(f; LocalSet(result));

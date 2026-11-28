@@ -41,9 +41,13 @@ const TRAPS: [&str; 11] = [
     "ownKeys",
 ];
 
+/// The operation name of `IsArray`'s revoked-proxy `TypeError`.
+const IS_ARRAY: &str = "IsArray";
+
 /// The static strings the proxy helpers reference.
 pub(in crate::emit) fn proxy_strings() -> impl Iterator<Item = &'static str> {
     TRAPS.into_iter().chain([
+        IS_ARRAY,
         INDEX_LENGTH_KEY,
         "value",
         "writable",
@@ -283,7 +287,7 @@ pub(in crate::emit) fn emit_proxy_trap(helpers: Helpers<'_>, leaves: &LeafSet) -
         LocalGet(v), I64Const(UNDEFINED_BITS), I64Eq, LocalGet(v), I64Const(NULL_BITS), I64Eq, I32Or,
         If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
     );
-    emit_is_function(&mut f, v);
+    emit_is_function(&mut f, v, helpers);
     wasm!(f; I32Eqz, If(BlockType::Empty));
     throw(&mut f, PROP_THROW_PROXY_TRAP);
     wasm!(f; End, LocalGet(v), End);
@@ -300,6 +304,46 @@ pub(in crate::emit) fn emit_get_proto(helpers: Helpers<'_>, leaves: &LeafSet) ->
         wasm!(f; LocalGet(o), Call(helpers.proxy_get_proto()), Return);
     });
     wasm!(f; LocalGet(o), I64Load(m64(OBJ_PROTO_OFFSET)), End);
+    finish_builder(f)
+}
+
+/// `__is_array(v: i64) -> i32`: `IsArray(v)` (ECMA-262 7.2.2): `1` for a
+/// `TYPE_ARRAY` block; a proxy answers for its target (repeatedly, for proxy
+/// chains), a revoked one throws `PROXY_REVOKED` (key `"IsArray"`) and
+/// returns `0`; anything else is `0`.
+pub(in crate::emit) fn emit_is_array(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_JS], &[RAW_I32]);
+    let (v, o) = (0, 1);
+    wasm!(f; Loop(BlockType::Empty));
+    emit_is_pointer(&mut f, v);
+    wasm!(f;
+        I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(v), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
+        If(BlockType::Empty), I32Const(1), Return, End,
+        LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_PROXY), I32Eq,
+        If(BlockType::Empty),
+        LocalGet(o), I64Load(m64(HANDLER)), I64Const(NULL_BITS), I64Eq,
+        If(BlockType::Empty),
+    );
+    throw_name(
+        &mut f,
+        IS_ARRAY,
+        PROP_THROW_PROXY_REVOKED,
+        Ret::I32,
+        strings,
+        helpers,
+    );
+    wasm!(f;
+        End,
+        LocalGet(o), I64Load(m64(TARGET)), LocalSet(v), Br(1),
+        End,
+        End,
+        I32Const(0), End,
+    );
     finish_builder(f)
 }
 
@@ -1198,6 +1242,11 @@ impl Helpers<'_> {
     /// `__set_bool(target, key, v, recv) -> i32` (see [`emit_set_bool`]).
     pub(in crate::emit) fn set_bool(self) -> u32 {
         self.extra(registry::Extra::SetBool)
+    }
+
+    /// `__is_array(v) -> i32` (see [`emit_is_array`]).
+    pub(in crate::emit) fn is_array(self) -> u32 {
+        self.extra(registry::Extra::IsArray)
     }
 
     /// `__proxy_get_proto(p) -> i64` (see [`emit_proxy_get_proto`]).

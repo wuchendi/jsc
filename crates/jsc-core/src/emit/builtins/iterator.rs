@@ -502,7 +502,7 @@ fn emit_flattenable(
     wasm!(function; LocalGet(o), LocalSet(it));
     emit_is_nullish(function, method);
     wasm!(function; I32Eqz, If(BlockType::Empty));
-    emit_is_function(function, method);
+    emit_is_function(function, method, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     raise_type(function, frame, FROM_NOT_CALLABLE, strings, helpers);
     abrupt(function);
@@ -636,7 +636,7 @@ fn emit_helper(
             LocalGet(limit), F64Const(Ieee64::from(0.0)), F64Add, LocalSet(limit),
         );
     } else {
-        emit_is_function(function, arg);
+        emit_is_function(function, arg, helpers);
         wasm!(function; I32Eqz, If(BlockType::Empty));
         raise_type(function, frame, CALLBACK_NOT_CALLABLE, strings, helpers);
         close_pending(function, o, saved, helpers);
@@ -1262,7 +1262,7 @@ fn emit_eager(
     if kind != EagerKind::ToArray {
         frame.arg(function, 0);
         wasm!(function; LocalSet(e.cb));
-        emit_is_function(function, e.cb);
+        emit_is_function(function, e.cb, helpers);
         wasm!(function; I32Eqz, If(BlockType::Empty));
         raise_type(function, frame, CALLBACK_NOT_CALLABLE, strings, helpers);
         close_pending(function, e.o, e.saved, helpers);
@@ -1378,7 +1378,7 @@ fn emit_wrap_next(
         I64Load(MemArg { offset: WRAP_NEXT_OFFSET, align: 3, memory_index: 0 }),
         LocalSet(next),
     );
-    emit_is_function(function, next);
+    emit_is_function(function, next, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, NEXT_NOT_CALLABLE, strings, helpers);
     wasm!(function; End);
@@ -1405,7 +1405,7 @@ fn emit_wrap_return(
     wasm!(function; If(BlockType::Empty));
     emit_node(&done_result(), function, frame.scratch(), strings, helpers);
     wasm!(function; Return, End);
-    emit_is_function(function, method);
+    emit_is_function(function, method, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, RETURN_NOT_CALLABLE, strings, helpers);
     wasm!(function; End);
