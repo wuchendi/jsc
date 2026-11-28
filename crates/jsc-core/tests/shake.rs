@@ -556,3 +556,32 @@ fn constant_key_get_on_nullish_throws_first() {
         "Cannot read properties of null (reading 'get') 0",
     );
 }
+
+/// A program holding the global object opens the `Proxy` and `Reflect`
+/// gates, however it holds it: a computed member on `globalThis` (which
+/// opens the global object, so the read is a global-object lookup, not the
+/// intrinsic), a top-level `this`, an alias. The constructor found by a
+/// run-time key then runs its real body, never the `unreachable` stub
+/// (DESIGN.md §4.2, §6.11).
+#[test]
+fn global_object_by_run_time_key_opens_the_gates() {
+    for (src, expected) in [
+        (r#"let k = "Pro" + "xy"; new globalThis[k]({}, {})"#, "{}"),
+        (
+            r#"let k = "Ref" + "lect"; globalThis[k].get({a:1}, "a")"#,
+            "1",
+        ),
+        (r#"let k = "Ref" + "lect"; this[k].get({ a: 1 }, "a")"#, "1"),
+        (r#"let k = "Pro" + "xy"; new this[k]({ a: 2 }, {}).a"#, "2"),
+        (
+            r#"const g = globalThis; let k = "Pro" + "xy"; new g[k]({ a: 3 }, {}).a"#,
+            "3",
+        ),
+        (
+            r#"const g = globalThis; let k = "Ref" + "lect"; g[k].has({ a: 1 }, "a")"#,
+            "true",
+        ),
+    ] {
+        same(src, expected);
+    }
+}

@@ -362,9 +362,14 @@ by the program (`new Proxy(t, Reflect)`, `new Proxy(t, Object)`) and calls
 it with keys that body chose: the program's own recorded keys, or the keys
 of an own-key list, whose values reach user code only through a
 `note_listed_values` body; a descriptor it returns reaches only
-attribute checks or `__own_desc`. A family the program cannot reach still
-emits `unreachable` stubs that record no use (`builtins::gated_off`:
-`Proxy` under the proxy gate, `Reflect` under the `Reflect` gate, the
+attribute checks or `__own_desc`. A compile-time gate that stubs a family
+reachable through a global must open whenever the program holds the global
+object (`sections.rs::holds_global`: the `Global` intrinsic, or a `GlobalGet`
+of `globalThis`, the form an open global object lowers it to), since a
+computed key on it reaches any global; strict code has no other path to the
+global object and no read of a global by a run-time name. A family the
+program cannot reach still emits `unreachable` stubs that record no use
+(`builtins::gated_off`: `Proxy` under the proxy gate, `Reflect` under the `Reflect` gate, the
 binary-data builtins and `__render_binary` / `__ta_canonical` under
 `has_binary`, §5.8.5), and the static strings only such stubs would look up
 are not interned (`builtins::gated_strings`, `builtins::strings(binary)`). Breaking
@@ -3146,9 +3151,14 @@ compile-time fact (`Helpers::proxies()`, the `ProxyGate` field set by
 `emit/sections.rs::program_has_proxies` from the IR): the program names
 `Proxy` (a global read or write, or the string `"Proxy"`, which covers a
 member or property name and a string literal) or holds the global object at
-all (`IrNode::Intrinsic(Global)`: `globalThis` or a top-level `this`, which
-can find `Proxy` by a run-time key; a superset of `GlobalUse::Open`, kept
-simple because no opcount program uses `globalThis`). Without it the emitted
+all (`sections.rs::holds_global`, which can find `Proxy` by a run-time key;
+a superset of `GlobalUse::Open`, kept simple because no opcount program uses
+`globalThis`). That is `IrNode::Intrinsic(Global)` (a top-level `this`, or
+`globalThis` while sealed) **and** `IrNode::GlobalGet` of `globalThis`: once
+the global object is open (`globalThis[k]`, `const g = globalThis`) the
+`globalThis` read is a global-object lookup, not the intrinsic. Missing that
+second form left `new globalThis["Pro" + "xy"]({}, {})` running the
+`unreachable` stub. Without it the emitted
 code is byte-for-byte what it is today (no opcount change), and the
 `__proxy_*` helpers are never called, so runtime shaking (§4.2) stubs them.
 With it `has_accessors` is forced on: a trap runs user code at any property
