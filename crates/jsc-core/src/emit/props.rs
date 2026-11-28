@@ -2658,10 +2658,12 @@ pub(super) fn emit_proto_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
 
 /// `__array_set_length(o: i32, v: i64)`: the `length` write `o.length = v` on
 /// the array `o` (`ArraySetLength`). A read-only `length` throws `Cannot
-/// assign to read only property 'length'` before any conversion. `n =
-/// ToUint32(v)`; an abrupt `ToNumber(v)` propagates, and when `ToNumber(v) !=
-/// n` it raises the `RangeError` "Invalid array length" (left pending); both
-/// change nothing. A shrink (`n < len`)
+/// assign to read only property 'length'` before any conversion (the
+/// `OrdinarySet` check). `n = ToUint32(v)`, then `ToNumber(v)` again (two
+/// conversions of a non-number); an abrupt one propagates, and when the
+/// second `!= n` it raises the `RangeError` "Invalid array length" (left
+/// pending); both change nothing. A `length` a conversion made read-only
+/// then throws the same `TypeError`. A shrink (`n < len`)
 /// turns the slots `n..len` into holes and keeps the store (so a regrowth and
 /// a GC walk see no stale element); a `SPARSE` array also drops its index
 /// keys `>= n`, except that a non-configurable element `k >= n` stops the
@@ -2685,7 +2687,7 @@ pub(super) fn emit_array_set_length(
     // `k` aliases the integer `j`, so neither is rooted: no key is held
     // across a safepoint here.
     f.locals(9, RAW_I32);
-    f.local(RAW_F64);
+    f.locals(2, RAW_F64);
     let (n, len, a, cap, j, e, end) = (
         base,
         base + 1,
@@ -2696,7 +2698,7 @@ pub(super) fn emit_array_set_length(
         base + 6,
     );
     let (m, stopped) = (base + 7, base + 8);
-    let d = base + 9;
+    let (d, x) = (base + 9, base + 10);
     let k = j;
     let length_key = static_key(strings, INDEX_LENGTH_KEY);
     // Walk the live array-index entries of the table in `a` (nonzero): `body`
@@ -2723,30 +2725,41 @@ pub(super) fn emit_array_set_length(
         );
     };
     // A read-only `length` rejects any write.
-    wasm!(f;
-        LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_LENGTH_READONLY), I32And,
-        If(BlockType::Empty),
-        LocalGet(o),
-    );
-    emit_box_heap(&mut f);
-    wasm!(f;
-        I64Const(HEAP_BITS | i64::from(length_key)),
-        I32Const(PROP_THROW_READ_ONLY), Call(helpers.prop_throw), Return,
-        End,
-    );
-    // d = ToNumber(v); a value that is not an integer in 0..2^32 is invalid.
+    let read_only = |f: &mut FnBuilder<'_>| {
+        wasm!(f;
+            LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_LENGTH_READONLY), I32And,
+            If(BlockType::Empty),
+            LocalGet(o),
+        );
+        emit_box_heap(f);
+        wasm!(f;
+            I64Const(HEAP_BITS | i64::from(length_key)),
+            I32Const(PROP_THROW_READ_ONLY), Call(helpers.prop_throw), Return,
+            End,
+        );
+    };
+    read_only(&mut f);
+    // x = ToNumber(v) (for `ToUint32`), d = ToNumber(v); `n = ToUint32(x)`
+    // must equal `d`.
     emit_is_number(&mut f, v);
     wasm!(f;
-        If(BlockType::Result(ValType::I64)),
-        LocalGet(v),
+        If(BlockType::Empty),
+        LocalGet(v), F64ReinterpretI64, LocalTee(x), LocalSet(d),
         Else,
         LocalGet(v), Call(helpers.to_number),
         GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
+        F64ReinterpretI64, LocalSet(x),
+        LocalGet(v), Call(helpers.to_number),
+        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
+        F64ReinterpretI64, LocalSet(d),
         End,
-        F64ReinterpretI64, LocalTee(d), F64Const(0.0.into()), F64Ge,
-        LocalGet(d), F64Const(4_294_967_296.0.into()), F64Lt, I32And,
-        LocalGet(d), F64Trunc, LocalGet(d), F64Eq, I32And,
-        I32Eqz,
+        // ToUint32(x) = t - 2^32 * floor(t / 2^32), t = trunc(x) (NaN /
+        // infinities saturate to 0).
+        LocalGet(x), F64Trunc,
+        LocalGet(x), F64Trunc, F64Const((1.0 / 4_294_967_296.0).into()), F64Mul,
+        F64Floor, F64Const(4_294_967_296.0.into()), F64Mul, F64Sub,
+        I32TruncSatF64U, LocalTee(n),
+        F64ConvertI32U, LocalGet(d), F64Ne,
         If(BlockType::Empty),
     );
     let error = IrNode::error_object(
@@ -2761,7 +2774,10 @@ pub(super) fn emit_array_set_length(
         I32Const(0), GlobalSet(CF_KIND_GLOBAL),
         Return,
         End,
-        LocalGet(d), I32TruncSatF64U, LocalSet(n),
+    );
+    // A conversion may have made `length` read-only.
+    read_only(&mut f);
+    wasm!(f;
         LocalGet(o), I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(len),
         LocalGet(o), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(a),
         If(BlockType::Result(ValType::I32)), LocalGet(a), I32Load(m32(ELEMS_CAP_OFFSET)), Else, I32Const(0), End,

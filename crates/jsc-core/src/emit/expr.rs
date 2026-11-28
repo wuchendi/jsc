@@ -1866,6 +1866,9 @@ pub(super) fn emit_construct<S: Sink>(
         emit_propagate_if_pending(function, helpers);
     }
     function.instruction(&Instruction::LocalSet(this));
+    if helpers.proxies() {
+        emit_function_realm_check(this, emit_new_target, function, strings, helpers);
+    }
     emit_select_object(
         function,
         this,
@@ -1919,6 +1922,82 @@ pub(super) fn emit_construct<S: Sink>(
     // An object return value replaces `this`.
     function.instruction(&Instruction::LocalSet(f));
     emit_select_object(function, f, &Instruction::LocalGet(this));
+}
+
+/// The `GetFunctionRealm(newTarget)` step of `GetPrototypeFromConstructor`
+/// when the `prototype` read into `proto` is not an object: the proxy chain
+/// from `new.target` (pushed by `emit_new_target`) is walked to its end and a
+/// revoked proxy on it throws (`Cannot perform 'construct' on a proxy that
+/// has been revoked`). There is one realm, so the walk only validates;
+/// `proto` is left a non-object, so the realm `%Object.prototype%` is used.
+fn emit_function_realm_check<S: Sink>(
+    proto: u32,
+    emit_new_target: impl Fn(&mut S),
+    function: &mut S,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let handler = MemArg {
+        offset: u64::from(abi::PROXY_HANDLER_OFFSET),
+        align: 3,
+        memory_index: 0,
+    };
+    let target = MemArg {
+        offset: u64::from(abi::PROXY_TARGET_OFFSET),
+        align: 3,
+        memory_index: 0,
+    };
+    let construct = HEAP_BITS | i64::from(static_key(strings, "construct"));
+    emit_is_object(function, proto);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    emit_new_target(function);
+    function.instruction(&Instruction::LocalSet(proto));
+    function.instruction(&Instruction::Block(BlockType::Empty));
+    function.instruction(&Instruction::Loop(BlockType::Empty));
+    enter_frame(helpers);
+    enter_frame(helpers);
+    emit_is_pointer(function, proto);
+    function.instruction(&Instruction::I32Eqz);
+    function.instruction(&Instruction::BrIf(1));
+    function.instruction(&Instruction::LocalGet(proto));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I32Load8U(MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    }));
+    function.instruction(&Instruction::I32Const(TYPE_PROXY));
+    function.instruction(&Instruction::I32Ne);
+    function.instruction(&Instruction::BrIf(1));
+    function.instruction(&Instruction::LocalGet(proto));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(handler));
+    function.instruction(&Instruction::I64Const(NULL_BITS));
+    function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::If(BlockType::Empty));
+    enter_frame(helpers);
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::I64Const(construct));
+    function.instruction(&Instruction::I32Const(PROP_THROW_PROXY_REVOKED));
+    function.instruction(&Instruction::Call(helpers.prop_throw));
+    emit_throw_return(function, helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::LocalGet(proto));
+    function.instruction(&Instruction::I32WrapI64);
+    function.instruction(&Instruction::I64Load(target));
+    function.instruction(&Instruction::LocalSet(proto));
+    function.instruction(&Instruction::Br(0));
+    leave_frame(helpers);
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::End);
+    function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
+    function.instruction(&Instruction::LocalSet(proto));
+    leave_frame(helpers);
+    function.instruction(&Instruction::End);
 }
 
 /// Emit an [`IrNode::ClassHeritage`]: `parent = value`; a non-`null` parent

@@ -740,3 +740,66 @@ fn functions_survive_gc_stress() {
          3:8:k8+d8:11:v8:8 3:9:k9+d9:12:v9:9\n",
     );
 }
+
+// --- argument checks before GetPrototypeFromConstructor (F7) -----------------------------
+
+/// `Promise` checks `IsCallable(executor)` before it reads
+/// `newTarget.prototype`, and `Date` converts its arguments first; the
+/// weak constructors check their argument first too.
+#[test]
+fn ctor_argument_checks_precede_prototype_read() {
+    let prelude = "const log = [];
+         const nt = function () {}.bind();
+         Object.defineProperty(nt, 'prototype', { get() { log.push('proto'); throw new RangeError('p'); } });";
+    let kind = |body: &str| {
+        format!(
+            "{prelude}
+             let r;
+             try {{ {body}; r = 'no throw'; }} catch (e) {{ r = e.constructor.name; }}
+             [r, log.join(' ')].join('|')"
+        )
+    };
+    assert_string(&kind("Reflect.construct(Promise, [], nt)"), "TypeError|");
+    assert_string(&kind("Reflect.construct(Promise, [1], nt)"), "TypeError|");
+    assert_string(
+        &kind("Reflect.construct(Promise, [() => {}], nt)"),
+        "RangeError|proto",
+    );
+    assert_string(&kind("Reflect.construct(WeakRef, [1], nt)"), "TypeError|");
+    assert_string(
+        &kind("Reflect.construct(FinalizationRegistry, [1], nt)"),
+        "TypeError|",
+    );
+    assert_string(
+        &kind("Reflect.construct(Date, [{ valueOf() { log.push('value'); return 0; } }], nt)"),
+        "RangeError|value proto",
+    );
+    assert_string(
+        &kind(
+            "Reflect.construct(Date, [2020, { valueOf() { log.push('month'); return 1; } }], nt)",
+        ),
+        "RangeError|month proto",
+    );
+    assert_string(
+        "class D extends Date {}
+         const d = new D(0);
+         [d instanceof D, d.getTime(), Object.getPrototypeOf(d) === D.prototype].join()",
+        "true,0,true",
+    );
+}
+
+/// The `Date` subclass construct keeps its proto across a collection at
+/// every allocation.
+#[test]
+fn date_construct_order_survives_gc_stress() {
+    assert_same_under_gc_stress(
+        "class D extends Date {}
+         const out = [];
+         for (let i = 0; i < 10; i++) {
+           const d = Reflect.construct(Date, [{ valueOf() { return [i].map((x) => x * 1000)[0]; } }], D);
+           out.push(d instanceof D, d.getTime());
+         }
+         console.log(out.join());",
+        "true,0,true,1000,true,2000,true,3000,true,4000,true,5000,true,6000,true,7000,true,8000,true,9000\n",
+    );
+}
