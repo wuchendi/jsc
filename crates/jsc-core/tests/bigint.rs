@@ -205,6 +205,22 @@ fn computed_keys_use_the_decimal_string() {
 }
 
 #[test]
+fn nullish_receiver_message_names_the_property_key() {
+    assert_uncaught(
+        "null[1n]",
+        "TypeError: Cannot read properties of null (reading '1')",
+    );
+    assert_uncaught(
+        "let u; u[-2n] = 0",
+        "TypeError: Cannot set properties of undefined (setting '-2')",
+    );
+    assert_string(
+        &format!("let k = {TWO_64}n; try {{ undefined[k] }} catch (e) {{ e.message }}"),
+        &format!("Cannot read properties of undefined (reading '{TWO_64}')"),
+    );
+}
+
+#[test]
 fn primitive_receiver() {
     assert_bool("(1n).x === undefined", true);
     assert_bool(
