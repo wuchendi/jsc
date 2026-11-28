@@ -149,6 +149,7 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
     graph.extend(libm::helper_graph(helpers));
     graph.extend(promise_engine::helper_graph(helpers));
     graph.extend(gc::helper_graph(helpers));
+    graph.extend(super::bigint::helper_graph(helpers));
     graph
 }
 
@@ -230,9 +231,11 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
         {
             ValueClass::numeric()
         }
-        IrNode::Str(_) | IrNode::TypeOf(_) | IrNode::DeclFunc(_) | IrNode::Intrinsic(_) => {
-            ValueClass::static_block()
-        }
+        IrNode::Str(_)
+        | IrNode::BigInt { .. }
+        | IrNode::TypeOf(_)
+        | IrNode::DeclFunc(_)
+        | IrNode::Intrinsic(_) => ValueClass::static_block(),
         IrNode::Local(local) => ValueClass {
             numeric: Some(vec![*local]),
             noroot: Some((vec![], vec![*local])),

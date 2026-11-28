@@ -81,6 +81,10 @@ pub(super) enum Intrinsic {
     /// `CLASS_ERROR` object with the own non-enumerable `message` and
     /// `stack`; not reachable from the global object.
     OutOfMemoryError,
+    /// `%BigInt.prototype%` (DESIGN.md §6.10.7): the `proto` of a `BigInt`
+    /// receiver and of its `CLASS_BIGINT` wrapper; an empty ordinary object
+    /// until the `BigInt` builtins land.
+    BigIntPrototype,
 }
 
 /// A builtin iterator family: the receivers of one iterator prototype's
@@ -256,7 +260,8 @@ impl Intrinsic {
             | Self::Console
             | Self::Prototype(_)
             | Self::IteratorPrototype
-            | Self::AsyncIteratorPrototype => Some(Self::ObjectPrototype),
+            | Self::AsyncIteratorPrototype
+            | Self::BigIntPrototype => Some(Self::ObjectPrototype),
             Self::IterPrototype(_)
             | Self::GeneratorPrototype
             | Self::WrapForValidIteratorPrototype
@@ -409,6 +414,7 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
             Intrinsic::WrapForValidIteratorPrototype,
             Intrinsic::IteratorHelperPrototype,
             Intrinsic::OutOfMemoryError,
+            Intrinsic::BigIntPrototype,
         ])
 }
 

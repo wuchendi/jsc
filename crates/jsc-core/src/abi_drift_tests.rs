@@ -248,6 +248,7 @@ fn symbol_layout_matches_design() {
     // Section 5.4: the iterator objects' class byte.
     assert_eq!(CLASS_ITERATOR, CLASS_SYMBOL + 1);
     assert_eq!(TYPEOF_STRINGS[6], "symbol");
+    assert_eq!(TYPEOF_STRINGS[7], "bigint");
 }
 
 /// Pins the allocator layout to design/runtime-memory.md §5.6: page-table
@@ -287,4 +288,26 @@ fn allocator_layout_matches_design() {
     assert_eq!((TYPE_FREE, GC_FREE_NEXT_OFFSET), (0xFF, 4));
     assert_eq!(HEADER_GC_OFFSET, 1);
     assert_eq!(GC_MIN_BUDGET, 4 << 20);
+}
+
+/// Pins the `TYPE_BIGINT` block, its wrapper class and the static `0n` to
+/// `DESIGN.md` §6.10.1.
+#[test]
+fn bigint_layout_matches_design() {
+    use super::{
+        BIGINT_DATA_OFFSET, BIGINT_FLAG_NEG, BIGINT_LEN_OFFSET, BIGINT_MAX_LIMBS, BIGINT_ZERO,
+        BLOCK_ALIGN, CLASS_BIGINT, DEC_POWERS, NUM_SCRATCH_ADDR, STR_LEN_OFFSET, TYPE_BIGINT,
+        TYPE_DATE,
+    };
+    assert_eq!(TYPE_BIGINT, 21);
+    // A collector leaf: past the object-family kinds.
+    assert_eq!(TYPE_BIGINT.max(TYPE_DATE), TYPE_BIGINT);
+    assert_eq!([BIGINT_LEN_OFFSET, BIGINT_DATA_OFFSET], [4, 8]);
+    assert_eq!(BIGINT_LEN_OFFSET, STR_LEN_OFFSET);
+    assert_eq!(BIGINT_FLAG_NEG, 1);
+    assert_eq!(BIGINT_MAX_LIMBS, 1 << 19);
+    assert_eq!(CLASS_BIGINT, CLASS_ITERATOR + 1);
+    assert_eq!(BIGINT_ZERO % BLOCK_ALIGN, 0);
+    assert_eq!(BIGINT_ZERO.max(DEC_POWERS + 19), BIGINT_ZERO);
+    assert_eq!((BIGINT_ZERO + 8).min(NUM_SCRATCH_ADDR), BIGINT_ZERO + 8);
 }

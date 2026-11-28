@@ -399,6 +399,8 @@ const DATE_BLOCK_SIZE: i32 = abi::DATE_BLOCK_SIZE.cast_signed();
 /// The TYPE BYTE of a Symbol primitive block. Maps to `typeof` "symbol". See
 /// [`abi::TYPE_SYMBOL`] for the full layout.
 const TYPE_SYMBOL: i32 = abi::TYPE_SYMBOL as i32;
+/// TYPE BYTE of a `BigInt` primitive; see [`abi::TYPE_BIGINT`].
+const TYPE_BIGINT: i32 = abi::TYPE_BIGINT as i32;
 const SYMBOL_DESCRIPTION_OFFSET: u64 = abi::SYMBOL_DESCRIPTION_OFFSET as u64;
 
 /// `%Symbol.prototype%` (DESIGN.md §7.9): where a property read
@@ -1535,6 +1537,7 @@ struct FnLayout {
 }
 
 mod array;
+mod bigint;
 mod builder;
 mod builtins;
 mod convert;

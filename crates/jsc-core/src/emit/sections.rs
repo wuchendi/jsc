@@ -313,6 +313,21 @@ pub(super) fn emit_data_section(
     for (text, offset) in segments {
         data.active(0, &ConstExpr::i32_const(offset), str_block(text));
     }
+    // The static `0n` and the BigInt literal blocks.
+    data.active(
+        0,
+        &ConstExpr::i32_const(abi::BIGINT_ZERO.cast_signed()),
+        [abi::TYPE_BIGINT],
+    );
+    let mut bigints: Vec<(&BigIntKey, i32)> = offsets
+        .bigints
+        .iter()
+        .map(|(key, offset)| (key, *offset))
+        .collect();
+    bigints.sort_by_key(|(_, offset)| *offset);
+    for (key, offset) in bigints {
+        data.active(0, &ConstExpr::i32_const(offset), bigint_block(key));
+    }
     let table: Vec<u8> = intern
         .slots
         .iter()
@@ -349,6 +364,20 @@ pub(super) fn str_block(text: &JsStr) -> Vec<u8> {
     let len = u32::try_from(text.len()).unwrap_or(u32::MAX);
     blob.extend_from_slice(&len.to_le_bytes());
     blob.extend_from_slice(&data);
+    blob
+}
+
+/// The static block of the `BigInt` literal `(neg, limbs)` (DESIGN.md
+/// §6.10.1): the `TYPE_BIGINT` header with `BIGINT_FLAG_NEG` for a negative
+/// value, the limb count, then the little-endian limbs.
+fn bigint_block((neg, limbs): &BigIntKey) -> Vec<u8> {
+    let flags = if *neg { abi::BIGINT_FLAG_NEG } else { 0 };
+    let mut blob = vec![abi::TYPE_BIGINT, 0, flags, 0];
+    let len = u32::try_from(limbs.len()).unwrap_or(u32::MAX);
+    blob.extend_from_slice(&len.to_le_bytes());
+    for limb in limbs {
+        blob.extend_from_slice(&limb.to_le_bytes());
+    }
     blob
 }
 
@@ -443,6 +472,7 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
     let realm_strs = realm::strings()
         .chain(builtins::strings())
         .chain(convert::strings())
+        .chain(bigint::strings())
         .chain(dtoa::STRINGS)
         .chain(render::STRINGS)
         .chain([STACK_KEY, STACK_OVERFLOW_MSG, STACK_OVERFLOW_STACK])
@@ -489,7 +519,17 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
         // Each blob is the block header, the 4-byte length, then the data:
         // `len` bytes, or `2 * len` for a two-byte string, padded to 8.
         let blob_len = STR_DATA_OFFSET + i32::try_from(str_data(&text).len()).unwrap_or(i32::MAX);
-        offsets.0.insert(text, next);
+        offsets.strs.insert(text, next);
+        next = next
+            .saturating_add(blob_len)
+            .saturating_add(BLOCK_ALIGN - 1)
+            & -BLOCK_ALIGN;
+    }
+    // The BigInt literals (DESIGN.md §6.10.1) follow, one static
+    // `TYPE_BIGINT` block per distinct value; `0n` is `abi::BIGINT_ZERO`.
+    for key in strs.bigints {
+        let blob_len = i32::try_from(bigint_block(&key).len()).unwrap_or(i32::MAX);
+        offsets.bigints.insert(key, next);
         next = next
             .saturating_add(blob_len)
             .saturating_add(BLOCK_ALIGN - 1)
@@ -498,10 +538,17 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
     (offsets, next)
 }
 
+/// The `(neg, limbs)` key of a static `BigInt` block (canonical form).
+pub(crate) type BigIntKey = (bool, Box<[u32]>);
+
 /// The compile-time offset of every static string block ([`collect_strings`]),
-/// keyed on the string's code units.
+/// keyed on the string's code units, and of every static `BigInt` literal block
+/// (the `BigIntOffsets` table of DESIGN.md §6.10.1), keyed on its value.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct StrOffsets(HashMap<JsStr, i32>);
+pub(crate) struct StrOffsets {
+    strs: HashMap<JsStr, i32>,
+    bigints: HashMap<BigIntKey, i32>,
+}
 
 impl StrOffsets {
     /// The block offset of the compiler-built string `text`.
@@ -515,7 +562,7 @@ impl StrOffsets {
 
     /// The block offset of the string `text`.
     pub(crate) fn get_str(&self, text: &JsStr) -> Option<&i32> {
-        let offset = self.0.get(text.as_units());
+        let offset = self.strs.get(text.as_units());
         if let Some(offset) = offset {
             shake::note_string(*offset);
         }
@@ -524,7 +571,21 @@ impl StrOffsets {
 
     fn peek_ref(&self, text: &str) -> Option<&i32> {
         let units: Vec<u16> = text.encode_utf16().collect();
-        self.0.get(units.as_slice())
+        self.strs.get(units.as_slice())
+    }
+
+    /// The jsval bits of the `BigInt` literal `(neg, limbs)`: the static
+    /// [`abi::BIGINT_ZERO`] for `0n`, else its literal block.
+    pub(crate) fn bigint_bits(&self, neg: bool, limbs: &[u32]) -> i64 {
+        let offset = if limbs.is_empty() {
+            abi::BIGINT_ZERO.cast_signed()
+        } else {
+            self.bigints
+                .get(&(neg, Box::from(limbs)))
+                .copied()
+                .unwrap_or(abi::BIGINT_ZERO.cast_signed())
+        };
+        HEAP_BITS | i64::from(offset)
     }
 
     /// [`Self::get`] without recording the lookup for [`shake`].
@@ -534,18 +595,21 @@ impl StrOffsets {
 
     /// The number of static strings.
     pub(crate) fn len(&self) -> usize {
-        self.0.len()
+        self.strs.len()
     }
 
     /// Every `(string, block offset)` pair, in no particular order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&JsStr, i32)> {
-        self.0.iter().map(|(text, offset)| (text, *offset))
+        self.strs.iter().map(|(text, offset)| (text, *offset))
     }
 }
 
 impl FromIterator<(JsStr, i32)> for StrOffsets {
     fn from_iter<I: IntoIterator<Item = (JsStr, i32)>>(entries: I) -> Self {
-        Self(entries.into_iter().collect())
+        Self {
+            strs: entries.into_iter().collect(),
+            bigints: HashMap::new(),
+        }
     }
 }
 
@@ -556,6 +620,8 @@ pub(super) struct Strs<'a> {
     seen: HashSet<JsStr>,
     /// The compiler-built strings already added, to skip re-encoding them.
     seen_str: HashSet<&'a str>,
+    /// The distinct nonzero `BigInt` literals, in first-appearance order.
+    bigints: Vec<BigIntKey>,
 }
 
 impl<'a> Strs<'a> {
@@ -563,6 +629,13 @@ impl<'a> Strs<'a> {
     fn add(&mut self, text: &'a str) {
         if self.seen_str.insert(text) {
             self.add_units(&JsStr::from(text));
+        }
+    }
+
+    /// Record the nonzero `BigInt` literal `(neg, limbs)` unless already seen.
+    fn add_bigint(&mut self, neg: bool, limbs: &[u32]) {
+        if !limbs.is_empty() && !self.bigints.iter().any(|(n, l)| *n == neg && **l == *limbs) {
+            self.bigints.push((neg, Box::from(limbs)));
         }
     }
 
@@ -659,6 +732,7 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
         IrNode::Str(text) => {
             strs.add_units(text);
         }
+        IrNode::BigInt { neg, limbs } => strs.add_bigint(*neg, limbs),
         IrNode::Binary { lhs, rhs, .. } | IrNode::Logical { lhs, rhs, .. } => {
             collect_node(lhs, strs);
             collect_node(rhs, strs);
