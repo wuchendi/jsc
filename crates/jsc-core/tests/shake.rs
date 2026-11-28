@@ -408,13 +408,23 @@ fn proxy_listed_values_keep_the_runtime() {
 
 /// `Reflect.get(o, 'x')` / `Object.getOwnPropertyDescriptor(o, 'x')` with a
 /// constant key shake like `o.x`; the same function under a run-time key, or
-/// read as a value, keeps the runtime whole.
+/// read as a value, keeps the runtime whole. `get` has a `Map` fast path, so
+/// `Reflect.get(..)` lowers to a guarded builtin call, not an ordinary method
+/// call: with side-effect-free arguments its interned key, otherwise its early
+/// callee read and receiver nullish guard, look up `"get"`; each must stay
+/// exempt (a first version wrapped only the ordinary method call, and every
+/// `Reflect.get` program stayed whole).
 #[test]
 fn constant_key_reflection_still_shakes() {
     for (src, expected) in [
         (
             "const o = { x: 4 }; Reflect.get(o, 'x') + Reflect.get([5], 0)",
             "9",
+        ),
+        // Arguments with side effects: the early callee read.
+        (
+            "Reflect.get({ x: 4 }, 'x') + Reflect.get([5].concat([6]), 1)",
+            "10",
         ),
         (
             "const d = Object.getOwnPropertyDescriptor({ x: 3 }, 'x'); d.value + d.writable",
@@ -434,8 +444,38 @@ fn constant_key_reflection_still_shakes() {
          Reflect.get({ x: 1 }, 'x') + Reflect.get(Array.prototype, k).call([1, 2], x => x * 2).join()",
         "const k = ['m', 'a', 'p'].join(''); const get = Reflect.get; \
          Reflect.get({ x: 1 }, 'x') + get(Array.prototype, k).call([1, 2], x => x * 2).join()",
+        // A run-time key with side-effect-free arguments: the interned key.
+        "const k = ['m', 'a', 'p'].join(''); const a = Array.prototype; \
+         Reflect.get({ x: 1 }, 'x') + Reflect.get(a, k).call([1, 2], x => x * 2).join()",
     ] {
         assert_eq!(size(src, false), size(src, true), "`{src}`");
         same(src, "12,4");
     }
+}
+
+/// Exactly the program L1 measured whole after the constant-key exemption
+/// (1.30 MB vs hello world's 0.49 MB): `{a: 1}` is not side-effect free, so
+/// the call reads `Reflect.get` early and nullish-guards `Reflect` first.
+/// Shaken, it is hello world plus the open `Reflect` gate's strings and the
+/// bodies kept by the `"get"` lookup (`Reflect.get` and `super_get`, the
+/// `Map` / `WeakMap` `get` methods and the `Map` fast path's helpers), well
+/// under 40 KB on top of [`HELLO_BOUND`].
+#[test]
+fn reflect_get_of_a_literal_shakes() {
+    let src = r#"console.log(Reflect.get({a:1},"a"))"#;
+    let (shaken, full) = (size(src, false), size(src, true));
+    assert!(shaken * 3 < full * 2, "{shaken} vs {full}");
+    assert!(shaken < HELLO_BOUND + 40_000, "{shaken} bytes");
+    same(src, "1\nundefined");
+}
+
+/// A constant-key `get` call on a nullish receiver still throws the read
+/// `TypeError` before its arguments run (the early read now guards it).
+#[test]
+fn constant_key_get_on_nullish_throws_first() {
+    same(
+        "let r = null, ran = 0, m; \
+         try { r.get({ a: (ran = 1) }, 'a') } catch (e) { m = e.message + ' ' + ran } m",
+        "Cannot read properties of null (reading 'get') 0",
+    );
 }

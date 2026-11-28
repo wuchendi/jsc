@@ -351,7 +351,12 @@ own code looks up one of its keys — except as the callee `o.m` of a call
 `o.m(a, key, ..)` with `m` one of `get`, `getOwnPropertyDescriptor`,
 `defineProperty` and a constant `key` (a literal, a plain numeric
 expression: `shake::constant_key_callee`), so `Reflect.get(o, 'x')` and
-`Object.getOwnPropertyDescriptor(o, 'x')` shake like `o.x`. Otherwise the
+`Object.getOwnPropertyDescriptor(o, 'x')` shake like `o.x`. The exemption
+covers every lookup of `m` the call makes, whatever its lowering: the
+ordinary method call's callee read and nullish guard, and, since `get` has
+a `Map` fast path, the guarded builtin call's interned key and its early
+callee read (`ProtoMethod::constant_key`: codegen then leaves the receiver
+for that read to nullish-guard, with a literal key only). Otherwise the
 builtin runs only if a runtime body reads it off its home object handed over
 by the program (`new Proxy(t, Reflect)`, `new Proxy(t, Object)`) and calls
 it with keys that body chose: the program's own recorded keys, or the keys

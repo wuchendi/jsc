@@ -42,6 +42,7 @@ use wasmparser::{BinaryReader, FunctionBody, Operator};
 use super::realm::{self, Builtin, Entry, Intrinsic, Key, Value};
 use super::roots::{classify_is_numeric, never_string};
 use super::{Helpers, IMPORT_FUNC_COUNT, IrNode, StrOffsets};
+use crate::ir::KEY_SECOND;
 
 /// What the emission of one body (or one family of bodies) used.
 #[derive(Debug, Default, Clone)]
@@ -120,25 +121,29 @@ pub(super) fn note_listed_values(helpers: Helpers<'_>) {
     }
 }
 
-/// The method names of the builtins whose run-time key is their second
-/// argument: `Reflect.get`, `Reflect` / `Object.getOwnPropertyDescriptor`,
-/// `Reflect` / `Object.defineProperty`.
-pub(super) const KEY_SECOND: [&str; 3] = ["get", "getOwnPropertyDescriptor", "defineProperty"];
-
 /// Whether `node`, as a property key, is a constant [`note_key`] does not
 /// record.
 pub(super) fn constant_key(node: &IrNode) -> bool {
     matches!(node, IrNode::Str(_)) || classify_is_numeric(node) || never_string(node)
 }
 
+/// Whether `o.method(args)` is a constant-key call: `method` is one of
+/// [`KEY_SECOND`] and the key argument `args[1]` is a [`constant_key`].
+pub(super) fn constant_key_call(method: &(impl PartialEq<str> + ?Sized), args: &[IrNode]) -> bool {
+    KEY_SECOND.iter().any(|m| method.eq(*m)) && args.get(1).is_some_and(constant_key)
+}
+
 /// Run `emit`, the lookup of the callee `o.m` of a call `o.m(a, key, ..)`
-/// whose `m` is one of [`KEY_SECOND`] and whose `key` is a [`constant_key`]:
-/// the strings it looks up keep their realm entries but do not name them for
-/// [`unnamed`] (`Reflect.get(o, 'x')` shakes like `o.x`).
-pub(super) fn constant_key_callee(emit: impl FnOnce()) {
+/// that is a [`constant_key_call`] (an [`IrNode::MethodCallUser`], or the
+/// [`IrNode::ProtoGuard`] / [`IrNode::ProtoMethod`] of a `get` call, which
+/// lowers as a `Map.prototype.get` fast path): the strings it looks up keep
+/// their realm entries but do not name them for [`unnamed`]
+/// (`Reflect.get(o, 'x')` shakes like `o.x`).
+pub(super) fn constant_key_callee<T>(emit: impl FnOnce() -> T) -> T {
     CALLEE.set(CALLEE.get() + 1);
-    emit();
+    let value = emit();
     CALLEE.set(CALLEE.get() - 1);
+    value
 }
 
 /// Run `emit`, whose keys are locals holding a key already recorded.
