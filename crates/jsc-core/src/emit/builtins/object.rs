@@ -106,7 +106,9 @@ pub(super) fn emit_has_own_property(
 /// `"[object Null]"`; else `O = ToObject(this)` and `"[object <tag>]"` with
 /// `Get(O, @@toStringTag)` (`__symbol_get`) when it is a string, else the
 /// builtin tag of `O` (Array, Function, Date, Error, Arguments, Boolean,
-/// Number, String, else Object).
+/// Number, String, else Object). A proxy's builtin tag (Array by `IsArray`,
+/// Function when callable, else Object) is computed before the
+/// `@@toStringTag` read (DESIGN.md §6.11).
 pub(super) fn emit_to_string(
     function: &mut FnBuilder<'_>,
     frame: Frame,
@@ -123,8 +125,31 @@ pub(super) fn emit_to_string(
     tag_if(function, TAG_UNDEFINED);
     wasm!(function; LocalGet(this), I64Const(NULL_BITS), I64Eq);
     tag_if(function, TAG_NULL);
+    wasm!(function; LocalGet(this), Call(helpers.to_object()), LocalSet(this));
+    let proxy_tag = frame.i32(1);
+    if helpers.proxies() {
+        // A proxy's builtin tag comes first (`IsArray` may throw): `1`
+        // Array, `2` Function, `3` Object; `0` for any other object.
+        wasm!(function;
+            I32Const(0), LocalSet(proxy_tag),
+            LocalGet(this), I32WrapI64, I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }),
+            I32Const(TYPE_PROXY), I32Eq,
+            If(BlockType::Empty),
+            LocalGet(this), Call(helpers.is_array()), LocalSet(proxy_tag),
+        );
+        return_if_pending(function);
+        wasm!(function;
+            I32Const(1), I32Const(2), I32Const(3),
+            LocalGet(this), I32WrapI64,
+            I32Load8U(MemArg { offset: u64::from(abi::HEADER_CLASS_OFFSET), align: 0, memory_index: 0 }),
+            I32Const(i32::from(abi::PROXY_CLASS_CALLABLE)), I32And,
+            Select,
+            LocalGet(proxy_tag), Select, LocalSet(proxy_tag),
+            End,
+        );
+    }
     wasm!(function;
-        LocalGet(this), Call(helpers.to_object()), LocalTee(this),
+        LocalGet(this),
         I32Const(realm::symbol_addr(WellKnown::ToStringTag, helpers)),
         Call(helpers.symbol_get()), LocalSet(tag),
     );
@@ -142,6 +167,12 @@ pub(super) fn emit_to_string(
     };
     emit_node(&tagged, function, frame.scratch(), strings, helpers);
     wasm!(function; Return, End);
+    if helpers.proxies() {
+        for (n, tag) in [(1, TAG_ARRAY), (2, TAG_FUNCTION), (3, TAG_OBJECT)] {
+            wasm!(function; LocalGet(proxy_tag), I32Const(n), I32Eq);
+            tag_if(function, tag);
+        }
+    }
     emit_load_type_byte(function, this);
     wasm!(function; LocalSet(kind));
     for (type_byte, tag) in [
@@ -188,7 +219,8 @@ pub(super) fn emit_value_of(
 }
 
 /// `Object.prototype.isPrototypeOf(V)`: `false` for a non-object `V`; else
-/// `ToObject(this)` and whether it is on `V`'s `proto` chain.
+/// `ToObject(this)` and whether it is on `V`'s `[[GetPrototypeOf]]` chain
+/// (a proxy link runs its `getPrototypeOf` trap).
 pub(super) fn emit_is_prototype_of(
     function: &mut FnBuilder<'_>,
     frame: Frame,
@@ -212,7 +244,17 @@ pub(super) fn emit_is_prototype_of(
     wasm!(function;
         LocalGet(this), Call(helpers.to_object()), LocalSet(this),
         Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(v), I32WrapI64, I64Load(proto), LocalTee(v), I64Const(NULL_BITS), I64Eq, BrIf(1),
+    );
+    if helpers.proxies() {
+        // `V.[[GetPrototypeOf]]()`: a proxy link runs its trap.
+        wasm!(function; LocalGet(v), Call(helpers.get_proto()), LocalSet(v));
+        return_if_pending(function);
+        wasm!(function; LocalGet(v));
+    } else {
+        wasm!(function; LocalGet(v), I32WrapI64, I64Load(proto));
+    }
+    wasm!(function;
+        LocalTee(v), I64Const(NULL_BITS), I64Eq, BrIf(1),
         LocalGet(v), LocalGet(this), I64Eq,
         If(BlockType::Empty), I64Const(TRUE_BITS), Return, End,
         Br(0),
@@ -258,7 +300,7 @@ pub(super) fn emit_to_locale_string(
         LocalGet(this), I32Const(static_key(strings, "toString")), Call(helpers.get), LocalSet(method),
     );
     return_if_pending(function);
-    emit_is_function(function, method);
+    emit_is_function(function, method, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, TO_STRING_NOT_CALLABLE, strings, helpers);
     wasm!(function; End);
@@ -287,7 +329,7 @@ pub(super) fn emit_define_accessor(
     wasm!(function; LocalGet(o), Call(helpers.to_object()), LocalSet(o));
     frame.arg(function, 1);
     wasm!(function; LocalSet(accessor));
-    emit_is_function(function, accessor);
+    emit_is_function(function, accessor, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     let text = if set {
         SETTER_NOT_CALLABLE
@@ -327,8 +369,9 @@ pub(super) fn emit_define_accessor(
 
 /// `Object.prototype.__lookupGetter__(P)` / `__lookupSetter__(P)` (Annex
 /// B.2.2.4-5): `ToObject(this)`, `ToPropertyKey(P)`, then the first own
-/// property `P` up the `proto` chain decides: an accessor's `get` / `set`,
-/// else (a data property or none) `undefined`.
+/// property `P` up the `[[GetPrototypeOf]]` chain decides: an accessor's
+/// `get` / `set`, else (a data property or none) `undefined` (a proxy level
+/// answers through its traps, DESIGN.md §6.11).
 pub(super) fn emit_lookup_accessor(
     set: bool,
     function: &mut FnBuilder<'_>,
@@ -348,8 +391,11 @@ pub(super) fn emit_lookup_accessor(
     let half = static_key(strings, if set { "set" } else { "get" });
     wasm!(function;
         Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(o), LocalGet(key), Call(helpers.own_desc()), LocalTee(desc),
-        I64Const(UNDEFINED_BITS), I64Ne,
+        LocalGet(o), LocalGet(key), Call(helpers.own_desc()), LocalSet(desc),
+    );
+    return_if_pending(function);
+    wasm!(function;
+        LocalGet(desc), I64Const(UNDEFINED_BITS), I64Ne,
         // A data descriptor has no own `get` / `set` (one inherited from
         // `%Object.prototype%` must not be read).
         If(BlockType::Empty),
@@ -359,16 +405,19 @@ pub(super) fn emit_lookup_accessor(
         Else, I64Const(UNDEFINED_BITS), End,
         Return,
         End,
-        LocalGet(o), I32WrapI64, I64Load(MemArg { offset: OBJ_PROTO_OFFSET, align: 3, memory_index: 0 }),
-        LocalTee(o), I64Const(NULL_BITS), I64Eq, BrIf(1),
+        LocalGet(o), Call(helpers.get_proto()), LocalSet(o),
+    );
+    return_if_pending(function);
+    wasm!(function;
+        LocalGet(o), I64Const(NULL_BITS), I64Eq, BrIf(1),
         Br(0),
         End, End,
         I64Const(UNDEFINED_BITS),
     );
 }
 
-/// The getter of `Object.prototype.__proto__`: the `proto` of
-/// `ToObject(this)`.
+/// The getter of `Object.prototype.__proto__`: `[[GetPrototypeOf]]` of
+/// `ToObject(this)` (a proxy's trap, DESIGN.md §6.11).
 pub(super) fn emit_proto_get(
     function: &mut FnBuilder<'_>,
     frame: Frame,
@@ -378,10 +427,7 @@ pub(super) fn emit_proto_get(
     let this = frame.i64(0);
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
     require_object_coercible(function, frame, this, strings, helpers);
-    wasm!(function;
-        LocalGet(this), Call(helpers.to_object()), I32WrapI64,
-        I64Load(MemArg { offset: OBJ_PROTO_OFFSET, align: 3, memory_index: 0 }),
-    );
+    wasm!(function; LocalGet(this), Call(helpers.to_object()), Call(helpers.get_proto()));
 }
 
 /// The setter of `Object.prototype.__proto__`: `RequireObjectCoercible(this)`;
@@ -405,14 +451,10 @@ pub(super) fn emit_proto_set(
     wasm!(function;
         I32And,
         If(BlockType::Empty),
-        LocalGet(this), I32WrapI64, LocalGet(proto), Call(helpers.set_proto()), LocalTee(r),
-        If(BlockType::Empty),
+        LocalGet(this), I32WrapI64, LocalGet(proto), Call(helpers.set_proto()), LocalSet(r),
     );
-    object_static::prop_throw(
-        function,
-        |function| push_str(function, strings, ""),
-        |function| wasm!(function; LocalGet(r)),
-        helpers,
-    );
+    return_if_pending(function);
+    wasm!(function; LocalGet(r), If(BlockType::Empty));
+    object_static::throw_proto_rejection(function, r, strings, helpers);
     wasm!(function; End, End, I64Const(UNDEFINED_BITS));
 }

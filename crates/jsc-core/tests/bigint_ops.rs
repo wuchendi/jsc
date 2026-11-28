@@ -501,6 +501,17 @@ mod gc_stress {
     }
 
     #[test]
+    fn bitwise_and_steps_across_limbs() {
+        assert_same_under_gc_stress(
+            "let x = -(2n ** 100n) + 12345n, y = 2n ** 96n - 1n, acc = 0n; \
+             for (let i = 0; i < 40; i++) { acc ^= (x | y) & (x ^ (y << 3n)); x--; y++; acc += 1n; } \
+             let z = 2n ** 64n; z--; let w = -(2n ** 64n); w--; \
+             console.log(acc, z, w, x < y, -x > y * 2n)",
+            "79228162514264337593543950384n 18446744073709551615n -18446744073709551617n true true\n",
+        );
+    }
+
+    #[test]
     fn divmod_round_trips() {
         assert_same_under_gc_stress(
             "let x = 3n ** 200n, ok = true; \

@@ -534,7 +534,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 25] = [
+const PROP_KEYED_MSGS: [(i32, &str, &str); 30] = [
     (
         PROP_THROW_READ_ONLY,
         "Cannot assign to read only property '",
@@ -640,6 +640,27 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 25] = [
         "Cannot use 'in' operator to search for '",
         "",
     ),
+    (
+        PROP_THROW_PROXY_REVOKED,
+        "Cannot perform '",
+        "' on a proxy that has been revoked",
+    ),
+    (PROP_THROW_PROXY_TRAP, "proxy trap '", "' is not a function"),
+    (
+        PROP_THROW_PROXY_FALSISH,
+        "proxy trap returned falsish for property '",
+        "'",
+    ),
+    (
+        PROP_THROW_PROXY_INVARIANT,
+        "proxy trap result for '",
+        "' violates an invariant",
+    ),
+    (
+        PROP_THROW_PROXY_FALSISH_OP,
+        "'",
+        "' on proxy: trap returned falsish",
+    ),
 ];
 /// The `.message` and `.stack` of the `RangeError` `__array_set_length` raises
 /// for a `length` write whose value is not a valid array length.
@@ -739,6 +760,24 @@ const PROP_THROW_PRIVATE_METHOD_WRITE: i32 = 26;
 /// `__prop_throw`'s `mode` argument: `#x in o` on a non-object `o` (the `key`
 /// is `"#x' in " + String(o)`, built by `__private_in`).
 const PROP_THROW_PRIVATE_IN: i32 = 27;
+/// `__prop_throw`'s `mode` argument: a trap of a revoked proxy (the `key` is
+/// the trap name, DESIGN.md §6.11).
+const PROP_THROW_PROXY_REVOKED: i32 = 28;
+/// `__prop_throw`'s `mode` argument: a proxy trap that is neither callable
+/// nor `undefined` / `null` (the `key` is the trap name).
+const PROP_THROW_PROXY_TRAP: i32 = 29;
+/// `__prop_throw`'s `mode` argument: a falsish `set` / `defineProperty` /
+/// `deleteProperty` trap result where the operation must throw (the `key` is
+/// the property key).
+const PROP_THROW_PROXY_FALSISH: i32 = 30;
+/// `__prop_throw`'s `mode` argument: a proxy trap result that violates an
+/// invariant of ECMA-262 §10.5 (the `key` is the property key, or the trap
+/// name for a trap without one).
+const PROP_THROW_PROXY_INVARIANT: i32 = 31;
+/// `__prop_throw`'s `mode` argument: a falsish `setPrototypeOf` /
+/// `preventExtensions` trap result where the operation must throw (the `key`
+/// is the trap name).
+const PROP_THROW_PROXY_FALSISH_OP: i32 = 32;
 /// The fragment `__private_in` splices between `#x` and `String(o)`.
 const PRIVATE_IN_MID: &str = "' in ";
 
@@ -907,15 +946,29 @@ enum BinaryData {
     Reachable,
 }
 
-/// Whether a program can produce a `BigInt` (DESIGN.md §6.10.9).
+/// The DESIGN.md §6.11 reachability gate: whether the program can create a
+/// proxy — it names `Proxy` (an identifier, a member or property name, a
+/// string) or reaches the global object. When closed, the property helpers
+/// emit no proxy arm and `__to_key` keeps its lookup-only mode.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BigInts {
-    /// No `BigInt` can exist: the numeric operators emit their Number-only
-    /// code.
-    Unreachable,
-    /// The program has a `BigInt` literal or names a `BigInt` source or the
-    /// global object.
-    Reachable,
+enum ProxyGate {
+    /// No proxy can exist.
+    Closed,
+    /// A proxy may exist.
+    Open,
+}
+
+/// The DESIGN.md §6.10.9 reachability gate: whether the program can produce
+/// a `BigInt` — a `BigInt` literal, a `BIGINT_NAMES` name (an identifier, a
+/// member or property name, a string) or the global object. When closed, the
+/// numeric operators emit their Number-only code and reference no `BigInt`
+/// kernel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BigIntGate {
+    /// No `BigInt` can exist.
+    Closed,
+    /// A `BigInt` may exist.
+    Open,
 }
 
 #[derive(Clone, Copy)]
@@ -1114,10 +1167,12 @@ struct Helpers<'a> {
     /// Whether the program can reach binary data (DESIGN.md §5.8.5). When
     /// not, the collector and the renderer leave out their binary-data arms.
     binary: BinaryData,
-    /// Whether the program can produce a `BigInt` (DESIGN.md §6.10.9). When
-    /// not, the numeric operators, `ToNumeric` sites and `Number(x)` emit
-    /// their Number-only code and reference no `BigInt` kernel.
-    bigints: BigInts,
+    /// Whether the program can create a proxy (DESIGN.md §6.11 reachability
+    /// gate; see [`Helpers::proxies`]).
+    proxy_gate: ProxyGate,
+    /// Whether the program can produce a `BigInt` (DESIGN.md §6.10.9
+    /// reachability gate; see [`Helpers::bigints`]).
+    bigint_gate: BigIntGate,
     /// Base address of the Unicode tables (see [`unicode`]).
     unicode: i32,
     /// Base address of the `__fn_info` table (see [`FnLayout`]). The static
@@ -1388,9 +1443,10 @@ impl Helpers<'_> {
         self.binary == BinaryData::Reachable
     }
 
-    /// Whether the program can produce a `BigInt` ([`Self::bigints`]).
-    fn has_bigints(self) -> bool {
-        self.bigints == BigInts::Reachable
+    /// Whether the program can produce a `BigInt` (DESIGN.md §6.10.9
+    /// reachability gate, [`Self::bigint_gate`]).
+    fn bigints(self) -> bool {
+        self.bigint_gate == BigIntGate::Open
     }
 
     /// `__ab_alloc(size) -> block | 0` (see [`binary`]).
@@ -1750,9 +1806,9 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // A program that can produce no `BigInt` (DESIGN.md §6.10.9) is emitted
     // from its Number-only IR, with the gate published to the emitters that
     // take no `Helpers` for the rest of this module.
-    let _bigint_scope = roots::BigIntScope::enter(helpers.has_bigints());
+    let _bigint_scope = roots::BigIntScope::enter(helpers.bigints());
     let number_only;
-    let program = if helpers.has_bigints() {
+    let program = if helpers.bigints() {
         program
     } else {
         number_only = lower_number_only(program);

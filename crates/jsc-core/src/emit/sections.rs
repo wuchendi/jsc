@@ -105,18 +105,21 @@ pub(super) fn build_type_and_function_sections<'a>(
         fn_type,
         max_args,
         gathers_arguments: program_any(program, |n| matches!(n, IrNode::SpreadArgsGlobal)),
-        has_accessors: program_has_accessors(program),
+        // A proxy trap runs user code at any property access, as a getter
+        // does (DESIGN.md §6.11).
+        has_accessors: program_has_accessors(program) || program_has_proxies(program),
         dirty_tracking: program_tests_dirty_bits(program),
         binary: if program_has_binary(program) {
             BinaryData::Reachable
         } else {
             BinaryData::Unreachable
         },
-        bigints: if program_has_bigint(program) {
-            BigInts::Reachable
+        proxy_gate: if program_has_proxies(program) {
+            ProxyGate::Open
         } else {
-            BigInts::Unreachable
+            ProxyGate::Closed
         },
+        bigint_gate: bigint_gate(program),
         unicode: layout.unicode,
         fn_info: layout.info,
     };
@@ -1399,6 +1402,20 @@ fn collect_entries<'a>(entries: &'a [(PropKey, IrNode)], strs: &mut Strs<'a>) {
 /// well-known symbol reads go through `__symbol_get`, which calls a getter
 /// regardless — the realm's `get [@@species]` and `%Iterator.prototype%`'s
 /// `get [@@toStringTag]` are reached that way.)
+/// Whether the program can create a proxy (DESIGN.md §6.11): it names
+/// `Proxy` as a global, a member or property key or a string literal, or it
+/// holds the global object (which can find `Proxy` by a run-time key).
+fn program_has_proxies(program: &IrProgram) -> bool {
+    program_any(program, |n| match n {
+        IrNode::Str(s) => s == "Proxy",
+        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
+            global.name == "Proxy"
+        }
+        IrNode::Intrinsic(GlobalIntrinsic::Global) => true,
+        _ => false,
+    })
+}
+
 fn program_has_accessors(program: &IrProgram) -> bool {
     let computed = |key: &IrNode| !matches!(key, IrNode::Str(_) | IrNode::Num(_));
     program_any(program, |n| match n {
@@ -1474,6 +1491,15 @@ const BIGINT_NAMES: [&str; 7] = [
     "setBigInt64",
     "setBigUint64",
 ];
+
+/// The [`BigIntGate`] of `program` ([`program_has_bigint`]).
+fn bigint_gate(program: &IrProgram) -> BigIntGate {
+    if program_has_bigint(program) {
+        BigIntGate::Open
+    } else {
+        BigIntGate::Closed
+    }
+}
 
 /// Whether `program` can produce a `BigInt` (DESIGN.md §6.10.9): it has a
 /// `BigInt` literal, names a [`BIGINT_NAMES`] source (the intrinsic, a global

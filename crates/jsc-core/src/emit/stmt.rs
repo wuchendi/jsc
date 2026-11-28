@@ -709,7 +709,7 @@ pub(super) fn emit_cond(
     // ARRAY / OBJECT / FUNCTION: unconditionally truthy; a BigInt iff
     // nonzero (its `len` shares the string's offset): type != BIGINT | len != 0.
     // Without a reachable `BigInt` (DESIGN.md §6.10.9) the arm is a constant.
-    if helpers.has_bigints() {
+    if helpers.bigints() {
         emit_load_type_byte(function, value);
         function.instruction(&Instruction::I32Const(TYPE_BIGINT));
         function.instruction(&Instruction::I32Ne);

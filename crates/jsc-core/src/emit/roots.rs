@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 
 thread_local! {
     /// Whether the program being emitted can produce a `BigInt`
-    /// ([`Helpers::has_bigints`], DESIGN.md §6.10.9), for the emitters that
+    /// ([`Helpers::bigints`], DESIGN.md §6.10.9), for the emitters that
     /// take no [`Helpers`]: [`classify`] and [`emit_is_object`]. `true`
     /// outside [`BigIntScope`], the sound default.
     static BIGINTS: Cell<bool> = const { Cell::new(true) };
@@ -39,7 +39,7 @@ pub(super) fn bigints_reachable() -> bool {
     BIGINTS.get()
 }
 
-/// Publishes [`Helpers::has_bigints`] to [`bigints_reachable`] for the
+/// Publishes [`Helpers::bigints`] to [`bigints_reachable`] for the
 /// emission of one module; dropping it restores the sound default.
 pub(super) struct BigIntScope;
 
@@ -87,12 +87,20 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         (helpers.intern_find, vec![helpers.intern_slot]),
         (helpers.index_value, vec![]),
         (helpers.str_exotic_index(), vec![helpers.index_value]),
-        (helpers.same_value_zero, vec![helpers.str_eq]),
+        // The BigInt kernels both call are leaves (DESIGN.md §6.10.6); neither
+        // body depends on the `bigints` gate.
+        (
+            helpers.same_value_zero,
+            vec![helpers.str_eq, helpers.bigint(registry::Big::Eq)],
+        ),
         (
             helpers.array_search,
             vec![helpers.same_value_zero, helpers.index_value],
         ),
-        (helpers.map_hash(), vec![helpers.str_hash]),
+        (
+            helpers.map_hash(),
+            vec![helpers.str_hash, helpers.bigint(registry::Big::Hash)],
+        ),
         (
             helpers.map_find,
             vec![helpers.same_value_zero, helpers.map_hash()],
@@ -106,7 +114,7 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         // entry, so that call never materializes, but the graph is static).
         (helpers.private_find(), vec![helpers.prop_find]),
         (helpers.json_ws, vec![]),
-        (helpers.test_integrity(), vec![]),
+        (helpers.test_integrity(), integrity_callees(helpers)),
         (helpers.heap_object(), vec![]),
         (helpers.str_of(), vec![]),
         (helpers.fn_name(), vec![helpers.heap_object()]),
@@ -180,6 +188,17 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
     ];
     graph.extend(module_graphs(helpers));
     graph
+}
+
+/// The callees of `__test_integrity` the leaf solver must see: none, or the
+/// proxy trap helper (not itself declared, so a safepoint) when the program
+/// can hold proxies (DESIGN.md §6.11).
+fn integrity_callees(helpers: Helpers<'_>) -> Vec<u32> {
+    if helpers.proxies() {
+        vec![helpers.proxy_is_extensible()]
+    } else {
+        vec![]
+    }
 }
 
 /// The leaf-graph declarations of the runtime modules, in group order.

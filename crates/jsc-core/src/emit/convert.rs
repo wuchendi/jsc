@@ -206,7 +206,7 @@ pub(super) fn emit_to_primitive(
         I32Const(HINT_STRING), LocalGet(hint), LocalGet(hint), I32Eqz, Select, LocalSet(hint),
         Else,
     );
-    emit_is_function(&mut f, method);
+    emit_is_function(&mut f, method, helpers);
     wasm!(f; I32Eqz, If(BlockType::Empty));
     emit_throw_not_a_function(&mut f, TO_PRIMITIVE_NOT_CALLABLE, scratch, strings, helpers);
     wasm!(f;
@@ -239,7 +239,7 @@ pub(super) fn emit_to_primitive(
         }
         wasm!(f; LocalGet(v), LocalGet(key), Call(helpers.get), LocalSet(method));
         return_if_pending(&mut f, &Instruction::I64Const(UNDEFINED_BITS));
-        emit_is_function(&mut f, method);
+        emit_is_function(&mut f, method, helpers);
         wasm!(f; If(BlockType::Empty));
         emit_accessor_call(&mut f, method, v, None, base, helpers);
         wasm!(f; LocalSet(result));
@@ -356,7 +356,7 @@ pub(super) fn emit_add_helper(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
     wasm!(f; Call(helpers.concat));
     f.release_temps(mark);
     wasm!(f; I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Else);
-    if helpers.has_bigints() {
+    if helpers.bigints() {
         bigint::emit_is_bigint(&mut f, a);
         bigint::emit_is_bigint(&mut f, b);
         wasm!(f;
@@ -404,7 +404,7 @@ pub(super) fn emit_compare(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let (a, b, op, ord, lhs, rhs) = (0, 1, 2, 3, 4, 5);
     // Without a reachable `BigInt` (DESIGN.md §6.10.9) the `BigInt` arm and
     // its three locals are left out.
-    let bigints = helpers.has_bigints();
+    let bigints = helpers.bigints();
     let locals: &[LocalClass] = if bigints {
         &[RAW_I32, RAW_F64, RAW_F64, ROOT_JS, ROOT_JS, RAW_I32]
     } else {

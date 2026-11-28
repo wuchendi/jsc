@@ -2149,9 +2149,6 @@ pub(super) fn emit_numeric_unary(helpers: Helpers<'_>, leaves: &LeafSet) -> Func
 pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
     let big = |h| helpers.bigint(h);
     vec![
-        // The shared equality and hashing helpers call the leaf kernels.
-        (helpers.same_value_zero, vec![big(Big::Eq)]),
-        (helpers.map_hash(), vec![big(Big::Hash)]),
         (big(Big::Trim), vec![]),
         (big(Big::Eq), vec![]),
         (big(Big::CmpMag), vec![]),

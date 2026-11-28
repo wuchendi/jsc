@@ -27,7 +27,7 @@ pub(super) fn emit_inc_dec(
     } else {
         Instruction::F64Sub
     };
-    let bigints = helpers.has_bigints();
+    let bigints = helpers.bigints();
     if bigints {
         // Three writes follow: the coercion's, the `BigInt` update's and the
         // number update's; each keeps the local numeric exactly when it already
@@ -203,7 +203,7 @@ fn emit_numeric_binary(
     // No `BigInt` can exist (DESIGN.md §6.10.9): `**` is the `Math.pow` code
     // ([`lower_number_only`] already made it a `Math.pow` call), the others
     // [`emit_number_binary`].
-    if !helpers.has_bigints() {
+    if !helpers.bigints() {
         if op == BinOp::Exp {
             emit_pow(lhs, rhs, function, scratch, strings, helpers);
         } else {
@@ -681,7 +681,7 @@ fn yields_number(node: &IrNode, helpers: Helpers<'_>) -> bool {
             op: BinOp::UShr, ..
         } => true,
         IrNode::Binary { op, .. } => {
-            !helpers.has_bigints()
+            !helpers.bigints()
                 && matches!(
                     op,
                     BinOp::Sub
@@ -1225,7 +1225,7 @@ pub(super) fn emit_convert_call(
         return;
     }
     if matches!(op, ConvertOp::ToNumber)
-        || (!helpers.has_bigints() && matches!(op, ConvertOp::ToNumeric | ConvertOp::NumberCall))
+        || (!helpers.bigints() && matches!(op, ConvertOp::ToNumeric | ConvertOp::NumberCall))
     {
         // The shared ToNumber: a number passes through, anything else is
         // converted by `__to_number`. Without a reachable `BigInt` (DESIGN.md
@@ -1593,7 +1593,7 @@ pub(super) fn emit_strict_eq(
     //   equality, matching JS (`[1] === [1]` is `false`).
     // Without a reachable `BigInt` (DESIGN.md §6.10.9) the THEN arm is the
     // string compare alone.
-    let bigints = helpers.has_bigints();
+    let bigints = helpers.bigints();
     let is_str = if bigints {
         emit_is_str_or_bigint
     } else {
