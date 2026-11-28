@@ -37,7 +37,7 @@ use roots::LeafSet;
 
 use crate::abi;
 use crate::ir::{
-    ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ErrorKind, FnKind,
+    ArrayHofOp, BinOp, BuiltinCtor, CalleeError, ConvertOp, DateOp, ElementKind, ErrorKind, FnKind,
     GlobalIntrinsic, GlobalRef, InstanceOfKind, IrCase, IrFunction, IrNode, IrProgram, IrStmt,
     IterRecord, JsStr, LogicalOp, MapOp, MathOp, MethodOp, ObjectBuiltinOp, OpSetKind,
     PrivateError, PropKey, ProtoKind, SpreadCallee, SpreadElem,
@@ -534,7 +534,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 30] = [
+const PROP_KEYED_MSGS: [(i32, &str, &str); 35] = [
     (
         PROP_THROW_READ_ONLY,
         "Cannot assign to read only property '",
@@ -661,6 +661,31 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 30] = [
         "'",
         "' on proxy: trap returned falsish",
     ),
+    (
+        PROP_THROW_TA_INCOMPATIBLE,
+        "Method ",
+        " called on incompatible receiver",
+    ),
+    (
+        PROP_THROW_TA_OUT_OF_BOUNDS,
+        "Cannot perform ",
+        " on a detached or out-of-bounds TypedArray",
+    ),
+    (
+        PROP_THROW_TA_PREVENT_EXTENSIONS,
+        "Cannot prevent extensions on a variable-length TypedArray",
+        "",
+    ),
+    (
+        PROP_THROW_TA_SEAL,
+        "Cannot seal array buffer views with elements",
+        "",
+    ),
+    (
+        PROP_THROW_TA_FREEZE,
+        "Cannot freeze array buffer views with elements",
+        "",
+    ),
 ];
 /// The `.message` and `.stack` of the `RangeError` `__array_set_length` raises
 /// for a `length` write whose value is not a valid array length.
@@ -778,6 +803,22 @@ const PROP_THROW_PROXY_INVARIANT: i32 = 31;
 /// `preventExtensions` trap result where the operation must throw (the `key`
 /// is the trap name).
 const PROP_THROW_PROXY_FALSISH_OP: i32 = 32;
+/// `__prop_throw`'s `mode` argument: a typed-array method or getter (the
+/// `key`, its name) on a receiver that is not a typed array (DESIGN.md
+/// §5.8.4). Modes `44..=51` belong to the binary-data workstream.
+const PROP_THROW_TA_INCOMPATIBLE: i32 = 44;
+/// `__prop_throw`'s `mode` argument: a typed-array method (the `key`, its
+/// name) on an out-of-bounds or detached typed array.
+const PROP_THROW_TA_OUT_OF_BOUNDS: i32 = 45;
+/// `__prop_throw`'s `mode` argument: `[[PreventExtensions]]` of a
+/// variable-length typed array (the `key` is the empty string).
+const PROP_THROW_TA_PREVENT_EXTENSIONS: i32 = 46;
+/// `__prop_throw`'s `mode` argument: `Object.seal` of a typed array with
+/// elements (the `key` is the empty string).
+const PROP_THROW_TA_SEAL: i32 = 47;
+/// `__prop_throw`'s `mode` argument: `Object.freeze` of a typed array with
+/// elements (the `key` is the empty string).
+const PROP_THROW_TA_FREEZE: i32 = 48;
 /// The fragment `__private_in` splices between `#x` and `String(o)`.
 const PRIVATE_IN_MID: &str = "' in ";
 
@@ -1442,14 +1483,59 @@ impl Helpers<'_> {
         self.group(registry::Group::Binary) + 2
     }
 
-    /// `__dv_get(addr, kind, swap) -> i64` (see [`binary`]).
-    fn dv_get(self) -> u32 {
+    /// `__ta_length(o) -> i32` (see [`binary`]).
+    fn ta_length(self) -> u32 {
         self.group(registry::Group::Binary) + 3
     }
 
-    /// `__dv_set(addr, kind, n, swap)` (see [`binary`]).
-    fn dv_set(self) -> u32 {
+    /// `__ta_oob(o) -> i32` (see [`binary`]).
+    fn ta_oob(self) -> u32 {
         self.group(registry::Group::Binary) + 4
+    }
+
+    /// `__ta_validate(o, name) -> i32` (see [`binary`]).
+    fn ta_validate(self) -> u32 {
+        self.group(registry::Group::Binary) + 5
+    }
+
+    /// `__ta_canonical(key) -> i32` (see [`binary`]).
+    fn ta_canonical(self) -> u32 {
+        self.group(registry::Group::Binary) + 6
+    }
+
+    /// `__ta_get(o, i) -> i64` (see [`binary`]).
+    fn ta_get(self) -> u32 {
+        self.group(registry::Group::Binary) + 7
+    }
+
+    /// `__ta_set(o, i, n)` (see [`binary`]).
+    fn ta_set(self) -> u32 {
+        self.group(registry::Group::Binary) + 8
+    }
+
+    /// `__ta_set_value(o, i, v)` (see [`binary`]).
+    fn ta_set_value(self) -> u32 {
+        self.group(registry::Group::Binary) + 9
+    }
+
+    /// `__ta_index_get(o, k) -> i64` (see [`binary`]).
+    fn ta_index_get(self) -> u32 {
+        self.group(registry::Group::Binary) + 10
+    }
+
+    /// `__ta_index_set(o, k, v)` (see [`binary`]).
+    fn ta_index_set(self) -> u32 {
+        self.group(registry::Group::Binary) + 11
+    }
+
+    /// `__raw_load(addr, kind, swap) -> i64` (see [`binary`]).
+    fn raw_load(self) -> u32 {
+        self.group(registry::Group::Binary) + 12
+    }
+
+    /// `__raw_store(addr, kind, n, swap)` (see [`binary`]).
+    fn raw_store(self) -> u32 {
+        self.group(registry::Group::Binary) + 13
     }
 
     /// `__super_get(home, key, recv) -> i64` (see [`props::emit_super_get`]).

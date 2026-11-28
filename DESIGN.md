@@ -1100,33 +1100,45 @@ and never nests (`$__gc_busy`).
 
 ### 5.8 Binary data: `ArrayBuffer`, typed arrays, `DataView` (target design)
 
-**Status: stages T2 (`ArrayBuffer`) and T4 (`DataView`) implemented, the
-rest is design.** This
+**Status: stages T2 (`ArrayBuffer`), T3a (typed-array core) and T4
+(`DataView`) implemented, the rest is design.** This
 section is the target of the phase-5b binary-data workstream (§14, stages
-T2–T6 in §5.8.10). In the tree now: the three type constants and the
-`ArrayBuffer` layout (`abi::TYPE_*`, `AB_*`, `BYTE_LENGTH_MAX`), the
-`TYPE_ARRAYBUFFER` part of §5.8.2–§5.8.4 (byte blocks from `__ab_alloc`,
-`resize`, `transfer` / `transferToFixedLength` and detaching), its
-collector arm (§5.8.3), the `%ArrayBuffer%` / `%ArrayBuffer.prototype%`
-part of §5.8.7 (`emit/builtins/array_buffer.rs`), its rendering (§5.8.8,
-`emit/binary.rs`, the `Group::Binary` helpers), and the test262 `$262`
-prelude. A byte block's `len` (its capacity) is exactly the size requested
-from `__ab_alloc`, not rounded up to the size class. `DataView` is in the
-tree too: the `TYPE_DATAVIEW` layout (`abi::DV_*`), its collector arm, the
-`%DataView%` / `%DataView.prototype%` part of §5.8.7
+T2–T6 in §5.8.10). In the tree now: the three type constants and the three
+layouts (`abi::TYPE_*`, `AB_*`, `TA_*`, `DV_*`, `BYTE_LENGTH_MAX`), the
+§5.8.2–§5.8.4 byte blocks from `__ab_alloc`, `resize`, `transfer` /
+`transferToFixedLength` and detaching, the buffer witnesses `__ta_length`
+/ `__ta_oob` / `__dv_length` and `__ta_validate`, the collector arms
+(§5.8.3), every §5.8.5 hook with `__ta_canonical`, the element helpers and
+the inline `ta[k]` arms, the number kinds of §5.8.6 through the shared
+element accessors `__raw_load(addr, kind, swap)` / `__raw_store(addr, kind,
+n, swap)` (both typed arrays, with `swap = 0`, and `DataView`, with `swap
+= !littleEndian`, call them; the byte swap is implemented), the
+`%ArrayBuffer%` / `%ArrayBuffer.prototype%` part of §5.8.7
+(`emit/builtins/array_buffer.rs`), its `%TypedArray%` part except the T3b
+methods — the nine constructors `Int8Array` .. `Float64Array` (each
+`Builtin::Ctor(BuiltinCtor::Typed(kind))`), `from`, `of`, `get
+[@@species]`, the prototype getters, `get [@@toStringTag]`, `keys` /
+`values` / `entries` / `[@@iterator]` and the Array Iterator `next` arm
+(`emit/builtins/typed_array.rs`; `TypedArrayCreateFromConstructor` is there,
+`TypedArraySpeciesCreate` lands with its first user in T3b) — and its
+`%DataView%` part except `Float16` and the BigInt pairs
 (`emit/builtins/data_view.rs`; the get / set bodies are
-`Builtin::DataView(DataViewOp::Get(kind) | DataViewOp::Set(kind))` over the
-§5.8.6 kind numbers), its rendering (§5.8.8), and the `Group::Binary`
-helpers `__dv_length` (§5.8.4) and `__dv_get(addr, kind, swap) -> i64` /
-`__dv_set(addr, kind, n, swap)`, which are §5.8.6's `__raw_load` /
-`__raw_store` restricted to the number kinds `DataView` uses (they give way
-to the shared accessors when stage T3a lands them). The `has_binary` gate of
+`Builtin::DataView(DataViewOp::Get(kind) | DataViewOp::Set(kind))` over
+`ir::ElementKind`), the rendering of all three (§5.8.8, `emit/binary.rs`,
+the `Group::Binary` helpers), and the test262 `$262` prelude. A byte
+block's `len` (its capacity) is exactly the size requested from
+`__ab_alloc`, not rounded up to the size class. The `has_binary` gate of
 §5.8.5 exists (`Helpers::has_binary`, `sections.rs::program_has_binary`,
-naming only `ArrayBuffer`, `DataView` and the global object so far) and keeps
-the collector and renderer arms out of a program that cannot reach binary
-data; `ArrayBuffer` and `DataView` are also `program_has_accessors` names.
-Typed arrays, the §5.8.5 hooks and the typed-array element helpers do not
-exist yet:
+naming `ArrayBuffer`, `DataView`, the nine typed-array constructors and the
+global object so far) and keeps every binary arm out of a program that
+cannot reach binary data; the same names are `program_has_accessors`' too.
+The typed-array `__prop_throw` modes are `44` (incompatible receiver), `45`
+(out of bounds or detached), `46` (`[[PreventExtensions]]` of a
+variable-length view; `__set_integrity` itself returns status `0` without
+throwing, `Object.preventExtensions` / `seal` / `freeze` raise mode `46`),
+`47` / `48` (`seal` / `freeze` with elements, left pending by
+`__set_integrity`). `Float16Array`, the BigInt kinds and the
+`%TypedArray%.prototype` methods of T3b do not exist yet:
 every stage implements its part against this text and,
 as it lands, moves the landed facts into the sections that describe the
 current tree (§5.1 family list, §5.2 table, §5.7 tracing table, §6.2 helpers,
@@ -1313,11 +1325,12 @@ a user-observable step.
   `IsTypedArrayOutOfBounds` (detached included). `__dv_length(o) -> i32`
   is `GetViewByteLength` with `-1` for `IsViewOutOfBounds` (the same rule over
   bytes). All three are non-allocating leaves.
-- **Validation.** `__ta_validate(o, msg) -> i32` is `ValidateTypedArray`: a
+- **Validation.** `__ta_validate(o, name) -> i32` is `ValidateTypedArray`: a
   receiver that is not `TYPE_TYPEDARRAY` throws `TypeError: Method <name>
   called on incompatible receiver`, an out-of-bounds or detached one throws
   `TypeError: Cannot perform <name> on a detached or out-of-bounds TypedArray`
-  (`msg` selects the static message pair, §5.8.7), else it returns the length.
+  (`name` is the builtin's static name string, spliced in by `__prop_throw`
+  modes `44` / `45`), else it returns the length.
 - **Re-validation rule.** Every builtin follows its spec step order exactly.
   After any step that can run user code — `ToNumber` / `ToIntegerOrInfinity`
   / `ToIndex` of an argument (`valueOf`, `@@toPrimitive`), a callback, a
@@ -1575,7 +1588,7 @@ entries with no setter, configurable, not enumerable.
   Each concrete constructor's `[[Prototype]]` is `%TypedArray%`.
 - **Concrete constructors** `%Int8Array%` .. `%BigUint64Array%` (`length` 3,
   own `BYTES_PER_ELEMENT` non-writable, non-enumerable, non-configurable):
-  one shared builtin body per kind (`Builtin::TypedCtor(kind)`) implementing
+  one shared builtin body per kind (`Builtin::Ctor(BuiltinCtor::Typed(kind))`) implementing
   every overload of `TypedArray(...args)`: no argument or a non-object →
   `ToIndex(length)` and a fresh zeroed buffer from `%ArrayBuffer%`
   (`RangeError: Invalid typed array length` past `BYTE_LENGTH_MAX`); a typed
@@ -1930,11 +1943,10 @@ hands the operation to its traps.
   when visited) whose key is not in the exclusion list, the value read with
   `[[Get]]` (a getter runs). A nullish or non-string primitive source copies
   nothing; a string copies its indices.
-- **Integer-indexed exotic objects** (typed arrays; target design, not yet
-  implemented): every helper above gains one arm for a `TYPE_TYPEDARRAY`
-  object, emitted only in a program that can reach binary data, which
-  answers canonical numeric string keys from the buffer and never lets them
-  reach the table or the chain (§5.8.5).
+- **Integer-indexed exotic objects** (typed arrays): every helper above has
+  one arm for a `TYPE_TYPEDARRAY` object, emitted only in a program that can
+  reach binary data, which answers canonical numeric string keys from the
+  buffer and never lets them reach the table or the chain (§5.8.5).
 
 ### 6.4 Realm, global object, and fast paths
 
@@ -4363,8 +4375,8 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | errors | §7.7 |
 | generators | `%GeneratorPrototype%` `next`, `return`, `throw` |
 | iterators | `%IteratorPrototype%[@@iterator]`, `%AsyncIteratorPrototype%[@@asyncIterator]` (both return `this`); the `next` of the Array, String, Map and Set Iterator prototypes (a receiver that is not an iterator of the family throws `TypeError: next method called on incompatible receiver`); `Iterator` (abstract: calling it, or `new` with `new.target === Iterator`, throws `TypeError`; a subclass constructs), `Iterator.prototype` (`%IteratorPrototype%`, non-writable) with `constructor` (`%Iterator%`) and `@@toStringTag` (`"Iterator"`) accessors whose setters are `SetterThatIgnoresPrototypeProperties` (a `TypeError` on a non-object or on `Iterator.prototype` itself; an own data property on any other receiver); `Iterator.from(O)` (`GetIteratorFlattenable`: strings are iterated, other primitives throw `TypeError`; an iterator inheriting `Iterator.prototype` is returned as is, any other is wrapped in a `CLASS_ITERATOR` object of kind `16` over `%WrapForValidIteratorPrototype%`, whose `next` / `return` forward to the wrapped record, `next` read once); the lazy helpers `Iterator.prototype.map` / `filter` / `take` / `drop` / `flatMap` (`this` must be an object; the argument is validated first — a non-callable callback is a `TypeError`, a `take` / `drop` limit goes through `ToNumber` and `NaN` or a negative integer is a `RangeError` — closing `this` on failure; then `next` is read once and a helper object is returned without stepping). A helper's `next` steps the underlying iterator only on demand; a throwing callback, or a `flatMap` result that is not an object (a string included) or not iterable, closes the underlying iterator; `take` closes it once the limit is reached; a `next` / `return` while the helper runs throws `TypeError`; `return()` closes the underlying iterator (and a `flatMap`'s open inner one first) and completes the helper. The eager helpers `reduce` / `toArray` / `forEach` / `some` / `every` / `find` validate `this` and the callback the same way, read `next` once and consume the iterator, passing a counter as the callback's last argument (`reduce` without an initial value starts from the first value with counter `1`, and throws `TypeError` on an empty iterator); a throwing callback closes the iterator under its throw, `some` / `every` / `find` close it on an early result, and a throw from `next` or a result's `value` propagates without closing. A program that names `Iterator`, `constructor`, `getPrototypeOf` or `setPrototypeOf` compiles the accessor dispatch of `__get` / `__set` |
-| `ArrayBuffer` | §5.8.7: `new ArrayBuffer(length, { maxByteLength })` (calling it without `new` is a `TypeError`; `ToIndex` `RangeError`s, a length or maximum past `2^29` is `RangeError: Array buffer allocation failed`; subclassable through `new.target`), `ArrayBuffer.isView` (`true` only for a typed array or `DataView`; typed arrays do not exist yet), `get [@@species]`; prototype getters `byteLength`, `maxByteLength`, `resizable`, `detached`; `resize`, `slice` (through `SpeciesConstructor`), `transfer`, `transferToFixedLength` (both detach the receiver), `@@toStringTag`; rendered as `ArrayBuffer { [Uint8Contents]: <..>, byteLength: n }` (§5.8.8). No immutable buffers, no `SharedArrayBuffer` (§5.8.9) |
-| typed arrays | **target, not yet available** (§5.8.7, stages T3a / T3b / T5a / T5b): `%TypedArray%` (abstract) with `from`, `of`, `get [@@species]`; `Int8Array`, `Uint8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float16Array`, `Float32Array`, `Float64Array`, `BigInt64Array`, `BigUint64Array` (every constructor overload, `BYTES_PER_ELEMENT`); `%TypedArray.prototype%` getters `buffer`, `byteLength`, `byteOffset`, `length`, `@@toStringTag` and every ES2025 method; `Uint8Array.fromBase64`, `fromHex`, `Uint8Array.prototype.toBase64`, `toHex`, `setFromBase64`, `setFromHex`; `Math.f16round` |
+| `ArrayBuffer` | §5.8.7: `new ArrayBuffer(length, { maxByteLength })` (calling it without `new` is a `TypeError`; `ToIndex` `RangeError`s, a length or maximum past `2^29` is `RangeError: Array buffer allocation failed`; subclassable through `new.target`), `ArrayBuffer.isView` (`true` only for a typed array or `DataView`), `get [@@species]`; prototype getters `byteLength`, `maxByteLength`, `resizable`, `detached`; `resize`, `slice` (through `SpeciesConstructor`), `transfer`, `transferToFixedLength` (both detach the receiver), `@@toStringTag`; rendered as `ArrayBuffer { [Uint8Contents]: <..>, byteLength: n }` (§5.8.8). No immutable buffers, no `SharedArrayBuffer` (§5.8.9) |
+| typed arrays | §5.8.7, stage T3a: `%TypedArray%` (abstract: calling or constructing it is a `TypeError`) with `from`, `of`, `get [@@species]`; `Int8Array`, `Uint8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array` (every constructor overload incl. length-tracking views over resizable buffers, `BYTES_PER_ELEMENT`, subclassable through `new.target`); `%TypedArray.prototype%` getters `buffer`, `byteLength`, `byteOffset`, `length`, `get [@@toStringTag]`, and `keys` / `values` / `entries` / `[@@iterator]`; the integer-indexed exotic hooks (§5.8.5); rendered as `Uint8Array(3) [ 1, 2, 3 ]` (§5.8.8). **Target, not yet available** (stages T3b / T5a / T5b): every other `%TypedArray.prototype%` method, `Float16Array`, `BigInt64Array`, `BigUint64Array`, `Uint8Array.fromBase64`, `fromHex`, `Uint8Array.prototype.toBase64`, `toHex`, `setFromBase64`, `setFromHex`; `Math.f16round` |
 | `DataView` | §5.8.7: `new DataView(buffer, byteOffset, byteLength)` (calling it without `new` is a `TypeError`; a non-`ArrayBuffer` `buffer` or a detached one is a `TypeError`, an offset or length outside the buffer a `RangeError`, re-checked after `GetPrototypeFromConstructor`; an `undefined` `byteLength` over a resizable buffer makes a length-tracking view; subclassable through `new.target`); getters `buffer`, `byteLength`, `byteOffset` (the last two throw `TypeError` on an out-of-bounds or detached view); `get` / `set` of `Int8`, `Uint8`, `Int16`, `Uint16`, `Int32`, `Uint32`, `Float32`, `Float64` (big-endian unless `littleEndian` is truthy; `ToIndex(byteOffset)`, the setter's `ToNumber(value)`, `ToBoolean(littleEndian)`, then the out-of-bounds `TypeError` and the range `RangeError`; a NaN reads as the canonical NaN); `@@toStringTag`; rendered as `DataView { byteLength: n, byteOffset: n, buffer: ArrayBuffer { .. } }` (§5.8.8). `getFloat16` / `setFloat16` arrive with stage T5a, the BigInt pairs with T5b (§5.8.9) |
 
 No input produces an invalid wasm module.
@@ -4679,9 +4691,10 @@ Each item below is current behaviour of this tree.
   compile time: a sealed `Symbol` compiles to the intrinsic's address, and the
   member is an ordinary `__get` on it.
 - Not available: `RegExp` (literals and constructor), `BigInt`, `Proxy`, `Reflect`,
-  typed arrays, `Intl`, `eval`. `Proxy` and `Reflect` are
-  phase 5b work in progress: designed (§6.11), not implemented, and their
-  test262 features are still skipped.
+  the `%TypedArray%.prototype` methods other than the getters and iterators,
+  `Float16Array`, the BigInt typed arrays, `Intl`, `eval`. `Proxy` and
+  `Reflect` are phase 5b work in progress: designed (§6.11), not
+  implemented, and their test262 features are still skipped.
   The `Function` constructor throws `TypeError`.
 - The builtin library is exactly §7.9.
 - Binary data has no `SharedArrayBuffer`, `Atomics` or immutable buffers
