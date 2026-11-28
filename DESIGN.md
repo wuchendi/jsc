@@ -1515,8 +1515,10 @@ names a binary global — `IrNode::Intrinsic(GlobalIntrinsic::Ctor(c))` /
 constructor, or an `IrNode::Str` equal to one of those names (a static
 `globalThis.Uint8Array` or `o["DataView"]`) — or the program uses the global
 object as a value
-(`IrNode::Intrinsic(GlobalIntrinsic::Global)`: a `globalThis` / top-level
-`this` that could reach a constructor by a computed name). A binary program
+(`IrNode::Intrinsic(GlobalIntrinsic::Global)` — a sealed `globalThis`, a
+top-level `this` — or a `GlobalGet` of `globalThis`, the form an escaping
+`globalThis` lowers to once it unseals every global; either could reach a
+constructor by a computed name). A binary program
 also needs the accessor dispatch of `__get` (the `length` / `buffer` /
 `byteLength` / `byteOffset` getters), so the same names are added to
 `program_has_accessors`. Runtime shaking (§4.2) applies the same gate to

@@ -1515,19 +1515,29 @@ const BINARY_NAMES: [&str; 14] = [
     "BigUint64Array",
 ];
 
+/// Whether `n` yields the global object as a value: its constant address
+/// (top-level `this`, a sealed `globalThis`) or a global-object lookup of
+/// `globalThis` (an escaping `globalThis` unseals every global, so
+/// `globalThis` itself lowers to a [`IrNode::GlobalGet`]).
+fn reaches_global_object(n: &IrNode) -> bool {
+    match n {
+        IrNode::Intrinsic(GlobalIntrinsic::Global) => true,
+        IrNode::GlobalGet { global, .. } => global.name == "globalThis",
+        _ => false,
+    }
+}
+
 /// Whether `program` can reach binary data (DESIGN.md §5.8.5): it names a
 /// binary-data constructor (the intrinsic, a global reference, or a string
-/// such as a static `globalThis.ArrayBuffer` key), or uses the global object
-/// as a value, which could reach one by a computed name. Then the collector
-/// and the renderer carry their binary-data arms.
-fn program_has_binary(program: &IrProgram) -> bool {
+/// such as a static `globalThis.ArrayBuffer` key), or holds the global
+/// object ([`reaches_global_object`]), which could reach one by a computed
+/// name. Then the collector and the renderer carry their binary-data arms.
+pub(super) fn program_has_binary(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
-        IrNode::Intrinsic(
-            GlobalIntrinsic::Global
-            | GlobalIntrinsic::Ctor(
-                BuiltinCtor::ArrayBuffer | BuiltinCtor::DataView | BuiltinCtor::Typed(_),
-            ),
-        ) => true,
+        _ if reaches_global_object(n) => true,
+        IrNode::Intrinsic(GlobalIntrinsic::Ctor(
+            BuiltinCtor::ArrayBuffer | BuiltinCtor::DataView | BuiltinCtor::Typed(_),
+        )) => true,
         IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
             BINARY_NAMES.contains(&global.name.as_str())
         }
