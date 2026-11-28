@@ -322,22 +322,48 @@ counts for a binary-data builtin or entry in a program that cannot reach
 binary data, §5.8.5); and the prototype chain of every kept intrinsic. The module is left whole when user code
 converts a value that is not a literal or a plain numeric expression to a
 property key (`o[k]`, a computed key, `k in o`, `delete o[k]`), or when a
-kept runtime body returns or redefines a property its caller picks by a
-run-time key (`shake::note_runtime_key`: `Object.getOwnPropertyDescriptor(s)`,
+kept body returns or redefines a property its caller picks by a run-time
+key (`shake::note_runtime_key`: `Object.getOwnPropertyDescriptor(s)`,
 `__lookupGetter__` / `__lookupSetter__`, `Object.defineProperty`,
-`defineProperties` and `create`, and `JSON.stringify` for its property
-list): either can reach a builtin by a name no body mentions. The realm match
+`defineProperties` and `create`, `JSON.stringify` for its property list,
+and the `Reflect` functions of §6.11), or, while the program can hold a
+proxy, reads the values under the own-key list of an object that may be one
+and hands them to user code (`shake::note_listed_values`: `Object.values` /
+`entries`, `Object.assign`, `CopyDataProperties`, `JSON.parse`'s reviver
+walk): either can reach a builtin by a name no body mentions. (An ordinary
+object lists only enumerable keys and no builtin is enumerable unless a
+`defineProperty` above made it so; a proxy's `ownKeys` and
+`getOwnPropertyDescriptor` traps can list any key of its target as
+enumerable, and the `[[Get]]` then forwards to the target. The proxy
+helpers themselves — `__own_prop`, `__proxy_own_keys`, the invariant
+checks — hand descriptors and key lists only to these bodies, to
+attribute-only checks, or to `__own_desc`, whose callers record their own
+use.) The realm match
 is by key text alone, whatever object the key is looked up on: the
 renderer's `"constructor"` lookup (always kept with `_start`) keeps every
-constructor, the `Map` constructor's `"set"` keeps every builtin named `set`.
-So a body with a run-time-key use must never sit under a common name in a
-program that cannot call it. Rule (§6.11): a family the program cannot reach
+constructor, the `Map` constructor's `"set"` keeps every builtin named `set`,
+a proxy helper's trap-name lookup keeps `Object.getOwnPropertyDescriptor`
+and `Object.defineProperty`. So such a use counts only when the program can
+call the builtin with a key of its choosing (`shake::unnamed`): a builtin
+installed under a string key (not a callable intrinsic) counts only when a
+kept body references it (method block, table slot, call) or the program's
+own code looks up one of its keys — except as the callee `o.m` of a call
+`o.m(a, key, ..)` with `m` one of `get`, `getOwnPropertyDescriptor`,
+`defineProperty` and a constant `key` (a literal, a plain numeric
+expression: `shake::constant_key_callee`), so `Reflect.get(o, 'x')` and
+`Object.getOwnPropertyDescriptor(o, 'x')` shake like `o.x`. Otherwise the
+builtin runs only if a runtime body reads it off its home object handed over
+by the program (`new Proxy(t, Reflect)`, `new Proxy(t, Object)`) and calls
+it with keys that body chose: the program's own recorded keys, or the keys
+of an own-key list, whose values reach user code only through a
+`note_listed_values` body; a descriptor it returns reaches only
+attribute checks or `__own_desc`. A family the program cannot reach still
 emits `unreachable` stubs that record no use (`builtins::gated_off`:
-`Proxy` under the proxy gate, `Reflect` under the `Reflect` gate), and a
-`Reflect` function's run-time-key use counts only when user code names it
-(`shake::unnamed_reflect`). Breaking it is what made every program the full
-runtime after the `Reflect` merge (`Reflect.set` reached via `"constructor"`
-→ `Map` → `"set"`). `console.log('hi')` was 432 KB shaken and 890 KB whole
+`Proxy` under the proxy gate, `Reflect` under the `Reflect` gate). Breaking
+the rule is what made every program the full runtime after the `Reflect`
+merge (`Reflect.set` reached via `"constructor"` → `Map` → `"set"`), and
+every proxy program after it (`__own_prop`, `__proxy_own_keys`).
+`console.log('hi')` was 432 KB shaken and 890 KB whole
 at the phase-4 close. The data
 segments are not shaken. `CompileOptions::full_runtime` turns the shake off.
 
@@ -3513,11 +3539,27 @@ are rejected by every receiver test, so most guards are already safe:
   `Reflect.getOwnPropertyDescriptor` (which hand out the value under a
   run-time key), `Reflect.defineProperty` and `Reflect.ownKeys` record a
   run-time-key use (§4.2), but it leaves the module whole only when the
-  program's own code names that function (`shake::unnamed_reflect`):
-  reached only through a runtime lookup of its common name (a proxy trap
+  program can choose the key (`shake::unnamed`): a kept body references the
+  function, or the program's own code looks up its name other than as the
+  callee of a constant-key call (`Reflect.get(o, 'x')` shakes like `o.x`).
+  Reached only through a runtime lookup of its common name (a proxy trap
   with `Reflect` as handler, the `Map` constructor's `"set"`), it is handed
-  keys the program already wrote. `has`, `deleteProperty` and `set` record
-  none (a boolean, or the program's own value stored).
+  keys the program already wrote or the keys of an own-key list (below).
+  `has`, `deleteProperty` and `set` record none (a boolean, or the
+  program's own value stored). The proxy helpers record no use of their
+  own: `__own_prop`'s record reaches attribute-only checks (`__own_enum`,
+  the receiver half of `[[Set]]`, the invariant checks, integrity levels)
+  or `__own_desc` (whose callers `Object.getOwnPropertyDescriptor(s)`,
+  `__lookupGetter__` and `Reflect.getOwnPropertyDescriptor` record theirs),
+  and `__proxy_own_keys`' list reaches user code as keys (a key used as one
+  is a computed access or a run-time-key builtin, already counted) or feeds
+  a `[[Get]]` per listed key: the bodies doing that and handing the values
+  to user code (`Object.values` / `entries`, `Object.assign`,
+  `CopyDataProperties`, `JSON.parse` with a reviver) record
+  `note_listed_values` while `proxies` is open, since a
+  `getOwnPropertyDescriptor` trap can report a builtin enumerable (the
+  renderer only prints the values). A get- or set-trap proxy program
+  therefore shakes.
 
 **Reflect** (`emit/builtins/reflect.rs`, a new `ReflectFn` enum of thirteen
 variants in `emit/realm.rs` — distinct from the existing `ReflectOp`, which

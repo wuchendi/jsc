@@ -411,6 +411,9 @@ pub(super) fn emit_parse(
     helpers: Helpers<'_>,
 ) {
     let (text, reviver, value) = (frame.i64(0), frame.i64(1), frame.i64(2));
+    // The reviver walk (`__json_revive`, called only from here) reads the
+    // values under the own keys of whatever the reviver returns.
+    shake::note_listed_values(helpers);
     frame.arg(function, 0);
     wasm!(function; LocalSet(text));
     frame.arg(function, 1);

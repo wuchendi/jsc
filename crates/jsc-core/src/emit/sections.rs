@@ -487,7 +487,11 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
         .chain(dtoa::STRINGS)
         .chain(render::STRINGS)
         .chain([STACK_KEY, STACK_OVERFLOW_MSG, STACK_OVERFLOW_STACK])
-        .chain(FN_KEYS);
+        .chain(FN_KEYS)
+        .chain(builtins::gated_strings(
+            program_has_proxies(program),
+            program_has_reflect(program),
+        ));
     for text in realm_strs {
         strs.add(text);
     }

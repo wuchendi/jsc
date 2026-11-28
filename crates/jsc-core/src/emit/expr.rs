@@ -940,23 +940,32 @@ pub(super) fn emit_method_call_user(
     // evaluation, the member read, and the `__this` set).
     emit_node(obj, function, scratch, strings, helpers);
     function.instruction(&Instruction::LocalSet(obj_local));
-    // A nullish receiver throws on the method lookup, before any argument runs.
-    // The key is only evaluated here on the throw path.
-    emit_nullish_guard(function, obj_local, key, false, scratch, strings, helpers);
-
-    // Read the callee — the function value at `receiver[key]` — via the
-    // ordinary object-member read (already nullish-guarded above) before any
-    // argument runs, into its stable frame local.
-    emit_index_node(
-        &IrNode::Local(obj_local),
-        key,
-        false,
-        function,
-        scratch,
-        strings,
-        helpers,
-    );
-    function.instruction(&Instruction::LocalSet(callee_val));
+    let mut callee = || {
+        // A nullish receiver throws on the method lookup, before any argument
+        // runs. The key is only evaluated here on the throw path.
+        emit_nullish_guard(function, obj_local, key, false, scratch, strings, helpers);
+        // Read the callee — the function value at `receiver[key]` — via the
+        // ordinary object-member read (already nullish-guarded above) before
+        // any argument runs, into its stable frame local.
+        emit_index_node(
+            &IrNode::Local(obj_local),
+            key,
+            false,
+            function,
+            scratch,
+            strings,
+            helpers,
+        );
+        function.instruction(&Instruction::LocalSet(callee_val));
+    };
+    // `Reflect.get(o, 'x')` and its kin: a constant key names no builtin.
+    let constant_key = matches!(&**key, IrNode::Str(name) if shake::KEY_SECOND.iter().any(|m| name == m))
+        && args.get(1).is_some_and(shake::constant_key);
+    if constant_key {
+        shake::constant_key_callee(callee);
+    } else {
+        callee();
+    }
 
     // K padded argument slots (deepest on the stack). Nested method calls here set
     // `__this`, but it is overwritten below after all arguments are evaluated.

@@ -1216,7 +1216,6 @@ pub(in crate::emit) fn emit_proxy_own_keys(
         i: first + 4,
         kb: first + 5,
     };
-    shake::note_runtime_key();
     prologue(&mut f, l, p, "ownKeys", ret, strings, helpers);
     wasm!(f;
         Block(BlockType::Empty),

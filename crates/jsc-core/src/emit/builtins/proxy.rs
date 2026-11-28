@@ -32,7 +32,6 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(NON_OBJECT)
         .chain(CONSTRUCT_NON_OBJECT)
         .chain(["proxy", "revoke", "apply", "construct"])
-        .chain(proxy_strings())
 }
 
 fn m8(offset: u32) -> MemArg {
