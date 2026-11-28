@@ -1583,22 +1583,23 @@ fn bigint_gate(program: &IrProgram) -> BigIntGate {
 
 /// Whether `program` can produce a `BigInt` (DESIGN.md §6.10.9): it has a
 /// `BigInt` literal, names a [`BIGINT_NAMES`] source (the intrinsic, a global
-/// reference, or a string such as a static member key), or uses the global
-/// object as a value, which could reach `BigInt` by a computed name. When
-/// not, the numeric operators emit their Number-only code.
+/// reference, or a string such as a static member key), or it
+/// [`holds_global`] (which can find `BigInt` by a run-time key). When not,
+/// the numeric operators emit their Number-only code.
 pub(super) fn program_has_bigint(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
         IrNode::BigInt { .. }
-        | IrNode::Intrinsic(
-            GlobalIntrinsic::Global
-            | GlobalIntrinsic::Ctor(BuiltinCtor::BigInt | BuiltinCtor::DataView),
-        ) => true,
+        | IrNode::Intrinsic(GlobalIntrinsic::Ctor(BuiltinCtor::BigInt | BuiltinCtor::DataView)) => {
+            true
+        }
         IrNode::Intrinsic(GlobalIntrinsic::Ctor(BuiltinCtor::Typed(kind))) => kind.is_bigint(),
-        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
-            BIGINT_NAMES.contains(&global.name.as_str())
+        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. }
+            if BIGINT_NAMES.contains(&global.name.as_str()) =>
+        {
+            true
         }
         IrNode::Str(s) => BIGINT_NAMES.iter().any(|name| s == name),
-        _ => false,
+        n => holds_global(n),
     })
 }
 

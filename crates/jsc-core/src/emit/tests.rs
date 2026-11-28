@@ -2147,8 +2147,16 @@ fn bigint_gate_triggers() {
         "typeof BigUint64Array",
         "const o = {}; o['BigInt']",
         "const k = 'BigInt'",
+        // An escaping `globalThis` opens the global object: these read it as
+        // a `GlobalGet` (asserted below).
         "globalThis",
         "const k = 'x'; globalThis[k]",
+        "const g = globalThis;",
+        "const k = 'Big' + 'Int'; globalThis[k](5)",
+        // Only static member reads keep `globalThis` sealed: the intrinsic.
+        "globalThis.x",
+        "globalThis.globalThis",
+        "this",
         "function f(v) { return v.getBigInt64(0); }",
         "function f(v) { return v.getBigUint64(0); }",
         "function f(v) { v.setBigInt64(0, 0); }",
@@ -2158,6 +2166,19 @@ fn bigint_gate_triggers() {
         "new BigInt64Array(1)",
     ] {
         assert!(gate(src), "`{src}` must open the BigInt gate");
+    }
+    let ir = |src: &str| format!("{:?}", lower_js(src).stmts);
+    for src in ["const g = globalThis;", "const k = 'x'; globalThis[k]"] {
+        assert!(
+            ir(src).contains("GlobalGet { global: GlobalRef { name: \"globalThis\""),
+            "`{src}` must read `globalThis` as a GlobalGet"
+        );
+    }
+    for src in ["globalThis.x", "this"] {
+        assert!(
+            ir(src).contains("Intrinsic(Global)"),
+            "`{src}` must read the global object as the intrinsic"
+        );
     }
     for src in [
         "1 + 2",

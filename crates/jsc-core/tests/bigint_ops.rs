@@ -6,7 +6,9 @@
 //! loops with a collection at every allocation.
 
 mod common;
-use common::{assert_bool, assert_eval, assert_number, assert_string, assert_uncaught};
+use common::{
+    assert_bool, assert_eval, assert_number, assert_output, assert_string, assert_uncaught,
+};
 
 /// Assert each `(source, expected rendering)` pair.
 fn table(cases: &[(&str, &str)]) {
@@ -523,6 +525,33 @@ mod gc_stress {
             "true true true\n",
         );
     }
+
+    /// The `BigInt` gate opened by a `globalThis` read (DESIGN.md §6.10.9).
+    #[test]
+    fn gate_opened_by_a_global_object_alias() {
+        assert_same_under_gc_stress(
+            "const g = globalThis; const B = g['Big' + 'Int']; const y = B(7); \
+             console.log(y * y, -y, y ** 2n, y > 6, y + 1n)",
+            "49n -7n 49n true 8n\n",
+        );
+    }
+}
+
+/// The `BigInt` gate opens on any `globalThis` read (DESIGN.md §6.10.9): an
+/// escaping `globalThis` reads the global object as a global lookup, not
+/// the sealed intrinsic, and a `BigInt` found through it must not take the
+/// Number-only operator code.
+#[test]
+fn gate_opened_by_a_global_object_lookup() {
+    assert_output(
+        "let k = \"Big\" + \"Int\"; let x = globalThis[k](5); console.log(x * x, x > 2)",
+        "25n true\n",
+    );
+    assert_output(
+        "const g = globalThis; const B = g[\"Big\" + \"Int\"]; const y = B(7); \
+         console.log(y * y, -y, y ** 2n, y > 6, y + 1n)",
+        "49n -7n 49n true 8n\n",
+    );
 }
 
 /// The compile-time gate (DESIGN.md §6.10.9): a `BigInt` reached only through
