@@ -10,7 +10,8 @@ use jsc_core::emit::CompileOptions;
 /// `Map` key, rendering, error messages), a dynamic key (which disables
 /// shaking), binary data (whose collector and renderer arms are gated),
 /// the numeric operators on `BigInts` and numbers, the `BigInt` built-ins,
-/// `BigInt` keys and values through a proxy or `Reflect`, and the `BigInt` gate
+/// `BigInt` keys and values through a proxy or `Reflect`, the `Number`
+/// wrapper constructor over a `BigInt`, and the `BigInt` gate
 /// (DESIGN.md §6.10.9): every gated operator site with the gate closed, and
 /// with it opened by the global object or a name only.
 const PROGRAMS: [&str; 23] = [
@@ -43,7 +44,8 @@ const PROGRAMS: [&str; 23] = [
      console.log(-x, ~x, x ** 2n, x < 7, typeof x, !!x, x === 6n, Number(x))",
     "const o = { BigInt: 1 }; let a = 1; a++; console.log(-a, ~a, a ** 2, a < 3, o.BigInt)",
     "try { Reflect.get(1n, 'x') } catch (e) { console.log(e instanceof TypeError) } \
-     console.log(Reflect.ownKeys(Object(2n)).length, Reflect.has({ 1: 0 }, 1n))",
+     console.log(Reflect.ownKeys(Object(2n)).length, Reflect.has({ 1: 0 }, 1n)); \
+     console.log(Number(2n), new Number(3n).valueOf(), typeof new Number(1n))",
 ];
 
 fn validate(src: &str, full_runtime: bool, gc_stress: u32) {
