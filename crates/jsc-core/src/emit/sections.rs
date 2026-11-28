@@ -1416,7 +1416,7 @@ fn collect_entries<'a>(entries: &'a [(PropKey, IrNode)], strs: &mut Strs<'a>) {
 /// no other path to the global object and no read of a global by a run-time
 /// name. Every compile-time gate that stubs a family whose constructor is a
 /// global must open on it.
-fn holds_global(node: &IrNode) -> bool {
+pub(super) fn holds_global(node: &IrNode) -> bool {
     match node {
         IrNode::Intrinsic(GlobalIntrinsic::Global) => true,
         IrNode::GlobalGet { global, .. } => global.name == "globalThis",
