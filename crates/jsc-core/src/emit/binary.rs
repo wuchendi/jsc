@@ -5,7 +5,9 @@
 //! element accessors `__ta_get` / `__ta_set` / `__ta_set_value`, the inline
 //! fast-path halves `__ta_index_get` / `__ta_index_set`), and the element
 //! accessors `__raw_load` / `__raw_store` that typed arrays and `DataView`
-//! share, a helper group of their own ([`super::registry::Group::Binary`]).
+//! share, and the binary16 conversions `__f16_encode` / `__f16_decode`
+//! (also behind `Math.f16round`), a helper group of their own
+//! ([`super::registry::Group::Binary`]).
 
 use wasm_encoder::{BlockType, Function, Ieee64, Instruction, MemArg, ValType};
 
@@ -27,10 +29,10 @@ macro_rules! wasm {
     }};
 }
 
-use ValType::{I32, I64};
+use ValType::{F64, I32, I64};
 
 /// The `(params, results)` of the binary helpers, in function-index order.
-pub(super) const TYPES: [(&[ValType], &[ValType]); 14] = [
+pub(super) const TYPES: [(&[ValType], &[ValType]); 16] = [
     (&[I32], &[I32]),             // __ab_alloc(size) -> block
     (&[I32, I32], &[]),           // __render_binary(p, depth)
     (&[I32], &[I32]),             // __dv_length(view) -> byte length | -1
@@ -45,6 +47,8 @@ pub(super) const TYPES: [(&[ValType], &[ValType]); 14] = [
     (&[I32, I64, I64], &[]),      // __ta_index_set(o, k, v)
     (&[I32, I32, I32], &[I64]),   // __raw_load(addr, kind, swap) -> number
     (&[I32, I32, I64, I32], &[]), // __raw_store(addr, kind, n, swap)
+    (&[F64], &[I32]),             // __f16_encode(x) -> binary16 bits
+    (&[I32], &[I64]),             // __f16_decode(h) -> number
 ];
 
 /// The data offset of a `TYPE_RAW` block (after the header and `len`).
@@ -110,7 +114,10 @@ fn m32(offset: u32) -> MemArg {
 /// buffers' bytes, except that a `BigInt` element read allocates its value
 /// (`__bigint_from_i64`) in a program whose `BigInt` gate is open.
 pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
-    let (mut load, mut store) = (vec![helpers.box_f64], vec![]);
+    let (mut load, mut store) = (
+        vec![helpers.box_f64, helpers.f16_decode()],
+        vec![helpers.f16_encode()],
+    );
     if helpers.bigints() {
         load.push(helpers.bigint(Big::FromI64));
         store.push(helpers.bigint(Big::ToI64));
@@ -121,6 +128,8 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         (helpers.ta_oob(), vec![]),
         (helpers.raw_load(), load),
         (helpers.raw_store(), store),
+        (helpers.f16_encode(), vec![]),
+        (helpers.f16_decode(), vec![]),
         (
             helpers.ta_get(),
             vec![helpers.ta_length(), helpers.raw_load()],
@@ -165,6 +174,8 @@ pub(super) fn emit_helpers(
         emit_ta_index_set(helpers, leaves),
         emit_raw_load(helpers, leaves),
         emit_raw_store(helpers, leaves),
+        emit_f16_encode(leaves),
+        emit_f16_decode(leaves),
     ]
 }
 
@@ -713,8 +724,7 @@ fn emit_ta_index_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     finish_builder(f)
 }
 
-/// The number of element kinds the `kind` byte can name (DESIGN.md §5.8.6),
-/// the reserved `Float16` and `BigInt` kinds included.
+/// The number of element kinds the `kind` byte can name (DESIGN.md §5.8.6).
 const KIND_COUNT: u32 = 12;
 
 /// Emit a `br_table` switch over the i32 local `kind` with one arm per kind
@@ -740,13 +750,12 @@ fn kind_switch<S: Sink>(f: &mut S, kind: u32, result: BlockType, mut arm: impl F
 /// width loaded at `addr` (unaligned) as integer bits, byte-swapped when
 /// `swap` (a big-endian `DataView` read; typed arrays pass `0`), and read as
 /// a number by the kind's rule; a float goes through `__box_f64`, so a
-/// stored NaN of any payload reads as the canonical `NaN`; the `BigInt`
-/// kinds read a fresh `BigInt` of the signed / unsigned 64 bits
-/// (`__bigint_from_i64`, which allocates; out of memory leaves the
-/// `RangeError` pending). The reserved kind (`Float16`) is never stored yet
-/// and reads `undefined`, as do the `BigInt` kinds in a program whose
-/// `BigInt` gate is closed (none can exist there). A non-allocating leaf for
-/// the Number kinds.
+/// stored NaN of any payload reads as the canonical `NaN` (`Float16`
+/// through `__f16_decode`); the `BigInt` kinds read a fresh `BigInt` of the
+/// signed / unsigned 64 bits (`__bigint_from_i64`, which allocates; out of
+/// memory leaves the `RangeError` pending), or `undefined` in a program
+/// whose `BigInt` gate is closed (none can exist there). A non-allocating
+/// leaf for the Number kinds.
 fn emit_raw_load(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[RAW_I32, RAW_I32, RAW_I32], &[RAW_I32, RAW_I64]);
     let (addr, kind, swap, x, y) = (0, 1, 2, 3, 4);
@@ -784,6 +793,10 @@ fn emit_raw_load(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
                 load(f, Instruction::I32Load(ma(0)), true);
                 wasm!(f; F64ConvertI32U, I64ReinterpretF64);
             }
+            7 => {
+                load(f, Instruction::I32Load16U(ma(0)), false);
+                wasm!(f; Call(helpers.f16_decode()));
+            }
             8 => {
                 load(f, Instruction::I32Load(ma(0)), true);
                 wasm!(f; F32ReinterpretI32, F64PromoteF32, Call(helpers.box_f64));
@@ -810,12 +823,12 @@ fn emit_raw_load(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 /// `__raw_store(addr, kind, n, swap)` (DESIGN.md §5.8.6): the number `n`
 /// converted to the kind's bits — the low bits of the `ToInt32` pattern for
 /// the integer kinds (`ToInt8` .. `ToUint32`), `Uint8Clamped` rounding half
-/// to even after clamping to `0 .. 255` (`NaN` is `0`), `Float32` demoted,
-/// `Float64` its own bits, the `BigInt` kinds the low 64 bits of the `BigInt`
-/// `n` (`ToBigInt64` / `ToBigUint64`, `__bigint_to_i64`) — byte-swapped when
-/// `swap` (a big-endian `DataView` write; typed arrays pass `0`), and stored
-/// at `addr` (unaligned). The reserved kind stores nothing. A non-allocating
-/// leaf.
+/// to even after clamping to `0 .. 255` (`NaN` is `0`), `Float16` through
+/// `__f16_encode`, `Float32` demoted, `Float64` its own bits, the `BigInt`
+/// kinds the low 64 bits of the `BigInt` `n` (`ToBigInt64` /
+/// `ToBigUint64`, `__bigint_to_i64`) — byte-swapped when `swap` (a
+/// big-endian `DataView` write; typed arrays pass `0`), and stored at `addr`
+/// (unaligned). A non-allocating leaf.
 fn emit_raw_store(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(
         leaves,
@@ -859,6 +872,10 @@ fn emit_raw_store(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
                 wasm!(f; LocalSet(x));
                 store(f, Instruction::I32Store(ma(0)), true);
             }
+            7 => {
+                wasm!(f; LocalGet(n), F64ReinterpretI64, Call(helpers.f16_encode()), LocalSet(x));
+                store(f, Instruction::I32Store16(ma(0)), false);
+            }
             8 => {
                 wasm!(f; LocalGet(n), F64ReinterpretI64, F32DemoteF64, I32ReinterpretF32, LocalSet(x));
                 store(f, Instruction::I32Store(ma(0)), true);
@@ -877,5 +894,89 @@ fn emit_raw_store(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         }
     });
     wasm!(f; End);
+    finish_builder(f)
+}
+
+/// The `f64` bits of `65520`, the midpoint between the largest finite
+/// binary16 value `65504` and `2^16`: from it up a value rounds to infinity.
+const F16_OVERFLOW_BITS: i64 = 0x40EF_FE00_0000_0000;
+
+/// The `f64` bits of `2^-14`, the smallest normal binary16 magnitude.
+const F16_MIN_NORMAL_BITS: i64 = 0x3F10_0000_0000_0000;
+
+/// `__f16_encode(x: f64) -> i32` (DESIGN.md §5.8.6): the IEEE binary16 bits
+/// of `x` rounded half to even directly from the `f64` bits (never through
+/// `f32`, which would round twice). `NaN` is the canonical quiet `0x7E00`;
+/// `|x| >= 65520` is `±Infinity`; a normal result keeps the top 10 of the
+/// 52 mantissa bits, rounded on the 42 dropped ones (a carry into the
+/// exponent is the next binade's correct encoding); a subnormal result is
+/// `nearest(|x| * 2^24)`, exact in `f64` and rounded half to even by
+/// `f64.nearest` (`1024` is the smallest normal's encoding, also correct);
+/// the sign bit is kept, so `-0` stays `0x8000`. A non-allocating leaf.
+fn emit_f16_encode(leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_F64], &[RAW_I64, RAW_I32, RAW_I32, RAW_I64]);
+    let (x, a, sign, h, rest) = (0, 1, 2, 3, 4);
+    wasm!(f;
+        LocalGet(x), I64ReinterpretF64, LocalTee(a),
+        I64Const(48), I64ShrU, I32WrapI64, I32Const(0x8000), I32And, LocalSet(sign),
+        LocalGet(a), I64Const(i64::MAX), I64And, LocalSet(a),
+        // NaN.
+        LocalGet(a), I64Const(0x7FF0_0000_0000_0000), I64GtU,
+        If(BlockType::Empty), I32Const(0x7E00), Return, End,
+        // Overflow (and infinity).
+        LocalGet(a), I64Const(F16_OVERFLOW_BITS), I64GeU,
+        If(BlockType::Empty), LocalGet(sign), I32Const(0x7C00), I32Or, Return, End,
+        LocalGet(a), I64Const(F16_MIN_NORMAL_BITS), I64GeU,
+        If(BlockType::Empty),
+        // Normal: rebias the exponent (1023 -> 15) on the top 22 bits.
+        LocalGet(a), I64Const(42), I64ShrU, I32WrapI64, I32Const((1023 - 15) << 10), I32Sub,
+        LocalSet(h),
+        LocalGet(a), I64Const((1 << 42) - 1), I64And, LocalSet(rest),
+        // Round half to even on the dropped bits.
+        LocalGet(h),
+        LocalGet(rest), I64Const(1 << 41), I64GtU,
+        LocalGet(rest), I64Const(1 << 41), I64Eq, LocalGet(h), I32Const(1), I32And, I32And,
+        I32Or, I32Add,
+        LocalGet(sign), I32Or, Return,
+        End,
+        // Subnormal or zero.
+        LocalGet(a), F64ReinterpretI64, F64Const(Ieee64::from(16_777_216.0)), F64Mul, F64Nearest,
+        I32TruncSatF64U, LocalGet(sign), I32Or,
+        End,
+    );
+    finish_builder(f)
+}
+
+/// `__f16_decode(h: i32) -> i64` (DESIGN.md §5.8.6): the number jsval of
+/// the binary16 bits `h`, exact in `f64`: exponent `0` is `±m · 2^-24`,
+/// `31` is `±Infinity` or the canonical `NaN`, else the `f64` with the
+/// exponent rebiased (15 -> 1023) and the mantissa shifted up by 42. A
+/// non-allocating leaf.
+fn emit_f16_decode(leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[RAW_I32], &[RAW_I32, RAW_I64]);
+    let (h, e, bits) = (0, 1, 2);
+    wasm!(f;
+        LocalGet(h), I32Const(10), I32ShrU, I32Const(0x1F), I32And, LocalTee(e),
+        I32Const(0x1F), I32Eq,
+        If(BlockType::Empty),
+        LocalGet(h), I32Const(0x3FF), I32And,
+        If(BlockType::Empty), I64Const(abi::QNAN.cast_signed()), Return, End,
+        I64Const(0x7FF0_0000_0000_0000), LocalSet(bits),
+        Else,
+        LocalGet(e),
+        If(BlockType::Empty),
+        LocalGet(h), I32Const(0x3FF), I32And, I64ExtendI32U, I64Const(42), I64Shl,
+        LocalGet(e), I32Const(1023 - 15), I32Add, I64ExtendI32U, I64Const(52), I64Shl,
+        I64Or, LocalSet(bits),
+        Else,
+        LocalGet(h), I32Const(0x3FF), I32And, F64ConvertI32U,
+        F64Const(Ieee64::from(1.0 / 16_777_216.0)), F64Mul, I64ReinterpretF64, LocalSet(bits),
+        End,
+        End,
+        LocalGet(bits),
+        LocalGet(h), I32Const(0x8000), I32And, I64ExtendI32U, I64Const(48), I64Shl,
+        I64Or,
+        End,
+    );
     finish_builder(f)
 }

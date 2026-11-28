@@ -1490,7 +1490,7 @@ fn program_has_accessors(program: &IrProgram) -> bool {
 }
 
 /// The globals of the binary-data constructors (DESIGN.md §5.8.5).
-const BINARY_NAMES: [&str; 13] = [
+const BINARY_NAMES: [&str; 14] = [
     "ArrayBuffer",
     "DataView",
     "Int8Array",
@@ -1500,6 +1500,7 @@ const BINARY_NAMES: [&str; 13] = [
     "Uint16Array",
     "Int32Array",
     "Uint32Array",
+    "Float16Array",
     "Float32Array",
     "Float64Array",
     "BigInt64Array",

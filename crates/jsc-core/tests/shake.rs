@@ -80,6 +80,33 @@ fn hello_world_pays_nothing_for_binary_data() {
     );
 }
 
+/// `Math.f16round` does not make a program reach binary data: it keeps the
+/// two binary16 helpers and none of the typed-array runtime.
+#[test]
+fn f16round_does_not_pull_binary_data() {
+    let f16 = "Math.f16round(1.337)";
+    let named = "new Uint8Array(1); Math.f16round(1.337)";
+    let (f16_size, named_size) = (size(f16, false), size(named, false));
+    assert!(f16_size + 20_000 < named_size, "{f16_size} vs {named_size}");
+    same(f16, "1.3369140625");
+    same("const r = Math.f16round; r(65520)", "Infinity");
+}
+
+/// The base64 / hex methods and `Float16Array` survive shaking in a program
+/// that names them.
+#[test]
+fn base64_and_float16_are_kept_when_named() {
+    same(
+        "new Uint8Array([1, 2, 3]).toBase64() + Uint8Array.fromHex('0a')[0]",
+        "AQID10",
+    );
+    same(
+        "const t = new Uint8Array(2); t.setFromBase64('AQI=').written + t.toHex()",
+        "20102",
+    );
+    same("new Float16Array([0.1])[0]", "0.0999755859375");
+}
+
 /// Binary data reached through the global object, by a literal or a computed
 /// name, keeps what it uses.
 #[test]

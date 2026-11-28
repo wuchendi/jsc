@@ -496,8 +496,8 @@ pub(super) fn emit_math_call<S: Sink>(
             emit_node(&args[0], function, scratch, strings, helpers);
             // A single-use number operand stays on the stack.
             let s0 = scratch + NUM_A;
-            let stashed =
-                !(yields_number(&args[0], helpers) && (native.is_some() || op == MathOp::Fround));
+            let stashed = !(yields_number(&args[0], helpers)
+                && (native.is_some() || matches!(op, MathOp::Fround | MathOp::F16round)));
             if stashed {
                 function.instruction(&Instruction::LocalSet(s0));
                 if !yields_number(&args[0], helpers) {
@@ -522,6 +522,12 @@ pub(super) fn emit_math_call<S: Sink>(
                 function.instruction(&Instruction::LocalGet(s0));
             }
             function.instruction(&Instruction::F64ReinterpretI64);
+            if op == MathOp::F16round {
+                // The decoded number is exact and never a non-canonical NaN.
+                function.instruction(&Instruction::Call(helpers.f16_encode()));
+                function.instruction(&Instruction::Call(helpers.f16_decode()));
+                return;
+            }
             if let Some(native) = native {
                 function.instruction(&native);
             } else if op == MathOp::Fround {
