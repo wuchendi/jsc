@@ -1638,165 +1638,239 @@ pub(super) fn emit_str_to_array(
     finish_builder(function)
 }
 
+/// The hash index block's `used` and `cap` words and its first slot.
+const MAP_INDEX_USED: u64 = 8;
+/// See [`MAP_INDEX_USED`].
+const MAP_INDEX_CAP: u64 = 12;
+/// See [`MAP_INDEX_USED`].
+const MAP_INDEX_SLOTS: i32 = 16;
+
+/// `__map_hash(key: i64) -> i32`: a hash equal for `SameValueZero`-equal
+/// keys. A string hashes its content (`__str_hash`); anything else its bits,
+/// `-0` as `+0`.
+pub(super) fn emit_map_hash(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(leaves, &[ROOT_JS], &[RAW_I32]);
+    let (key, h) = (0, 1);
+    emit_is_string(&mut f, key);
+    wasm!(f;
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(key), I32WrapI64, Call(helpers.str_hash),
+        Else,
+        LocalGet(key), F64ReinterpretI64, F64Const(0.0.into()), F64Eq,
+        If(BlockType::Result(ValType::I64)), I64Const(0), Else, LocalGet(key), End,
+        LocalTee(key), LocalGet(key), I64Const(32), I64ShrU, I64Xor, I32WrapI64,
+        End,
+        I32Const(0x9E37_79B1_u32.cast_signed()), I32Mul, LocalTee(h),
+        LocalGet(h), I32Const(15), I32ShrU, I32Xor,
+        End,
+    );
+    finish_builder(f)
+}
+
 /// Emit the `__map_find(handle: i32, key: i64) -> i32` Map/Set lookup.
 ///
-/// `handle` is the base of a `TYPE_MAP`/`TYPE_SET` block; its `entries` slot (at
-/// [`MAP_ENTRIES_OFFSET`]) holds the backing array jsval. Reads the array's
-/// `len` and element store, then linear-scans the EVEN element slots (the keys) `i = 0, 2, 4, ..`,
-/// skipping tombstones (a `HOLE` key, DESIGN.md §5.2) and
-/// returning the byte ADDRESS of the first slot whose value is `__same_value_zero` (at
-/// `svz_index`) to `key`, or `-1` on a miss. The value slot sits 8 bytes past the
-/// returned address. Params occupy locals 0/1; four extra `i32` locals hold the
-/// backing element store, its length, the loop index, and the current slot
-/// address.
-pub(super) fn emit_map_find(svz_index: u32, leaves: &LeafSet) -> Function {
+/// Returns the byte ADDRESS of the backing key slot `__same_value_zero` to
+/// `key`, or `-1` on a miss; the value slot sits 8 bytes past it. With a hash
+/// index (DESIGN.md §5.2) it probes linearly from `__map_hash(key)` until an
+/// empty slot; without one it scans the even backing slots. A tombstone (a
+/// `HOLE` key) never matches.
+pub(super) fn emit_map_find(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut function = helper_builder(
         leaves,
         &[ROOT_BASE, ROOT_JS],
-        &[RAW_I32, RAW_I32, RAW_I32, RAW_I32],
+        &[RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32],
     );
-    let (handle, key, store, len, i, slot) = (0, 1, 2, 3, 4, 5);
-    let entries_slot = MemArg {
-        offset: MAP_ENTRIES_OFFSET,
-        align: 3,
-        memory_index: 0,
-    };
+    let (handle, key, store, len, i, slot, index, mask) = (0, 1, 2, 3, 4, 5, 6, 7);
     let elem = MemArg {
         offset: 0,
         align: 0,
         memory_index: 0,
     };
-
-    // arr = wrap(load_i64(handle + entries_slot)); len = arr.len; store = arr.elems.
-    function.instruction(&Instruction::LocalGet(handle));
-    function.instruction(&Instruction::I64Load(entries_slot));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalTee(store));
-    function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
-    function.instruction(&Instruction::LocalSet(len));
-    function.instruction(&Instruction::LocalGet(store));
-    function.instruction(&Instruction::I32Load(mem32(ARRAY_ELEMS_OFFSET)));
-    function.instruction(&Instruction::LocalSet(store));
-
-    // Scan even key slots; `i` starts at 0 (the fresh local's default).
-    function.instruction(&Instruction::Block(BlockType::Empty));
-    function.instruction(&Instruction::Loop(BlockType::Empty));
-    // if i >= len { break -> no match }.
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::LocalGet(len));
-    function.instruction(&Instruction::I32GeU);
-    function.instruction(&Instruction::BrIf(1));
-    // slot = store + ELEMS_DATA_OFFSET + 8*i.
-    function.instruction(&Instruction::LocalGet(store));
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Const(8));
-    function.instruction(&Instruction::I32Mul);
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Const(abi::ELEMS_DATA_OFFSET.cast_signed()));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(slot));
-    // if load_i64(slot) != HOLE && __same_value_zero(load_i64(slot), key) { return slot }.
-    function.instruction(&Instruction::LocalGet(slot));
-    function.instruction(&Instruction::I64Load(elem));
-    function.instruction(&Instruction::I64Const(HOLE_BITS));
-    function.instruction(&Instruction::I64Ne);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(slot));
-    function.instruction(&Instruction::I64Load(elem));
-    function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::Call(svz_index));
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(slot));
-    function.instruction(&Instruction::Return);
-    function.instruction(&Instruction::End);
-    function.instruction(&Instruction::End);
-    // i += 2 (skip the value slot); continue.
-    function.instruction(&Instruction::LocalGet(i));
-    function.instruction(&Instruction::I32Const(2));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::LocalSet(i));
-    function.instruction(&Instruction::Br(0));
-    function.instruction(&Instruction::End); // loop
-    function.instruction(&Instruction::End); // block
-
-    // No key matched.
-    function.instruction(&Instruction::I32Const(-1));
-    function.instruction(&Instruction::End);
+    let data = abi::ELEMS_DATA_OFFSET.cast_signed();
+    wasm!(function;
+        // store = the backing element store; len = its slot count.
+        LocalGet(handle), I64Load(mem64(MAP_ENTRIES_OFFSET)), I32WrapI64, LocalTee(store),
+        I32Load(mem32(ARRAY_LEN_OFFSET)), LocalSet(len),
+        LocalGet(store), I32Load(mem32(ARRAY_ELEMS_OFFSET)), LocalSet(store),
+        LocalGet(handle), I32Load(mem32(u64::from(abi::MAP_INDEX_OFFSET))), LocalTee(index),
+        If(BlockType::Empty),
+        LocalGet(index), I32Load(mem32(MAP_INDEX_CAP)), I32Const(1), I32Sub, LocalSet(mask),
+        LocalGet(key), Call(helpers.map_hash()), LocalGet(mask), I32And, LocalSet(i),
+        Loop(BlockType::Empty),
+        // len = the probed entry: a key slot index plus one, 0 = empty.
+        LocalGet(index), LocalGet(i), I32Const(2), I32Shl, I32Add,
+        I32Load(mem32(MAP_INDEX_SLOTS.cast_unsigned().into())), LocalTee(len),
+        I32Eqz, If(BlockType::Empty), I32Const(-1), Return, End,
+        LocalGet(store), LocalGet(len), I32Const(1), I32Sub, I32Const(3), I32Shl, I32Add,
+        I32Const(data), I32Add, LocalTee(slot),
+        I64Load(elem), I64Const(HOLE_BITS), I64Ne,
+        If(BlockType::Empty),
+        LocalGet(slot), I64Load(elem), LocalGet(key), Call(helpers.same_value_zero),
+        If(BlockType::Empty), LocalGet(slot), Return, End,
+        End,
+        LocalGet(i), I32Const(1), I32Add, LocalGet(mask), I32And, LocalSet(i),
+        Br(0),
+        End,
+        Unreachable,
+        End,
+        // No index: scan the even key slots.
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(i), LocalGet(len), I32GeU, BrIf(1),
+        LocalGet(store), LocalGet(i), I32Const(3), I32Shl, I32Add, I32Const(data), I32Add,
+        LocalTee(slot),
+        I64Load(elem), I64Const(HOLE_BITS), I64Ne,
+        If(BlockType::Empty),
+        LocalGet(slot), I64Load(elem), LocalGet(key), Call(helpers.same_value_zero),
+        If(BlockType::Empty), LocalGet(slot), Return, End,
+        End,
+        LocalGet(i), I32Const(2), I32Add, LocalSet(i),
+        Br(0),
+        End, End,
+        I32Const(-1),
+        End,
+    );
     finish_builder(function)
 }
 
+/// `__map_reindex(handle: i32)`: replace the hash index with a fresh one of
+/// at least four slots per live entry holding every live backing entry. Out
+/// of memory leaves the handle without an index.
+pub(super) fn emit_map_reindex(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+    let mut f = helper_builder(
+        leaves,
+        &[ROOT_BASE],
+        &[
+            RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I32,
+        ],
+    );
+    let (handle, cap, index, store, len, i, j, used) = (0, 1, 2, 3, 4, 5, 6, 7);
+    let index_slot = mem32(u64::from(abi::MAP_INDEX_OFFSET));
+    let elem = MemArg {
+        offset: u64::from(abi::ELEMS_DATA_OFFSET),
+        align: 0,
+        memory_index: 0,
+    };
+    let slots = mem32(MAP_INDEX_SLOTS.cast_unsigned().into());
+    wasm!(f;
+        LocalGet(handle), I32Const(0), I32Store(index_slot),
+        // cap = the least power of two >= max(16, 4 * (size + 1)).
+        I32Const(16), LocalSet(cap),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(cap),
+        LocalGet(handle), I32Load(mem32(MAP_SIZE_OFFSET)), I32Const(1), I32Add, I32Const(2), I32Shl,
+        I32GeU, BrIf(1),
+        LocalGet(cap), I32Const(1), I32Shl, LocalSet(cap),
+        Br(0),
+        End, End,
+        LocalGet(cap), I32Const(2), I32Shl, I32Const(MAP_INDEX_SLOTS), I32Add,
+        Call(helpers.alloc), LocalTee(index),
+        I32Eqz, If(BlockType::Empty), Return, End,
+        LocalGet(index), I32Const(0),
+        LocalGet(cap), I32Const(2), I32Shl, I32Const(MAP_INDEX_SLOTS), I32Add,
+        MemoryFill(0),
+        LocalGet(index), I32Const(i32::from(abi::TYPE_RAW)), I32Store8(mem8(0)),
+        LocalGet(index), LocalGet(cap), I32Const(2), I32Shl, I32Const(8), I32Add,
+        I32Store(mem32(u64::from(abi::HEADER_SIZE))),
+        LocalGet(index), LocalGet(cap), I32Store(mem32(MAP_INDEX_CAP)),
+        LocalGet(handle), LocalGet(index), I32Store(index_slot),
+        LocalGet(handle), I64Load(mem64(MAP_ENTRIES_OFFSET)), I32WrapI64, LocalTee(store),
+        I32Load(mem32(ARRAY_LEN_OFFSET)), LocalSet(len),
+        LocalGet(store), I32Load(mem32(ARRAY_ELEMS_OFFSET)), LocalSet(store),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(i), LocalGet(len), I32GeU, BrIf(1),
+        LocalGet(store), LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(elem),
+        I64Const(HOLE_BITS), I64Ne,
+        If(BlockType::Empty),
+        LocalGet(store), LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(elem),
+        Call(helpers.map_hash()), LocalSet(j),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(j), LocalGet(cap), I32Const(1), I32Sub, I32And, LocalSet(j),
+        LocalGet(index), LocalGet(j), I32Const(2), I32Shl, I32Add, I32Load(slots),
+        I32Eqz, BrIf(1),
+        LocalGet(j), I32Const(1), I32Add, LocalSet(j),
+        Br(0),
+        End, End,
+        LocalGet(index), LocalGet(j), I32Const(2), I32Shl, I32Add,
+        LocalGet(i), I32Const(1), I32Add, I32Store(slots),
+        LocalGet(used), I32Const(1), I32Add, LocalSet(used),
+        End,
+        LocalGet(i), I32Const(2), I32Add, LocalSet(i),
+        Br(0),
+        End, End,
+        LocalGet(index), LocalGet(used), I32Store(mem32(MAP_INDEX_USED)),
+        End,
+    );
+    finish_builder(f)
+}
+
 /// Emit the `__map_set(handle: i32, key: i64, val: i64)` Map/Set insert-or-update.
-/// Looks the key up with `__map_find` (at `map_find_index`): on a hit it
-/// overwrites the value slot (8 bytes past the found key slot); on a miss it appends
-/// `key` then `val` to the backing array in place via `__array_push` (at
-/// `array_push_index`) and bumps the u32 `size` header by one (a key deleted
-/// before is not found, so re-adding it appends). `set.add` reuses
-/// this with `val = undefined`. Params occupy locals 0/1/2; two extra `i32`
-/// locals hold the found address and the backing array base.
-pub(super) fn emit_map_set(
-    map_find_index: u32,
-    array_push_index: u32,
-    leaves: &LeafSet,
-) -> Function {
+/// A `__map_find` hit overwrites the value slot. A miss appends `key` then
+/// `val` to the backing array through `__array_push` and bumps `size` (a key
+/// deleted before is not found, so re-adding it appends), then enters the
+/// new key slot into the hash index: in place while the index stays at most
+/// half full, else through `__map_reindex`, which also builds the first index
+/// once the backing has [`abi::MAP_INDEX_MIN_SLOTS`] slots. `set.add` reuses
+/// this with `val = undefined`.
+pub(super) fn emit_map_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut function = helper_builder(
         leaves,
         &[ROOT_BASE, ROOT_JS, ROOT_JS],
-        &[RAW_I32, ROOT_BASE],
+        &[RAW_I32, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32],
     );
-    let (handle, key, val, addr, arr) = (0, 1, 2, 3, 4);
-    let entries_slot = MemArg {
-        offset: MAP_ENTRIES_OFFSET,
-        align: 3,
-        memory_index: 0,
-    };
-    let size_slot = MemArg {
-        offset: MAP_SIZE_OFFSET,
-        align: 2,
-        memory_index: 0,
-    };
+    let (handle, key, val, addr, arr, index, len, i) = (0, 1, 2, 3, 4, 5, 6, 7);
     let val_at = MemArg {
         offset: 8,
         align: 0,
         memory_index: 0,
     };
-
-    // addr = __map_find(handle, key).
-    function.instruction(&Instruction::LocalGet(handle));
-    function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::Call(map_find_index));
-    function.instruction(&Instruction::LocalSet(addr));
-    // if addr != -1 { store val at addr + 8; return }.
-    function.instruction(&Instruction::LocalGet(addr));
-    function.instruction(&Instruction::I32Const(-1));
-    function.instruction(&Instruction::I32Ne);
-    function.instruction(&Instruction::If(BlockType::Empty));
-    function.instruction(&Instruction::LocalGet(addr));
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::I64Store(val_at));
-    function.instruction(&Instruction::Return);
-    function.instruction(&Instruction::End);
-
-    // Miss: append (key, val) to the backing array.
-    // arr = wrap(load_i64(handle + entries_slot)).
-    function.instruction(&Instruction::LocalGet(handle));
-    function.instruction(&Instruction::I64Load(entries_slot));
-    function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::LocalSet(arr));
-    // __array_push(arr, key); __array_push(arr, val).
-    function.instruction(&Instruction::LocalGet(arr));
-    function.instruction(&Instruction::LocalGet(key));
-    function.instruction(&Instruction::Call(array_push_index));
-    function.instruction(&Instruction::LocalGet(val));
-    function.instruction(&Instruction::Call(array_push_index));
-    function.instruction(&Instruction::Drop);
-    // size += 1.
-    function.instruction(&Instruction::LocalGet(handle));
-    function.instruction(&Instruction::LocalGet(handle));
-    function.instruction(&Instruction::I32Load(size_slot));
-    function.instruction(&Instruction::I32Const(1));
-    function.instruction(&Instruction::I32Add);
-    function.instruction(&Instruction::I32Store(size_slot));
-    function.instruction(&Instruction::End);
+    let slots = mem32(MAP_INDEX_SLOTS.cast_unsigned().into());
+    wasm!(function;
+        LocalGet(handle), LocalGet(key), Call(helpers.map_find), LocalTee(addr),
+        I32Const(-1), I32Ne,
+        If(BlockType::Empty),
+        LocalGet(addr), LocalGet(val), I64Store(val_at),
+        Return,
+        End,
+        LocalGet(handle), I64Load(mem64(MAP_ENTRIES_OFFSET)), I32WrapI64, LocalTee(arr),
+        LocalGet(key), Call(helpers.array_push),
+        LocalGet(val), Call(helpers.array_push),
+        Drop,
+        LocalGet(handle),
+        LocalGet(handle), I32Load(mem32(MAP_SIZE_OFFSET)), I32Const(1), I32Add,
+        I32Store(mem32(MAP_SIZE_OFFSET)),
+        LocalGet(arr), I32Load(mem32(ARRAY_LEN_OFFSET)), LocalSet(len),
+        LocalGet(handle), I32Load(mem32(u64::from(abi::MAP_INDEX_OFFSET))), LocalTee(index),
+        If(BlockType::Empty),
+        // Room while (used + 1) * 2 <= cap.
+        LocalGet(index), I32Load(mem32(MAP_INDEX_USED)), I32Const(1), I32Add, I32Const(1), I32Shl,
+        LocalGet(index), I32Load(mem32(MAP_INDEX_CAP)), I32LeU,
+        If(BlockType::Empty),
+        LocalGet(key), Call(helpers.map_hash()), LocalSet(i),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(i), LocalGet(index), I32Load(mem32(MAP_INDEX_CAP)), I32Const(1), I32Sub, I32And,
+        LocalSet(i),
+        LocalGet(index), LocalGet(i), I32Const(2), I32Shl, I32Add, I32Load(slots),
+        I32Eqz, BrIf(1),
+        LocalGet(i), I32Const(1), I32Add, LocalSet(i),
+        Br(0),
+        End, End,
+        // The new key slot is `len - 2`; the entry is that plus one.
+        LocalGet(index), LocalGet(i), I32Const(2), I32Shl, I32Add,
+        LocalGet(len), I32Const(1), I32Sub, I32Store(slots),
+        LocalGet(index),
+        LocalGet(index), I32Load(mem32(MAP_INDEX_USED)), I32Const(1), I32Add,
+        I32Store(mem32(MAP_INDEX_USED)),
+        Return,
+        End,
+        LocalGet(handle), Call(helpers.map_reindex()),
+        Return,
+        End,
+        LocalGet(len), I32Const(abi::MAP_INDEX_MIN_SLOTS.cast_signed()), I32GeU,
+        If(BlockType::Empty),
+        LocalGet(handle), Call(helpers.map_reindex()),
+        End,
+        End,
+    );
     finish_builder(function)
 }
 

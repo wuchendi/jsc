@@ -228,6 +228,7 @@ pub(super) fn emit_prop_key(
     if let IrNode::Str(key) = index {
         wasm!(function; I32Const(static_str_key(strings, key)));
     } else {
+        shake::note_key(index);
         wasm!(function; LocalGet(local), I32Const(i32::from(insert)), Call(helpers.to_key));
     }
 }
@@ -245,6 +246,7 @@ pub(super) fn emit_key_lookup(
     if let IrNode::Str(name) = key {
         wasm!(function; I32Const(static_str_key(strings, name)));
     } else {
+        shake::note_key(key);
         emit_node(key, function, scratch, strings, helpers);
         wasm!(function; I32Const(0), Call(helpers.to_key));
     }
@@ -812,7 +814,7 @@ pub(super) fn emit_prop_find(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
         If(BlockType::Empty), I32Const(0), Return, End,
     );
     f.frame_begin();
-    wasm!(f; LocalGet(o), Call(helpers.define + 1));
+    wasm!(f; LocalGet(o), Call(helpers.core(registry::Core::FnMaterialize)));
     f.frame_end();
     wasm!(f;
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalSet(e),
@@ -1058,7 +1060,7 @@ pub(super) fn emit_fn_materialize(
 pub(super) fn emit_materialize(function: &mut impl Sink, o: u32, helpers: Helpers<'_>) {
     wasm!(function;
         LocalGet(o), I32Load(m32(0)), I32Const(LAZY_FN_MASK), I32And, I32Const(LAZY_FN_WORD), I32Eq,
-        If(BlockType::Empty), LocalGet(o), Call(helpers.define + 1), End,
+        If(BlockType::Empty), LocalGet(o), Call(helpers.core(registry::Core::FnMaterialize)), End,
     );
 }
 
@@ -2428,7 +2430,7 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
     let (kv, val) = (13, 14);
     // `w`: the values/entries write index; `recheck`: the table has an accessor.
     let (w, recheck) = (15, 16);
-    let new_array = helpers.new_string + 1;
+    let new_array = helpers.new_array();
     // include(e) = key != 0 && (mode is ALL / SYMBOLS / ALL_KEYS || attrs & ENUMERABLE)
     let include = |f: &mut FnBuilder<'_>| {
         wasm!(f;
@@ -2807,7 +2809,7 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
     let (o, ks, n, i, j, m) = (1, 2, 3, 4, 5, 6);
     let (out, seen, cur, k) = (7, 8, 9, 10);
     let cursor = 11;
-    let new_array = helpers.new_string + 1;
+    let new_array = helpers.new_array();
     // A primitive (a symbol included) has no enumerable keys of its own or on
     // its prototype chain.
     emit_is_pointer(&mut f, obj);

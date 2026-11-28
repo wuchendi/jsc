@@ -276,7 +276,7 @@ impl Intrinsic {
 
     /// The builtin body a callable intrinsic runs, or `None` for an ordinary
     /// object.
-    fn call(self) -> Option<Builtin> {
+    pub(super) fn call(self) -> Option<Builtin> {
         match self {
             Self::FunctionPrototype => Some(Builtin::FunctionPrototype),
             Self::Ctor(ctor) => Some(Builtin::Ctor(ctor)),
@@ -3296,6 +3296,7 @@ pub(super) fn intrinsic_addr_bits(base: i32, intrinsic: Intrinsic) -> i64 {
 
 /// The heap-pointer jsval of `intrinsic` (a compile-time constant).
 pub(super) fn intrinsic_bits(intrinsic: Intrinsic, helpers: Helpers<'_>) -> i64 {
+    shake::note_intrinsic(intrinsic);
     intrinsic_addr_bits(helpers.realm(), intrinsic)
 }
 
@@ -3308,6 +3309,7 @@ pub(super) fn symbol_addr(symbol: WellKnown, helpers: Helpers<'_>) -> i32 {
 /// The heap-pointer jsval of `builtin`'s static method block (a
 /// compile-time constant).
 pub(super) fn method_bits(builtin: Builtin, helpers: Helpers<'_>) -> i64 {
+    shake::note_builtin(builtin);
     let addr = helpers.realm().cast_unsigned() + method_offset(&registry(), builtin);
     HEAP_BITS | i64::from(addr)
 }

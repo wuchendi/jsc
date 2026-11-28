@@ -15,11 +15,10 @@
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Shl, Sub};
 
 use wasm_encoder::{
-    BlockType, ConstExpr, DataSection, Function, FunctionSection, Ieee64, Instruction, MemArg,
-    TypeSection, ValType,
+    BlockType, ConstExpr, DataSection, Function, Ieee64, Instruction, MemArg, ValType,
 };
 
-use super::{Helpers, LeafSet, LocalClass, MathOp, Sink, finish_builder, helper_builder, unicode};
+use super::{Helpers, LeafSet, LocalClass, MathOp, Sink, finish_builder, helper_builder};
 use crate::abi;
 
 type W = Instruction<'static>;
@@ -561,11 +560,8 @@ pub(super) enum H {
 
 use ValType::{F64, I32};
 
-/// The number of libm helpers (the engine helpers follow them).
-pub(super) const HELPER_COUNT: usize = TYPES.len();
-
 /// The `(params, results)` of every helper, in [`H`] order.
-const TYPES: [(&[ValType], &[ValType]); 30] = [
+pub(super) const TYPES: [(&[ValType], &[ValType]); 30] = [
     (&[F64, I32], &[F64]),           // __libm_scalbn(x, n)
     (&[F64, F64, F64], &[F64]),      // __libm_mul_err(a, b, p)
     (&[F64], &[F64]),                // __libm_asin_r(z)
@@ -665,22 +661,11 @@ pub(super) fn emit_data(data: &mut DataSection) {
     data.active(0, &ConstExpr::i32_const(TABLES_BASE), bytes);
 }
 
-/// Declare every helper's type and function-section entry.
-pub(super) fn register(types: &mut TypeSection, functions: &mut FunctionSection) {
-    for (params, results) in TYPES {
-        let index = types.len();
-        types
-            .ty()
-            .function(params.iter().copied(), results.iter().copied());
-        functions.function(index);
-    }
-}
-
 impl Helpers<'_> {
     /// The wasm function index of libm helper `h`; the helpers follow the
     /// [`unicode`](super::unicode) helpers, which follow `_start`.
     pub(super) fn libm(self, h: H) -> u32 {
-        self.start() + 1 + u32::try_from(unicode::TYPES.len()).unwrap_or(0) + h as u32
+        self.group(super::registry::Group::Libm) + h as u32
     }
 }
 

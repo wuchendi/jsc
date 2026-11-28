@@ -14,6 +14,9 @@ fn emit(program: &IrProgram) -> Vec<u8> {
         CompileOptions {
             print_completion: true,
             gc_stress: crate::emit::gc_stress_from_env(),
+            no_stack_guard: false,
+            // The layout tests below read every helper body.
+            full_runtime: true,
         },
     )
 }
@@ -1765,6 +1768,8 @@ fn gc_stress_interval_after_prefix() {
             CompileOptions {
                 print_completion: true,
                 gc_stress,
+                no_stack_guard: false,
+                full_runtime: false,
             },
         )
     };

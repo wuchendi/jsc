@@ -187,7 +187,7 @@ pub(super) const TYPES: [(&[ValType], &[ValType]); 24] = [
 
 impl Helpers<'_> {
     fn render_base(self) -> u32 {
-        self.to_primitive() + 26
+        self.group(super::registry::Group::Render)
     }
     fn out_reserve(self) -> u32 {
         self.render_base()

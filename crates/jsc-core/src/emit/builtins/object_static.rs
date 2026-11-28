@@ -214,6 +214,7 @@ fn emit_define_property(
         helpers,
     );
     frame.arg(function, 1);
+    shake::note_runtime_key();
     wasm!(function; I32Const(1), Call(helpers.to_key), LocalSet(key));
     return_if_pending(function);
     wasm!(function; I32Const(0), Call(helpers.new_array()), LocalSet(list));
@@ -281,6 +282,7 @@ fn object_define_properties(
             LocalGet(i), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)),
             I32Const(1), Call(helpers.to_key), LocalSet(key),
         );
+        shake::note_runtime_key();
     };
     let each = |function: &mut FnBuilder<'_>, body: &dyn Fn(&mut FnBuilder<'_>)| {
         wasm!(function;
@@ -336,6 +338,7 @@ fn emit_get_own_property_descriptor(
     frame.arg(function, 1);
     wasm!(function; I32Const(0), Call(helpers.to_key), LocalSet(key));
     return_if_pending(function);
+    shake::note_runtime_key();
     wasm!(function; LocalGet(v), LocalGet(key), Call(helpers.own_desc()));
 }
 
@@ -406,6 +409,7 @@ fn emit_get_own_property_descriptors(
         End,
         LocalGet(kv), I32Const(1), Call(helpers.to_key), LocalSet(key),
     );
+    shake::note_runtime_key();
     add(function, &|function| wasm!(function; LocalGet(key)));
     wasm!(function;
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),

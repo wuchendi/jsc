@@ -275,6 +275,7 @@ pub(super) fn emit_function(
     let scratch = func.locals;
     // Fresh unwinding state for this function body.
     helpers.unwind.borrow_mut().reset();
+    emit_stack_guard(&mut function, scratch, helpers);
     emit_stmts(
         &func.body,
         &mut function,
@@ -284,8 +285,85 @@ pub(super) fn emit_function(
         None,
         None,
     );
+    emit_call_depth_leave(&mut function, helpers);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
+    finish_builder(function)
+}
+
+/// Count a user function out of `$__call_depth` on an exit that falls off
+/// its end: [`emit_stack_guard`] only covers the `Return` instructions.
+pub(super) fn emit_call_depth_leave(function: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
+    if helpers.stack_guard.is_some() {
+        for op in [
+            Instruction::GlobalGet(CALL_DEPTH_GLOBAL),
+            Instruction::I32Const(1),
+            Instruction::I32Sub,
+            Instruction::GlobalSet(CALL_DEPTH_GLOBAL),
+        ] {
+            function.instruction(&op);
+        }
+    }
+}
+
+/// The call-stack guard at a user function's entry: count the call in
+/// `$__call_depth` (every later `Return` counts it out), and throw a
+/// `RangeError` when more than [`abi::CALL_DEPTH_LIMIT`] calls are active or
+/// the shadow stack cannot hold this function's largest frame plus
+/// [`abi::SHADOW_STACK_MARGIN`].
+pub(super) fn emit_stack_guard(function: &mut FnBuilder<'_>, scratch: u32, helpers: Helpers<'_>) {
+    let Some(limit) = helpers.stack_guard else {
+        return;
+    };
+    function.count_exits(CALL_DEPTH_GLOBAL);
+    let floor = abi::SHADOW_STACK_MARGIN.saturating_add(scratch.saturating_mul(8));
+    for op in [
+        Instruction::GlobalGet(CALL_DEPTH_GLOBAL),
+        Instruction::I32Const(1),
+        Instruction::I32Add,
+        Instruction::GlobalSet(CALL_DEPTH_GLOBAL),
+        Instruction::GlobalGet(CALL_DEPTH_GLOBAL),
+        Instruction::I32Const(limit.cast_signed()),
+        Instruction::I32GtU,
+        Instruction::GlobalGet(SP_GLOBAL),
+        Instruction::I32Const(floor.cast_signed()),
+        Instruction::I32LtS,
+        Instruction::I32Or,
+        Instruction::If(BlockType::Empty),
+    ] {
+        function.instruction(&op);
+    }
+    enter_frame(helpers);
+    function.call_then_exit(helpers.stack_overflow());
+    emit_throw_return(function, helpers);
+    function.instruction(&Instruction::End);
+    leave_frame(helpers);
+}
+
+/// `__stack_overflow()`: leave the call-stack guard's `RangeError` in flight.
+pub(super) fn emit_stack_overflow(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
+    let mut function = FnBuilder::new(leaves);
+    declare_scratch(&mut function);
+    let error = IrNode::error_object(
+        ErrorKind::RangeError,
+        Some(IrNode::Str(STACK_OVERFLOW_MSG.into())),
+        IrNode::Str(STACK_OVERFLOW_STACK.into()),
+    );
+    emit_node(&error, &mut function, 0, strings, helpers);
+    emit_set_exc_value(&mut function, helpers);
+    for op in [
+        Instruction::I32Const(1),
+        Instruction::GlobalSet(EXC_PENDING_GLOBAL),
+        Instruction::I32Const(0),
+        Instruction::GlobalSet(CF_KIND_GLOBAL),
+        Instruction::End,
+    ] {
+        function.instruction(&op);
+    }
     finish_builder(function)
 }
 

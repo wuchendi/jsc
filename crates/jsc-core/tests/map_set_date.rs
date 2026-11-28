@@ -772,3 +772,86 @@ fn for_each_passes_three_arguments_past_a_small_arity() {
         "3 x x true true\n3 y y true true\n",
     );
 }
+
+/// A Map / Set past the hash-index threshold: every key kind is found by
+/// `SameValueZero`, deleted keys miss, re-added keys append, and iteration
+/// keeps insertion order.
+#[test]
+fn hashed_map_and_set_lookups() {
+    assert_eval(
+        "const m = new Map(); const objs = [];
+         for (let i = 0; i < 300; i++) {
+           const o = { i }; objs.push(o);
+           m.set(i, 'n' + i); m.set('s' + i, i); m.set(o, i); m.set(i + 0.5, -i);
+         }
+         m.set(NaN, 'nan'); m.set(-0, 'zero'); m.set(undefined, 'u'); m.set(null, 'l');
+         m.set(true, 't'); m.set('', 'empty');
+         let ok = m.size === 1205;
+         for (let i = 0; i < 300; i++) {
+           ok = ok && (i === 0 || m.get(i) === 'n' + i) && m.get('s' + i) === i
+             && m.get(objs[i]) === i && m.get(i + 0.5) === -i;
+         }
+         ok = ok && m.get(0 / 0) === 'nan' && m.get(0) === 'zero' && m.get(+0) === 'zero'
+           && m.get(undefined) === 'u' && m.get(null) === 'l' && m.get(true) === 't'
+           && m.get('') === 'empty' && !m.has(false) && !m.has('0') && !m.has({ i: 0 })
+           && !m.has(300) && !m.has('s300');
+         ok",
+        "true",
+    );
+    assert_eval(
+        "const s = new Set(); for (let i = 0; i < 1000; i++) s.add('k' + (i % 500));
+         let ok = s.size === 500;
+         for (let i = 0; i < 500; i += 2) ok = ok && s.delete('k' + i) && !s.has('k' + i);
+         ok = ok && s.size === 250 && s.has('k1') && !s.delete('k0');
+         s.add('k0');
+         const order = [...s];
+         ok && s.size === 251 && order[0] === 'k1' && order[250] === 'k0'",
+        "true",
+    );
+    // `clear` empties a hashed map; later entries are found again.
+    assert_eval(
+        "const m = new Map(); for (let i = 0; i < 100; i++) m.set(i, i);
+         m.clear();
+         let ok = m.size === 0 && !m.has(5);
+         for (let i = 0; i < 100; i++) m.set(i, i * 2);
+         ok && m.size === 100 && m.get(99) === 198 && [...m.keys()][0] === 0",
+        "true",
+    );
+    // Entries added while iterating are visited, across index growth.
+    assert_eval(
+        "const s = new Set([0]); let n = 0;
+         for (const v of s) { n++; if (v < 400) s.add(v + 1) }
+         n",
+        "401",
+    );
+    // Add / delete churn keeps lookups right through index rebuilds.
+    assert_eval(
+        "const m = new Map(); let ok = true;
+         for (let i = 0; i < 3000; i++) { m.set('k' + i, i); if (i >= 10) ok = ok && m.delete('k' + (i - 10)) }
+         ok && m.size === 10 && m.get('k2999') === 2999 && !m.has('k2000')",
+        "true",
+    );
+}
+
+/// Map / Set operations stay near constant time: 20 000 inserts and lookups
+/// fit a fuel budget a linear scan exceeds a hundredfold.
+#[test]
+fn map_lookups_do_not_scan() {
+    let src = "const m = new Map(); let z = 0;
+               for (let i = 0; i < 20000; i++) m.set('k' + i, i);
+               for (let i = 0; i < 20000; i++) z += m.get('k' + i);
+               z";
+    let options = jsc_core::emit::CompileOptions {
+        print_completion: true,
+        ..Default::default()
+    };
+    let wasm = common::compile_with(src, options).expect("compiles");
+    let capture = jsc_core::run::Capture::new();
+    let outcome = jsc_core::run::run(
+        &wasm,
+        jsc_core::run::Sinks::Capture(capture.clone()),
+        Some(400_000_000),
+    )
+    .expect("runs within the fuel budget");
+    assert_eq!((outcome.code, capture.stdout().trim()), (0, "199990000"));
+}

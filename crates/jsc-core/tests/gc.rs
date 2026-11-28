@@ -214,6 +214,8 @@ fn gc_stress_run_suite() {
     let options = |gc_stress| CompileOptions {
         print_completion: false,
         gc_stress,
+        no_stack_guard: false,
+        full_runtime: false,
     };
     let plain = common::compile_with(src, options(0)).expect("compiles");
     let stressed = common::compile_with(src, options(1)).expect("compiles");

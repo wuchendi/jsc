@@ -137,7 +137,8 @@ jsc/
 │   │   │   │   └── generator.rs       # generator / async state-machine CFG
 │   │   │   ├── emit/              # IR -> wasm
 │   │   │   │   ├── mod.rs             # module builder, globals, Helpers index table
-│   │   │   │   ├── sections.rs        # type / function index layout, globals, data segment
+│   │   │   │   ├── registry.rs        # the helper roster: groups, signatures and bodies in function-index order
+│   │   │   │   ├── sections.rs        # type / function sections, globals, data segment
 │   │   │   │   ├── props.rs           # property tables, interning, __get/__set/...
 │   │   │   │   ├── realm.rs           # realm image: intrinsics registry, Builtin roster
 │   │   │   │   ├── builtins/          # builtin bodies by family (array, string, json, ...)
@@ -299,7 +300,32 @@ jsval, or the **construct marker** `-(n + 1)` when the callee runs under `new`
 | then | the builtin bodies, one per `Builtin::ALL` entry (`emit/realm.rs`, 366 entries) |
 | then | `__to_primitive`, `__to_string`, `__add`, `__compare`, `__array_join`, `__to_object`, `__json_rep`, `__json_indent`, `__json_revive`, and the rest of §6.2 up to the private-name helpers |
 | then | the renderer helpers (§6.2), then `_start` |
-| last | the Unicode helpers (`emit/unicode.rs`), the `Math` helpers (`emit/libm.rs`), the promise engine (`emit/promise_engine.rs`, §6.7), then the allocator helpers (`emit/gc.rs`, §5.6) |
+| then | the Unicode helpers (`emit/unicode.rs`), the `Math` helpers (`emit/libm.rs`), the promise engine (`emit/promise_engine.rs`, §6.7), then the allocator helpers (`emit/gc.rs`, §5.6) |
+| last | `__stack_overflow` (§6.6), `__map_hash`, `__map_reindex` (§5.2) |
+
+The helper roster is `emit/registry.rs`: groups in this order, each helper one
+`(member, signature, body)` row or a family module's `TYPES` and
+`emit_helpers`; a helper's index is its group's base plus its position.
+
+**Runtime shaking** (`emit/shake.rs`). Every module declares every runtime
+function, so indices, types and the table never depend on the program; the
+body of a function the program cannot reach is an `unreachable` stub. While a
+body is emitted, the emitters record the static strings it looks up, the
+builtins and intrinsics it names by address, table slot or call, and each
+conversion of a run-time value to a property key. Kept, to a fixpoint: `main`,
+the user functions, the settlers and `_start`; every function a kept body
+calls; every builtin or callable intrinsic a kept body names; every builtin
+installed in the realm (§6.4) under a string key a kept body looks up, under
+a symbol key, as an accessor half, or under no key at all; and the prototype
+chain of every kept intrinsic. The module is left whole when user code
+converts a value that is not a literal or a plain numeric expression to a
+property key (`o[k]`, a computed key, `k in o`, `delete o[k]`), or when a
+kept runtime body returns or redefines a property its caller picks by a
+run-time key (`shake::note_runtime_key`: `Object.getOwnPropertyDescriptor(s)`,
+`__lookupGetter__` / `__lookupSetter__`, `Object.defineProperty`,
+`defineProperties` and `create`, and `JSON.stringify` for its property
+list): either can reach a builtin by a name no body mentions. `console.log('hi')` is 432 KB shaken and 890 KB whole. The data
+segments are not shaken. `CompileOptions::full_runtime` turns the shake off.
 
 **Table.** A funcref table of exactly `n + 2 + 366` entries (min = max), filled
 by one active element segment: slots `0 … n-1` are the user functions, slots
@@ -350,7 +376,8 @@ None is exported.
 | 43 | `$__gc_weak_regs` | `i32` | the running collection's `FinalizationRegistry` list, same shape (§5.7) |
 | 44 | `$__kept_objects` | `i32` | the `KeepDuringJob` set: raw ref to an internal array handle, `0` until the first push (§6.7) |
 | 45 | `$__fin_jobs` | `i32` | pending finalization cleanup jobs: raw ref to a registry, linked through `job_next`, `0` = none (§6.7) |
-| 46+ | module cells | `i64` | one cell pointer per module binding (`46 + slot`, §7.1), then one per tagged-template site (§7.4) |
+| 46 | `$__call_depth` | `i32` | active user-function calls, counted by the call-stack guard (§6.6) |
+| 47+ | module cells | `i64` | one cell pointer per module binding (`47 + slot`, §7.1), then one per tagged-template site (§7.4) |
 | after the cells | `$__gc_stress_count` | `i32` | test-only `gc_stress` interval above `1`: collections run so far, saturating at `GC_STRESS_PREFIX` (§5.6); absent otherwise |
 
 **Exports.** Exactly `_start: () -> ()` and `memory` (§6.8).
@@ -372,8 +399,10 @@ by 8 (slot `k` at `$fp + 8 + 8k`, the first frame's top slot ending at
 `SS_SIZE`), and addresses `0..8` never hold stack data, so a raw ref of `0`
 always reads zero. A big frame (`N > 4`) is cleared by `memory.fill` from `$fp`
 for `8N + 8` bytes, never from `$fp + 8`, which wraps to `0` at `$fp = -8`. The
-collector (M2) scans `[$__sp + 8, SS_SIZE)`. Overflow wraps below `0` and the
-first slot store traps: at `$fp = -8` the static-offset address does not wrap.
+collector (M2) scans `[$__sp + 8, SS_SIZE)`. The call-stack guard (§6.6)
+keeps user recursion away from the floor; past it, overflow wraps below `0`
+and the first slot store traps: at `$fp = -8` the static-offset address does
+not wrap.
 
 **Static region (data segments).** Everything from `SS_SIZE` to the heap
 start is laid out by the compiler, in this order:
@@ -513,7 +542,7 @@ the array bits is ever cleared (except `JOINING`).
 | `3` `TYPE_FUNCTION` | function | prefix, `func_idx: u32 @16`, reserved `u32 @20`, `env: i64 @24` | 32 | `function` |
 | `4` `TYPE_ENV` | closure environment (internal) | header, `count: u32 @4`, `cell: i64 × count @8` | `8 + 8·count` | — |
 | `5` `TYPE_CELL` | boxed binding (internal) | header, `value: i64 @4` | 12 | — |
-| `6` `TYPE_MAP` | `Map` | prefix, `size: u32 @16`, pad, `entries: i64 @24` → backing array | 32 | `object` |
+| `6` `TYPE_MAP` | `Map` | prefix, `size: u32 @16`, `index: u32 @20` → hash index (`0` = none), `entries: i64 @24` → backing array | 32 | `object` |
 | `7` `TYPE_SET` | `Set` | same as `TYPE_MAP` | 32 | `object` |
 | `8` `TYPE_PROMISE` | promise | prefix, `state: i32 @16`, `reactions: u32 @20`, `value: i64 @24`, `seq: u32 @32`, `rejected_next: u32 @36` | 40 | `object` |
 | `9` `TYPE_GENERATOR` | generator / async generator | prefix, `sm_idx: u32 @16`, `state: i32 @20`, `done: i32 @24`, `limits: u32 @28`, `env: i64 @32`, `queue: u32 @40`, `queue_tail: u32 @44` | 48 | `object` |
@@ -570,8 +599,17 @@ Notes per kind:
   shrunk, not even by the collector (a running `forEach` holds a slot index
   in a wasm local; §13). `size` is
   the live entry
-  count. Lookup is a linear scan with `__same_value_zero` that skips
-  tombstones; the renderer skips them too.
+  count. A backing shorter than 16 slots is scanned with
+  `__same_value_zero`, skipping tombstones. From 16 slots on, the handle's
+  `index` word points at a hash index: a `TYPE_RAW` block
+  `[used: u32 @8][cap: u32 @12][slot: u32 x cap @16]`, open addressing with
+  linear probing over `__map_hash(key)` (a string's content hash, else the
+  value bits with `-0` as `+0`), each slot a backing key slot index plus one
+  (`0` = empty). `__map_set` enters an appended key while the index stays at
+  most half full; otherwise `__map_reindex` builds a fresh one of at least
+  four slots per live entry from the backing. A deleted entry keeps its index
+  slot (its `HOLE` key matches nothing) until the next rebuild. The renderer
+  skips tombstones too.
 - **WeakMap / WeakSet** handles (`emit/builtins/weak.rs`) point (`entries`)
   at a `TYPE_ELEMS` store flagged `ELEMS_FLAG_WEAK` holding `(key, value)`
   pairs (a `WeakSet`: keys alone), allocated with 4 entries by the first
@@ -1005,7 +1043,7 @@ and never nests (`$__gc_busy`).
   | `3` `TYPE_FUNCTION` | jsval `env @24` (a bound function's `[target, boundThis, ...args]` array, a settler's resolving record) |
   | `4` `TYPE_ENV` | jsval slots `@8 + 8k`, `k < count @4`: closure envs, generator frames, async-generator request records, promise reaction / job / thenable-job records, resolving-function records, `Array.fromAsync` state |
   | `5` `TYPE_CELL` | jsval `@4` (unaligned) |
-  | `6` `TYPE_MAP`, `7` `TYPE_SET` | jsval `entries @24` |
+  | `6` `TYPE_MAP`, `7` `TYPE_SET` | raw ref `index @20`, jsval `entries @24` |
   | `8` `TYPE_PROMISE` | raw `reactions @20`, jsval `value @24`, raw `rejected_next @36` |
   | `9` `TYPE_GENERATOR` | jsval `env @32`, raw `queue @40`, `queue_tail @44` |
   | `10` `TYPE_DATE` | prefix only |
@@ -1085,7 +1123,7 @@ function-index order:
 | property tables (§6.3) | `__prop_find(o, key)`, `__define(o, key, v, attrs)`, `__fn_materialize(o)`, `__get(recv, key)`, `__set(recv, key, v)`, `__has(key, obj)`, `__delete(obj, key)`, `__own_keys(obj, mode)`, `__for_in_keys(obj)`, `__copy_data(dst, src, excl)` |
 | arrays (§5.4) | `__array_reserve(base, need)`, `__array_push(base, v)`, `__array_concat(dst, src)`, `__array_set(recv, key, v)`, `__array_set_length(arr, v)`, `__sparse_get(arr, i)`, `__sparse_set(arr, i, v)`, `__protos_indexless(o)`, `__proto_elem(o, i)`, `__proto_set(o, i, v)`, `__array_define(recv, key, v)`, `__sparse_define(arr, i, v)` |
 | JSON (stringify) | `__json_escape(str)`, `__json_str(v)` — the primitive serializer: finite numbers via `__prim_str`, `NaN`/`±Infinity`/`undefined` as `null`, keywords, escaped strings, any heap kind `null` |
-| Map/Set, equality | `__same_value_zero`, `__map_find`, `__map_set`, `__map_get`, `__map_has`, `__map_delete`, `__loose_eq`, `__str_to_array` |
+| Map/Set, equality | `__same_value_zero`, `__map_hash`, `__map_reindex`, `__map_find`, `__map_set`, `__map_get`, `__map_has`, `__map_delete`, `__loose_eq`, `__str_to_array` |
 | JSON (parse) | `__json_ws`, `__json_throw`, `__json_string`, `__json_number`, `__json_value`, `__json_array`, `__json_object`, `__json_parse` |
 | number to string (§6.5) | `__umul128`, `__ryu_pow5`, `__ryu_mul_shift`, `__ryu_mp5`, `__ryu_d2d(bits)` (Ryu shortest digits), `__scratch_str(ptr, len)`, `__num_to_str(bits)` (`Number::toString`), `__prim_str(v)` (`ToString` of a primitive), `__msg_str(v)` (the text of any value in an error message), `__dec_expand(bits)` (the exact decimal expansion), `__num_format(bits, mode, f)` (`toFixed` / `toExponential` / `toPrecision`), `__num_radix(bits, radix)` |
 | string to number (§6.5) | `__num_unit`, `__str_ws`, `__dec_parse(data, start, end)`, `__dec_slow`, `__dec_round`, `__dec_left`, `__dec_right`, `__digit_span`, `__radix_pow2`, `__radix_fold`, `__string_to_number(s)`, `__to_number_prim(v)`, `__parse_float(v)`, `__parse_int(v, radix)` |
@@ -1492,6 +1530,14 @@ carry the in-flight exception: `$exc_pending` and `$exc_value`.
   it; a finalizer that itself completes abruptly overrides the pending action
   (`try { return 1 } finally { return 2 }` returns `2`). A pending exception is
   re-propagated after a normally completing `finally`.
+- **Call-stack guard.** Every user function (and generator / async state
+  machine) counts itself into `$__call_depth` on entry and out before each
+  `return`. On entry, more than `abi::CALL_DEPTH_LIMIT` (10 000) active calls,
+  or a shadow stack that cannot hold the function's locals plus
+  `abi::SHADOW_STACK_MARGIN` (64 KiB), calls `__stack_overflow()`, which
+  leaves a fresh `RangeError: Maximum call stack size exceeded` pending, and
+  the function unwinds like any throw. The `jsc` runner gives wasmtime a
+  64 MiB wasm stack so the guard fires before the host stack runs out.
 - At the boundary `_start` reads `$exc_pending`; if set, it renders
   `$exc_value` as `Uncaught <value>` on fd 2 and calls `proc_exit(1)` (§4.2).
 
@@ -2819,6 +2865,18 @@ Each item below is current behaviour of this tree.
   the `HasProperty` check throws the `ReferenceError`.
 - `-p` completion values come from expression statements and `try`
   statements; `switch` and loops contribute none.
+- Runtime shaking (§4.2) gives up on any member access whose key is a
+  variable or another non-literal, non-arithmetic expression, `a[i]` in a
+  loop included, and on any use of `JSON.stringify`, `Object.create`,
+  `Object.defineProperty` / `defineProperties` or descriptor reflection:
+  such a module carries the whole runtime. The Unicode tables
+  and the realm image are in every module.
+- The call-stack guard (§6.6) counts user-function calls only. Recursion
+  inside the runtime that depends on data depth (`JSON.parse` /
+  `JSON.stringify` nesting, the console renderer) is unguarded, and a host
+  with a smaller stack than the `jsc` runner (`node:wasi`, a browser) can
+  exhaust it before 10 000 calls: both end in a host trap, not a
+  `RangeError`.
 
 **Values & operators**
 
@@ -2930,8 +2988,8 @@ Each item below is current behaviour of this tree.
   may run in between; the output (`console.log`) never does.
 - Map / Set backing arrays never shrink: `delete` and `clear` leave
   tombstones (§5.2), so set / delete churn grows the backing without bound
-  and lookups scan the tombstones (the collector does not compact them: a
-  running `forEach` or iterator holds a slot index).
+  and iteration walks the tombstones (the collector does not compact them:
+  a running `forEach` or iterator holds a slot index).
 - Collections run only when an allocation exhausts the budget (§5.6); there
   is no host hook to force one, so when a `WeakRef` empties or a
   `FinalizationRegistry` cleanup runs depends on allocation volume, and a

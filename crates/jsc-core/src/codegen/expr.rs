@@ -631,10 +631,9 @@ impl LowerCtx<'_> {
     }
 
     /// Lower a function expression to a function value named by its own
-    /// identifier, else by `name`. A generator/async expression's identifier is
-    /// bound, read-only, inside its own body (for self-reference): a cell in a
-    /// scope of its own, created before the value and set to it, which the body
-    /// captures. An ordinary function expression's identifier is not bound.
+    /// identifier, else by `name`. The identifier is bound, read-only, inside
+    /// its own body (for self-reference): a cell in a scope of its own, created
+    /// before the value and set to it, which the body captures.
     fn lower_fn_expr(
         &mut self,
         fn_expr: &swc_ecma_ast::FnExpr,
@@ -646,7 +645,7 @@ impl LowerCtx<'_> {
         };
         let name = ident.sym.as_ref();
         let id = ident.span.lo.0;
-        if !(function.is_generator || function.is_async) || !self.shared.captured.contains(&id) {
+        if !self.shared.captured.contains(&id) {
             return self.lower_function_value(function, &JsStr::from(name));
         }
         self.push_scope();

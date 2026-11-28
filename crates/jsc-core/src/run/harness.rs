@@ -182,11 +182,28 @@ pub fn run(wasm: &[u8], sinks: Sinks, fuel: Option<u64>) -> anyhow::Result<RunOu
     Ok(execute(wasm, sinks, fuel)?.outcome)
 }
 
+/// The wasm stack of a run: room for [`abi::CALL_DEPTH_LIMIT`] nested calls,
+/// so the guest's call-stack guard fires before the host stack runs out.
+const WASM_STACK: usize = 64 << 20;
+
+/// Run [`execute_on_stack`] on a thread whose stack holds [`WASM_STACK`].
 fn execute(wasm: &[u8], sinks: Sinks, fuel: Option<u64>) -> anyhow::Result<Finished> {
-    let engine = match fuel {
-        Some(_) => Engine::new(Config::new().consume_fuel(true))?,
-        None => Engine::default(),
-    };
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(WASM_STACK + (8 << 20))
+            .spawn_scoped(scope, || execute_on_stack(wasm, sinks, fuel))?
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+fn execute_on_stack(wasm: &[u8], sinks: Sinks, fuel: Option<u64>) -> anyhow::Result<Finished> {
+    let mut config = Config::new();
+    // `Engine::new` rejects a `max_wasm_stack` above `async_stack_size`.
+    config.max_wasm_stack(WASM_STACK);
+    config.async_stack_size(WASM_STACK);
+    config.consume_fuel(fuel.is_some());
+    let engine = Engine::new(&config)?;
     let module = Module::new(&engine, wasm)?;
     let mut store = Store::new(&engine, WasiCtx::new(sinks));
     if let Some(budget) = fuel {

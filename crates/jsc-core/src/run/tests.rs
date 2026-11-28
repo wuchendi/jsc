@@ -17,6 +17,8 @@ fn run_with_memory(src: &str) -> (f64, usize) {
         CompileOptions {
             print_completion: true,
             gc_stress: crate::emit::gc_stress_from_env(),
+            no_stack_guard: false,
+            full_runtime: false,
         },
     );
     let done = run_inspect(&wasm).expect("runs");

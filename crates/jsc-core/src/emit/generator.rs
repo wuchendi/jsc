@@ -400,6 +400,7 @@ pub(super) fn emit_generator_sm(
     // uncaught throw completes the generator (below) instead of returning with
     // `state` unchanged.
     open_landing_pad(&mut function, helpers);
+    emit_stack_guard(&mut function, scratch, helpers);
     // A `loop` wraps the whole dispatch so a `Jump`/`Branch` terminator can store
     // the next block index and `br` back to re-dispatch (CFG flattening). Inside
     // it, one `block` per basic block plus a trailing out-of-range default, then a
@@ -495,6 +496,7 @@ pub(super) fn emit_generator_sm(
     close_landing_pad(&mut function, helpers);
     store_gen_i32(&mut function, gen_local, GEN_DONE_OFFSET, 1);
     store_gen_i32(&mut function, gen_local, GEN_STATE_OFFSET, n.cast_signed());
+    emit_call_depth_leave(&mut function, helpers);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
     finish_builder(function)

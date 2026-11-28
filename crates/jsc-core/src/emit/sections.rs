@@ -1,18 +1,14 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use registry::{Core, Group, Sig, Tail};
 
 /// Build the module's type and function sections and resolve the [`Helpers`].
 ///
 /// Function 0 is `main` (`() -> i64`, type 0). Every user function shares the ONE
 /// uniform-ABI signature `(a0..a_{K-1}, env, argc) -> i64` (type 1, `K = max_args`,
 /// all `i64`), so a single `call_indirect` type serves them all; user function
-/// `i` (0-based) is wasm function `i + 1`. The runtime helpers are appended LAST
-/// so user-function indices `1..=n` stay stable. Because user functions now share
-/// ONE deduplicated type, helper TYPE indices are distinct from their FUNCTION
-/// indices, so the next free type index is tracked explicitly.
-// One straight-line section builder: it grows with the helper roster (each helper
-// adds a type + function registration), not with branching complexity.
-#[allow(clippy::too_many_lines)]
+/// `i` (0-based) is wasm function `i + 1`. The runtime helpers follow, declared
+/// by [`registry::declare`].
 pub(super) fn build_type_and_function_sections<'a>(
     program: &'a IrProgram,
     unwind: &'a RefCell<Unwind>,
@@ -46,116 +42,66 @@ pub(super) fn build_type_and_function_sections<'a>(
     // Every DEFINED function index is shifted up by IMPORT_FUNC_COUNT because the
     // WASI imports occupy the lowest function indices: `main` is function
     // `IMPORT_FUNC_COUNT`, user function `i` is `i + 1 + IMPORT_FUNC_COUNT`, and
-    // the helpers follow in the order `helper_types` lists them (and `emit`
-    // appends their bodies).
-    let mut next = IMPORT_FUNC_COUNT + 1 + u32::try_from(n).unwrap_or(u32::MAX);
-    let mut index = || {
-        next += 1;
-        next - 1
-    };
+    // the helpers follow in [`registry`] order.
+    let first = IMPORT_FUNC_COUNT + 1 + u32::try_from(n).unwrap_or(u32::MAX);
+    let core = |helper: Core| first + helper as u32;
     let helpers = Helpers {
         unwind,
-        alloc: index(),
-        concat: index(),
-        str_eq: index(),
-        str_cmp: index(),
-        str_index: index(),
-        str_hash: index(),
-        intern_slot: index(),
-        intern_find: index(),
-        intern: index(),
-        index_value: index(),
-        index_string: index(),
-        // `__str_exotic_index` takes the index right after `__index_string`.
-        to_key: {
-            index();
-            index()
-        },
-        prop_find: index(),
-        define: index(),
-        // `__fn_materialize` takes the index right after `__define`.
-        get: {
-            index();
-            index()
-        },
-        set: index(),
-        has: index(),
-        delete: index(),
-        own_keys: index(),
-        for_in_keys: index(),
-        copy_data: index(),
-        // `__array_reserve` takes the index right before `__array_push`.
-        array_push: {
-            index();
-            index()
-        },
-        // `__array_set`, `__array_set_length`, `__sparse_get`,
-        // `__sparse_set`, `__protos_indexless`, `__proto_elem`, `__proto_set`,
-        // `__array_define`, and `__sparse_define` take the indices right after
-        // `__array_concat`.
-        array_concat: {
-            let array_concat = index();
-            for _ in 0..9 {
-                index();
-            }
-            array_concat
-        },
-        json_escape: index(),
-        json_str: index(),
-        same_value_zero: index(),
-        array_search: index(),
-        map_find: index(),
-        map_set: index(),
-        map_get: index(),
-        map_has: index(),
-        map_delete: index(),
-        loose_eq: index(),
-        str_to_array: index(),
-        json_ws: index(),
-        json_throw: index(),
-        json_string: index(),
-        json_number: index(),
-        json_value: index(),
-        json_array: index(),
-        json_object: index(),
-        json_parse: index(),
-        gen_to_array: index(),
-        nullish_throw: index(),
-        prop_throw: index(),
-        box_f64: index(),
-        to_number: index(),
-        dtoa: {
-            let first = index();
-            for _ in 1..dtoa::HELPER_COUNT {
-                index();
-            }
-            first
-        },
-        // The number parsers (`strtod`), in emission order.
-        strtod: {
-            let first = index();
-            for _ in 0..13 {
-                index();
-            }
-            first
-        },
-        // `__now`, then `__random` (read back as `now + 1`).
-        now: {
-            let first = index();
-            index();
-            first
-        },
-        // The `__invoke1` callback trampoline is appended after every helper
-        // above; the `__async_step` trampoline follows it, then the two
-        // `new Promise` settler functions.
-        invoke1: index(),
-        async_step: index(),
+        stack_guard: Some(abi::CALL_DEPTH_LIMIT),
+        alloc: core(Core::Alloc),
+        concat: core(Core::Concat),
+        str_eq: core(Core::StrEq),
+        str_cmp: core(Core::StrCmp),
+        str_index: core(Core::StrIndex),
+        str_hash: core(Core::StrHash),
+        intern_slot: core(Core::InternSlot),
+        intern_find: core(Core::InternFind),
+        intern: core(Core::Intern),
+        index_value: core(Core::IndexValue),
+        index_string: core(Core::IndexString),
+        to_key: core(Core::ToKey),
+        prop_find: core(Core::PropFind),
+        define: core(Core::Define),
+        get: core(Core::Get),
+        set: core(Core::Set),
+        has: core(Core::Has),
+        delete: core(Core::Delete),
+        own_keys: core(Core::OwnKeys),
+        for_in_keys: core(Core::ForInKeys),
+        copy_data: core(Core::CopyData),
+        array_push: core(Core::ArrayPush),
+        array_concat: core(Core::ArrayConcat),
+        json_escape: core(Core::JsonEscape),
+        json_str: core(Core::JsonStr),
+        same_value_zero: core(Core::SameValueZero),
+        array_search: core(Core::ArraySearch),
+        map_find: core(Core::MapFind),
+        map_set: core(Core::MapSet),
+        map_get: core(Core::MapGet),
+        map_has: core(Core::MapHas),
+        map_delete: core(Core::MapDelete),
+        loose_eq: core(Core::LooseEq),
+        str_to_array: core(Core::StrToArray),
+        json_ws: core(Core::JsonWs),
+        json_throw: core(Core::JsonThrow),
+        json_string: core(Core::JsonString),
+        json_number: core(Core::JsonNumber),
+        json_value: core(Core::JsonValue),
+        json_array: core(Core::JsonArray),
+        json_object: core(Core::JsonObject),
+        json_parse: core(Core::JsonParse),
+        gen_to_array: core(Core::GenToArray),
+        nullish_throw: core(Core::NullishThrow),
+        prop_throw: core(Core::PropThrow),
+        box_f64: core(Core::BoxF64),
+        to_number: core(Core::ToNumber),
+        dtoa: Group::Dtoa.base(first),
+        now: Group::Tail.base(first) + Tail::Now as u32,
+        new_string: Group::Ctor.base(first),
         // The settler funcref-TABLE slots sit right after the `n` user-function
         // slots (`0..n`), so slots `n` and `n + 1`.
         settle_resolve_slot: u32::try_from(n).unwrap_or(u32::MAX),
         settle_reject_slot: u32::try_from(n).unwrap_or(u32::MAX).saturating_add(1),
-        // The constructors follow the two settlers.
-        new_string: index() + 2,
         fn_type,
         max_args,
         gathers_arguments: program_any(program, |n| matches!(n, IrNode::SpreadArgsGlobal)),
@@ -164,314 +110,16 @@ pub(super) fn build_type_and_function_sections<'a>(
         unicode: layout.unicode,
         fn_info: layout.info,
     };
-    // Helper types follow the main (type 0) and uniform (type 1) types, one
-    // per helper in function-index order.
-    let mut next_type = 2;
-    for (params, results) in helper_types() {
-        types
-            .ty()
-            .function(params.iter().copied(), results.iter().copied());
-        functions.function(next_type);
-        next_type += 1;
-    }
-    // The two `new Promise` settler functions reuse the uniform function
-    // type (type 1) — they are called through the funcref table like any function
-    // value — so they add a FunctionSection entry but NO new type.
-    functions.function(fn_type);
-    functions.function(fn_type);
-
-    // Append the import types LAST so they never disturb the main/uniform/
-    // helper type indices above. Imports add a type but no defined function.
-    let signatures: [(&[ValType], &[ValType]); IMPORT_FUNC_COUNT as usize] = [
+    let signatures: [Sig; IMPORT_FUNC_COUNT as usize] = [
         (&[I32, I32, I32, I32], &[I32]), // fd_write(fd, iovs, iovs_len, nwritten)
         (&[I32, I64, I32], &[I32]),      // clock_time_get(id, precision, time)
         (&[I32, I32], &[I32]),           // random_get(buf, buf_len)
         (&[I32], &[]),                   // proc_exit(rval)
     ];
-    let import_base = next_type;
-    for (params, results) in signatures {
-        types
-            .ty()
-            .function(params.iter().copied(), results.iter().copied());
-    }
-    let import_types = std::array::from_fn(|i| import_base + u32::try_from(i).unwrap_or(0));
-    let next_type = next_type + IMPORT_FUNC_COUNT;
-
-    // The block constructors: `new_string(len: i32, two_byte: i32) -> i32`
-    // and `__new_array(len: i32) -> i32`. Their types follow the import types.
-    types
-        .ty()
-        .function([ValType::I32, ValType::I32], [ValType::I32]);
-    functions.function(next_type);
-    types.ty().function([ValType::I32], [ValType::I32]);
-    functions.function(next_type + 1);
-    // The realm functions follow: `__has_own(key: i32, obj: i64) -> i32`,
-    // then the builtin bodies with the uniform type.
-    types
-        .ty()
-        .function([ValType::I32, ValType::I64], [ValType::I32]);
-    functions.function(next_type + 2);
-    for _ in Builtin::ALL {
-        functions.function(fn_type);
-    }
-    // The conversion helpers follow the builtin bodies:
-    // `__to_primitive(v: i64, hint: i32) -> i64`, `__to_string(v: i64) -> i32`,
-    // `__add(a: i64, b: i64) -> i64`, `__compare(a: i64, b: i64, op: i32) -> i32`,
-    // `__array_join(recv: i64, sep: i64) -> i64` and `__to_object(v: i64) -> i64`;
-    // then the `JSON` helpers `__json_rep(holder, key, value, replacer, list,
-    // stack: i32) -> i64`, `__json_indent(s: i32, gap: i32) -> i32` and
-    // `__json_revive(holder: i64, key: i32, reviver: i64) -> i64`; then the
-    // property-descriptor helpers `__define_own(o: i32, key: i32, desc: i32,
-    // value: i64, get: i64, set: i64) -> i32`, `__to_desc(attrs: i64, list:
-    // i32)`, `__own_desc(obj: i64, key: i32) -> i64`, `__set_integrity(obj:
-    // i64, level: i32)`, `__test_integrity(obj: i64, level: i32) -> i32`,
-    // `__own_enum(obj: i64, key: i32) -> i32` and `__set_proto(o: i32, proto:
-    // i64) -> i32`; then the self-resolution `TypeError` constructor `() ->
-    // i64`; then `__symbol_get(v: i64, sym: i32) -> i64`; then the `super` property
-    // helpers `__super_get(home: i64, key: i32, recv: i64) -> i64` and
-    // `__super_set(home: i64, key: i32, v: i64, recv: i64)`; then the
-    // private-name helpers `__private_find(o: i64, key: i32) -> i32`,
-    // `__private_add(o: i64, key: i32, v: i64, attrs: i32, name: i32)`,
-    // `__private_get(o: i64, key: i32, name: i32) -> i64`, `__private_set(o:
-    // i64, key: i32, v: i64, name: i32) -> i64`, `__private_brand(o: i64, v:
-    // i64, brand: i64, name: i32, mode: i32) -> i64` and `__private_in(o: i64,
-    // brand: i64, name: i32) -> i64`.
-    let conversions: [(&[ValType], &[ValType]); 26] = [
-        (&[ValType::I64, ValType::I32], &[ValType::I64]),
-        (&[ValType::I64], &[ValType::I32]),
-        (&[ValType::I64, ValType::I64], &[ValType::I64]),
-        (&[ValType::I64, ValType::I64, ValType::I32], &[ValType::I32]),
-        (&[ValType::I64, ValType::I64], &[ValType::I64]),
-        (&[ValType::I64], &[ValType::I64]),
-        (
-            &[
-                ValType::I64,
-                ValType::I64,
-                ValType::I64,
-                ValType::I64,
-                ValType::I64,
-                ValType::I32,
-            ],
-            &[ValType::I64],
-        ),
-        (&[ValType::I32, ValType::I32], &[ValType::I32]),
-        (&[ValType::I64, ValType::I32, ValType::I64], &[ValType::I64]),
-        (
-            &[
-                ValType::I32,
-                ValType::I32,
-                ValType::I32,
-                ValType::I64,
-                ValType::I64,
-                ValType::I64,
-            ],
-            &[ValType::I32],
-        ),
-        (&[ValType::I64, ValType::I32], &[]),
-        (&[ValType::I64, ValType::I32], &[ValType::I64]),
-        (&[ValType::I64, ValType::I32], &[]),
-        (&[ValType::I64, ValType::I32], &[ValType::I32]),
-        (&[ValType::I64, ValType::I32], &[ValType::I32]),
-        (&[ValType::I32, ValType::I64], &[ValType::I32]),
-        (&[], &[ValType::I64]),
-        (&[ValType::I64, ValType::I32], &[ValType::I64]),
-        (&[ValType::I64, ValType::I32, ValType::I64], &[ValType::I64]),
-        (
-            &[ValType::I64, ValType::I32, ValType::I64, ValType::I64],
-            &[],
-        ),
-        (&[ValType::I64, ValType::I32], &[ValType::I32]),
-        (
-            &[
-                ValType::I64,
-                ValType::I32,
-                ValType::I64,
-                ValType::I32,
-                ValType::I32,
-            ],
-            &[],
-        ),
-        (&[ValType::I64, ValType::I32, ValType::I32], &[ValType::I64]),
-        (
-            &[ValType::I64, ValType::I32, ValType::I64, ValType::I32],
-            &[ValType::I64],
-        ),
-        (
-            &[
-                ValType::I64,
-                ValType::I64,
-                ValType::I64,
-                ValType::I32,
-                ValType::I32,
-            ],
-            &[ValType::I64],
-        ),
-        (&[ValType::I64, ValType::I64, ValType::I32], &[ValType::I64]),
-    ];
-    let render_type = next_type + 3 + u32::try_from(conversions.len()).unwrap_or(0);
-    for (ty, (params, results)) in (next_type + 3..).zip(conversions) {
-        types
-            .ty()
-            .function(params.iter().copied(), results.iter().copied());
-        functions.function(ty);
-    }
-    for (ty, (params, results)) in (render_type..).zip(render::TYPES) {
-        types
-            .ty()
-            .function(params.iter().copied(), results.iter().copied());
-        functions.function(ty);
-    }
-
-    let unicode_type = render_type + u32::try_from(render::TYPES.len()).unwrap_or(0);
-    for (ty, (params, results)) in (unicode_type..).zip(unicode::TYPES) {
-        types
-            .ty()
-            .function(params.iter().copied(), results.iter().copied());
-        functions.function(ty);
-    }
+    let import_types = registry::declare(&mut types, &mut functions, fn_type, &signatures);
+    let import_types = std::array::from_fn(|i| import_types.get(i).copied().unwrap_or(0));
 
     (types, functions, helpers, import_types)
-}
-
-/// The `(params, results)` of every runtime helper, in function-index order
-/// (the order [`build_type_and_function_sections`] assigns their indices and
-/// [`emit`] appends their bodies).
-fn helper_types() -> Vec<(&'static [ValType], &'static [ValType])> {
-    use ValType::{F64, I32, I64};
-    vec![
-        // `__alloc(size) -> base`.
-        (&[I32], &[I32]),
-        // `__concat` / `__str_eq` / `__str_cmp` / `__str_index`: `(i32, i32) -> i32`.
-        (&[I32, I32], &[I32]),
-        (&[I32, I32], &[I32]),
-        (&[I32, I32], &[I32]),
-        (&[I32, I32], &[I32]),
-        // Interning: `__str_hash(s)`, `__intern_slot(s)`, `__intern_find(s)`,
-        // `__intern(s)`, `__index_value(s)`, `__index_string(n)`: `(i32) -> i32`.
-        (&[I32], &[I32]),
-        (&[I32], &[I32]),
-        (&[I32], &[I32]),
-        (&[I32], &[I32]),
-        (&[I32], &[I32]),
-        (&[I32], &[I32]),
-        // `__str_exotic_index(o, key) -> i32`.
-        (&[I32, I32], &[I32]),
-        // `__to_key(v, insert) -> key`.
-        (&[I64, I32], &[I32]),
-        // `__prop_find(o, key) -> entry`.
-        (&[I32, I32], &[I32]),
-        // `__define(o, key, v, attrs)`.
-        (&[I32, I32, I64, I32], &[]),
-        // `__fn_materialize(o)`.
-        (&[I32], &[]),
-        // `__get(recv, key) -> v`.
-        (&[I64, I32], &[I64]),
-        // `__set(recv, key, v)`.
-        (&[I64, I32, I64], &[]),
-        // `__has(key, obj) -> i32`.
-        (&[I32, I64], &[I32]),
-        // `__delete(obj, key)`.
-        (&[I64, I32], &[]),
-        // `__own_keys(obj, mode) -> array`.
-        (&[I64, I32], &[I64]),
-        // `__for_in_keys(obj) -> array`.
-        (&[I64], &[I64]),
-        // `__copy_data(dst, src, excl) -> dst`.
-        (&[I64, I64, I64], &[I64]),
-        // `__array_reserve(base, need)`.
-        (&[I32, I32], &[]),
-        // `__array_push(base, value) -> base`.
-        (&[I32, I64], &[I32]),
-        // `__array_concat(dst, src) -> dst`.
-        (&[I32, I32], &[I32]),
-        // `__array_set(recv, key, v)`.
-        (&[I64, I64, I64], &[]),
-        // `__array_set_length(arr, v)`.
-        (&[I32, I64], &[]),
-        // `__sparse_get(arr, i) -> v`.
-        (&[I32, I32], &[I64]),
-        // `__sparse_set(arr, i, v)`.
-        (&[I32, I32, I64], &[]),
-        // `__protos_indexless(o) -> i32`.
-        (&[I32], &[I32]),
-        // `__proto_elem(o, i) -> v`.
-        (&[I32, I32], &[I64]),
-        // `__proto_set(o, i, v) -> i32`.
-        (&[I32, I32, I64], &[I32]),
-        // `__array_define(recv, key, v)` and `__sparse_define(arr, i, v)`.
-        (&[I64, I64, I64], &[]),
-        (&[I32, I32, I64], &[]),
-        // `__json_escape(str) -> str` and `__json_str(v) -> str`.
-        (&[I32], &[I32]),
-        (&[I64], &[I32]),
-        // The Map/Set helpers: `__same_value_zero(a, b) -> i32`,
-        // `__array_search(recv, needle, includes) -> i64`,
-        // `__map_find(handle, key) -> i32`, `__map_set(handle, key, val)`,
-        // `__map_get(handle, key) -> i64`, `__map_has(handle, key) -> i32`,
-        // `__map_delete(handle, key) -> i32`.
-        (&[I64, I64], &[I32]),
-        (&[I64, I64, I32], &[I64]),
-        (&[I32, I64], &[I32]),
-        (&[I32, I64, I64], &[]),
-        (&[I32, I64], &[I64]),
-        (&[I32, I64], &[I32]),
-        (&[I32, I64], &[I32]),
-        // `__loose_eq(a, b) -> i32` and `__str_to_array(s) -> i64`.
-        (&[I64, I64], &[I32]),
-        (&[I64], &[I64]),
-        // The `JSON.parse` family: `__json_ws()`, `__json_throw() -> i64`,
-        // `__json_string`/`__json_number`/`__json_value`/`__json_array`/
-        // `__json_object() -> i64`, `__json_parse(s) -> i64`.
-        (&[], &[]),
-        (&[], &[I64]),
-        (&[], &[I64]),
-        (&[], &[I64]),
-        (&[], &[I64]),
-        (&[], &[I64]),
-        (&[], &[I64]),
-        (&[I64], &[I64]),
-        // `__gen_to_array(gen) -> i64`.
-        (&[I64], &[I64]),
-        // `__nullish_throw(recv, key, set)` and `__prop_throw(recv, key, mode)`.
-        (&[I64, I64, I32], &[]),
-        (&[I64, I64, I32], &[]),
-        // `__box_f64(x) -> i64` and `__to_number(v) -> i64`.
-        (&[F64], &[I64]),
-        (&[I64], &[I64]),
-        // The `Number` to string helpers, in `dtoa::emit_helpers` order.
-        (&[I64, I64], &[I64, I64]),
-        (&[I32, I32], &[I64, I64]),
-        (&[I64, I64, I64, I32], &[I64]),
-        (&[I64, I32], &[I32]),
-        (&[I64], &[I64, I32]),
-        (&[I32, I32], &[I32]),
-        (&[I64], &[I32]),
-        (&[I64], &[I32, I32, I32]),
-        (&[I64, I32, I32], &[I32]),
-        (&[I64, I32], &[I32]),
-        (&[I64], &[I32]),
-        (&[I64], &[I32]),
-        // The number parsers, in `strtod`'s emission order.
-        (&[I32, I32], &[I32]),           // __num_unit(data, i)
-        (&[I32], &[I32]),                // __str_ws(c)
-        (&[I32, I32, I32], &[F64]),      // __dec_parse(data, start, end)
-        (&[], &[I64]),                   // __dec_slow()
-        (&[], &[I64]),                   // __dec_round()
-        (&[I32], &[]),                   // __dec_left(shift)
-        (&[I32], &[]),                   // __dec_right(shift)
-        (&[I32, I32, I32, I32], &[I32]), // __digit_span(data, start, end, radix)
-        (&[I32, I32, I32, I32], &[F64]), // __radix_pow2(data, start, end, bits)
-        (&[I32, I32, I32, I32], &[F64]), // __radix_fold(data, start, end, radix)
-        (&[I32], &[F64]),                // __string_to_number(s)
-        (&[I64], &[I64]),                // __to_number_prim(v)
-        (&[I64], &[I64]),                // __parse_float(v)
-        (&[I64, I32], &[I64]),           // __parse_int(v, radix)
-        (&[], &[F64]),                   // __now()
-        (&[], &[F64]),                   // __random()
-        // The `__invoke1(fn, arg)` and `__async_step(gen, sent)` trampolines.
-        (&[I64, I64], &[I64]),
-        (&[I64, I64], &[I64]),
-    ]
 }
 
 /// Build the module's global section: the page frontier (`$__heap_ptr`,
@@ -606,6 +254,9 @@ pub(super) fn build_globals(
         let (ty, init) = mut_i32(init);
         globals.global(ty, &init);
     }
+    // `$__call_depth` (i32, 0).
+    let (ty, init) = mut_i32(0);
+    globals.global(ty, &init);
     // The module-cell pointers (i64, index `MODULE_CELL_GLOBAL_BASE + n`), set in
     // `main`'s prologue before any user code runs.
     for _ in 0..gc.module_cells {
@@ -794,7 +445,7 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
         .chain(convert::strings())
         .chain(dtoa::STRINGS)
         .chain(render::STRINGS)
-        .chain([STACK_KEY])
+        .chain([STACK_KEY, STACK_OVERFLOW_MSG, STACK_OVERFLOW_STACK])
         .chain(FN_KEYS);
     for text in realm_strs {
         strs.add(text);
@@ -855,13 +506,30 @@ pub(crate) struct StrOffsets(HashMap<JsStr, i32>);
 impl StrOffsets {
     /// The block offset of the compiler-built string `text`.
     pub(crate) fn get(&self, text: &str) -> Option<&i32> {
-        let units: Vec<u16> = text.encode_utf16().collect();
-        self.0.get(units.as_slice())
+        let offset = self.peek_ref(text);
+        if let Some(offset) = offset {
+            shake::note_string(*offset);
+        }
+        offset
     }
 
     /// The block offset of the string `text`.
     pub(crate) fn get_str(&self, text: &JsStr) -> Option<&i32> {
-        self.0.get(text.as_units())
+        let offset = self.0.get(text.as_units());
+        if let Some(offset) = offset {
+            shake::note_string(*offset);
+        }
+        offset
+    }
+
+    fn peek_ref(&self, text: &str) -> Option<&i32> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        self.0.get(units.as_slice())
+    }
+
+    /// [`Self::get`] without recording the lookup for [`shake`].
+    pub(crate) fn peek(&self, text: &str) -> Option<i32> {
+        self.peek_ref(text).copied()
     }
 
     /// The number of static strings.

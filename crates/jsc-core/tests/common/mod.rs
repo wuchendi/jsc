@@ -38,6 +38,8 @@ pub(crate) fn compile(src: &str, print_completion: bool) -> anyhow::Result<Vec<u
         CompileOptions {
             print_completion,
             gc_stress: gc_stress_from_env(),
+            no_stack_guard: false,
+            full_runtime: false,
         },
     )
 }
@@ -61,6 +63,8 @@ pub(crate) fn exec(src: &str, print_completion: bool) -> anyhow::Result<Finished
         CompileOptions {
             print_completion,
             gc_stress: gc_stress_from_env(),
+            no_stack_guard: false,
+            full_runtime: false,
         },
     )
 }
@@ -73,6 +77,8 @@ pub(crate) fn exec_gc_stress(src: &str, print_completion: bool) -> anyhow::Resul
         CompileOptions {
             print_completion,
             gc_stress: 1,
+            no_stack_guard: false,
+            full_runtime: false,
         },
     )
 }

@@ -59,7 +59,11 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
             helpers.array_search,
             vec![helpers.same_value_zero, helpers.index_value],
         ),
-        (helpers.map_find, vec![helpers.same_value_zero]),
+        (helpers.map_hash(), vec![helpers.str_hash]),
+        (
+            helpers.map_find,
+            vec![helpers.same_value_zero, helpers.map_hash()],
+        ),
         (helpers.map_get, vec![helpers.map_find]),
         (helpers.map_has, vec![helpers.map_find]),
         (helpers.map_delete, vec![helpers.map_find]),
@@ -74,7 +78,10 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         (helpers.str_of(), vec![]),
         (helpers.fn_name(), vec![helpers.heap_object()]),
         // Not a leaf: a lazy function's own properties materialize on lookup.
-        (helpers.prop_find, vec![helpers.define + 1]),
+        (
+            helpers.prop_find,
+            vec![helpers.core(registry::Core::FnMaterialize)],
+        ),
         // The number conversions: Ryu and the decimal parser only touch their
         // static scratch.
         (helpers.umul128(), vec![]),
@@ -247,6 +254,12 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
         },
         _ => ValueClass::default(),
     }
+}
+
+/// Whether `node` is a number, boolean, `null` or `undefined` whatever the
+/// locals hold.
+pub(super) fn classify_is_numeric(node: &IrNode) -> bool {
+    classify(node).numeric.is_some_and(|deps| deps.is_empty())
 }
 
 /// The solved `NoRoot` facts of one function.
