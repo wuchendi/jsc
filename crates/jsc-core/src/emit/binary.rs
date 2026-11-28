@@ -153,20 +153,33 @@ pub(super) fn integrity_callees(helpers: Helpers<'_>) -> Vec<u32> {
     }
 }
 
-/// Every binary helper body, in [`TYPES`] order.
+/// Every binary helper body, in [`TYPES`] order. Without binary data the
+/// two that look up static strings (`__render_binary`, `__ta_canonical`)
+/// are `unreachable` stubs: nothing calls them, and their strings are not
+/// interned (DESIGN.md §4.2).
 pub(super) fn emit_helpers(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
     leaves: &LeafSet,
 ) -> Vec<Function> {
+    let gated = |emit: fn(&StrOffsets, Helpers<'_>, &LeafSet) -> Function| {
+        if helpers.has_binary() {
+            emit(strings, helpers, leaves)
+        } else {
+            let mut stub = Function::new([]);
+            stub.instruction(&Instruction::Unreachable);
+            stub.instruction(&Instruction::End);
+            stub
+        }
+    };
     vec![
         emit_ab_alloc(helpers, leaves),
-        emit_render_binary(strings, helpers, leaves),
+        gated(emit_render_binary),
         emit_dv_length(leaves),
         emit_ta_length(false, leaves),
         emit_ta_length(true, leaves),
         emit_ta_validate(helpers, leaves),
-        emit_ta_canonical(strings, helpers, leaves),
+        gated(emit_ta_canonical),
         emit_ta_get(helpers, leaves),
         emit_ta_set(helpers, leaves),
         emit_ta_set_value(helpers, leaves),

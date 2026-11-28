@@ -97,8 +97,9 @@ fn arg_at(function: &mut FnBuilder<'_>, frame: Frame, i: u32, spread: u32, out: 
 }
 
 /// The IR fragments the hand-written bodies emit with `K = k`, for the
-/// static-string scan.
-pub(super) fn fragments(k: u32) -> Vec<IrNode> {
+/// static-string scan; the binary-data ones only when `binary` (otherwise
+/// their bodies are stubs, [`gated_off`]).
+pub(super) fn fragments(k: u32, binary: bool) -> Vec<IrNode> {
     let mut nodes = array::fragments(k);
     nodes.extend(function::fragments(k));
     nodes.extend(map_set::fragments(k));
@@ -110,8 +111,10 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
     nodes.extend(iter::fragments(k));
     nodes.extend(async_iter::fragments(k));
     nodes.extend(iterator::fragments());
-    nodes.extend(array_buffer::fragments(k));
-    nodes.extend(typed_array::fragments(k));
+    if binary {
+        nodes.extend(array_buffer::fragments(k));
+        nodes.extend(typed_array::fragments(k));
+    }
     nodes
 }
 
@@ -316,8 +319,21 @@ fn declare_error_scratch(b: &mut FnBuilder<'_>) {
     b.locals(2, Raw(ValType::I64)); // +24, +25
 }
 
-/// Every static string the builtin bodies reference. Interned in every program.
-pub(super) fn strings() -> impl Iterator<Item = &'static str> {
+/// Every static string the builtin bodies reference. Interned in every
+/// program, except that the binary-data families' strings are interned only
+/// when `binary` (DESIGN.md §4.2): their bodies are otherwise stubs
+/// ([`gated_off`]) that look up none.
+pub(super) fn strings(binary: bool) -> impl Iterator<Item = &'static str> {
+    let binary_families = binary
+        .then(|| {
+            array_buffer::strings()
+                .chain(typed_array::strings())
+                .chain(typed_array_methods::strings())
+                .chain(data_view::strings())
+        })
+        .into_iter()
+        .flatten();
+    let base64 = binary.then(base64::strings).into_iter().flatten();
     object::STRINGS
         .into_iter()
         .chain(object_static::strings())
@@ -338,13 +354,10 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(iter::strings())
         .chain(async_iter::strings())
         .chain(iterator::STRINGS)
-        .chain(array_buffer::strings())
-        .chain(typed_array::strings())
-        .chain(typed_array_methods::strings())
-        .chain(data_view::strings())
+        .chain(binary_families)
         .chain(proxy_strings())
         .chain(bigint::STRINGS)
-        .chain(base64::strings())
+        .chain(base64)
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
 
@@ -378,15 +391,16 @@ pub(super) fn emit_builtin(
 }
 
 /// Whether `builtin` belongs to a family the program cannot reach (DESIGN.md
-/// §6.11): a `Proxy` builtin while no proxy can exist, a `Reflect` function
-/// while `%Reflect%` cannot be held. Its body is then an `unreachable` stub
+/// §6.11, §4.2): a `Proxy` builtin while no proxy can exist, a `Reflect`
+/// function while `%Reflect%` cannot be held, a binary-data builtin
+/// ([`Builtin::is_binary`]) while binary data cannot be reached. Its body is then an `unreachable` stub
 /// that records no shake uses, so a name-only registry match (`"get"`,
 /// `"set"`, `"apply"`, ...) keeps nothing behind it.
 fn gated_off(builtin: Builtin, helpers: Helpers<'_>) -> bool {
     match builtin {
         Builtin::Proxy(_) => !helpers.proxies(),
         Builtin::Reflect(_) => !helpers.reflect(),
-        _ => false,
+        _ => builtin.is_binary() && !helpers.has_binary(),
     }
 }
 
