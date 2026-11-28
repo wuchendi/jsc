@@ -15,7 +15,7 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use builtins::{CallArg, call_spilling};
+use builtins::{CallArg, call_spilling, emit_with_array_length};
 
 /// Kind byte of a proxy (see [`abi::TYPE_PROXY`]).
 pub(in crate::emit) const TYPE_PROXY: i32 = abi::TYPE_PROXY as i32;
@@ -989,6 +989,28 @@ fn keys_load(f: &mut FnBuilder<'_>, k: Keys, arr: u32, out: u32) {
     wasm!(f; I64Load(m64(ELEMS_DATA_OFFSET)), LocalSet(out));
 }
 
+/// The target's full `[[OwnPropertyKeys]]` list into the rooted base
+/// `into`: a `LAZY` function target is materialized first, and an array
+/// target's `"length"` follows its integer keys (`__own_keys` lists
+/// neither). Clobbers `k.out`, `k.n`, `k.i`, `l.a`, `l.c` and `l.x`.
+fn target_keys(
+    f: &mut FnBuilder<'_>,
+    l: L,
+    k: Keys,
+    into: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let ret = Ret::I64;
+    wasm!(f; LocalGet(l.t), I32WrapI64, LocalSet(l.a));
+    emit_materialize(f, l.a, helpers);
+    wasm!(f; LocalGet(l.t), I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalSet(into));
+    check(f, ret);
+    wasm!(f; LocalGet(l.t), I32WrapI64, I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq, If(BlockType::Empty));
+    emit_with_array_length(f, [into, k.out, k.n, k.i, l.c], l.x, strings, helpers);
+    wasm!(f; LocalGet(k.out), LocalSet(into), End);
+}
+
 /// `CreateListFromArrayLike(l.r, « String, Symbol »)` into a fresh `k.ks`:
 /// a non-object, a non-string non-symbol element and a duplicate throw;
 /// strings are interned.
@@ -1062,8 +1084,7 @@ fn check_trap_keys(
         );
     };
     target_extensible(f, l, ret, helpers);
-    wasm!(f; LocalGet(l.t), I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalSet(k.tks));
-    check(f, ret);
+    target_keys(f, l, k, k.tks, strings, helpers);
     wasm!(f; I32Const(0), Call(helpers.new_array()), LocalSet(l.list));
     keys_loop(f, k, k.tks);
     keys_load(f, k, k.tks, l.x);
@@ -1167,8 +1188,8 @@ fn filter_keys(f: &mut FnBuilder<'_>, l: L, k: Keys, [p, mode]: [u32; 2], helper
 }
 
 /// `__proxy_own_keys(p: i32, mode: i32) -> i64` (§10.5.11): the keys of
-/// `[[OwnPropertyKeys]]` — the target's (`__own_keys(target, OWN_ALL_KEYS)`)
-/// without a trap, else the trap result through `CreateListFromArrayLike`
+/// `[[OwnPropertyKeys]]` — the target's full list (`LAZY` keys materialized,
+/// an array's `"length"` included) without a trap, else the trap result through `CreateListFromArrayLike`
 /// (an object; strings and symbols only, strings interned; no duplicates)
 /// checked against the target (every non-configurable key listed; a
 /// non-extensible target's keys exactly) — then filtered by the
@@ -1200,9 +1221,8 @@ pub(in crate::emit) fn emit_proxy_own_keys(
     wasm!(f;
         Block(BlockType::Empty),
         LocalGet(l.tr), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty),
-        LocalGet(l.t), I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalSet(k.ks),
     );
-    check(&mut f, ret);
+    target_keys(&mut f, l, k, k.ks, strings, helpers);
     wasm!(f; Br(1), End);
     call_trap(&mut f, l, &[CallArg::Val(l.t)], ret, helpers);
     trap_keys(&mut f, l, k, strings, helpers);

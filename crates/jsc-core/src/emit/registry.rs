@@ -448,6 +448,23 @@ pub(super) enum Big {
     ToNumeric,
     ToBigInt,
     LooseEq,
+    NumberValue,
+    AsN,
+    ToI64,
+    FromI64,
+    Add,
+    Sub,
+    Mul,
+    DivMod,
+    Pow,
+    Neg,
+    MagStep,
+    AddSmall,
+    Not,
+    BitOp,
+    Shift,
+    NumericOp,
+    NumericUnary,
 }
 
 const CORE: [Row<Core>; 59] = [
@@ -885,7 +902,7 @@ const EXTRA: [Row<Extra>; 20] = [
     }),
 ];
 
-const BIGINT: [Row<Big>; 14] = [
+const BIGINT: [Row<Big>; 31] = [
     (Big::New, (&[I32, I32], &[I32]), |cx| {
         bigint::emit_new(cx.strings, cx.helpers, cx.leaves)
     }),
@@ -927,6 +944,57 @@ const BIGINT: [Row<Big>; 14] = [
     }),
     (Big::LooseEq, (&[I64, I64], &[I32]), |cx| {
         bigint::emit_loose_eq(cx.helpers, cx.leaves)
+    }),
+    (Big::NumberValue, (&[I64], &[I64]), |cx| {
+        bigint::emit_number_value(cx.helpers, cx.leaves)
+    }),
+    (Big::AsN, (&[F64, I64, I32], &[I64]), |cx| {
+        bigint::emit_as_n(cx.helpers, cx.leaves)
+    }),
+    (Big::ToI64, (&[I32], &[I64]), |cx| {
+        bigint::emit_to_i64(cx.leaves)
+    }),
+    (Big::FromI64, (&[I64, I32], &[I64]), |cx| {
+        bigint::emit_from_i64(cx.helpers, cx.leaves)
+    }),
+    (Big::Add, (&[I32, I32], &[I64]), |cx| {
+        bigint::emit_add_sub(false, cx.helpers, cx.leaves)
+    }),
+    (Big::Sub, (&[I32, I32], &[I64]), |cx| {
+        bigint::emit_add_sub(true, cx.helpers, cx.leaves)
+    }),
+    (Big::Mul, (&[I32, I32], &[I64]), |cx| {
+        bigint::emit_mul(cx.helpers, cx.leaves)
+    }),
+    (Big::DivMod, (&[I32, I32, I32], &[I64]), |cx| {
+        bigint::emit_divmod(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Big::Pow, (&[I32, I32], &[I64]), |cx| {
+        bigint::emit_pow(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Big::Neg, (&[I32], &[I64]), |cx| {
+        bigint::emit_neg(cx.helpers, cx.leaves)
+    }),
+    (Big::MagStep, (&[I32, I32, I32], &[I64]), |cx| {
+        bigint::emit_mag_step(cx.helpers, cx.leaves)
+    }),
+    (Big::AddSmall, (&[I64, I32], &[I64]), |cx| {
+        bigint::emit_add_small(cx.helpers, cx.leaves)
+    }),
+    (Big::Not, (&[I32], &[I64]), |cx| {
+        bigint::emit_not(cx.helpers, cx.leaves)
+    }),
+    (Big::BitOp, (&[I32, I32, I32], &[I64]), |cx| {
+        bigint::emit_bitop(cx.helpers, cx.leaves)
+    }),
+    (Big::Shift, (&[I32, I32, I32], &[I64]), |cx| {
+        bigint::emit_shift(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Big::NumericOp, (&[I64, I64, I32], &[I64]), |cx| {
+        bigint::emit_numeric_op(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Big::NumericUnary, (&[I64, I32], &[I64]), |cx| {
+        bigint::emit_numeric_unary(cx.helpers, cx.leaves)
     }),
 ];
 

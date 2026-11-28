@@ -310,8 +310,10 @@ fn load_kind(function: &mut impl Sink, x: u32, kind: u32) {
 /// `__add(a: i64, b: i64) -> i64`: the `+` operator once either operand is
 /// a heap value: `ToPrimitive` both (hint default; only objects call out, a
 /// symbol comes back as is), then concatenate the `ToString`s when either
-/// primitive is a string, else add the `ToNumber`s (a symbol throws in
-/// either conversion).
+/// primitive is a string, else add the `ToNumeric`s: a `BigInt` operand goes
+/// through `__numeric_op` (two `BigInts` add, a mix throws); otherwise the
+/// `ToNumber`s add (a symbol throws in either conversion). A program that
+/// can produce no `BigInt` (DESIGN.md §6.10.9) leaves the `BigInt` arm out.
 pub(super) fn emit_add_helper(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let (a, b, ka, kb, lhs, num) = (0, 1, 2, 3, 4, 5);
     let mut f = helper_builder(
@@ -354,6 +356,17 @@ pub(super) fn emit_add_helper(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
     wasm!(f; Call(helpers.concat));
     f.release_temps(mark);
     wasm!(f; I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Else);
+    if helpers.bigints() {
+        bigint::emit_is_bigint(&mut f, a);
+        bigint::emit_is_bigint(&mut f, b);
+        wasm!(f;
+            I32Or,
+            If(BlockType::Empty),
+            LocalGet(a), LocalGet(b), I32Const(bigint::NUMOP_ADD),
+            Call(helpers.bigint(registry::Big::NumericOp)), Return,
+            End,
+        );
+    }
     wasm!(f; LocalGet(a), Call(helpers.to_number), F64ReinterpretI64, LocalSet(num));
     return_if_pending(&mut f, &undefined);
     wasm!(f;
@@ -380,15 +393,24 @@ fn pick_relational(function: &mut FnBuilder<'_>, op: u32, cmps: [&dyn Fn(&mut Fn
 
 /// `__compare(a: i64, b: i64, op: i32) -> i32`: the relational operators
 /// once an operand is not a number: `ToPrimitive` both (hint number), then
-/// two strings compare by bytes and anything else by `ToNumber` (which
-/// throws for a symbol).
+/// two strings compare by bytes; with a `BigInt` operand (DESIGN.md
+/// §6.10.6), two `BigInts` compare by value, a `BigInt` and a string through
+/// `StringToBigInt` (an unparsable string makes every operator `false`), a
+/// `BigInt` and anything else exactly against its `ToNumber` (`NaN`:
+/// `false`; a symbol throws); anything else by `ToNumber` (which throws for a
+/// symbol).
+#[allow(clippy::too_many_lines)]
 pub(super) fn emit_compare(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let (a, b, op, ord, lhs, rhs) = (0, 1, 2, 3, 4, 5);
-    let mut f = helper_builder(
-        leaves,
-        &[ROOT_JS, ROOT_JS, RAW_I32],
-        &[RAW_I32, RAW_F64, RAW_F64],
-    );
+    // Without a reachable `BigInt` (DESIGN.md §6.10.9) the `BigInt` arm and
+    // its three locals are left out.
+    let bigints = helpers.bigints();
+    let locals: &[LocalClass] = if bigints {
+        &[RAW_I32, RAW_F64, RAW_F64, ROOT_JS, ROOT_JS, RAW_I32]
+    } else {
+        &[RAW_I32, RAW_F64, RAW_F64]
+    };
+    let mut f = helper_builder(leaves, &[ROOT_JS, ROOT_JS, RAW_I32], locals);
     for v in [a, b] {
         wasm!(f; LocalGet(v), I32Const(HINT_NUMBER), Call(helpers.to_primitive()), LocalSet(v));
         return_if_pending(&mut f, &Instruction::I32Const(0));
@@ -411,6 +433,10 @@ pub(super) fn emit_compare(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
             &int(Instruction::I32GeS),
         ],
     );
+    if bigints {
+        wasm!(f; Else);
+        compare_bigint_arm(&mut f, op, helpers);
+    }
     wasm!(f;
         Else,
         LocalGet(a), Call(helpers.to_number), F64ReinterpretI64, LocalSet(lhs),
@@ -430,7 +456,72 @@ pub(super) fn emit_compare(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         ],
     );
     wasm!(f; End, End);
+    if bigints {
+        wasm!(f; End);
+    }
     finish_builder(f)
+}
+
+/// The `BigInt` arm of [`emit_compare`] (DESIGN.md §6.10.6), leaving the
+/// operator's i32 result: `ord` is the order of `a` against `b` (-1 / 0 / 1).
+fn compare_bigint_arm(f: &mut FnBuilder<'_>, op: u32, helpers: Helpers<'_>) {
+    let (a, b, ord, big, other, flip) = (0, 1, 3, 6, 7, 8);
+    let big_helper = |h| helpers.bigint(h);
+    let int = |cmp: Instruction<'static>| move |function: &mut FnBuilder<'_>| wasm!(function; LocalGet(ord), I32Const(0), cmp.clone());
+    // A BigInt operand: ord = the order of a against b (-1 / 0 / 1).
+    bigint::emit_is_bigint(f, a);
+    bigint::emit_is_bigint(f, b);
+    wasm!(f; I32Or, If(BlockType::Result(ValType::I32)));
+    bigint::emit_is_bigint(f, a);
+    bigint::emit_is_bigint(f, b);
+    wasm!(f;
+        I32And,
+        If(BlockType::Empty),
+        LocalGet(a), I32WrapI64, LocalGet(b), I32WrapI64,
+        Call(big_helper(registry::Big::Cmp)), LocalSet(ord),
+        Else,
+    );
+    bigint::emit_is_bigint(f, a);
+    wasm!(f;
+        I32Eqz, LocalTee(flip),
+        If(BlockType::Empty),
+        LocalGet(b), LocalSet(big), LocalGet(a), LocalSet(other),
+        Else,
+        LocalGet(a), LocalSet(big), LocalGet(b), LocalSet(other),
+        End,
+    );
+    emit_is_string(f, other);
+    wasm!(f;
+        If(BlockType::Empty),
+        LocalGet(other), I32WrapI64, Call(big_helper(registry::Big::FromString)), LocalSet(other),
+        // A size RangeError while parsing a huge string: unparsable.
+        I32Const(0), GlobalSet(EXC_PENDING_GLOBAL),
+        LocalGet(other), I64Const(UNDEFINED_BITS), I64Eq,
+        If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(big), I32WrapI64, LocalGet(other), I32WrapI64,
+        Call(big_helper(registry::Big::Cmp)), LocalSet(ord),
+        Else,
+        LocalGet(other), Call(helpers.to_number), LocalSet(other),
+    );
+    return_if_pending(f, &Instruction::I32Const(0));
+    wasm!(f;
+        LocalGet(big), I32WrapI64, LocalGet(other), F64ReinterpretI64,
+        Call(big_helper(registry::Big::CmpNum)), LocalTee(ord), I32Const(2), I32Eq,
+        If(BlockType::Empty), I32Const(0), Return, End,
+        End,
+        I32Const(0), LocalGet(ord), I32Sub, LocalGet(ord), LocalGet(flip), Select, LocalSet(ord),
+        End,
+    );
+    pick_relational(
+        f,
+        op,
+        [
+            &int(Instruction::I32LtS),
+            &int(Instruction::I32GtS),
+            &int(Instruction::I32LeS),
+            &int(Instruction::I32GeS),
+        ],
+    );
 }
 
 /// `__array_join(recv: i64, sep: i64) -> i64`: `Array.prototype.join` on an

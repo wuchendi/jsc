@@ -12,19 +12,21 @@
 pub enum OpSetKind {
     /// `obj[index] op= rhs`: combine the current value as-is; yield the new value.
     Compound,
-    /// `++obj[index]` / `--obj[index]`: convert the current value with `ToNumber`
-    /// before combining; yield the new value.
+    /// `++obj[index]` / `--obj[index]`: convert the current value with
+    /// `ToNumeric` and step it by `rhs` (`±1`) in its own type
+    /// ([`IrNode::NumericStep`]); yield the new value.
     PrefixUpdate,
     /// `obj[index]++` / `obj[index]--`: like [`Self::PrefixUpdate`], but yield the
-    /// OLD value converted to a number.
+    /// OLD value converted with `ToNumeric`.
     PostfixUpdate,
 }
 
 /// A binary operator over jsval operands.
 ///
-/// Arithmetic operators (`Add`..`Mod`) unbox their operands to `f64` and produce
-/// a number jsval; bitwise and shift operators (`BitAnd`..`UShr`) apply
-/// `ToNumber` then `ToInt32`/`ToUint32` and produce a number jsval; comparison operators (`Lt`..`LooseNe`) produce a boolean jsval
+/// Arithmetic operators (`Add`..`Mod`, `Exp`) and bitwise and shift operators
+/// (`BitAnd`..`UShr`) compute inline on two numbers (`ToInt32`/`ToUint32` for
+/// the bitwise ones) and otherwise apply `ToNumeric` (DESIGN.md §6.10.5): two
+/// `BigInts` give a `BigInt`, a mix throws; comparison operators (`Lt`..`LooseNe`) produce a boolean jsval
 /// (`true`/`false`). Relational operators (`Lt`..`Ge`) compare numerically;
 /// `Eq`/`Ne` are strict `===`/`!==` (type-then-value across all jsval types);
 /// `LooseEq`/`LooseNe` are loose `==`/`!=` (Abstract Equality with coercion).
@@ -45,8 +47,7 @@ pub enum BinOp {
     BitAnd,
     /// Bitwise OR (`|`) over the operands' `ToInt32`.
     BitOr,
-    /// Bitwise XOR (`^`) over the operands' `ToInt32`. Unary `~x` lowers to
-    /// `x ^ -1`.
+    /// Bitwise XOR (`^`) over the operands' `ToInt32`.
     BitXor,
     /// Left shift (`<<`): `ToInt32(lhs)` shifted by `ToUint32(rhs) & 31`.
     Shl,
@@ -56,6 +57,10 @@ pub enum BinOp {
     /// Zero-fill right shift (`>>>`): `ToUint32(lhs)` shifted logically by
     /// `ToUint32(rhs) & 31`; the result is an unsigned 32-bit number.
     UShr,
+    /// Exponentiation (`**`, `**=`): `ToNumeric` both operands; two numbers
+    /// compute `Number::exponentiate` (the `Math.pow` code), two `BigInts`
+    /// `BigInt::exponentiate`, a mix throws (DESIGN.md §6.10.5).
+    Exp,
     /// Less-than (`<`).
     Lt,
     /// Greater-than (`>`).
@@ -211,9 +216,14 @@ pub enum ConvertOp {
     /// `String(x)` called (not constructed): [`ConvertOp::ToString`], except
     /// a symbol yields its `SymbolDescriptiveString` (`"Symbol(desc)"`).
     String,
-    /// `Number(x)` — `ToNumber`: a number passes through, anything else goes
-    /// through `__to_number` (`ToPrimitive`, then the host `StringToNumber`).
+    /// `ToNumber(x)` (unary `+`, the update desugarings): a number passes
+    /// through, anything else goes through `__to_number` (`ToPrimitive`, then
+    /// `StringToNumber`; a symbol or a `BigInt` throws).
     ToNumber,
+    /// `Number(x)` (DESIGN.md §6.10.7): a number passes through inline like
+    /// [`ConvertOp::ToNumber`], anything else goes through `__number_value`
+    /// (`ToNumeric`, then a `BigInt` converts to its Number value).
+    NumberCall,
     /// `Boolean(x)` — JS truthiness (a boolean jsval). Lowered to inline wasm.
     ToBoolean,
     /// `parseInt(s, radix)` — the guest `__parse_int` over `ToString(s)` and the
@@ -222,6 +232,10 @@ pub enum ConvertOp {
     /// `parseFloat(s)` — the leading decimal float of `ToString(s)`, parsed on
     /// the host, or NaN when none.
     ParseFloat,
+    /// `ToNumeric(x)` (DESIGN.md §6.10.5): a number passes through, anything
+    /// else goes through `__to_numeric` (a `BigInt` is kept). The read of a
+    /// non-local `++` / `--`.
+    ToNumeric,
 }
 
 /// The inline fast path of an `Array.prototype` search/join method on an
@@ -571,6 +585,8 @@ pub enum BuiltinCtor {
     TypedArray,
     /// A concrete typed-array constructor (`Int8Array` .. `Float64Array`).
     Typed(ElementKind),
+    /// `BigInt` (DESIGN.md §6.10.7): callable, `new` throws.
+    BigInt,
 }
 
 /// A typed-array element kind (DESIGN.md §5.8.6), in the spec's Table 71
@@ -660,7 +676,7 @@ impl ElementKind {
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 36] = [
+    pub(crate) const ALL: [BuiltinCtor; 37] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -697,6 +713,7 @@ impl BuiltinCtor {
         Self::Typed(ElementKind::Uint32),
         Self::Typed(ElementKind::Float32),
         Self::Typed(ElementKind::Float64),
+        Self::BigInt,
     ];
 
     /// The constructor's global name (also its `name`).
@@ -721,9 +738,9 @@ impl BuiltinCtor {
             Self::FinalizationRegistry => "FinalizationRegistry",
             Self::ArrayBuffer => "ArrayBuffer",
             Self::DataView => "DataView",
-
             Self::TypedArray => "TypedArray",
             Self::Typed(kind) => kind.name(),
+            Self::BigInt => "BigInt",
         }
     }
 
@@ -1632,7 +1649,8 @@ pub enum IrNode {
     /// `console.log(...)` with a spread argument: builds the argument array
     /// (like [`IrNode::ArraySpread`], carried by `args`) then prints its
     /// elements like [`IrNode::ConsoleLog`] prints its arguments; yields
-    /// `undefined`.
+    /// `undefined`. Every argument (the whole spread included) is evaluated
+    /// before anything is printed.
     ConsoleLogSpread {
         /// The argument array to print — an [`IrNode::ArraySpread`].
         args: Box<IrNode>,
@@ -1889,13 +1907,29 @@ pub enum IrNode {
         /// (yields the old value).
         prefix: bool,
     },
-    /// A `console.log(a0, a1, ..)` call. It is NOT a user-function call:
-    /// it lowers to a sequence of calls to the host `print` import, one per
-    /// argument, then yields the `undefined` jsval (its expression value). The
-    /// backend formats each argument's jsval on the host side (reusing
-    /// `format_value`), separating arguments with a single space and terminating
-    /// the line with a newline. `console.log()` with no arguments prints just a
-    /// newline. Arguments are evaluated left-to-right.
+    /// Unary minus `-operand` (DESIGN.md §6.10.5): `ToNumeric`, then a number
+    /// is negated (`-0 - x`) and a `BigInt` goes through `__bigint_neg`.
+    Negate(Box<IrNode>),
+    /// Bitwise NOT `~operand`: `ToNumeric`, then a number is `ToInt32(x) ^ -1`
+    /// and a `BigInt` is `-x - 1n`.
+    BitNot(Box<IrNode>),
+    /// `arg ± 1` of `arg`'s own numeric type (`arg` is already a number or a
+    /// `BigInt`, the result of a [`ConvertOp::ToNumeric`]): the update step of
+    /// a non-local `++` / `--`, and the old value of a postfix one.
+    NumericStep {
+        /// The numeric operand.
+        arg: Box<IrNode>,
+        /// `true` for `+ 1`, `false` for `- 1`.
+        inc: bool,
+    },
+    /// A `console.log(a0, a1, ..)` call. It is NOT a user-function call: the
+    /// guest renderer formats each argument's jsval into the output buffer,
+    /// separating arguments with a single space and terminating the line with
+    /// a newline, then yields the `undefined` jsval (its expression value).
+    /// `console.log()` with no arguments prints just a newline. Arguments are
+    /// evaluated left-to-right, all of them before anything is printed: a
+    /// throwing argument prints nothing, and each value renders in its state
+    /// after the last argument ran.
     ConsoleLog {
         /// The argument expressions, in source order (0..N).
         args: Vec<IrNode>,
@@ -2789,6 +2823,9 @@ impl IrNode {
             | IrNode::NullishCheck { value: inner, .. }
             | IrNode::ArrayPush { value: inner, .. }
             | IrNode::Not(inner)
+            | IrNode::Negate(inner)
+            | IrNode::BitNot(inner)
+            | IrNode::NumericStep { arg: inner, .. }
             | IrNode::Throw(inner)
             | IrNode::ObjectBuiltin { arg: inner, .. }
             | IrNode::JsonStringify { arg: inner }
@@ -3030,6 +3067,9 @@ impl IrNode {
             | IrNode::NullishCheck { value: inner, .. }
             | IrNode::ArrayPush { value: inner, .. }
             | IrNode::Not(inner)
+            | IrNode::Negate(inner)
+            | IrNode::BitNot(inner)
+            | IrNode::NumericStep { arg: inner, .. }
             | IrNode::Throw(inner)
             | IrNode::ObjectBuiltin { arg: inner, .. }
             | IrNode::JsonStringify { arg: inner }

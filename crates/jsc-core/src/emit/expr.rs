@@ -718,6 +718,11 @@ fn emit_node_inner(
         IrNode::IncDec { local, inc, prefix } => {
             emit_inc_dec(*local, *inc, *prefix, function, helpers);
         }
+        IrNode::Negate(arg) => emit_numeric_unary(true, arg, function, scratch, strings, helpers),
+        IrNode::BitNot(arg) => emit_numeric_unary(false, arg, function, scratch, strings, helpers),
+        IrNode::NumericStep { arg, inc } => {
+            emit_numeric_step(arg, *inc, function, scratch, strings, helpers);
+        }
         // The promise primitives call the guest promise engine.
         IrNode::PromiseResolve(value) => {
             emit_promise_resolve(value, function, scratch, strings, helpers);
@@ -1947,7 +1952,8 @@ fn emit_select_object(function: &mut impl Sink, local: u32, alt: &Instruction<'_
 }
 
 /// Push `1` if the jsval in `local` is an object (a heap value other than a
-/// string or a symbol), else `0`.
+/// string, a symbol or a `BigInt`), else `0`. A program that can produce no
+/// `BigInt` (DESIGN.md §6.10.9) skips the `BigInt` test.
 pub(super) fn emit_is_object(function: &mut impl Sink, local: u32) {
     emit_is_pointer(function, local);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
@@ -1958,10 +1964,12 @@ pub(super) fn emit_is_object(function: &mut impl Sink, local: u32) {
     function.instruction(&Instruction::I32Const(TYPE_SYMBOL));
     function.instruction(&Instruction::I32Ne);
     function.instruction(&Instruction::I32And);
-    emit_load_type_byte(function, local);
-    function.instruction(&Instruction::I32Const(TYPE_BIGINT));
-    function.instruction(&Instruction::I32Ne);
-    function.instruction(&Instruction::I32And);
+    if roots::bigints_reachable() {
+        emit_load_type_byte(function, local);
+        function.instruction(&Instruction::I32Const(TYPE_BIGINT));
+        function.instruction(&Instruction::I32Ne);
+        function.instruction(&Instruction::I32And);
+    }
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);
@@ -3106,13 +3114,34 @@ fn emit_end_line(function: &mut impl Sink, helpers: Helpers<'_>) {
     function.instruction(&Instruction::Call(helpers.out_flush()));
 }
 
+/// Whether evaluating `node` can neither throw, run user code, nor allocate:
+/// a literal, a static block, or a plain local read.
+fn is_inert(node: &IrNode) -> bool {
+    matches!(
+        node,
+        IrNode::Num(_)
+            | IrNode::Bool(_)
+            | IrNode::Null
+            | IrNode::Undefined
+            | IrNode::Str(_)
+            | IrNode::BigInt { .. }
+            | IrNode::Local(_)
+            | IrNode::Intrinsic(_)
+            | IrNode::DeclFunc(_)
+    )
+}
+
 /// Emit a `console.log(a0, .., a_{n-1})` expression, leaving the
 /// `undefined` jsval (its expression value) on the stack.
 ///
-/// Each argument is evaluated left-to-right and appended to the output buffer
-/// by the guest renderer, separated by a single space; the line is written
-/// with one `fd_write` after the last argument (for no arguments, just a
-/// newline).
+/// Every argument is evaluated left-to-right before anything is printed, so
+/// a throwing argument leaves no partial line and each value renders in its
+/// state after the last argument ran. When every argument past the first is
+/// inert ([`is_inert`]) the arguments are streamed: each is evaluated and
+/// appended to the output buffer by the guest renderer, separated by a single
+/// space, and the line is written with one `fd_write` after the last argument
+/// (for no arguments, just a newline). Otherwise the arguments are collected
+/// into a rooted array literal and printed by [`emit_console_log_spread`].
 pub(super) fn emit_console_log(
     args: &[IrNode],
     function: &mut impl Sink,
@@ -3120,6 +3149,11 @@ pub(super) fn emit_console_log(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    if args.iter().skip(1).any(|arg| !is_inert(arg)) {
+        let array = IrNode::Array(args.to_vec());
+        emit_console_log_spread(&array, function, scratch, strings, helpers);
+        return;
+    }
     // An allocation that ran out of memory earlier (a valid block from the
     // reserve, design/runtime-memory.md §5.8) throws before any output.
     emit_propagate_if_pending(function, helpers);
@@ -3138,9 +3172,10 @@ pub(super) fn emit_console_log(
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
 }
 
-/// Emit a `console.log(...)` spread call: build the argument array, then
-/// render each element (a hole as `undefined`) like [`emit_console_log`]
-/// renders its arguments — a bare newline for none — and push `undefined`.
+/// Emit a `console.log(...)` spread call: build the argument array (every
+/// argument evaluated before anything is printed), then render each element
+/// (a hole as `undefined`) like [`emit_console_log`] renders its arguments — a
+/// bare newline for none — and push `undefined`.
 pub(super) fn emit_console_log_spread(
     args: &IrNode,
     function: &mut impl Sink,
@@ -3187,6 +3222,8 @@ pub(super) fn emit_console_log_spread(
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     emit_end_line(function, helpers);
+    // The render buffers may have taken the out-of-memory reserve.
+    emit_propagate_if_pending(function, helpers);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
 }
 
@@ -3233,10 +3270,14 @@ pub(super) fn emit_typeof_node(
     function.instruction(&Instruction::If(BlockType::Result(ValType::I64)));
     // HEAP: map the type byte -> typeof index. Base is 3 ("object", array/object);
     // override string -> 4, function -> 5, symbol -> 6 and bigint -> 7 with
-    // layered selects.
+    // layered selects (no bigint select when the program can produce no
+    // `BigInt`, DESIGN.md §6.10.9).
+    let bigints = helpers.bigints();
     function.instruction(&Instruction::I64Const(4)); // val1: "string"
     function.instruction(&Instruction::I64Const(6)); // val1: "symbol"
-    function.instruction(&Instruction::I64Const(7)); // val1: "bigint"
+    if bigints {
+        function.instruction(&Instruction::I64Const(7)); // val1: "bigint"
+    }
     function.instruction(&Instruction::I64Const(5)); // val1: "function"
     function.instruction(&Instruction::I64Const(3)); // val2: base "object"
     emit_load_type_byte(function, scratch);
@@ -3260,10 +3301,12 @@ pub(super) fn emit_typeof_node(
         function.instruction(&Instruction::I32Or);
     }
     function.instruction(&Instruction::Select); // function ? 5 : 3
-    emit_load_type_byte(function, scratch);
-    function.instruction(&Instruction::I32Const(TYPE_BIGINT));
-    function.instruction(&Instruction::I32Eq);
-    function.instruction(&Instruction::Select); // bigint ? 7 : (function ? 5 : 3)
+    if bigints {
+        emit_load_type_byte(function, scratch);
+        function.instruction(&Instruction::I32Const(TYPE_BIGINT));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::Select); // bigint ? 7 : (function ? 5 : 3)
+    }
     emit_load_type_byte(function, scratch);
     function.instruction(&Instruction::I32Const(TYPE_SYMBOL));
     function.instruction(&Instruction::I32Eq);
@@ -3309,8 +3352,10 @@ pub(super) fn emit_typeof_node(
             .unwrap_or(HEAP_BASE);
         HEAP_BITS | i64::from(offset)
     };
+    // "bigint" is the last word; index 7 never arises without a `BigInt`.
+    let words = crate::abi::TYPEOF_STRINGS.len() - usize::from(!bigints);
     function.instruction(&Instruction::I64Const(word_ptr(0)));
-    for k in 1..crate::abi::TYPEOF_STRINGS.len() {
+    for k in 1..words {
         function.instruction(&Instruction::I64Const(word_ptr(k)));
         function.instruction(&Instruction::LocalGet(scratch));
         function.instruction(&Instruction::I32WrapI64);

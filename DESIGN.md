@@ -532,7 +532,7 @@ Arrays additionally: `4` `SPARSE`, `8` `JOINING` (set while `join` runs, so a
 cyclic element joins as `""`), `16` `LENGTH_READONLY` (`length` is
 non-writable; only on a `DICTIONARY` array), `32` `DICTIONARY` (§5.4). None of
 the array bits is ever cleared (except `JOINING`).
-Proxies (`TYPE_PROXY`, phase 5b, planned, §6.11) keep the prefix shape but
+Proxies (`TYPE_PROXY`, phase 5b, §6.11) keep the prefix shape but
 are not in the object family; their flags reuse `CONSTRUCTOR` (`8`) and
 `SELF_ALLOC` (`32`), and header byte 3 holds `1` `PROXY_CLASS_CALLABLE`.
 
@@ -559,7 +559,7 @@ are not in the object family; their flags reuse `CONSTRUCTOR` (`8`) and
 | `17` `TYPE_WEAKREF` | `WeakRef` | prefix, `weak_next: u32 @16`, pad, `target: i64 @24` (weak; `undefined` once collected) | 32 | `object` |
 | `18` `TYPE_FINREG` | `FinalizationRegistry` | prefix, `weak_next: u32 @16`, `cells: u32 @20` → weak `TYPE_ELEMS` of `(target, held, token)` triples, `cleanup: i64 @24`, `flags: u32 @32` (`1` `FINREG_FLAG_JOB_QUEUED`), `job_next: u32 @36` (the `$__fin_jobs` link) | 40 | `object` |
 | `19` `TYPE_RAW` | internal raw buffer | header, `len: u32 @4`, `len` bytes from `@8`, no references (the grown intern table, `Math.sumPrecise` accumulator) | 8 + `len` | — |
-| `20` `TYPE_PROXY` | Proxy exotic object (phase 5b, planned, §6.11) | header (flags `8` `CONSTRUCTOR`, `32` `SELF_ALLOC`; byte 3 `1` `PROXY_CLASS_CALLABLE`), `props: u32 @4` (private entries only), `proto: i64 @8` (always `null`), `func_idx: u32 @16` (the `ProxyCall` slot when callable), reserved `u32 @20`, `env: i64 @24` (itself when callable), `target: i64 @32`, `handler: i64 @40` (both `null` once revoked) | 48 | `function` when callable, else `object` |
+| `20` `TYPE_PROXY` | Proxy exotic object (phase 5b, §6.11) | header (flags `8` `CONSTRUCTOR`, `32` `SELF_ALLOC`; byte 3 `1` `PROXY_CLASS_CALLABLE`), `props: u32 @4` (private entries only), `proto: i64 @8` (always `null`), `func_idx: u32 @16` (the `ProxyCall` slot when callable), reserved `u32 @20`, `env: i64 @24` (itself when callable), `target: i64 @32`, `handler: i64 @40` (both `null` once revoked) | 48 | `function` when callable, else `object` |
 | `14` `TYPE_SYMBOL` | Symbol primitive | header (flags: `4` `SYMBOL_FLAG_REGISTERED`, `8` `SYMBOL_FLAG_PRIVATE` (a private name, §7.6, phase 5a); bits `1`/`2` always clear), reserved `u32 @4` = 0, `description: i64 @8` (string or `undefined`) | 16 | `symbol` |
 | `21` `TYPE_BIGINT` | BigInt primitive (§6.10) | header (flags: `1` `BIGINT_FLAG_NEG`), `len: u32 @4` (limb count), `u32` limbs × `len` @8, little-endian, canonical | `8 + 4·len`, rounded | `bigint` |
 
@@ -850,7 +850,8 @@ in the data segment (§4.2), so it has one identity for the whole run.
   (callable only with the construct marker; its `prototype` is installed by
   the class definition). `SELF_ALLOC` marks a derived class and the builtin
   constructors that allocate their own object from `new.target` (Array, the
-  Error family, Map, Set, Promise, Date).
+  Error family, Map, Set, Promise, Date, the weak collections, the binary-data
+  constructors, and the `String` / `Number` / `Boolean` wrappers).
 - **No own `caller` / `arguments`.** Every function is strict; both names
   resolve to the `%ThrowTypeError%` accessors on `%Function.prototype%`.
 - **Bound functions.** `Function.prototype.bind` allocates a `BOUND`
@@ -1059,7 +1060,7 @@ and never nests (`$__gc_busy`).
   | `12` `TYPE_PROPS` | entries `k < count @4` at `16 + 16k`: raw key `@+0` (`0` = tombstone), jsval value `@+8` |
   | `13` `TYPE_ELEMS` | jsval slots `@8 + 8i` for every `i < cap @4` (not `len`, so a stale slot can only retain); a store flagged `ELEMS_FLAG_WEAK` is marked but none of its slots is traced |
   | `14` `TYPE_SYMBOL` | jsval `description @8` |
-  | `20` `TYPE_PROXY` (phase 5b, planned, §6.11) | raw `props @4`, jsvals `proto @8`, `env @24`, `target @32`, `handler @40` |
+  | `20` `TYPE_PROXY` (phase 5b, §6.11) | raw `props @4`, jsvals `proto @8`, `env @24`, `target @32`, `handler @40` |
   | `15` `TYPE_WEAKMAP`, `16` `TYPE_WEAKSET` | raw `entries @20` (the weak store: marked, not traced); the handle is linked into `$__gc_weak` through `weak_next` unless already linked this cycle |
   | `17` `TYPE_WEAKREF` | nothing past the prefix (`target @24` is weak); linked into `$__gc_weak_refs` |
   | `18` `TYPE_FINREG` | jsval `cleanup @24`, raw `cells @20` (the weak store: marked, not traced) and each cell's `held` value (slot `3i + 1`; targets and tokens are weak); linked into `$__gc_weak_regs` |
@@ -1159,7 +1160,7 @@ here reports the conflict instead of picking a different design.
 
 | type byte | kind |
 |---|---|
-| `20`..`23` | **reserved** for the parallel phase-5b workstreams (Proxy, BigInt); never used here |
+| `20`..`23` | `20` is `TYPE_PROXY` (§6.11), `21` is `TYPE_BIGINT` (§6.10); `22` / `23` spare |
 | `24` `TYPE_ARRAYBUFFER` | an `ArrayBuffer` object |
 | `25` `TYPE_TYPEDARRAY` | an instance of any of the concrete typed-array constructors |
 | `26` `TYPE_DATAVIEW` | a `DataView` object |
@@ -1780,7 +1781,7 @@ function-index order:
 | number to string (§6.5) | `__umul128`, `__ryu_pow5`, `__ryu_mul_shift`, `__ryu_mp5`, `__ryu_d2d(bits)` (Ryu shortest digits), `__scratch_str(ptr, len)`, `__num_to_str(bits)` (`Number::toString`), `__prim_str(v)` (`ToString` of a primitive), `__msg_str(v)` (the text of any value in an error message), `__dec_expand(bits)` (the exact decimal expansion), `__num_format(bits, mode, f)` (`toFixed` / `toExponential` / `toPrecision`), `__num_radix(bits, radix)` |
 | string to number (§6.5) | `__num_unit`, `__str_ws`, `__dec_parse(data, start, end)`, `__dec_slow`, `__dec_round`, `__dec_left`, `__dec_right`, `__digit_span`, `__radix_pow2`, `__radix_fold`, `__string_to_number(s)`, `__to_number_prim(v)`, `__parse_float(v)`, `__parse_int(v, radix)` |
 | clock, random | `__now()`, `__random()` (§6.5) |
-| BigInt (§6.10) | `__bigint_new(len, neg)`, `__bigint_trim(p)`, `__bigint_eq(a, b)`, `__bigint_cmp_mag(a, b)`, `__bigint_cmp(a, b)`, `__bigint_cmp_num(a, x)`, `__bigint_hash(p)`, `__bigint_to_string(v, radix)`, `__string_to_bigint(s)`, `__bigint_to_f64(p)`, `__bigint_from_f64(x)`, `__to_numeric(v)`, `__to_bigint(v)`, `__bigint_loose_eq(a, b)` (the last group, after the extra helpers) |
+| BigInt (§6.10) | `__bigint_new(len, neg)`, `__bigint_trim(p)`, `__bigint_eq(a, b)`, `__bigint_cmp_mag(a, b)`, `__bigint_cmp(a, b)`, `__bigint_cmp_num(a, x)`, `__bigint_hash(p)`, `__bigint_to_string(v, radix)`, `__string_to_bigint(s)`, `__bigint_to_f64(p)`, `__bigint_from_f64(x)`, `__to_numeric(v)`, `__to_bigint(v)`, `__bigint_loose_eq(a, b)`, `__number_value(v)`, `__bigint_as_n(bits, v, signed)`, `__bigint_to_i64(p)`, `__bigint_from_i64(v, signed)`, `__bigint_add(a, b)`, `__bigint_sub(a, b)`, `__bigint_mul(a, b)`, `__bigint_divmod(a, b, want_rem)`, `__bigint_pow(a, b)`, `__bigint_neg(a)`, `__bigint_mag_step(p, inc, neg)`, `__bigint_add_small(v, d)`, `__bigint_not(a)`, `__bigint_bitop(a, b, op)`, `__bigint_shift(a, n, right)`, `__numeric_op(a, b, op)`, `__numeric_unary(v, op)` (the last group, after the extra helpers) |
 | misc | `__gen_to_array(gen)`, `__nullish_throw(recv, key, set)`, `__prop_throw(recv, key, mode)`, `__box_f64(x)`, `__to_number(v)` |
 | trampolines | `__invoke1(fn, arg)` (the promise jobs' callback trampoline), `__async_step(gen, sent)` (the `async` driver's step trampoline), the two `new Promise` settlers |
 | constructors | `new_string(len, two_byte)`, `__new_array(len)` |
@@ -1791,7 +1792,7 @@ function-index order:
 | promises (§6.7) | the self-resolution `TypeError` constructor `() -> i64` that `__promise_settle` rejects with |
 | well-known symbols | `__symbol_get(v, sym)` — `Get(v, sym)`, looking only in the tables on `v`'s chain that have `HAS_SYMBOL_KEYS` (`undefined` when none does; the well-known symbol consult sites, §6.4); an accessor hit always calls its getter, even in a program compiled without the accessor dispatch of `__get`, since builtins alone read the realm's `get [@@species]` and `%Iterator.prototype%`'s `get [@@toStringTag]` |
 | `super` references (§6.3) | `__super_get(home, key, recv)`, `__super_set(home, key, v, recv)` |
-| proxies (§6.11, phase 5b, planned), appended after the collector's | `__proxy_trap(p, name)`, `__proxy_get_proto`, `__proxy_set_proto`, `__proxy_is_extensible`, `__proxy_prevent_ext`, `__proxy_own_prop`, `__proxy_define_own`, `__proxy_has`, `__proxy_get`, `__proxy_set`, `__proxy_delete`, `__proxy_own_keys`; the generic `__get_proto(v)`, `__own_prop(obj, key, list)`, `__desc_compatible(ext, d, cur)`, `__is_array(v)`, `__set_bool(target, key, v, recv)` |
+| proxies (§6.11, phase 5b), appended after the collector's | `__proxy_trap(p, name)`, `__proxy_get_proto`, `__proxy_set_proto`, `__proxy_is_extensible`, `__proxy_prevent_ext`, `__proxy_own_prop`, `__proxy_define_own`, `__proxy_has`, `__proxy_get`, `__proxy_set`, `__proxy_delete`, `__proxy_own_keys`; the generic `__get_proto(v)`, `__own_prop(obj, key, list)`, `__desc_compatible(ext, d, cur)`, `__is_array(v)`, `__set_bool(target, key, v, recv)` |
 | private names (§7.6) | `__private_find(o, key)`, `__private_add(o, key, v, attrs, name)`, `__private_get(o, key, name)`, `__private_set(o, key, v, name)`, `__private_brand(o, v, brand, name, mode)`, `__private_in(o, brand, name)` |
 | output (§6.9) | `__out_reserve(need)`, `__path_reserve(need)`, `__refs_reserve(need)`, `__out_byte(b)`, `__out_cp(cp)`, `__out_str(s)`, `__out_uint(n)`, `__out_flush(fd)`, `__report(fd, prefix, v)` |
 | renderer (§6.9) | `__render_top(v)`, `__render(v, depth)`, `__render_heap(p, depth)`, `__render_array(p, depth)`, `__render_object(p, depth)`, `__render_function(p, depth)`, `__render_props(..)`, `__render_entry(e, quote, first, open, depth)`, `__render_key(key, quote)`, `__render_lookup(o, key)`, `__heap_object(v)`, `__str_of(v)`, `__fn_name(v)`, `__date_text(v)` |
@@ -1827,8 +1828,8 @@ object unchanged.
 `__get`, `__set`, `__has`, `__delete`, `__define`, `__own_keys`,
 `__for_in_keys`, `__copy_data`, and the descriptor helpers (`emit/props.rs`,
 `emit/props/descriptor.rs`) are the only code that reads or writes property
-tables. Keys are interned `u32`s. Phase 5b adds a proxy arm to each of them
-(§6.11, planned): a proxy as the object or anywhere on a prototype chain
+tables. Keys are interned `u32`s. Each of them has a proxy arm
+(§6.11, phase 5b): a proxy as the object or anywhere on a prototype chain
 hands the operation to its traps.
 
 - **`__get(recv, key)`** — `OrdinaryGet`. Each object on the chain (`recv`,
@@ -2111,7 +2112,7 @@ then a call with `this = recv`; it also throws for a nullish receiver. Its
 `call_indirect`. Array fast paths keep the `props == 0` and `proto` checks
 even when the program is intrinsics-sealed: the sealed analysis does not cover
 an own property shadowing a builtin (`a.push = f` is honoured).
-§6.11 (phase 5b, planned) lists which guards stay correct when a proxy is a
+§6.11 (phase 5b) lists which guards stay correct when a proxy is a
 receiver or sits on a prototype chain, and the two (`__protos_indexless`,
 `__symbol_get`) plus the `instanceof` walk that need a proxy test.
 
@@ -2357,7 +2358,12 @@ jsvals. Layout knowledge lives in the emitter and `abi.rs` alone.
 
 The guest renderer (`emit/render.rs`) appends the Node-console form of a value
 to the output buffer (`$__out_buf`) as UTF-8. It runs no user code and never
-throws. `console.log` joins its arguments with one space and ends the line with
+throws. `console.log` evaluates every argument before printing anything (a
+throwing argument prints nothing; each value renders in its state after the
+last argument ran): with every argument past the first a literal, static block
+or plain local read, they stream straight into the buffer; otherwise they are
+first collected into an array literal and printed like the spread form. It
+joins its arguments with one space and ends the line with
 one `fd_write` to fd 1; `__report` writes one
 `prefix + value + "\n"` line to its fd (the `Uncaught …` reports and the `-p`
 completion, §4.2). A failed or stalled write ends the program with
@@ -2391,7 +2397,7 @@ call site's check (§5.6). The rules:
   `FinalizationRegistry {}` (contents never listed; a subclass instance
   renders the same form);
 - cycles as `<ref *1> { self: [Circular *1] }`;
-- (phase 5b, planned, §6.11) a proxy as its target, without running a trap;
+- (phase 5b, §6.11) a proxy as its target, without running a trap;
   a revoked one as `<Revoked Proxy>`.
 
 Private-name entries (§7.6) are never enumerable, so the renderer does not list
@@ -2399,13 +2405,11 @@ them.
 
 ### 6.10 BigInt
 
-> **Partly implemented** (phase 5b, workstream L2-B). Stage B2a (the value,
-> literals, conversions, equality, hashing, property keys, JSON, the wrapper
-> and the empty `%BigInt.prototype%`) is implemented as described; the
-> operators (B2b), the `BigInt` builtins (B3) and the closeout (B4) are still
-> the design (table at the end). Each stage turns its part of this text into
-> a description of the implementation and drops the "lands in" notes it
-> fulfils. ECMA-262 §6.1.6.2 (the BigInt
+> **Implemented** (phase 5b): the value, literals, conversions, equality,
+> hashing, property keys, JSON, the wrapper and `%BigInt.prototype%`, the
+> operators (§6.10.4–6.10.6), the `BigInt` builtins, `Number(1n)` and the
+> 64-bit boundary helpers, as described below; the stage table at the end
+> records how it was built. ECMA-262 §6.1.6.2 (the BigInt
 > type), §7.1 (conversions), §13 (operators), §21.2 (the BigInt object).
 
 #### 6.10.1 Value and block layout
@@ -2474,10 +2478,14 @@ is ToBoolean for both strings and BigInts (§6.10.2).
 `WRAPPER_VALUE_OFFSET`, proto `%BigInt.prototype%`), traced like the other
 wrapper classes (jsval `@16`), rendered `[BigInt: 1n]`, unwrapped by
 `JSON.stringify`. `%BigInt.prototype%` is `Intrinsic::BigIntPrototype`, an
-ordinary object over `%Object.prototype%`, empty until B3. No other new
+ordinary object over `%Object.prototype%` holding the builtins of §6.10.7.
+No other new
 heap kind is needed.
 
 #### 6.10.2 Type tests, `typeof`, ToBoolean, rendering
+
+The `typeof`, ToBoolean, strict-equality and `emit_is_object` tests below
+are emitted only when the program can produce a BigInt (§6.10.9).
 
 - **Primitive, not object.** Every site that tells a symbol (a heap
   primitive) from an object also tells a BigInt (`emit_is_bigint(local)` in
@@ -2511,16 +2519,20 @@ heap kind is needed.
   `__bigint_to_string(v, 10)` followed by `__out_str`; its allocation may
   run out of memory like the render buffers (§6.9). `__msg_str` (error
   message text) appends the `n` too; `__prim_str` (ToString) has no `n`.
+  The `null` / `undefined` member error names a BigInt key by its property
+  key (`__nullish_throw` uses `__prim_str` for it: `null[1n]` reads `'1'`).
 
 #### 6.10.3 Conversions
 
 All conversion helpers live in `emit/bigint.rs` (the `Big` group of
 `emit/registry.rs`, the last helper group, tree-shaken by `emit/shake.rs`
-like every helper: a
-program with no BigInt literal, no `BigInt` reference and no
-`TYPE_BIGINT`-producing builtin emits none of them; the shared conversion
-helpers (`__to_string`, `__loose_eq`, ..) call them only behind a type-byte
-test, so a program without BigInts keeps them out of its module).
+like every helper). The shaker follows static calls: when the program can
+produce a BigInt (the `bigints` gate, §6.10.9) the cold arm of every
+numeric operator calls `__numeric_op` / `__numeric_unary` /
+`__bigint_add_small` (§6.10.5), so the operator kernels and the conversions
+they reach are kept. With the gate closed no operator, `ToNumeric` or
+`Number(x)` site references a BigInt kernel; the kernels still reached are
+the B2a ones called from always-present runtime helpers (§6.10.9).
 
 | operation | helper / site | rule |
 |---|---|---|
@@ -2570,15 +2582,16 @@ compare.
 | helper | algorithm |
 |---|---|
 | `__bigint_cmp_mag(a, b) -> i32` | length, then limbs from the top; leaf |
-| `__bigint_add(a, b)`, `__bigint_sub(a, b)` | sign dispatch to magnitude add (carry) or subtract-larger-minus-smaller; result `max(len) + 1` limbs |
-| `__bigint_mul(a, b)` | schoolbook O(n·m), `len_a + len_b` limbs; a zero operand returns `BIGINT_ZERO`; bound checked first |
-| `__bigint_divmod(a, b, want_rem)` | `b = 0n` → `RangeError: Division by zero`; `|a| < |b|` → `0n` / `a`; one-limb divisor → short division; otherwise Knuth's Algorithm D (normalize so the divisor's top bit is set, estimate each quotient limb from the top two limbs with the `q̂` correction, multiply-subtract, add back on borrow, denormalize the remainder). Chosen over shift-subtract, which costs a full-width subtract per *bit* (32× more passes). Quotient truncates toward zero with sign `sa ^ sb`; the remainder takes the dividend's sign |
+| `__bigint_add(a, b)`, `__bigint_sub(a, b)` | sign dispatch to magnitude add (carry, `max(len) + 1` limbs) or subtract-larger-minus-smaller (`__bigint_cmp_mag` picks the larger, which gives the sign; equal magnitudes are `0n`); one body emitted twice (`emit_add_sub(sub)`) |
+| `__bigint_mul(a, b)` | schoolbook O(n·m), `len_a + len_b` limbs (every `r + a_i·b_j + carry` fits a `u64`); a zero operand returns `BIGINT_ZERO`; the bound is `__bigint_new`'s |
+| `__bigint_divmod(a, b, want_rem)` | `b = 0n` → `RangeError: Division by zero`; `|a| < |b|` → `0n` / `a`; one-limb divisor → short division; otherwise Knuth's Algorithm D (normalize copies of both operands — two unpublished `__bigint_new` blocks — so the divisor's top bit is set, estimate each quotient limb from the top two limbs with the `q̂` correction, multiply-subtract, add back on borrow, denormalize the remainder; `q̂ <= B + 1`, so `q̂·v[n-2]` and `r̂:u[j+n-2]` fit a `u64`). Chosen over shift-subtract, which costs a full-width subtract per *bit* (32× more passes). Quotient truncates toward zero with sign `sa ^ sb`; the remainder takes the dividend's sign |
 | `__bigint_pow(a, b)` | `b < 0n` → `RangeError: Exponent must be non-negative`; `b = 0n` → `1n` (also `0n ** 0n`); base `0n` / `1n` → itself, `-1n` → `±1n` by parity; otherwise `b` must fit `u32` and `bitlen(a)·b <= 2^24`, else `RangeError: Maximum BigInt size exceeded`; then square-and-multiply |
 | `__bigint_neg(a)` | copy with the sign flipped (`0n` stays `0n`) |
-| `__bigint_add_small(a, d: i32)` | `a + d` for `d = ±1` (`++` / `--`) |
+| `__bigint_mag_step(p, inc, neg)` | the value with magnitude `|p| + 1` (`inc`) or `|p| - 1` and sign `neg` (carry / borrow pass) |
+| `__bigint_add_small(v: i64, d: i32)` | `v + d` for `d = ±1` (`++` / `--`): `__bigint_mag_step` growing the magnitude when `d` has the value's sign (or the value is `0n`), else shrinking it |
 | `__bigint_bitop(a, b, op)` | `&` `|` `^` on infinite two's complement: width `w = max(len) + 1` limbs; a negative operand is converted limb by limb to `~(|x| - 1)` (sign-extended with `0xFFFF_FFFF`), the op runs limb-wise, the result is negative iff its top limb's bit 31 is set (AND: both negative; OR: either; XOR: exactly one) and is converted back with `|r| = ~r + 1` |
-| `__bigint_not(a)` | `~a = -a - 1n` |
-| `__bigint_shl(a, n)` / `__bigint_sar(a, n)` | the count is a BigInt: a negative count shifts the other way. `a = 0n` → `0n`. Left: a count above `2^24` → `RangeError: Maximum BigInt size exceeded`; else limb move + bit shift. Right (floor semantics): a count `>= bitlen(a)` gives `0n` (non-negative) or `-1n` (negative); else `q = |a| >> n` and, for a negative `a`, `q + 1` when any shifted-out bit was set, result `-q` |
+| `__bigint_not(a)` | `~a = -a - 1n`: `__bigint_mag_step` with `-(|a| + 1)` for a non-negative `a`, `|a| - 1` for a negative one |
+| `__bigint_shift(a, n, right)` | `<<` (`right` 0) and `>>` (`right` 1) in one helper; the count is a BigInt: a negative count shifts the other way (a count of more than one limb is huge either way). `a = 0n` → `0n`. Left: a count above `2^24` → `RangeError: Maximum BigInt size exceeded`; else limb move + bit shift. Right (floor semantics): a count `>= bitlen(a)` gives `0n` (non-negative) or `-1n` (negative); else `q = |a| >> n` and, for a negative `a`, `q + 1` when any shifted-out bit was set (one spare limb for the carry), result `-q` |
 | `__bigint_as_n(bits: f64, a, signed: i32)` | `asUintN`: `a mod 2^bits` — non-negative `a` keeps its low `bits` bits; negative `a` with nonzero low part `r` gives `2^bits - r` (size checked: `bits` above `2^24` with such an `a` is the size `RangeError`); `asIntN`: that value minus `2^bits` when `bits > 0` and bit `bits - 1` is set; `bits = 0` → `0n` |
 | `__bigint_eq(a, b) -> i32` | both `TYPE_BIGINT` and identical header sign, `len` and limbs (canonical form); `0` when either is not a BigInt; leaf |
 | `__bigint_cmp(a, b) -> i32` | signed compare (`-1/0/1`); leaf |
@@ -2589,24 +2602,26 @@ compare.
 
 Codegen decides nothing about BigInt statically except literals: every
 operator keeps its Number fast path inline and reaches BigInt only on the
-path where an operand is already known not to be a number.
+path where an operand is already known not to be a number. Everything in
+this section applies only when the program can produce a BigInt; with the
+`bigints` gate closed the operators emit their Number-only code (§6.10.9).
 
 **New IR** (`ir.rs`, lowered in `codegen/expr.rs`):
 
 - `IrNode::BigInt { neg: bool, limbs: Box<[u32]> }`: a literal, from swc's
   `Lit::BigInt` (`value.to_u32_digits()`; no new dependency). Unary minus
   folds into a literal operand (`-1n`; `-0n` is `0n`).
-- `BinOp::Exp`: `a ** b` and `**=` (the five `MathOp::Pow` construction
-  sites for `**` in `codegen/expr.rs`: the binary at ~150 and the `**=`
-  forms at ~1726, ~1915, ~2024). `Math.pow` keeps `MathCall Pow` (ToNumber
-  semantics: `Math.pow(2n, 1n)` throws). `BinOp::Exp` emits the existing
-  `emit_pow` body after the numeric-operand prologue below, so a
-  Number `**` computes exactly what it does today.
+- `BinOp::Exp`: `a ** b` and `**=` (the binary, and the `**=` forms of
+  identifiers, members, private names and `super`). `Math.pow` keeps
+  `MathCall Pow` (ToNumber semantics: `Math.pow(2n, 1n)` throws).
+  `BinOp::Exp` emits the `emit_pow` body (`emit_pow_body`) after the
+  numeric-operand prologue below, so a Number `**` computes exactly what it
+  did before.
 - `IrNode::Negate(Box<IrNode>)` and `IrNode::BitNot(Box<IrNode>)`: unary `-`
-  and `~` (today `-0 - x` and `x ^ -1`, which are wrong for BigInt:
-  `-0 - 1n` and `1n ^ -1` throw). They emit the same Number code as today
-  (`emit_arith` with lhs `-0`, `emit_bitwise` with rhs `-1`), differing only
-  in the cold arm's opcode.
+  and `~` (formerly `-0 - x` and `x ^ -1`, which are wrong for BigInt:
+  `-0 - 1n` and `1n ^ -1` throw). `emit_numeric_unary` computes a number
+  operand inline (`-0 - x`, `ToInt32(x) ^ -1`: the same values) and sends
+  any other operand to `__numeric_unary`.
 - `ConvertOp::ToNumeric` and `IrNode::NumericStep { arg, inc }` (`arg ± 1`
   of `arg`'s own type; `arg` is already numeric): the update forms that are
   not a plain local — cells, globals, generator slots (`codegen/generator.rs`
@@ -2616,10 +2631,11 @@ path where an operand is already known not to be a number.
   delta`, and postfix's old value to `NumericStep(store, !inc)` instead of
   `store - delta` (exact for BigInt; for numbers the same value as today).
 
-**Numeric-operand prologue** (`emit/numeric.rs`). `emit_arith`, `emit_mod`,
-`emit_bitwise` and `Exp` stop calling `emit_coerce_operands` (which stays,
-with ToNumber semantics, for `Math.atan2` / `Math.imul` and the other
-`Math` paths) and use a new `emit_numeric_operands(op)`:
+**Numeric-operand prologue** (`emit/numeric.rs`). The binary numeric
+operators no longer call `emit_coerce_operands` (which stays, with ToNumber
+semantics, for `Math.pow` / `Math.atan2` / `Math.imul`); one emitter,
+`emit_numeric_binary(op)`, replaces `emit_arith`, `emit_mod` and
+`emit_bitwise`:
 
 ```text
 block (result i64)                         ;; new; 0 fuel
@@ -2634,27 +2650,32 @@ block (result i64)                         ;; new; 0 fuel
 end
 ```
 
+The prologue is `emit_numeric_binary`; the inline Number computation is
+`emit_number_op(op, s0, s1, pow_scratch)` (the `emit_pow` body is
+`emit_pow_body`, shared with `Math.pow`, whose prologue keeps
+`emit_coerce_operands`).
+
 `__numeric_op(a, b, op: i32) -> i64` (`emit/bigint.rs`): `a =
 __to_numeric(a)`, then `b = __to_numeric(b)` (left first, each may throw);
-both numbers → the Number result (the same f64 / `ToInt32` code as the
-inline path, emitted from the shared `emit/numeric.rs` routines, `emit_pow`
-included); one BigInt and one number → `TypeError: Cannot mix BigInt and
+both numbers → the Number result (`emit_number_op`, the inline code);
+one BigInt and one number → `TypeError: Cannot mix BigInt and
 other types, use explicit conversions`; two BigInts → the kernel. Op codes
-(`NUMOP_*` in `emit/bigint.rs`): `SUB MUL DIV MOD EXP AND OR XOR SHL SHR
-USHR`. `>>>` on two BigInts throws `TypeError: BigInts have no unsigned right
+(`NUMOP_*` in `emit/bigint.rs`): `ADD SUB MUL DIV MOD EXP AND OR XOR SHL SHR
+USHR` (`ADD` is `__add`'s, below). `>>>` on two BigInts throws `TypeError: BigInts have no unsigned right
 shift, use >> instead`. `__numeric_unary(v, op)` does the same for
-`Negate` / `BitNot` (`ToNumeric` once; number → `-x` / `~ToInt32(x)`,
-BigInt → `__bigint_neg` / `__bigint_not`). Unary `+` stays `ToNumber` and
-so throws for a BigInt.
+`Negate` / `BitNot` (`NUMOP_NEG` / `NUMOP_NOT`; `ToNumeric` once; number →
+`-0 - x` / `~ToInt32(x)`, BigInt → `__bigint_neg` / `__bigint_not`); the
+inline site computes a number operand itself and calls it only for any other
+operand. Unary `+` stays `ToNumber` and so throws for a BigInt.
 
 | operator | two BigInts | BigInt with number | notes |
 |---|---|---|---|
-| `+` | `__bigint_add` | `TypeError` | in `__add` (`emit/convert.rs`): after both `ToPrimitive`s, a string operand concatenates (BigInt → decimal), else `ToNumeric` both and dispatch. The inline `+` already sends any heap operand to `__add`, so `emit_add` is unchanged |
+| `+` | `__bigint_add` | `TypeError` | in `__add` (`emit/convert.rs`): after both `ToPrimitive`s, a string operand concatenates (BigInt → decimal), else a BigInt operand hands both to `__numeric_op(a, b, NUMOP_ADD)` (the other is a primitive, so its `ToNumeric` is `ToNumber`; a symbol throws), else the `ToNumber`s add as before. The inline `+` already sends any heap operand to `__add`, so `emit_add` is unchanged |
 | `-` `*` | `__bigint_sub` / `__bigint_mul` | `TypeError` | |
 | `/` `%` | `__bigint_divmod` | `TypeError` | divisor `0n` → `RangeError` |
 | `**` | `__bigint_pow` | `TypeError` | negative exponent → `RangeError` |
 | `&` `|` `^` | `__bigint_bitop` | `TypeError` | two's complement |
-| `<<` `>>` | `__bigint_shl` / `__bigint_sar` | `TypeError` | negative count reverses |
+| `<<` `>>` | `__bigint_shift` | `TypeError` | negative count reverses |
 | `>>>` | `TypeError` | `TypeError` | |
 | unary `-` `~` | `__bigint_neg` / `__bigint_not` | — | via `__numeric_unary` |
 | `++` `--` | `__bigint_add_small(v, ±1)` | — | below |
@@ -2663,8 +2684,16 @@ so throws for a BigInt.
 existing `emit_coerce_number(local)` becomes `local = __to_numeric(local)`
 followed, still inside the arm, by a BigInt branch that computes
 `__bigint_add_small(local, ±1)`, leaves the prefix / postfix result and
-`br`s out of a new enclosing block; the Number path is unchanged.
-`NumericStep` emits `is_number ? f64 add ±1 : __numeric_step(v, inc)`.
+`br`s out of a new enclosing block; the Number path is unchanged. The three
+writes of the local are announced as `IncDec { local }` definitions (the
+old `note_numeric_def` is gone), so the fixpoint keeps a numeric loop
+counter unrooted. `NumericStep` emits `is_number ? f64 add ±1 :
+__bigint_add_small(v, ±1)`: its operand is already numeric, so a separate
+`__numeric_step` helper is not needed. A member update (`IndexOpSet` with
+`OpSetKind::{Prefix,Postfix}Update`, `emit/object.rs`) reads with
+`ToNumeric` and stores `NumericStep` of the old value; the cell, global,
+generator-slot, private and `super` updates are lowered to the same nodes in
+codegen.
 
 **Root classification** (`emit/roots.rs::classify`, and `yields_number` in
 `emit/numeric.rs`). An arithmetic result is no longer always a number: it may
@@ -2678,7 +2707,13 @@ the relational and equality operators, `MathCall`, `MathSpread` and
 `static_block()`. `yields_number` keeps `Num`, `MathCall`, `MathSpread`,
 `ToNumber` and `UShr` only; the `Math.*` argument paths that skip the
 coercion of a `yields_number` operand therefore coerce an arithmetic
-argument (`Math.floor(a - b)` with BigInts must throw).
+argument (`Math.floor(a - b)` with BigInts must throw). The shaker's
+dynamic-key test (`shake::note_key`) treats the numeric operators other than
+`+` as never yielding a string (`roots::never_string`): a BigInt key is a
+canonical numeric string, which names no builtin, so `a[i - 1]` still
+shakes. With the `bigints` gate closed `classify` and `yields_number` are
+the Number-only ones again: every arithmetic operator but `+` and every
+`IncDec` is unconditionally numeric (§6.10.9).
 
 #### 6.10.6 Equality, comparison, hashing
 
@@ -2708,10 +2743,13 @@ argument (`Math.floor(a - b)` with BigInts must throw).
   and retry (the BigInt counts as a primitive); BigInt against `null` /
   `undefined` / symbol → `false`.
 - **Relational** (`__compare`, reached when the operands are not two strings
-  or two numbers): after `ToPrimitive` (hint number), BigInt / BigInt →
+  or two numbers): after `ToPrimitive` (hint number) and the two-strings
+  test, a BigInt operand selects the BigInt arm: BigInt / BigInt →
   `__bigint_cmp`; BigInt / string → `StringToBigInt` of the string
-  (failure → *undefined*); otherwise `ToNumeric` both (a symbol throws) and
-  BigInt / number → `__bigint_cmp_num`. An *undefined* or unordered (`2`)
+  (failure, or the size `RangeError` of a huge string, cleared → *undefined*);
+  otherwise `ToNumber` of the other operand (a symbol throws) and
+  `__bigint_cmp_num`, the order negated when the BigInt is the right
+  operand. An *undefined* or unordered (`2`)
   outcome is `false` for all four operators, including `<=` / `>=`.
 - **`Array.prototype.sort`** without a comparator compares `ToString`s, so
   BigInts sort by their decimal text through `__prim_str`.
@@ -2733,28 +2771,40 @@ argument (`Math.floor(a - b)` with BigInts must throw).
   object does; a `CLASS_BIGINT` wrapper is then unwrapped like the other
   wrappers; a BigInt still left throws `TypeError: Do not know how to
   serialize a BigInt`, at any nesting depth. `__json_str` never sees one.
-- **`BigInt`** (`BuiltinCtor::BigInt` in `ir.rs`, the realm entries in
-  `emit/realm.rs` appended after the existing constructors, bodies in a new
-  `emit/builtins/bigint.rs` following `emit/builtins/number.rs`): `BigInt(v)`
-  is `ToPrimitive(v, number)`, then a number → NumberToBigInt (`RangeError`
-  for non-integers), anything else → `ToBigInt`. It is a constructor for
+- **`BigInt`** (`BuiltinCtor::BigInt` in `ir.rs`, the last constructor;
+  the realm entries in `emit/realm.rs`: the global, `Builtin::Ctor(BigInt)`
+  and `Builtin::BigInt(BigIntOp)` appended to `Builtin::ALL`, the statics and
+  the tag in `bigint_entries`; bodies in `emit/builtins/bigint.rs`, which
+  also re-exports `emit_is_bigint` for the sibling bodies): `BigInt(v)`
+  is `ToPrimitive(v, number)`, then a number → NumberToBigInt (`RangeError:
+  The number <x> cannot be converted to a BigInt because it is not an
+  integer` for `NaN`, `±Infinity` and non-integers, tested as `x - trunc(x)
+  != 0`), anything else → `ToBigInt`. It is a constructor for
   `IsConstructor` (flag `CONSTRUCTOR`, like `Symbol`), but `new BigInt(..)`
   throws `TypeError: BigInt is not a constructor` before converting.
   `length` 1, `name` `"BigInt"`. `BigInt.asIntN(bits, bigint)` /
-  `BigInt.asUintN(bits, bigint)`: `bits = ToIndex(bits)` (`RangeError` for
+  `BigInt.asUintN(bits, bigint)` (`length` 2): `bits = ToIndex(bits)`
+  (`RangeError: Invalid value: not (convertible to) a safe integer` for
   negative or `> 2^53 - 1`), `bigint = ToBigInt(bigint)`, in that order, then
-  `__bigint_as_n`.
+  `__bigint_as_n` (§6.10.4; the `w = ceil(bits / 32)`-limb result is built
+  only when `w <= len + 1` or for `asUintN` of a negative value, every other
+  wider case returns the operand).
 - **`%BigInt.prototype%`** (an ordinary object, not a BigInt): `constructor`,
   `toString(radix)` (`thisBigIntValue`: a BigInt or a `CLASS_BIGINT`
   wrapper, else `TypeError`; `radix` `undefined` → 10, else
-  `ToIntegerOrInfinity`, outside `2..=36` → `RangeError`),
-  `toLocaleString()` (= `toString()`, no locale data), `valueOf()`,
+  `ToIntegerOrInfinity`, outside `2..=36` → `RangeError` with
+  `Number.prototype.toString`'s message), `toLocaleString()` (=
+  `toString()`, no locale data), `valueOf()` (all three `length` 0),
   `[@@toStringTag]` `"BigInt"` (configurable only). `Object.prototype.toString`
   then gives `[object BigInt]`.
 - **Unchanged builtins that now see BigInts**: `Number(1n)` is `1` (the
-  `Number` call — not unary `+` — uses `ToNumeric` and converts a BigInt with
-  `__bigint_to_f64`; `ConvertOp::ToNumber` stays the unary-`+` / ToNumber
-  conversion and a new `ConvertOp::NumberCall` is the inlined `Number(v)`);
+  `Number` call and construct — not unary `+` — use `ToNumeric` and convert a
+  BigInt with `__bigint_to_f64`; `ConvertOp::ToNumber` stays the unary-`+` /
+  ToNumber conversion and `ConvertOp::NumberCall` is `Number(v)`, inlined at
+  the call site and in the `Number` constructor body: the number test inline,
+  anything else through `__number_value(v) -> i64` (`emit/bigint.rs`:
+  `__to_numeric`, then `__bigint_to_f64` of a BigInt); `NumberCall` is
+  numeric for the root classification and `yields_number`);
   `Number.isInteger(1n)` / `isSafeInteger` / `isFinite` / `isNaN` are
   `false` (no coercion); `parseInt(1n)` / `parseFloat` read `"1"`; `isNaN`,
   `isFinite`, `Math.*`, `Date` setters throw (ToNumber); `String(1n)` is
@@ -2762,15 +2812,24 @@ argument (`Math.floor(a - b)` with BigInts must throw).
 
 #### 6.10.8 Opcount, diagnostics, conformance
 
-**Opcount** (`tests/opcount/snapshot.tsv`). The Number fast paths execute
-the same instructions as before (the new `block` / `end` and the cold arms
-cost no fuel unless taken), but four mechanical changes move rows, and each
-moved row gets a reason cell in the stage that moves it:
+**Opcount** (`tests/opcount/snapshot.tsv`). The `bigints` gate (§6.10.9)
+confines the changes below to programs that can produce a BigInt: a program
+with the gate closed emits the pre-B2b operator, `ToNumeric` and
+`Number(x)` code and the pre-B2a `typeof`, ToBoolean, strict-equality and
+`IsObject` code, so its rows move only by the always-present guest tests of
+item 3 and by static-address shifts. In a program with the gate open the
+Number fast paths execute the same instructions as before (the new `block`
+/ `end` and the cold arms cost no fuel unless taken), but four mechanical
+changes move rows, and each moved row gets a reason cell in the stage that
+moves it:
 
 1. B2b: the cold arms of every `- * / % ** & | ^ << >> >>>`, unary `-` /
    `~` and `++` / `--` site grow (a `__numeric_op` call and a `br` instead
    of a `__to_number` call): `user_ops` of every row with such a site;
-   `fuel` only where a non-number operand is actually converted.
+   `fuel` only where a non-number operand is actually converted, except
+   that unary `-` / `~` on a number now run their own short inline code
+   (one `is_number` test, no constant-operand stash), and `++` / `--` on a
+   local open one more `block`.
 2. B2b: the root classification (§6.10.5): a local defined from
    arithmetic over a non-numeric operand (a parameter, property read or call
    result) is now rooted, adding shadow-stack stores (`user_ops` and `fuel`);
@@ -2791,48 +2850,147 @@ moved row gets a reason cell in the stage that moves it:
 **Diagnostics** (§8). Nothing BigInt-specific is a compile error (the
 literal and literal-key diagnostics are gone; their `tests/pattern_keys.rs`
 cases are positive tests); every BigInt error is a run-time `TypeError` /
-`RangeError` / `SyntaxError` as listed above. Until B2b an operator on a
-BigInt throws the `ToNumber` `TypeError` rather than computing.
+`RangeError` / `SyntaxError` as listed above.
 
-**Conformance.** `BigInt` leaves `tests/test262/unsupported-features.txt`
-in B4. Of the ≈ 1 500 tests tagged `BigInt`, about 325 become eligible on
-their own (146 `language/expressions`, 69 `built-ins/BigInt`, 59
-`language/literals/bigint`, the rest in `Object`, `JSON`, `String`, `Map`,
-`Set`, `Promise`, `Array`, `Number`; 39 of them negative, mostly literal
-syntax errors); the other ≈ 1 180 also need `TypedArray*` / `DataView*` /
-`Atomics*` / `Temporal` and stay skipped until those land (L2-T's typed
-arrays then reuse `__bigint_to_i64` / `__bigint_from_i64`). Expected
-remaining failures: tests that combine BigInt with still-unsupported
-features without tagging them, `toLocaleString` locale expectations, and
-very large exponent / shift tests that hit the 2^24-bit cap where V8 allows
-2^30.
+**Conformance.** `BigInt` is not in `tests/test262/unsupported-features.txt`.
+Of the 1 506 tests tagged `BigInt`, 395 are eligible (146
+`language/expressions`, 69 `built-ins/BigInt`, 59 `language/literals/bigint`,
+57 `DataView` BigInt accessors, 19 `BigInt64Array` / `BigUint64Array` and
+`%TypedArray%` tag tests not tagged `TypedArray`, 10 `intl402`, the rest in
+`Object`, `JSON`, `String`, `Map`, `Set`, `Promise`, `Array`, `Number`,
+`ArrayBuffer`, `Error`, annex B and `harness`; 39 negative, all literal
+syntax errors); the other 1 111 also need `TypedArray*` / `Atomics*` /
+`SharedArrayBuffer` / `Temporal` / `Reflect*` / `Intl*` or a skipped flag.
+Remaining BigInt limitations are in §13.
 
-#### 6.10.9 Stages
+#### 6.10.9 Compile-time gate (`bigints`)
+
+Most programs can never produce a BigInt, and they must not pay for one:
+not in module size (the operator cold arms would keep the kernels alive
+through static calls), not in opcount (cold arms, the `++` / `--` block,
+the extra rooting of arithmetic results). `Helpers::bigints`
+(`emit/mod.rs`, field `bigint_gate: BigIntGate::{Closed, Open}` next to
+`binary` and `proxy_gate`), computed once per program by
+`sections.rs::program_has_bigint` next to `program_has_binary` (§5.8) and
+`program_has_proxies` (§6.11), says whether a BigInt can exist.
+
+**Triggers.** The gate is open iff the program
+
+- has a BigInt literal (`IrNode::BigInt`, including a folded `-1n`);
+- names one of `BIGINT_NAMES` (`sections.rs`, next to `BINARY_NAMES`) as a
+  global reference (`GlobalGet` / `GlobalSet`), an intrinsic
+  (`GlobalIntrinsic::Ctor(BuiltinCtor::BigInt)`) or a string constant (a
+  static member key or any string literal, which a computed access could
+  use): `BigInt`, `BigInt64Array`, `BigUint64Array`, `getBigInt64`,
+  `getBigUint64`, `setBigInt64`, `setBigUint64`;
+- uses the global object as a value (`GlobalIntrinsic::Global`:
+  `globalThis` in any form, top-level `this`), which reaches `BigInt` by a
+  computed name or by reflection — the rule of the binary-data gate (§5.8)
+  and of the Proxy gate (§6.11).
+
+These are every source of a BigInt value on this base: a literal; the
+`BigInt` function (`BigInt(v)`, and `asIntN` / `asUintN`, reachable only
+through it); the `%BigInt.prototype%` methods and the operators, which need
+a BigInt operand first; `__to_object`'s wrapper, likewise. `JSON.parse`,
+`Number`, `parseInt` and every other builtin produce no BigInt, the realm
+reaches `BigInt` only through the global object (a reflective walk such as
+`Object.getOwnPropertyDescriptors(globalThis)` names `globalThis`), and
+strict mode leaves no other path to the global object. The typed arrays
+of §5.8 (T3a) install only the nine Number kinds (`ElementKind` has no
+`BigInt64` / `BigUint64`, kinds `10` / `11` stay reserved) and `DataView`
+has no `get/setBig(U)Int64`, so binary data produces no BigInt yet. The
+typed-array and `DataView` names in `BIGINT_NAMES` are for L2-T's BigInt
+kinds. When those land, a `BigInt64Array` / `BigUint64Array` constructor is
+reachable only by its name or through the global object (`%TypedArray%`
+lists no subclasses), but a `DataView` reached by reflection
+(`Object.getOwnPropertyDescriptors(DataView.prototype)`) can call
+`getBigInt64` without naming it, so that stage must add `DataView` to
+`BIGINT_NAMES`.
+
+**What it switches.** With the gate closed `emit` first rewrites the IR to
+its Number-only shapes (`numeric.rs::lower_number_only`, on a copy of the
+program): `a ** b` (`BinOp::Exp`) becomes `MathCall Pow`, `Negate(x)` `-0 -
+x`, `BitNot(x)` `x ^ -1`, `ConvertOp::ToNumeric` / `NumberCall`
+`ToNumber`, and `NumericStep { arg, inc }` `arg + ±1` — or, for a postfix
+update's old value (`arg` is the store: `Assign`, `CellSet`, `GlobalSet`),
+`store - ±1` —, exactly the IR codegen produced before B2b. The emitters
+then branch on the flag:
+
+| site | gate closed | file |
+|---|---|---|
+| `- * / % & \| ^ << >> >>>` | `emit_number_binary`: stash, `emit_coerce_operands`, `emit_number_op` (the old `emit_arith` / `emit_mod` / `emit_bitwise` code) | `emit/numeric.rs` |
+| `++` / `--` of a local | `emit_coerce_number`, two numeric definitions, the inline step (no block, no `__to_numeric` / `__bigint_add_small` arm) | `emit/numeric.rs` |
+| member `++` / `--` | `ToNumber` read, `Binary(op, old, ±1)` step | `emit/object.rs` |
+| `ToNumeric`, `Number(x)` (also the `Number` constructor body) | the `ToNumber` path of `emit_convert_call` | `emit/numeric.rs` |
+| `+` with a heap operand | `__add` without the BigInt arm | `emit/convert.rs` |
+| relational | `__compare` without the BigInt arm and its three locals | `emit/convert.rs` |
+| `typeof` | no `bigint` select; the word fold stops at `symbol` | `emit/expr.rs` |
+| ToBoolean | the non-string heap arm is the constant `1` | `emit/stmt.rs` |
+| strict equality | `emit_is_string` tests and `__str_eq` only | `emit/numeric.rs` |
+| `IsObject` | no `TYPE_BIGINT` test | `emit/expr.rs` |
+| root classification, `yields_number` | every arithmetic operator but `+`, and `IncDec`, unconditionally numeric | `emit/roots.rs`, `emit/numeric.rs` |
+
+`classify` and `emit_is_object` take no `Helpers`, so `emit` also publishes
+the flag for the duration of the module through `roots::BigIntScope`
+(a thread-local, `true` outside an `emit`, the sound default). The
+shaker's `note_key` needs no change: on the Number-only IR the numeric
+operators are numeric for `classify_is_numeric`, as before B2b. With the
+gate closed no emitted body references `__numeric_op`, `__numeric_unary`,
+`__bigint_add_small`, `__to_numeric` or `__number_value`, so they and the
+kernels only they reach are shaken out; with it open everything is as
+§6.10.3–6.10.8 describe.
+
+**Soundness.** With the gate closed no BigInt can exist at run time: none
+of the sources above appears, and every other operation that returns a
+BigInt needs a BigInt operand. So the Number-only operator code is exact
+(no operand can take the BigInt arm it lacks), the pre-B2b rooting is
+sound (an arithmetic result or a stepped local is always a number and
+never needs a root), and the missing `typeof`, ToBoolean, equality and
+`IsObject` tests could only have been taken by a BigInt. With the gate open
+the operators, their rooting and the GC behave exactly as §6.10.5
+describes.
+
+**Cost model.** A gate-closed program pays nothing in user code relative to
+the pre-B2a emission. The runtime helpers that every program may keep stay
+shared and keep their B2a BigInt tests, rather than emitting two variants
+of each body: `__same_value_zero`, `__map_hash`, `__loose_eq`,
+`__to_number`, `__prim_str`, `__msg_str`, `__to_object`, `__json_rep`, the
+renderer, `__get`'s primitive-receiver dispatch, `__prop_throw`'s receiver
+kind and the `__own_keys` / `__has_own` / `__delete` / `__for_in_keys`
+guards. Each costs one `emit_is_bigint` test (a pointer test, then a
+type-byte load: about 15 instructions) plus an `if`, executed only on the
+call path that reaches it (a non-string operand of `__same_value_zero`, a
+non-string key in `__map_hash`, a heap primitive in the others). They keep
+the B2a kernels they call (`__bigint_eq`, `__bigint_hash`,
+`__bigint_loose_eq`, `__bigint_to_string`) in modules that keep those
+helpers.
+
+#### 6.10.10 Stages
 
 | stage | scope | files | tests (written per the no-local-run rule; CI runs them) |
 |---|---|---|---|
 | **B2a** value | `abi.rs` (`TYPE_BIGINT`, `BIGINT_*`, `CLASS_BIGINT`, `TYPEOF_STRINGS[7]`, `BIGINT_ZERO`); literals (`IrNode::BigInt`, static blocks, `-` folding); `__bigint_new` / `trim` / `eq` / `cmp` / `hash` / `to_string` / `string_to_bigint` / `to_f64` / `from_f64`; ToBoolean, `typeof`, ToNumber `TypeError`, ToString, ToPrimitive, `__to_numeric`, `__to_bigint`; the `TYPE_SYMBOL`-site audit (primitive vs object), primitive receivers, `CLASS_BIGINT` wrapper + empty `%BigInt.prototype%` skeleton, `__to_object`; renderer, `__msg_str`; strict equality, SameValue(Zero), `__array_search`, Map hash, loose equality; property keys (literal and `__to_key`); JSON `TypeError`; §4.1 / §5.2 / §5.7 / §6.9 / §7.2 / §8 text | `abi.rs`, `ir.rs`, `codegen/{expr,stmt}.rs`, `emit/{bigint,sections,registry,shake,roots,value,expr,stmt,render,dtoa,strtod,convert,runtime,props,realm,gc}.rs`, `emit/props/descriptor.rs`, `emit/builtins/{json,mod,map_set,array}.rs` | new `tests/bigint.rs` (literals, `typeof`, truthiness, rendering incl. nested and wrapper, ToString of multi-limb values in radix 10, equality / SameValueZero / Map keys, loose equality vs number / string incl. `NaN`, `±Infinity`, values above `2^64`, property keys, JSON `TypeError`, ToNumber `TypeError` through `+x` / `Math.abs`); `pattern_keys.rs` rewrites; `abi_drift_tests.rs` `TYPEOF_STRINGS[7]` |
-| **B2b** operators | `BinOp::Exp`, `Negate`, `BitNot`, `ToNumeric`, `NumericStep`; `emit_numeric_operands`, `__numeric_op`, `__numeric_unary`, `__numeric_step`; every kernel of §6.10.4 except `as_n`; `__add` BigInt path; relational `__compare`; `emit_inc_dec`; root classification and `yields_number`; opcount reasons | `ir.rs`, `codegen/{expr,generator}.rs`, `emit/{numeric,bigint,convert,expr,roots}.rs`, `tests/opcount/snapshot.tsv` | new `tests/bigint_ops.rs` (every operator and compound form, relational operators vs number / string incl. `NaN`, `±Infinity`, non-integral numbers and unparsable strings, mixed-type `TypeError`s, `>>>` / unary `+` `TypeError`, division / remainder signs and `RangeError`, `**` negative exponent, bitwise and shifts on negatives across limb boundaries, huge shift counts, `++`/`--` on locals, cells, globals, members, generator slots, multi-limb `*` and `/` cross-checked against known products); a `gc_stress` variant module in the same file (`CompileOptions::gc_stress = 1`) over multi-limb loops (factorial of 200, a Fibonacci accumulator, divmod round trips) so every allocation collects while operands are live |
+| **B2b** operators | `BinOp::Exp`, `Negate`, `BitNot`, `ToNumeric`, `NumericStep`; `emit_numeric_binary`, `__numeric_op`, `__numeric_unary`; every kernel of §6.10.4 except `as_n`; `__add` BigInt path; relational `__compare`; `emit_inc_dec`; root classification and `yields_number`; opcount reasons | `ir.rs`, `codegen/{expr,generator}.rs`, `emit/{numeric,bigint,convert,expr,roots}.rs`, `tests/opcount/snapshot.tsv` | new `tests/bigint_ops.rs` (every operator and compound form, relational operators vs number / string incl. `NaN`, `±Infinity`, non-integral numbers and unparsable strings, mixed-type `TypeError`s, `>>>` / unary `+` `TypeError`, division / remainder signs and `RangeError`, `**` negative exponent, bitwise and shifts on negatives across limb boundaries, huge shift counts, `++`/`--` on locals, cells, globals, members, generator slots, multi-limb `*` and `/` cross-checked against known products); a `gc_stress` variant module in the same file (`CompileOptions::gc_stress = 1`) over multi-limb loops (factorial of 200, a Fibonacci accumulator, divmod round trips) so every allocation collects while operands are live |
 | **B3** built-ins | `BigInt` ctor, `asIntN` / `asUintN` (`__bigint_as_n`), `%BigInt.prototype%` methods and `@@toStringTag`, `toString(radix)`, `Number(1n)` (`ConvertOp::NumberCall`), `__bigint_to_i64` / `__bigint_from_i64` | `ir.rs`, `codegen/*` (the `Number(..)` inline call), `emit/realm.rs`, new `emit/builtins/bigint.rs`, `emit/builtins/{mod,number}.rs`, `emit/bigint.rs` | new `tests/bigint_builtins.rs` (constructor coercions incl. strings in every radix, whitespace, syntax errors, `new BigInt` `TypeError`, `RangeError` for non-integers, `asIntN` / `asUintN` edge widths 0 / 1 / 64 / 65 and negative inputs, `toString` radices 2..36 on multi-limb values, `thisBigIntValue` errors, `Number(2n**1024n)` = `Infinity`, round-half-even at `2^53 + 1`), with a `gc_stress` variant for the radix conversions |
-| **B4** closeout | remove `BigInt` from `unsupported-features.txt`; delete the §13 BigInt lines (the `RegExp, BigInt, ..` "not available" line, the limitation-table row, the BigInt property-key line, the §14 roadmap mention); test262 baseline / history from CI; fold this section's design notes into present-tense text | `tests/test262/*`, `DESIGN.md` | test262 delta recorded (target ≈ +300 of the 325 newly eligible) |
-### 6.11 Proxy and Reflect (phase 5b, in progress)
+| **B4** closeout | `BigInt` out of `unsupported-features.txt`; the §13 / §14 BigInt lines; `null[1n]` names the key `'1'` | `tests/test262/unsupported-features.txt`, `emit/object.rs`, `DESIGN.md` | `tests/bigint.rs` nullish-key message; a `gc_stress` bitwise / `++` `--` test in `tests/bigint_ops.rs` |
+### 6.11 Proxy and Reflect (phase 5b)
 
-**Status: P2a and P2b implemented** (the proxy block, `%Proxy%`,
+**Status: implemented** (stages P2a-P4): the proxy block, `%Proxy%`,
 `Proxy.revocable`, the eleven object internal methods with their
-invariants, callable / constructor proxies and the integration paths,
-below); P3 and P4 are still design. Until P4 the test262 runner keeps skipping the
-`Proxy`, `proxy-missing-checks` and `Reflect*` features (§10). The
-subsection names the code that changes so an implementer does not have to
-re-derive it; "Stages" records where P2a departed from the plan.
+invariants, callable / constructor proxies, the integration paths and the
+`Reflect` namespace. The test262 runner no longer skips the `Proxy`,
+`proxy-missing-checks` and `Reflect*` features. The subsection names the
+code each part lives in; "Stages" records where the stages departed from
+the plan.
 
 **Scope.** ECMA-262 Proxy exotic objects (§10.5: all thirteen internal
 methods with every invariant check, `ProxyCreate`, `Proxy.revocable`) and the
-`Reflect` namespace (§28.1: all thirteen functions). P4 drops all three
-feature flags: `proxy-missing-checks` names the invariant checks that
+`Reflect` namespace (§28.1: all thirteen functions). None of the three
+feature flags is skipped: `proxy-missing-checks` names the invariant checks that
 ES2020-ES2022 added (`deleteProperty` on a non-extensible target,
 `getOwnPropertyDescriptor` / `defineProperty` reporting a non-writable view of
 a writable non-configurable target property; three tests). They are part of
-the current spec and this design implements them, so the flag goes with the
+the current spec and are implemented, so the flag is enabled with the
 other two.
 
 **Block.** A proxy is a `TYPE_PROXY = 20` block of 48 bytes
@@ -3290,23 +3448,27 @@ into locals at entry, before `ToPropertyKey` or any other user code runs
 | function | `length` | steps |
 |---|---|---|
 | `apply(f, thisArg, args)` | 3 | `IsCallable(f)` else `TypeError`; `CreateListFromArrayLike(args)` (a non-object, `undefined` included, throws); `call_with_array` |
-| `construct(F, args, newTarget = F)` | 2 | `IsConstructor(F)`, `IsConstructor(newTarget)` else `TypeError`; the list; `IrNode::Construct { callee: F, spread: list, new_target: Some(newTarget) }` |
+| `construct(F, args, newTarget = F)` | 2 | `IsConstructor(F)`, `IsConstructor(newTarget)` (when passed, `undefined` included) else `TypeError`; the list; `IrNode::Construct { callee: F, spread: list, new_target: Some(newTarget) }` (`function.rs::bound_construct`) |
 | `defineProperty(t, k, attrs)` | 3 | `__to_key`, `__to_desc`, `__define_own == DEFINE_OK` (no throw on rejection) |
 | `deleteProperty(t, k)` | 2 | `__delete(t, k, 0)` |
-| `get(t, k, receiver = t)` | 2 | `__super_get(t, k, receiver)` |
+| `get(t, k, receiver = t)` | 2 | `__super_get(t, k, receiver)` (the default only when fewer than three arguments are passed) |
 | `getOwnPropertyDescriptor(t, k)` | 2 | `__own_desc` |
 | `getPrototypeOf(t)` | 1 | `__get_proto` |
 | `has(t, k)` | 2 | `__has` |
 | `isExtensible(t)` | 1 | `__test_integrity(t, 0)` |
-| `ownKeys(t)` | 1 | `__own_keys(t, OWN_ALL_KEYS)`: integer keys ascending, then strings, then symbols, each in insertion order (a proxy: the checked trap list) |
+| `ownKeys(t)` | 1 | `__own_keys(t, OWN_ALL_KEYS)`: integer keys ascending, then strings, then symbols, each in insertion order (a proxy: the checked trap list); a `LAZY` function is materialized first and an array's `length` follows its indices (`object_static.rs::own_key_list`, shared with `Object.getOwnPropertyNames`) |
 | `preventExtensions(t)` | 1 | `__set_integrity(t, 0)` status |
-| `set(t, k, v, receiver = t)` | 3 | `__set_bool(t, k, v, receiver)` |
+| `set(t, k, v, receiver = t)` | 3 | `__set_bool(t, k, v, receiver)` (the key interned; the default only when fewer than four arguments are passed) |
 | `setPrototypeOf(t, proto)` | 2 | `proto` an object or `null` else `TypeError`; `__set_proto(t, proto) == 0` |
 
 `CreateListFromArrayLike` for `apply` / `construct` is the list-building part
 of `Function.prototype.apply` (`builtins/function.rs::emit_apply`), factored
-into a shared function in that file (`apply` itself keeps accepting
-`undefined` / `null` as "no arguments").
+into `function.rs::create_list` (`apply` itself keeps accepting
+`undefined` / `null` as "no arguments"). The other error texts are plain
+`TypeError`s (`Reflect.apply target is not a function`, `Reflect.construct
+target is not a constructor` / `newTarget is not a constructor`); `setPrototypeOf`'s
+prototype check is `Object.setPrototypeOf`'s (`PROP_THROW_PROTO_TYPE`), so
+no `__prop_throw` mode is added (`33`..`35` stay free).
 
 **`Reflect.construct` and builtin constructors.** Builtin constructors
 already receive `newTarget` through `$__new_target` and compute
@@ -3321,7 +3483,8 @@ site (`emit_construct`), derived classes pass `newTarget` on through
 `Promise`, `Map` / `Set`, `WeakMap` / `WeakSet` / `WeakRef` /
 `FinalizationRegistry`, `Date`, and `Boolean` / `Number` / `String` (their
 wrapper under `new`) use `Body::proto`; `Object` with a `newTarget` other
-than `%Object%` returns the allocated `this` (`ctor.rs::object`); `Symbol`
+than `%Object%` returns the allocated `this` (`ctor.rs::object`; its
+prototype falls back to `%Object.prototype%`, `Object`'s own); `Symbol`
 throws (`new` is refused); `Function` throws (unsupported); `Iterator` is
 abstract unless `newTarget` differs; a bound function constructs its target
 with `newTarget` per §5.5; a constructor proxy forwards `newTarget` to its
@@ -3419,11 +3582,28 @@ shared files):
   `%Reflect%` in `emit/realm.rs`, `builtins/mod.rs`, the
   `CreateListFromArrayLike` factoring in `builtins/function.rs`. No
   constructor body changes (above).
-- **P4 — closeout.** Remove `Proxy`, `proxy-missing-checks` and `Reflect*`
-  from `tests/test262/unsupported-features.txt`; refresh the baseline from CI;
-  rewrite this subsection in the present tense (dropping "planned"); update
-  §5.1 / §5.2 / §5.7 / §6.2 / §7.6, §13 (the new limitations below, and the
-  per-family failure table) and §14.
+  **Delivered**, with these departures: `String` / `Number` / `Boolean` are
+  now `SELF_ALLOC` (`realm.rs::Intrinsic::flags`): their bodies already
+  return a wrapper whose prototype comes from `Body::proto`, and without the
+  flag the construct site also allocated an unused `this` from
+  `Get(newTarget, "prototype")`, reading a user-code `prototype` twice.
+  `Reflect.ownKeys` shares `Object.getOwnPropertyNames`'s body
+  (`object_static.rs::own_key_list`, parameterized by the `__own_keys`
+  mode) for the `LAZY` and array-`length` handling. The `ReflectFn` bodies
+  dispatch through `builtins/mod.rs::emit_handle_family` (the main dispatch
+  is at its line limit). No registry helper rows. The array-`length`
+  insertion is `object_static.rs::emit_with_array_length`, which
+  `__proxy_own_keys` also uses: the target's list (trap-less forward and the
+  `ownKeys` invariant check) materializes a `LAZY` function target and
+  includes an array target's `length`.
+- **P4 — closeout.** `Proxy`, `proxy-missing-checks` and `Reflect*` are
+  removed from `tests/test262/unsupported-features.txt`; the baseline refresh
+  comes from the CI run. **Delivered**, with one fix to P2a: the target's
+  `[[OwnPropertyKeys]]` list (the trap-less forward and the `ownKeys`
+  invariant check) used `__own_keys(target, OWN_ALL_KEYS)`, which omits an
+  array target's `length` and a `LAZY` function target's keys; it now
+  materializes the target and inserts `length` (above, P3). The §13 per-family
+  failure table keeps its counts until the next CI recount.
 
 A different split would not be materially better: P2a is the largest stage
 (every property helper), but its arms share one protocol helper and one test
@@ -3475,28 +3655,27 @@ trampoline, so they review well on their own.
   prototype; `Reflect.construct(Date, [7 fields], nt)`,
   `Reflect.construct(Error, [msg, {cause}], nt)`, `AggregateError`, `Array`
   with more than `K` elements and `Promise` must see their own arguments,
-  not the nested call's (`Body::snapshotted`); with an `assert_same_under_gc_stress`
+  not the nested call's (`Body::snapshotted`), as must a user class with a
+  rest parameter and `Date` under a bound-function `newTarget` whose
+  `prototype` is an accessor; with an `assert_same_under_gc_stress`
   twin.
-- P4 — no new tests; the test262 run is the gate. No opcount row should
-  move (the arms are compiled out without `proxies`); a row that moves needs
-  its `reason` cell.
+- P4 — `proxy.rs`: the target's full key list (array, lazy function and
+  proxy targets, trap-less and as the `ownKeys` invariant's reference, with a
+  `gc_stress` twin); otherwise the test262 run is the gate. No opcount row
+  moves (the arms are compiled out without `proxies`).
 
-**Expected test262 effect.** 1555 tests carry a `Proxy`, `Reflect*` or
-`proxy-missing-checks` feature; 989 of them carry no other skipped feature
-and are strict-compatible (built-ins/Proxy 261, Reflect 153, Object 89,
-Array 77, Date 49, String 38, Math 36, Promise 35, JSON 24, Function 22, ...).
-While the flags stay (P2a-P3) only untagged tests that happen to use a proxy
-or `Reflect` move (about 380 files mention either; harness files
-`deepEqual.js` and `wellKnownIntrinsicObjects.js` use `Reflect.ownKeys` /
-name `%Proxy%`): roughly +20..60 after P2a, +10..30 after P2b, +60..120
-after P3. P4 adds the 989 to the eligible set; at the 85-90 % pass rate of
-comparable families that is about +850 passes. Known remaining failure
-classes: tests whose other half needs `RegExp`, `eval` or the `Function`
-constructor without a feature tag; `Array.prototype` methods whose generic
-loops clamp lengths to `2^32 - 1` (§13) observed through a proxy `length`;
-`Object.defineProperties` reading its keys before its descriptors (§13), which
-a proxy makes observable; and deep proxy chains (each level a nested helper
-call, unguarded like the renderer, §13).
+**test262 effect.** With the flags removed, about 1050 tests become
+eligible (1061 strict-compatible tests carry a `Proxy`, `Reflect*` or
+`proxy-missing-checks` feature and no other skipped one; 11 of them include
+`nativeFunctionMatcher.js`, which does not compile): built-ins/Proxy 260,
+Reflect 153, Object 89, Array 77, TypedArrayConstructors 60, Date 49,
+TypedArray 40, String 38, Math 36, Promise 35, JSON 24, DataView 24,
+Function 22, ... (421 include `isConstructor.js`, which needs
+`Reflect.construct`). The failure classes left are other sections' gaps:
+`RegExp` literals without a feature tag (§13), the `%TypedArray%.prototype`
+methods other than the getters and iterators (§5.8), the `Function`
+constructor and `eval` (§14 open decisions), and the generic `Array`
+loops' `2^32 - 1` length clamp (§13) observed through a proxy `length`.
 
 ---
 
@@ -3552,15 +3731,12 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   **ToNumber** (with `ToPrimitive` for objects). Binary `+` follows §6.5.
   `**` and `Math.pow` share one inline implementation.
 - **Bitwise and shift** `& | ^ ~ << >> >>>` and their compound forms, with
-  ToInt32 / ToUint32 on the operands.
-- **BigInt** (§6.10.5–6.10.6): equality, SameValue(Zero) and `+` with a
-  string are implemented (B2a); every other operator still applies
-  ToNumber, which throws a `TypeError` for a BigInt. Design (lands in B2b):
-  every operator above applies ToNumeric instead of ToNumber on its
-  non-number path; two BigInts use the BigInt kernels, a BigInt mixed with a
-  number throws `TypeError` (except `+` with a string, and the comparisons,
-  which are exact), unary `+` and `>>>` throw for a BigInt, and `**` leaves
-  the `Math.pow` lowering for its own `BinOp::Exp`.
+  ToInt32 / ToUint32 on the operands (ToNumeric first: see BigInt below).
+- **BigInt** (§6.10.5–6.10.6): every operator above applies ToNumeric
+  instead of ToNumber on its non-number path; two BigInts use the BigInt
+  kernels, a BigInt mixed with a number throws `TypeError` (except `+` with
+  a string, and the comparisons, which are exact), unary `+` and `>>>` throw
+  for a BigInt, and `**` is its own `BinOp::Exp` (`Math.pow` keeps ToNumber).
 - **Relational** `< > <= >=` (§6.5).
 - **Strict equality** `===` / `!==`: numbers numerically (`NaN !== NaN`,
   `+0 === -0`), strings by byte content, BigInts by value, everything else
@@ -4062,17 +4238,15 @@ invisibility and the early errors — and static blocks.
   Walks that read raw table keys must skip it: `__own_keys`' symbol pass
   (`OWN_SYMBOLS`: `getOwnPropertySymbols`; `OWN_ALL_KEYS`: object rest
   `__rest`, `Object.assign`, `defineProperties` / `create`,
-  `getOwnPropertyDescriptors`, and `Reflect.ownKeys` / object spread once
-  they land) lists a symbol key only when it lacks `SYMBOL_FLAG_PRIVATE`; the
+  `getOwnPropertyDescriptors`, `Reflect.ownKeys` and object spread) lists a symbol key only when it lacks `SYMBOL_FLAG_PRIVATE`; the
   string modes (`Object.keys/values/entries`, `getOwnPropertyNames`,
   `JSON.stringify`, `__for_in_keys`) already skip every symbol.
   `__set_integrity` (`freeze` / `seal` / `preventExtensions`) leaves private
   entries' attrs untouched and `__test_integrity` (`isFrozen` /
   `isSealed`) ignores them. The renderer (`emit/render.rs`) lists
   only `ENUMERABLE` entries, so it never shows one. A private key appended to a watched intrinsic's table only
-  sets its dirty bit. There is no `Proxy` yet; the phase-5b design (§6.11)
-  keeps private entries in the proxy's own table, so private operations act
-  on the proxy and never trap.
+  sets its dirty bit. A proxy keeps private entries in its own table
+  (§6.11), so private operations act on the proxy and never trap.
 
 **Static blocks** (phase 5a, built in P4). `static { .. }` lowers to a lifted
 zero-parameter method function (`lower_lifted_function`, method kind, not
@@ -4359,6 +4533,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `Promise` | §6.7, §7.8; `then` / `finally` create their result through `SpeciesConstructor(this, %Promise%)` (`get [Symbol.species]` on `%Promise%`); `Promise.resolve` / `Promise.reject` construct from `this` (`PromiseResolve(C, x)` / `NewPromiseCapability(C)`; a non-constructor `this` throws `TypeError`); `Promise.all`, `allSettled`, `any` (all rejected: an `AggregateError` with `errors`), `race` over any iterable (§6.7) |
 | `Date` | `new Date()`, `new Date(value)` (a Date's time value, else `ToPrimitive(value)`: a string is parsed as by `Date.parse`, anything else `ToNumber`), `new Date(year, month[, date, hours, minutes, seconds, ms])` (UTC fields: `MakeDay` / `MakeTime`, `TimeClip`), `Date()` (current time as a string), `Date.now()`, `Date.UTC(year[, month, ..])`, `Date.parse(string)` (`ToString`, then a guest-side parser of exactly the Date Time String Format — `YYYY[-MM[-DD]]` or `±YYYYYY` (not `-000000`), optional `THH:mm[:ss[.sss]]` and `Z` / `±HH:mm`, range-checked fields, `24:00` only as `24:00:00.000`; date-only forms are UTC, a date-time without offset is local time = UTC — and the `toString` (`Www Mmm DD YYYY HH:mm:ss GMT±hhmm[ (..)]`) / `toUTCString` outputs; anything else is `NaN`, the result `TimeClip`ped); `getTime`, `valueOf`, `getFullYear`, `getMonth`, `getDate`, `getDay`, `getHours`, `getMinutes`, `getSeconds`, `getMilliseconds`, the `getUTC*` twins, `getTimezoneOffset` (`0`), Annex B `getYear`; `setMilliseconds`, `setSeconds`, `setMinutes`, `setHours`, `setDate`, `setMonth`, `setFullYear`, the `setUTC*` twins (same body, distinct functions), `setTime`, Annex B `setYear` (`thisTimeValue` first, then `ToNumber` of every argument in order, then a `NaN` time value returns `NaN` unstored — `setFullYear` / `setYear` start from `+0` — else `TimeClip` is stored and returned); `toISOString` (`RangeError` on an invalid date; expanded `±YYYYYY` years), `toJSON`, `toString` (`Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)`), `toDateString` (`Thu Jan 01 1970`), `toTimeString` (`00:00:00 GMT+0000 (Coordinated Universal Time)`), `toUTCString` (`Thu, 01 Jan 1970 00:00:00 GMT`; Annex B `toGMTString` is the same function object), `toLocaleString` / `toLocaleDateString` / `toLocaleTimeString` (the `toString` / `toDateString` / `toTimeString` texts) — the string forms sign a negative year and pad it to four digits (`-0001`) and render an invalid date as `Invalid Date` —, `[@@toPrimitive]` (configurable only) — local time is UTC (`LocalTZA = 0`), computed in wasm |
 | `Symbol` | `Symbol(desc)` (a fresh symbol; `new Symbol()` throws `TypeError`, though `Symbol` is a constructor for `IsConstructor`), `Symbol.for` / `Symbol.keyFor` (the hidden registry; `keyFor` of a non-symbol throws), the 13 well-known symbols (non-writable, non-enumerable, non-configurable); `Symbol.prototype.toString` (`Symbol(desc)`), `valueOf`, the `description` getter (a program that names `description` compiles the accessor dispatch of `__get`), `[@@toPrimitive]`, `[@@toStringTag]` `"Symbol"` (both configurable only), each over `thisSymbolValue` (a symbol or a `CLASS_SYMBOL` wrapper) |
+| `BigInt` | §6.10: `BigInt(v)` (a number must be integral, else `RangeError`; strings in every `StringIntegerLiteral` radix, else `SyntaxError`; `new BigInt()` throws `TypeError`, though `BigInt` is a constructor for `IsConstructor`), `BigInt.asIntN` / `asUintN`; `BigInt.prototype.toString(radix)`, `toLocaleString` (`toString()`, no locale data), `valueOf`, `@@toStringTag`; `Number(1n)`; every arithmetic, bitwise, shift, relational, equality and update operator on BigInts (§7.2) |
 | errors | §7.7 |
 | generators | `%GeneratorPrototype%` `next`, `return`, `throw` |
 | iterators | `%IteratorPrototype%[@@iterator]`, `%AsyncIteratorPrototype%[@@asyncIterator]` (both return `this`); the `next` of the Array, String, Map and Set Iterator prototypes (a receiver that is not an iterator of the family throws `TypeError: next method called on incompatible receiver`); `Iterator` (abstract: calling it, or `new` with `new.target === Iterator`, throws `TypeError`; a subclass constructs), `Iterator.prototype` (`%IteratorPrototype%`, non-writable) with `constructor` (`%Iterator%`) and `@@toStringTag` (`"Iterator"`) accessors whose setters are `SetterThatIgnoresPrototypeProperties` (a `TypeError` on a non-object or on `Iterator.prototype` itself; an own data property on any other receiver); `Iterator.from(O)` (`GetIteratorFlattenable`: strings are iterated, other primitives throw `TypeError`; an iterator inheriting `Iterator.prototype` is returned as is, any other is wrapped in a `CLASS_ITERATOR` object of kind `16` over `%WrapForValidIteratorPrototype%`, whose `next` / `return` forward to the wrapped record, `next` read once); the lazy helpers `Iterator.prototype.map` / `filter` / `take` / `drop` / `flatMap` (`this` must be an object; the argument is validated first — a non-callable callback is a `TypeError`, a `take` / `drop` limit goes through `ToNumber` and `NaN` or a negative integer is a `RangeError` — closing `this` on failure; then `next` is read once and a helper object is returned without stepping). A helper's `next` steps the underlying iterator only on demand; a throwing callback, or a `flatMap` result that is not an object (a string included) or not iterable, closes the underlying iterator; `take` closes it once the limit is reached; a `next` / `return` while the helper runs throws `TypeError`; `return()` closes the underlying iterator (and a `flatMap`'s open inner one first) and completes the helper. The eager helpers `reduce` / `toArray` / `forEach` / `some` / `every` / `find` validate `this` and the callback the same way, read `next` once and consume the iterator, passing a counter as the callback's last argument (`reduce` without an initial value starts from the first value with counter `1`, and throws `TypeError` on an empty iterator); a throwing callback closes the iterator under its throw, `some` / `every` / `find` close it on an early result, and a throw from `next` or a result's `value` propagates without closing. A program that names `Iterator`, `constructor`, `getPrototypeOf` or `setPrototypeOf` compiles the accessor dispatch of `__get` / `__set` |
@@ -4461,7 +4636,8 @@ Errors are printed to stderr.
   `doneprintHandle.js`). A test flagged both `raw` and `async` is skipped as
   `flag:async`: a raw source leaves no place to prepend `$DONE`.
   `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` and
-  `symbols-as-weakmap-keys` are not listed (phase 4); `host-gc-required`
+  `symbols-as-weakmap-keys` are not listed (phase 4), nor is `BigInt`
+  (phase 5b, §6.10); `host-gc-required`
   stays, because a test cannot force a collection without a host hook
   (`$262.gc`), which jsc does not provide.
 - **Assembly** (`assemble.rs`). `raw` tests run byte-for-byte; all others are
@@ -4652,7 +4828,9 @@ Each item below is current behaviour of this tree.
   and the realm image are in every module.
 - The call-stack guard (§6.6) counts user-function calls only. Recursion
   inside the runtime that depends on data depth (`JSON.parse` /
-  `JSON.stringify` nesting, the console renderer) is unguarded, and a host
+  `JSON.stringify` nesting, the console renderer, a chain of proxies whose
+  levels forward without a trap: each level is a nested helper call) is
+  unguarded, and a host
   with a smaller stack than the `jsc` runner (`node:wasi`, a browser) can
   exhaust it before 10 000 calls: both end in a host trap, not a
   `RangeError`.
@@ -4677,11 +4855,13 @@ Each item below is current behaviour of this tree.
 - `Symbol.iterator` and the other `Symbol.*` statics are not folded at
   compile time: a sealed `Symbol` compiles to the intrinsic's address, and the
   member is an ordinary `__get` on it.
-- Not available: `RegExp` (literals and constructor), `BigInt`, `Proxy`, `Reflect`,
-  `Float16Array`, the BigInt typed arrays, `Intl`, `eval`. `Proxy` and
-  `Reflect` are phase 5b work in progress: designed (§6.11), not
-  implemented, and their test262 features are still skipped.
+- Not available: `RegExp` (literals and constructor),
+  `Float16Array`, the BigInt typed arrays, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
+- A BigInt holds at most `2^24` bits (`RangeError: Maximum BigInt size
+  exceeded`, §6.10.1; V8 allows `2^30`), and `BigInt.prototype.toLocaleString` ignores its locales
+  and options (no `Intl`): the 6 locale tests of
+  `intl402/BigInt/prototype/toLocaleString` fail (§6.10).
 - The builtin library is exactly §7.9.
 - Binary data has no `SharedArrayBuffer`, `Atomics` or immutable buffers
   (`transferToImmutable`, `sliceToImmutable`), and no host detach outside
@@ -4715,7 +4895,7 @@ Each item below is current behaviour of this tree.
   |---|---|---|---|---|---|---|---|
   | `RegExp` | phase 5b | 28 | 131 | 3 | | | |
   | `Function` constructor | unsupported (§14 open decisions) | | 4 | 124 | | | 1 |
-  | `eval` / `Proxy` / `BigInt` / `ArrayBuffer` | `eval` unsupported; the rest phase 5b | 21 | 19 | 4 | 1 | | |
+  | `eval` / `Proxy` / `ArrayBuffer` | `eval` unsupported; the rest phase 5b | 21 | 19 | 4 | 1 | | |
   | `String.prototype` / `Number.prototype` are not exotic (above) | object model | | 3 | | | 4 | |
   | `Array.fromAsync` over an array-like of length `2^53 - 1` (timeout) | — | 1 | | | | | |
   | strict `caller` access (`caller/prop-desc`) | — | | | 1 | | | |
@@ -4871,14 +5051,13 @@ steps.
 - All remaining early errors.
 - ES modules: `import`/`export` across files, bundled at compile time into one
   module.
-- `RegExp`, `BigInt`, typed arrays, `ArrayBuffer`, `DataView`, `Proxy`,
-  `Reflect`.
+- `RegExp`, typed arrays, `ArrayBuffer`, `DataView`; `BigInt` (phase 5b,
+  done: §6.10).
 - Phase 5b binary data (`ArrayBuffer`, typed arrays, `DataView`): designed
-  in §5.8 (type tags `24`..`26`; `20`..`23` reserved for the Proxy and BigInt
-  workstreams), implemented in stages T2, T3a, T4, T3b, T5a, T5b, T6
+  in §5.8 (type tags `24`..`26`; `20` is `TYPE_PROXY`, `21` is
+  `TYPE_BIGINT`, `22` / `23` spare), implemented in stages T2, T3a, T4, T3b, T5a, T5b, T6
   (§5.8.10).
-  `Reflect` (phase 5b; the `Proxy` / `Reflect` design is §6.11, stages
-  P2a-P4).
+- `Proxy` and `Reflect` (phase 5b, done; §6.11, stages P2a-P4).
 
 ### Phase 6 — Performance
 
