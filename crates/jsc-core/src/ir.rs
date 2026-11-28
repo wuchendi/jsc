@@ -565,11 +565,13 @@ pub enum BuiltinCtor {
     FinalizationRegistry,
     /// `ArrayBuffer` (DESIGN.md §5.8).
     ArrayBuffer,
+    /// `DataView` (DESIGN.md §5.8).
+    DataView,
 }
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 25] = [
+    pub(crate) const ALL: [BuiltinCtor; 26] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -595,6 +597,7 @@ impl BuiltinCtor {
         Self::WeakRef,
         Self::FinalizationRegistry,
         Self::ArrayBuffer,
+        Self::DataView,
     ];
 
     /// The constructor's global name (also its `name`).
@@ -618,6 +621,7 @@ impl BuiltinCtor {
             Self::WeakRef => "WeakRef",
             Self::FinalizationRegistry => "FinalizationRegistry",
             Self::ArrayBuffer => "ArrayBuffer",
+            Self::DataView => "DataView",
         }
     }
 
