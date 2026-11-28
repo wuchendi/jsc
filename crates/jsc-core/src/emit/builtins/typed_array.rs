@@ -45,7 +45,7 @@ macro_rules! alignment_errors {
 }
 
 /// The alignment `RangeError`s of each kind (DESIGN.md §5.8.7).
-const ALIGNMENT: [[CalleeErrorText<'static>; 2]; 11] = alignment_errors![
+const ALIGNMENT: [[CalleeErrorText<'static>; 2]; 12] = alignment_errors![
     "Int8Array" => "1",
     "Uint8Array" => "1",
     "Uint8ClampedArray" => "1",
@@ -53,6 +53,7 @@ const ALIGNMENT: [[CalleeErrorText<'static>; 2]; 11] = alignment_errors![
     "Uint16Array" => "2",
     "Int32Array" => "4",
     "Uint32Array" => "4",
+    "Float16Array" => "2",
     "Float32Array" => "4",
     "Float64Array" => "8",
     "BigInt64Array" => "8",
@@ -399,6 +400,33 @@ fn new_typed_array(
         LocalGet(base), LocalGet(view.length), I32Store(m32(abi::TA_LENGTH_OFFSET)),
         LocalGet(base), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(out),
     );
+}
+
+/// `AllocateTypedArray("Uint8Array", %Uint8Array%, %Uint8Array.prototype%,
+/// n)` for the byte count in i32 `n` into i64 `out` (the base64 / hex
+/// statics, DESIGN.md §5.8.7): a fresh fixed buffer and a view over all of
+/// it; no user code runs, and out of memory returns with the `RangeError`
+/// pending. `buffer` / `proto` are i64 temps, `data` / `zero` i32 temps.
+pub(super) fn new_uint8_array(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    (n, buffer, proto, data, zero, out): (u32, u32, u32, u32, u32, u32),
+    helpers: Helpers<'_>,
+) {
+    new_buffer(function, frame, (n, data, buffer), helpers);
+    let realm_proto = intrinsic_bits(
+        Intrinsic::Prototype(BuiltinCtor::Typed(ElementKind::Uint8)),
+        helpers,
+    );
+    wasm!(function; I64Const(realm_proto), LocalSet(proto), I32Const(0), LocalSet(zero));
+    let view = View {
+        buffer,
+        proto,
+        flags: zero,
+        offset: zero,
+        length: n,
+    };
+    new_typed_array(function, frame, ElementKind::Uint8, view, out, helpers);
 }
 
 /// The locals of a constructor body.

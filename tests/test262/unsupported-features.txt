@@ -9,9 +9,7 @@ regexp-*
 RegExp.escape
 legacy-regexp
 
-# Binary data: Float16Array, base64, DataView, Atomics (no constructors)
-Float16Array
-uint8array-base64
+# Binary data: immutable buffers, shared memory, Atomics (no constructors)
 immutable-arraybuffer
 SharedArrayBuffer
 Atomics*
