@@ -2598,10 +2598,13 @@ the extra rooting of arithmetic results). `Helpers::bigints`
   which a computed access could use): `BigInt`, `BigInt64Array`,
   `BigUint64Array`, `getBigInt64`, `getBigUint64`, `setBigInt64`,
   `setBigUint64`, `DataView`;
-- uses the global object as a value (`GlobalIntrinsic::Global`:
-  `globalThis` in any form, top-level `this`), which reaches `BigInt` by a
-  computed name or by reflection — the rule of the binary-data gate (§6.4)
-  and of the Proxy gate (§6.11).
+- uses the global object as a value (`sections.rs::holds_global`: the
+  intrinsic `GlobalIntrinsic::Global` — top-level `this`, or `globalThis`
+  while it is sealed, i.e. read only by static members — or a `GlobalGet`
+  of `globalThis` — any read once the global object is open:
+  `globalThis[k]`, `const g = globalThis`, aliases included), which reaches
+  `BigInt` by a computed name or by reflection — the rule of the Proxy and
+  `Reflect` gates (§6.11).
 
 These are every source of a BigInt value on this base: a literal; the
 `BigInt` function (`BigInt(v)`, and `asIntN` / `asUintN`, reachable only
