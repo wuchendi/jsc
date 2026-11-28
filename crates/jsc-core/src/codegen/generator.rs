@@ -328,9 +328,12 @@ impl LowerCtx<'_> {
         match body_kind {
             BodyKind::Block(stmts) => {
                 self.bind_vars(stmts, &mut body)?;
+                let start = body.len();
+                let lexical = self.predeclare_lexical(stmts, &mut body);
                 for stmt in stmts {
                     self.lower_stmt(stmt, &mut body)?;
                 }
+                self.settle_lexical(&lexical, &mut body, start);
             }
             BodyKind::Expr(expr) => {
                 let node = self.lower_expr(expr)?;

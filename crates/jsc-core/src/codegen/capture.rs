@@ -578,6 +578,7 @@ impl CaptureResolver {
     /// hoisted, so their names are bound before any statement and their bodies
     /// are analyzed last, after every binding of the list is declared (a body
     /// may capture a `let`/`const` declared later in the list, or a sibling).
+    /// The list's lexical bindings are declared up front too.
     fn stmts(&mut self, stmts: &[Stmt]) {
         let fns: Vec<&FnDecl> = stmts
             .iter()
@@ -589,6 +590,12 @@ impl CaptureResolver {
         for f in &fns {
             self.declare(f.ident.sym.as_ref(), f.ident.span.lo.0);
             self.var_ids.insert(f.ident.span.lo.0);
+        }
+        // The list's `let`/`const`/`class` bindings exist (in their TDZ) from
+        // the start of the list, so a closure in an initializer or an earlier
+        // statement resolves to them (see [`LowerCtx::predeclare_lexical`]).
+        for (name, id, _) in lexical_bindings(stmts) {
+            self.declare(&name, id);
         }
         for s in stmts {
             if !matches!(s, Stmt::Decl(Decl::Fn(_))) {
@@ -830,6 +837,31 @@ pub(super) fn pat_bindings(pat: &Pat, out: &mut Vec<(String, u32)>) {
         Pat::Assign(assign) => pat_bindings(&assign.left, out),
         Pat::Expr(_) | Pat::Invalid(_) => {}
     }
+}
+
+/// The lexical bindings a block or function-body statement list declares
+/// directly (`let`/`const` names, destructured ones included, and class
+/// declarations): each name with its [`binding_id`] and mutability, in source
+/// order.
+pub(super) fn lexical_bindings(stmts: &[Stmt]) -> Vec<(String, u32, bool)> {
+    let mut out = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            Stmt::Decl(Decl::Var(v)) if v.kind != VarDeclKind::Var => {
+                let mut names = Vec::new();
+                for d in &v.decls {
+                    pat_bindings(&d.name, &mut names);
+                }
+                let mutable = v.kind != VarDeclKind::Const;
+                out.extend(names.into_iter().map(|(name, id)| (name, id, mutable)));
+            }
+            Stmt::Decl(Decl::Class(c)) => {
+                out.push((c.ident.sym.as_ref().to_owned(), c.ident.span.lo.0, true));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Whether a parameter list has parameter expressions (a default or a

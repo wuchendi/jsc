@@ -550,6 +550,13 @@ struct Frame {
     /// observe it), and whether a destructured or rest name binds its
     /// pre-declared local (see [`LowerCtx::bind_params`]).
     binding: Option<ParamBinding>,
+    /// The ids of the block-scoped bindings declared ahead of their
+    /// declaration (see [`LowerCtx::predeclare_lexical`]) that are still in
+    /// their TDZ.
+    lexical_tdz: std::collections::HashSet<u32>,
+    /// The ids in `lexical_tdz` a closure has referenced while still in their
+    /// TDZ: their cell must exist, holding the hole, before the declaration.
+    lexical_early: std::collections::HashSet<u32>,
 }
 
 /// The in-progress parameter binding of a [`Frame`].

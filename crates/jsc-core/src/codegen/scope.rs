@@ -28,6 +28,8 @@ impl Frame {
             var_ids: std::collections::HashSet::new(),
             params: Vec::new(),
             binding: None,
+            lexical_tdz: std::collections::HashSet::new(),
+            lexical_early: std::collections::HashSet::new(),
         }
     }
 }
@@ -586,13 +588,15 @@ impl<'a> LowerCtx<'a> {
         let Some((fi, binding)) = self.find_binding(name) else {
             return self.resolve_module(name);
         };
-        // A parameter still in its TDZ (DESIGN.md §7.4): a reference from its
-        // own frame runs before the binding, so it throws outright; a closure
-        // may run later, so it checks the cell for the hole.
+        // A parameter or block-scoped binding still in its TDZ (DESIGN.md
+        // §7.1, §7.4): a reference from its own frame runs before the binding,
+        // so it throws outright; a closure may run later, so it checks the
+        // cell for the hole.
         let pending = self.frames[fi]
             .binding
             .as_ref()
-            .is_some_and(|b| b.pending.contains(&binding.id));
+            .is_some_and(|b| b.pending.contains(&binding.id))
+            || self.frames[fi].lexical_tdz.contains(&binding.id);
         if pending && fi == self.top() {
             return Some(Resolved {
                 kind: AccessKind::Cell(IrNode::Throw(Box::new(reference_error(&format!(
@@ -617,6 +621,9 @@ impl<'a> LowerCtx<'a> {
             }
         } else {
             // Captured from an enclosing frame: reached through this frame's env.
+            if self.frames[fi].lexical_tdz.contains(&binding.id) {
+                self.frames[fi].lexical_early.insert(binding.id);
+            }
             let slot = self.route_env(fi, binding.id);
             let ptr = IrNode::EnvLoad(slot);
             if pending {
