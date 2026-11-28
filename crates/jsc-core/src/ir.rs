@@ -581,13 +581,102 @@ pub enum BuiltinCtor {
     ArrayBuffer,
     /// `DataView` (DESIGN.md §5.8).
     DataView,
+    /// `%TypedArray%` (DESIGN.md §5.8.7): abstract, not a global.
+    TypedArray,
+    /// A concrete typed-array constructor (`Int8Array` .. `Float64Array`).
+    Typed(ElementKind),
     /// `BigInt` (DESIGN.md §6.10.7): callable, `new` throws.
     BigInt,
 }
 
+/// A typed-array element kind (DESIGN.md §5.8.6), in the spec's Table 71
+/// order. `Float16Array` (kind `7`) and the `BigInt` kinds (`10`, `11`) are
+/// not installed yet; their kind numbers stay reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElementKind {
+    /// `Int8Array`.
+    Int8,
+    /// `Uint8Array`.
+    Uint8,
+    /// `Uint8ClampedArray`.
+    Uint8Clamped,
+    /// `Int16Array`.
+    Int16,
+    /// `Uint16Array`.
+    Uint16,
+    /// `Int32Array`.
+    Int32,
+    /// `Uint32Array`.
+    Uint32,
+    /// `Float32Array`.
+    Float32,
+    /// `Float64Array`.
+    Float64,
+}
+
+impl ElementKind {
+    /// Every installed kind, in kind order.
+    pub(crate) const ALL: [ElementKind; 9] = [
+        Self::Int8,
+        Self::Uint8,
+        Self::Uint8Clamped,
+        Self::Int16,
+        Self::Uint16,
+        Self::Int32,
+        Self::Uint32,
+        Self::Float32,
+        Self::Float64,
+    ];
+
+    /// The kind number stored in a typed array's `kind` byte.
+    pub(crate) fn kind(self) -> u8 {
+        match self {
+            Self::Int8 => 0,
+            Self::Uint8 => 1,
+            Self::Uint8Clamped => 2,
+            Self::Int16 => 3,
+            Self::Uint16 => 4,
+            Self::Int32 => 5,
+            Self::Uint32 => 6,
+            Self::Float32 => 8,
+            Self::Float64 => 9,
+        }
+    }
+
+    /// The constructor's name.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Int8 => "Int8Array",
+            Self::Uint8 => "Uint8Array",
+            Self::Uint8Clamped => "Uint8ClampedArray",
+            Self::Int16 => "Int16Array",
+            Self::Uint16 => "Uint16Array",
+            Self::Int32 => "Int32Array",
+            Self::Uint32 => "Uint32Array",
+            Self::Float32 => "Float32Array",
+            Self::Float64 => "Float64Array",
+        }
+    }
+
+    /// `log2` of the element size.
+    pub(crate) fn shift(self) -> u8 {
+        match self {
+            Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 0,
+            Self::Int16 | Self::Uint16 => 1,
+            Self::Int32 | Self::Uint32 | Self::Float32 => 2,
+            Self::Float64 => 3,
+        }
+    }
+
+    /// The element size in bytes (`BYTES_PER_ELEMENT`).
+    pub(crate) fn size(self) -> u32 {
+        1 << self.shift()
+    }
+}
+
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 27] = [
+    pub(crate) const ALL: [BuiltinCtor; 37] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -614,6 +703,16 @@ impl BuiltinCtor {
         Self::FinalizationRegistry,
         Self::ArrayBuffer,
         Self::DataView,
+        Self::TypedArray,
+        Self::Typed(ElementKind::Int8),
+        Self::Typed(ElementKind::Uint8),
+        Self::Typed(ElementKind::Uint8Clamped),
+        Self::Typed(ElementKind::Int16),
+        Self::Typed(ElementKind::Uint16),
+        Self::Typed(ElementKind::Int32),
+        Self::Typed(ElementKind::Uint32),
+        Self::Typed(ElementKind::Float32),
+        Self::Typed(ElementKind::Float64),
         Self::BigInt,
     ];
 
@@ -639,13 +738,18 @@ impl BuiltinCtor {
             Self::FinalizationRegistry => "FinalizationRegistry",
             Self::ArrayBuffer => "ArrayBuffer",
             Self::DataView => "DataView",
+            Self::TypedArray => "TypedArray",
+            Self::Typed(kind) => kind.name(),
             Self::BigInt => "BigInt",
         }
     }
 
-    /// The constructor bound to the global `name`.
+    /// The constructor bound to the global `name` (`%TypedArray%` is not a
+    /// global).
     pub(crate) fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|c| c.name() == name)
+        Self::ALL
+            .into_iter()
+            .find(|c| *c != Self::TypedArray && c.name() == name)
     }
 }
 

@@ -404,7 +404,7 @@ pub(super) fn emit_number_unary(
 /// the i64 range still wrap correctly. NaN and ±Infinity make `m` NaN, and `-0`
 /// makes it `+0`; the saturating unsigned truncation maps both to `0` and
 /// reinterprets `[2^31, 2^32)` as the negative int32 range.
-fn emit_to_int32(function: &mut impl Sink, local: u32) {
+pub(super) fn emit_to_int32(function: &mut impl Sink, local: u32) {
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::F64ReinterpretI64);
     function.instruction(&Instruction::F64Trunc);

@@ -188,11 +188,11 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
 /// proxy trap helper (not itself declared, so a safepoint) when the program
 /// can hold proxies (DESIGN.md §6.11).
 fn integrity_callees(helpers: Helpers<'_>) -> Vec<u32> {
+    let mut callees = binary::integrity_callees(helpers);
     if helpers.proxies() {
-        vec![helpers.proxy_is_extensible()]
-    } else {
-        vec![]
+        callees.push(helpers.proxy_is_extensible());
     }
+    callees
 }
 
 /// The leaf-graph declarations of the runtime modules, in group order.
