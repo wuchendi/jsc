@@ -592,7 +592,7 @@ pub(in crate::emit) fn emit_to_desc(
             "value" => wasm!(f; LocalGet(v), LocalSet(value)),
             "get" | "set" => {
                 // Neither callable nor undefined: `<kind> must be a function: v`.
-                emit_is_function(&mut f, v);
+                emit_is_function(&mut f, v, helpers);
                 wasm!(f;
                     I32Eqz, LocalGet(v), I64Const(UNDEFINED_BITS), I64Ne, I32And,
                     If(BlockType::Empty),

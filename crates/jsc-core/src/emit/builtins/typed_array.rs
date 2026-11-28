@@ -930,7 +930,7 @@ fn emit_of(function: &mut FnBuilder<'_>, frame: Frame, strings: &StrOffsets, hel
         LocalTee(n), F64ConvertI32U, I64ReinterpretF64, LocalSet(len),
         GlobalGet(THIS_GLOBAL), LocalSet(c),
     );
-    emit_is_constructor(function, c);
+    emit_is_constructor(function, c, helpers);
     wasm!(function; I32Eqz);
     type_error_if(function, frame, OF_NOT_CONSTRUCTOR, strings, helpers);
     create_from_ctor(function, frame, (c, len, target), strings, helpers);
@@ -968,14 +968,14 @@ fn emit_from(
         frame.arg(function, i);
         wasm!(function; LocalSet(local));
     }
-    emit_is_constructor(function, c);
+    emit_is_constructor(function, c, helpers);
     wasm!(function; I32Eqz);
     type_error_if(function, frame, FROM_NOT_CONSTRUCTOR, strings, helpers);
     wasm!(function;
         LocalGet(map_fn), I64Const(UNDEFINED_BITS), I64Ne, LocalTee(mapping),
         If(BlockType::Empty),
     );
-    emit_is_function(function, map_fn);
+    emit_is_function(function, map_fn, helpers);
     wasm!(function; I32Eqz);
     type_error_if(function, frame, FROM_NOT_CALLABLE, strings, helpers);
     wasm!(function; End);

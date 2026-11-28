@@ -1557,7 +1557,7 @@ fn emit_open_body(
 ) {
     let (v, it, method) = (frame.i64(0), frame.i64(1), frame.k);
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(v));
-    emit_is_function(function, method);
+    emit_is_function(function, method, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_and_return(function, frame, &map_set::not_iterable(v), strings, helpers);
     wasm!(function; End);
@@ -1585,7 +1585,7 @@ fn emit_step_body(
         frame.k,
     );
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(it));
-    emit_is_function(function, next);
+    emit_is_function(function, next, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_and_return(
         function,
@@ -1652,7 +1652,7 @@ fn emit_close_body(
     return_if_pending(function);
     emit_is_nullish(function, method);
     wasm!(function; If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End);
-    emit_is_function(function, method);
+    emit_is_function(function, method, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_and_return(
         function,

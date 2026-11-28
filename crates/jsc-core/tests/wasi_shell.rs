@@ -252,6 +252,12 @@ fn every_compiled_module_validates() {
         "const p = new Proxy({ a: 1 }, { get(t, k) { return t[k]; } }); p.a; p.b = 2; 'a' in p;
          delete p.a; Object.keys(p); Object.freeze(p); Object.getPrototypeOf(p);
          for (const k in p) k; ({ ...p }); Proxy.revocable({}, {}).revoke()",
+        "const f = new Proxy(function (a) { return a; }, { apply(t, th, args) { return t(...args); } });
+         const C = new Proxy(class {}, { construct(t, args, nt) { return new t(...args); } });
+         f(1); f(...[1, 2, 3, 4, 5]); new C(1); class D extends C {} new D();
+         Array.isArray(new Proxy([], {})); Object.prototype.toString.call(f);
+         JSON.stringify(new Proxy([1], {})); ({}) instanceof f; f.bind(null)();
+         Function.prototype.toString.call(f); [0].concat(new Proxy([1], {})).flat()",
     ] {
         compile(src, false).expect("compiles");
         compile(src, true).expect("compiles with print_completion");
