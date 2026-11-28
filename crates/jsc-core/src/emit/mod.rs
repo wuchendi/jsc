@@ -999,6 +999,18 @@ enum ProxyGate {
     Open,
 }
 
+/// The DESIGN.md §6.11 `Reflect` reachability gate: whether the program can
+/// hold `%Reflect%` — it names `Reflect` (an identifier, a member or property
+/// name, a string) or reaches the global object. When closed, the thirteen
+/// `Reflect` bodies are `unreachable` stubs that record no shake uses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReflectGate {
+    /// `%Reflect%` cannot be reached.
+    Closed,
+    /// `%Reflect%` may be reached.
+    Open,
+}
+
 /// The DESIGN.md §6.10.9 reachability gate: whether the program can produce
 /// a `BigInt` — a `BigInt` literal, a `BIGINT_NAMES` name (an identifier, a
 /// member or property name, a string) or the global object. When closed, the
@@ -1211,6 +1223,9 @@ struct Helpers<'a> {
     /// Whether the program can create a proxy (DESIGN.md §6.11 reachability
     /// gate; see [`Helpers::proxies`]).
     proxy_gate: ProxyGate,
+    /// Whether the program can hold `%Reflect%` (DESIGN.md §6.11
+    /// reachability gate; see [`Helpers::reflect`]).
+    reflect_gate: ReflectGate,
     /// Whether the program can produce a `BigInt` (DESIGN.md §6.10.9
     /// reachability gate; see [`Helpers::bigints`]).
     bigint_gate: BigIntGate,
