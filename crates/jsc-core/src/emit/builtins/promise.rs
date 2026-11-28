@@ -128,6 +128,30 @@ fn is_promise(function: &mut FnBuilder<'_>, local: u32) {
     wasm!(function; I32Const(i32::from(abi::TYPE_PROMISE)), I32Eq, Else, I32Const(0), End);
 }
 
+/// Push i32 `1` when `Get(local, "then")` is the builtin `then`: a promise
+/// without own properties whose `proto` is a clean `%Promise.prototype%`.
+/// Without dirty tracking the bits prove nothing, so `0`.
+fn has_builtin_then(function: &mut FnBuilder<'_>, local: u32, helpers: Helpers<'_>) {
+    let bit = Intrinsic::Prototype(BuiltinCtor::Promise).watch_bit();
+    let Some(bit) = bit.filter(|_| helpers.dirty_tracking) else {
+        wasm!(function; I32Const(0));
+        return;
+    };
+    let proto = intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Promise), helpers);
+    is_promise(function, local);
+    wasm!(function;
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(local), I32WrapI64,
+        I32Load(MemArg { offset: u64::from(abi::OBJ_PROPS_OFFSET), align: 2, memory_index: 0 }),
+        I32Eqz,
+        LocalGet(local), I32WrapI64,
+        I64Load(MemArg { offset: u64::from(abi::OBJ_PROTO_OFFSET), align: 3, memory_index: 0 }),
+        I64Const(proto), I64Eq, I32And,
+        GlobalGet(DIRTY_GLOBAL), I32Const(1 << bit), I32And, I32Eqz, I32And,
+        Else, I32Const(0), End,
+    );
+}
+
 /// `this.then(undefined, onRejected)` over the frame's locals.
 fn catch_call(frame: Frame) -> IrNode {
     let args = vec![IrNode::Undefined, IrNode::Local(frame.i64(1))];
@@ -428,9 +452,10 @@ pub(super) fn emit_then(
 }
 
 /// `finally(onFinally)` on any object: `C = SpeciesConstructor(this,
-/// %Promise%)`; a promise whose `C` is `%Promise%` runs `__promise_finally`, any
-/// other receiver `this.then(thenFinally, catchFinally)` (both `onFinally`
-/// when it is not callable).
+/// %Promise%)`; a promise whose `C` is `%Promise%` and whose `then` is the
+/// builtin one ([`has_builtin_then`]) runs `__promise_finally`, any other
+/// receiver `this.then(thenFinally, catchFinally)` (both `onFinally` when it
+/// is not callable).
 pub(super) fn emit_finally(
     function: &mut FnBuilder<'_>,
     frame: Frame,
@@ -447,7 +472,7 @@ pub(super) fn emit_finally(
     throw_type_error(function, frame, NOT_PROMISE[1], strings, helpers);
     wasm!(function; End);
     species_constructor(function, frame, this, c, strings, helpers);
-    is_promise(function, this);
+    has_builtin_then(function, this, helpers);
     wasm!(function;
         LocalGet(c), I64Const(UNDEFINED_BITS), I64Eq, I32And,
         If(BlockType::Result(ValType::I64)),

@@ -163,6 +163,32 @@ fn finally_runs_on_rejection() {
     );
 }
 
+/// `finally` always goes through `Invoke(promise, "then", ..)`: a promise's
+/// own `then`, or a replaced `Promise.prototype.then`, is called with the
+/// two internal closures (each of `length` 1 and not a constructor), and its
+/// result is returned.
+#[test]
+fn finally_invokes_overridden_then() {
+    assert_output(
+        "const target = new Promise(() => {});
+         const ret = {};
+         let calls = 0, info;
+         target.then = function (a, b) {
+           calls += 1;
+           info = [this === target, arguments.length, typeof a, a.length, b.length].join();
+           return ret;
+         };
+         const r = Promise.prototype.finally.call(target, () => {}, 2, 3);
+         const proto = Promise.prototype.then;
+         let seen = 0;
+         Promise.prototype.then = function (a, b) { seen += 1; return proto.call(this, a, b); };
+         Promise.resolve(1).finally(() => {});
+         Promise.prototype.then = proto;
+         console.log(calls, info, r === ret, seen);",
+        "1 true,2,function,1,1 true 1\n",
+    );
+}
+
 // --- Rendering ----------------------------------------------------------------
 
 /// A settled promise renders Node-console style by settlement kind.
