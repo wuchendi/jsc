@@ -1434,9 +1434,20 @@ fn emit_ignoring_setter(
     throw_type_error(function, frame, SETTER_NOT_OBJECT, strings, helpers);
     wasm!(function; End, LocalGet(this), I64Const(home), I64Eq, If(BlockType::Empty));
     throw_type_error(function, frame, SETTER_HOME, strings, helpers);
+    wasm!(function; End);
+    if helpers.proxies() {
+        // `this.[[GetOwnProperty]](key)`: a proxy's trap (DESIGN.md §6.11).
+        let (list, found) = (frame.base(0), frame.i32(0));
+        wasm!(function;
+            I32Const(0), Call(helpers.new_array()), LocalSet(list),
+            LocalGet(this), I32Const(key), LocalGet(list), Call(helpers.own_prop()), LocalSet(found),
+            GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+            LocalGet(found), I32Eqz,
+        );
+    } else {
+        wasm!(function; LocalGet(this), I32WrapI64, I32Const(key), Call(helpers.prop_find), I32Eqz);
+    }
     wasm!(function;
-        End,
-        LocalGet(this), I32WrapI64, I32Const(key), Call(helpers.prop_find), I32Eqz,
         If(BlockType::Empty),
         LocalGet(this), I32WrapI64, I32Const(key), LocalGet(v),
         I32Const(abi::ATTRS_DEFAULT.cast_signed()), Call(helpers.define),
