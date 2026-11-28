@@ -4469,6 +4469,16 @@ Errors are printed to stderr.
   `--check` fails if any baseline test no longer passes; `--update-baseline`
   rewrites it to the current passes (with PATH_PREFIX filters, only the entries
   under those prefixes are replaced).
+- **Partitions** (`partition.rs`). `--partition K/N` (`1 <= K <= N`) runs one
+  of `N` disjoint shards: round-robin over the sorted list of collected paths
+  (skipped tests included), the test at index `i` belongs to shard `i % N + 1`,
+  so every directory spreads evenly over the shards and the `N` shards
+  together run exactly the unpartitioned set. `--check` then validates only the
+  baseline entries the shard owns (a baseline path no longer collected is
+  owned by the shard of its sorted insertion index), so each shard fails only
+  on its own regressions; the summary and the `regressed` line name the
+  partition. The results TSV holds only the shard's rows. `--update-baseline`
+  and `--history` need a full run and are usage errors with `--partition`.
 - **History.** `--history` appends `commit pass eligible total` for a full run to
   `tests/test262/history.tsv`; earlier rows include:
 
@@ -4499,6 +4509,7 @@ cargo run --release -p jsc-test262 -- --update-baseline --history
 Options: `--test262 DIR` (default `.tmp/test262`), `--jsc PATH` (default
 `target/release/jsc`), `--jobs N` (default: available parallelism),
 `--timeout SECS`, `--check`, `--update-baseline`, `--history` (full runs only),
+`--partition K/N` (one shard; not with `--update-baseline` / `--history`),
 and positional `PATH_PREFIX` filters. Per-test results are written to
 `.tmp/test262-results.tsv`. The runner exits `0` on success, `1` when `--check`
 finds a regression, and `2` on a setup error.
@@ -4543,11 +4554,22 @@ interval 1; design/runtime-memory.md §7.1 `gc_stress_run_suite`), excluding
 the opcount binary and the `memory` binary (heap-cap and million-allocation
 tests); collection must not change any output.
 
-**Job `test262`** (baseline regression gate, 90-minute timeout): fetch test262
+**Job `test262`** (baseline regression gate, matrix of 4, `fail-fast: false`,
+240-minute timeout per shard; named `test262 (shard K/4)`): fetch test262
 (cached on the hash of `scripts/test262-fetch.sh`), `cargo build --release -p
-jsc`, the M1 harness tests (`cargo test --release -p jsc --test
+jsc` (all shards restore one cargo cache that only shard 1 saves), in shard 1
+only the M1 harness tests (`cargo test --release -p jsc --test
 test262_harness`, after asserting `.tmp/test262/harness/assert.js` exists so
-they cannot skip), then `cargo run --release -p jsc-test262 -- --check`.
+they cannot skip), then `cargo run --release -p jsc-test262 -- --check
+--partition K/4` (§10), uploading `.tmp/test262-results.tsv` as artifact
+`test262-results-K`.
+
+**Job `test262-results`** (needs all shards, `if: always()`): downloads
+`test262-results-1..4` (failing if any is missing), concatenates them sorted
+by path (`LC_ALL=C`, the byte order of an unpartitioned run) and uploads the
+result as artifact `test262-results`, the same TSV a single full run writes,
+from which the baseline and history are regenerated. A failed shard still
+fails the workflow.
 
 ### `web.yml` — JS/TS gate
 
