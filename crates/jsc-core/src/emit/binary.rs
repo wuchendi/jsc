@@ -9,6 +9,7 @@
 
 use wasm_encoder::{BlockType, Function, Ieee64, Instruction, MemArg, ValType};
 
+use super::registry::Big;
 use super::{
     EXC_PENDING_GLOBAL, ElementKind, FnBuilder, HEAP_BITS, Helpers, LeafSet,
     PROP_THROW_TA_INCOMPATIBLE, PROP_THROW_TA_OUT_OF_BOUNDS, RAW_F64, RAW_I32, RAW_I64, ROOT_BASE,
@@ -106,14 +107,20 @@ fn m32(offset: u32) -> MemArg {
 
 /// The leaf declarations of the binary-data witness and element helpers
 /// (see [`super::roots::helper_graph`]): they only read and write the
-/// buffers' bytes.
+/// buffers' bytes, except that a `BigInt` element read allocates its value
+/// (`__bigint_from_i64`) in a program whose `BigInt` gate is open.
 pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
+    let (mut load, mut store) = (vec![helpers.box_f64], vec![]);
+    if helpers.bigints() {
+        load.push(helpers.bigint(Big::FromI64));
+        store.push(helpers.bigint(Big::ToI64));
+    }
     vec![
         (helpers.dv_length(), vec![]),
         (helpers.ta_length(), vec![]),
         (helpers.ta_oob(), vec![]),
-        (helpers.raw_load(), vec![helpers.box_f64]),
-        (helpers.raw_store(), vec![]),
+        (helpers.raw_load(), load),
+        (helpers.raw_store(), store),
         (
             helpers.ta_get(),
             vec![helpers.ta_length(), helpers.raw_load()],
@@ -157,7 +164,7 @@ pub(super) fn emit_helpers(
         emit_ta_index_get(helpers, leaves),
         emit_ta_index_set(helpers, leaves),
         emit_raw_load(helpers, leaves),
-        emit_raw_store(leaves),
+        emit_raw_store(helpers, leaves),
     ]
 }
 
@@ -265,8 +272,9 @@ fn emit_render_binary(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafS
 /// The typed-array arm of `__render_binary` (DESIGN.md §5.8.8): `<Kind>(n) [
 /// e0, e1, .., name: v ]` with the kind's constructor name (so a subclass
 /// instance renders as its kind), the current length (`0` when out of
-/// bounds or detached), each element by the number rule, then the own named
-/// properties as for an array; `<Kind>(0) []` when there is nothing to list.
+/// bounds or detached), each element by the number rule (a `BigInt` element
+/// as `1n`; reading one allocates it), then the own named properties as for
+/// an array; `<Kind>(0) []` when there is nothing to list.
 fn render_typed_array(
     f: &mut FnBuilder<'_>,
     strings: &StrOffsets,
@@ -575,8 +583,9 @@ fn element_addr(f: &mut impl Sink, o: u32, i: u32) {
 }
 
 /// `__ta_get(o, i) -> i64` (DESIGN.md §5.8.5): element `i` of the typed
-/// array `o` as a number, or `undefined` when `IsValidIntegerIndex` fails.
-/// A non-allocating leaf.
+/// array `o` as a number (a fresh `BigInt` for the `BigInt` kinds), or
+/// `undefined` when `IsValidIntegerIndex` fails. A non-allocating leaf for
+/// the Number kinds only.
 fn emit_ta_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_BASE, RAW_I32], &[]);
     let (o, i) = (0, 1);
@@ -593,9 +602,9 @@ fn emit_ta_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 }
 
 /// `__ta_set(o, i, n)` (DESIGN.md §5.8.5): store the number `n` (already
-/// converted) as element `i` of the typed array `o` when `IsValidIntegerIndex`
-/// holds (re-checked here, after any conversion), else nothing. A
-/// non-allocating leaf.
+/// converted; a `BigInt` for the `BigInt` kinds) as element `i` of the typed
+/// array `o` when `IsValidIntegerIndex` holds (re-checked here, after any
+/// conversion), else nothing. A non-allocating leaf.
 fn emit_ta_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_BASE, RAW_I32, RAW_I64], &[]);
     let (o, i, n) = (0, 1, 2);
@@ -612,27 +621,42 @@ fn emit_ta_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     finish_builder(f)
 }
 
-/// `ToNumber(v)` of the jsval in local `v` (a number as is) into the i64
-/// local `n`; a throw leaves the exception pending and returns from the
-/// helper.
-fn to_number_or_return(f: &mut FnBuilder<'_>, v: u32, n: u32, helpers: Helpers<'_>) {
+/// The conversion of `TypedArraySetElement` of the jsval in local `v` for
+/// the typed array in i32 local `o` into the i64 local `n`: `ToBigInt(v)`
+/// for a `BigInt` kind (DESIGN.md §5.8.6; only when the program's `BigInt`
+/// gate is open, as no `BigInt` typed array exists otherwise), else
+/// `ToNumber(v)` (a number as is); a throw leaves the exception pending and
+/// returns from the helper.
+fn to_element_or_return(f: &mut FnBuilder<'_>, o: u32, v: u32, n: u32, helpers: Helpers<'_>) {
+    if helpers.bigints() {
+        wasm!(f;
+            LocalGet(o), I32Load8U(m8(abi::TA_KIND_OFFSET)), I32Const(FIRST_BIGINT_KIND), I32GeU,
+            If(BlockType::Result(I64)), LocalGet(v), Call(helpers.bigint(Big::ToBigInt)), Else,
+        );
+    }
     emit_is_number(f, v);
+    wasm!(f; If(BlockType::Result(I64)), LocalGet(v), Else, LocalGet(v), Call(helpers.to_number), End);
+    if helpers.bigints() {
+        wasm!(f; End);
+    }
     wasm!(f;
-        If(BlockType::Result(I64)), LocalGet(v), Else, LocalGet(v), Call(helpers.to_number), End,
         LocalSet(n),
         GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
     );
 }
 
+/// The first `BigInt` element kind (DESIGN.md §5.8.6).
+const FIRST_BIGINT_KIND: i32 = 10;
+
 /// `__ta_set_value(o, i, v)`: `TypedArraySetElement` (DESIGN.md §5.8.5) —
-/// `ToNumber(v)` first (a user `valueOf` may run, detach or shrink the buffer,
+/// `ToNumber(v)` (`ToBigInt(v)` for a `BigInt` kind) first (a user `valueOf` may run, detach or shrink the buffer,
 /// or throw: the exception is left pending), then [`emit_ta_set`]'s checked
 /// store of element `i` (`-1` for an invalid canonical numeric key, which
 /// is never valid).
 fn emit_ta_set_value(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_BASE, RAW_I32, ROOT_JS], &[RAW_I64]);
     let (ta, index, value, number) = (0, 1, 2, 3);
-    to_number_or_return(&mut f, value, number, helpers);
+    to_element_or_return(&mut f, ta, value, number, helpers);
     wasm!(f;
         LocalGet(ta), LocalGet(index), LocalGet(number), Call(helpers.ta_set()),
         End,
@@ -653,7 +677,8 @@ fn is_index_number(f: &mut impl Sink, d: u32) {
 /// `__ta_index_get(o, k: i64) -> i64` (DESIGN.md §5.8.5, the inline `ta[k]`
 /// read for a number `k`): an array-index number is the element (or
 /// `undefined` past the length); any other number is an invalid integer
-/// index (`undefined`). The chain is never consulted. A non-allocating leaf.
+/// index (`undefined`). The chain is never consulted. A non-allocating leaf
+/// for the Number kinds only.
 fn emit_ta_index_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_BASE, RAW_I64], &[RAW_F64]);
     let (o, k, d) = (0, 1, 2);
@@ -669,13 +694,14 @@ fn emit_ta_index_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 }
 
 /// `__ta_index_set(o, k: i64, v)` (DESIGN.md §5.8.5, the inline `ta[k] = v`
-/// store for a number `k`): `ToNumber(v)` first (a throw is left pending),
+/// store for a number `k`): `ToNumber(v)` (`ToBigInt(v)` for a `BigInt`
+/// kind) first (a throw is left pending),
 /// then an array-index number stores through [`emit_ta_set`] (checked); any
 /// other number is an invalid integer index and the store is ignored.
 fn emit_ta_index_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_BASE, RAW_I64, ROOT_JS], &[RAW_I64, RAW_F64]);
     let (ta, key, value, number, index) = (0, 1, 2, 3, 4);
-    to_number_or_return(&mut f, value, number, helpers);
+    to_element_or_return(&mut f, ta, value, number, helpers);
     wasm!(f; LocalGet(key), F64ReinterpretI64, LocalSet(index));
     is_index_number(&mut f, index);
     wasm!(f;
@@ -714,9 +740,13 @@ fn kind_switch<S: Sink>(f: &mut S, kind: u32, result: BlockType, mut arm: impl F
 /// width loaded at `addr` (unaligned) as integer bits, byte-swapped when
 /// `swap` (a big-endian `DataView` read; typed arrays pass `0`), and read as
 /// a number by the kind's rule; a float goes through `__box_f64`, so a
-/// stored NaN of any payload reads as the canonical `NaN`. The reserved
-/// kinds (`Float16`, the `BigInt` kinds) are never stored yet and read
-/// `undefined`. A non-allocating leaf.
+/// stored NaN of any payload reads as the canonical `NaN`; the `BigInt`
+/// kinds read a fresh `BigInt` of the signed / unsigned 64 bits
+/// (`__bigint_from_i64`, which allocates; out of memory leaves the
+/// `RangeError` pending). The reserved kind (`Float16`) is never stored yet
+/// and reads `undefined`, as do the `BigInt` kinds in a program whose
+/// `BigInt` gate is closed (none can exist there). A non-allocating leaf for
+/// the Number kinds.
 fn emit_raw_load(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[RAW_I32, RAW_I32, RAW_I32], &[RAW_I32, RAW_I64]);
     let (addr, kind, swap, x, y) = (0, 1, 2, 3, 4);
@@ -763,6 +793,13 @@ fn emit_raw_load(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
                 when_swap(f, swap, |f| swap64(f, y));
                 wasm!(f; LocalGet(y), F64ReinterpretI64, Call(helpers.box_f64));
             }
+            10 | 11 if helpers.bigints() => {
+                wasm!(f; LocalGet(addr), I64Load(ma(0)), LocalSet(y));
+                when_swap(f, swap, |f| swap64(f, y));
+                wasm!(f;
+                    LocalGet(y), I32Const(i32::from(k == 10)), Call(helpers.bigint(Big::FromI64)),
+                );
+            }
             _ => wasm!(f; I64Const(UNDEFINED_BITS)),
         }
     });
@@ -774,10 +811,12 @@ fn emit_raw_load(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 /// converted to the kind's bits — the low bits of the `ToInt32` pattern for
 /// the integer kinds (`ToInt8` .. `ToUint32`), `Uint8Clamped` rounding half
 /// to even after clamping to `0 .. 255` (`NaN` is `0`), `Float32` demoted,
-/// `Float64` its own bits — byte-swapped when `swap` (a big-endian
-/// `DataView` write; typed arrays pass `0`), and stored at `addr`
-/// (unaligned). The reserved kinds store nothing. A non-allocating leaf.
-fn emit_raw_store(leaves: &LeafSet) -> Function {
+/// `Float64` its own bits, the `BigInt` kinds the low 64 bits of the `BigInt`
+/// `n` (`ToBigInt64` / `ToBigUint64`, `__bigint_to_i64`) — byte-swapped when
+/// `swap` (a big-endian `DataView` write; typed arrays pass `0`), and stored
+/// at `addr` (unaligned). The reserved kind stores nothing. A non-allocating
+/// leaf.
+fn emit_raw_store(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(
         leaves,
         &[RAW_I32, RAW_I32, RAW_I64, RAW_I32],
@@ -826,6 +865,11 @@ fn emit_raw_store(leaves: &LeafSet) -> Function {
             }
             9 => {
                 wasm!(f; LocalGet(n), LocalSet(y));
+                when_swap(f, swap, |f| swap64(f, y));
+                wasm!(f; LocalGet(addr), LocalGet(y), I64Store(ma(0)));
+            }
+            10 | 11 if helpers.bigints() => {
+                wasm!(f; LocalGet(n), I32WrapI64, Call(helpers.bigint(Big::ToI64)), LocalSet(y));
                 when_swap(f, swap, |f| swap64(f, y));
                 wasm!(f; LocalGet(addr), LocalGet(y), I64Store(ma(0)));
             }

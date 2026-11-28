@@ -1490,7 +1490,7 @@ fn program_has_accessors(program: &IrProgram) -> bool {
 }
 
 /// The globals of the binary-data constructors (DESIGN.md §5.8.5).
-const BINARY_NAMES: [&str; 11] = [
+const BINARY_NAMES: [&str; 13] = [
     "ArrayBuffer",
     "DataView",
     "Int8Array",
@@ -1502,6 +1502,8 @@ const BINARY_NAMES: [&str; 11] = [
     "Uint32Array",
     "Float32Array",
     "Float64Array",
+    "BigInt64Array",
+    "BigUint64Array",
 ];
 
 /// Whether `program` can reach binary data (DESIGN.md §5.8.5): it names a
@@ -1527,8 +1529,9 @@ fn program_has_binary(program: &IrProgram) -> bool {
 
 /// The names through which a program can obtain a `BigInt` without a
 /// literal (DESIGN.md §6.10.9): the `BigInt` global, the `BigInt` typed
-/// arrays and the `DataView` `BigInt` accessors.
-const BIGINT_NAMES: [&str; 7] = [
+/// arrays and the `DataView` `BigInt` accessors, and `DataView` itself (its
+/// prototype, reached by reflection, holds those accessors).
+const BIGINT_NAMES: [&str; 8] = [
     "BigInt",
     "BigInt64Array",
     "BigUint64Array",
@@ -1536,6 +1539,7 @@ const BIGINT_NAMES: [&str; 7] = [
     "getBigUint64",
     "setBigInt64",
     "setBigUint64",
+    "DataView",
 ];
 
 /// The [`BigIntGate`] of `program` ([`program_has_bigint`]).
@@ -1555,9 +1559,11 @@ fn bigint_gate(program: &IrProgram) -> BigIntGate {
 pub(super) fn program_has_bigint(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
         IrNode::BigInt { .. }
-        | IrNode::Intrinsic(GlobalIntrinsic::Global | GlobalIntrinsic::Ctor(BuiltinCtor::BigInt)) => {
-            true
-        }
+        | IrNode::Intrinsic(
+            GlobalIntrinsic::Global
+            | GlobalIntrinsic::Ctor(BuiltinCtor::BigInt | BuiltinCtor::DataView),
+        ) => true,
+        IrNode::Intrinsic(GlobalIntrinsic::Ctor(BuiltinCtor::Typed(kind))) => kind.is_bigint(),
         IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
             BIGINT_NAMES.contains(&global.name.as_str())
         }
