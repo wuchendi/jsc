@@ -293,3 +293,102 @@ fn same_frame_read_before_declaration_throws() {
         "ReferenceError: Cannot access 'x' before initialization",
     );
 }
+
+/// Declarations whose initializer creates a closure referring to the binding
+/// being declared, one per form: an object method, an arrow, a function
+/// expression, a class expression's static method, static field arrow and
+/// instance field initializer, and a class declaration's static method —
+/// over `let`, `const` and `class`. Each closure runs after initialization.
+const SELF_REFERENCING_DECLS: &str = "
+    const a = { m() { return a.v }, v: 1 };
+    let b = () => typeof b;
+    const c = function () { return typeof c };
+    let d = class { static v = 4; static m() { return d.v } };
+    const e = class { static v = 5; static s = () => e.v };
+    class C { static v = 6; static m() { return C.v } }
+    const g = class { static v = 7; x = g.v };
+    r = [a.m(), b(), c(), d.m(), e.s(), C.m(), new g().x].join();
+";
+
+const SELF_REFERENCING_RESULT: &str = "1,function,function,4,5,6,7\n";
+
+/// L1's reduced repro: a method in a `const` initializer inside a function.
+#[test]
+fn method_in_const_initializer_in_function() {
+    assert_output(
+        "(function(){ const h = { f(){ return h.v }, v: 3 }; console.log(h.f()) })()",
+        "3\n",
+    );
+}
+
+/// Every self-referencing form, in a function body, a nested block, a
+/// generator body and a `while` loop body inside a function.
+#[test]
+fn self_referencing_initializers_in_function_scopes() {
+    let d = SELF_REFERENCING_DECLS;
+    for src in [
+        format!("function f() {{ let r; {d} return r }} console.log(f())"),
+        format!("function f() {{ let r; {{ {d} }} return r }} console.log(f())"),
+        format!("function* f() {{ let r; {d} yield r }} console.log(f().next().value)"),
+        format!(
+            "function f() {{ let r, i = 0; while (i < 2) {{ i++; {d} }} return r }} \
+             console.log(f())"
+        ),
+    ] {
+        assert_output(&src, SELF_REFERENCING_RESULT);
+    }
+}
+
+/// Every self-referencing form at the top level: directly, in a block, in
+/// `try` / `catch` / `finally` blocks, and in a `for` loop body.
+#[test]
+fn self_referencing_initializers_in_top_level_scopes() {
+    let d = SELF_REFERENCING_DECLS;
+    for src in [
+        format!("let r; {d} console.log(r)"),
+        format!("let r; {{ {d} }} console.log(r)"),
+        format!("let r; try {{ {d} }} catch (e) {{ r = String(e) }} console.log(r)"),
+        format!("let r; try {{ throw 0 }} catch (_) {{ {d} }} console.log(r)"),
+        format!("let r; try {{}} finally {{ {d} }} console.log(r)"),
+        format!("let r; for (let i = 0; i < 2; i++) {{ {d} }} console.log(r)"),
+    ] {
+        assert_output(&src, SELF_REFERENCING_RESULT);
+    }
+}
+
+/// The self-referencing forms under `gc_stress = 1`.
+#[test]
+fn self_referencing_initializers_survive_gc_stress() {
+    assert_same_under_gc_stress(
+        &format!("function f() {{ let r; {SELF_REFERENCING_DECLS} return r }} console.log(f())"),
+        SELF_REFERENCING_RESULT,
+    );
+}
+
+/// A self-referencing closure called DURING its binding's initializer sees
+/// the binding in its TDZ: a method, an arrow, a function expression, and a
+/// class static field initializer, in a function and in a top-level block.
+#[test]
+fn self_reference_during_initializer_throws_tdz() {
+    let tdz = "ReferenceError: Cannot access 'h' before initialization\n";
+    for init in [
+        "({ m() { return h } }).m()",
+        "(() => h)()",
+        "(function () { return h })()",
+        "class { static s = h }",
+    ] {
+        assert_output(
+            &format!(
+                "function f() {{ try {{ const h = {init}; return 'no throw' }} \
+                 catch (e) {{ return String(e) }} }} console.log(f())"
+            ),
+            tdz,
+        );
+        assert_output(
+            &format!(
+                "try {{ let h = {init}; console.log('no throw') }} catch (e) {{ console.log(String(e)) }}"
+            ),
+            tdz,
+        );
+    }
+}
