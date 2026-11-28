@@ -356,6 +356,9 @@ pub(super) fn emit_object_builtin_node(
         function.instruction(&Instruction::End);
         function.instruction(&Instruction::LocalGet(scratch));
     }
+    if matches!(op, ObjectBuiltinOp::Values | ObjectBuiltinOp::Entries) {
+        shake::note_listed_values(helpers);
+    }
     let mode = match op {
         ObjectBuiltinOp::Keys => OWN_KEYS,
         ObjectBuiltinOp::Values => OWN_VALUES,

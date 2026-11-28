@@ -23,14 +23,15 @@
 //!
 //! A program is left whole when its own code converts a run-time value that
 //! may be a string to a property key (a computed member access), or when it
-//! keeps a runtime body that reads or redefines a property chosen by a
-//! run-time key ([`note_runtime_key`]): either can reach a builtin by a name
-//! no body mentions. The registry match above is by key text alone, so a
-//! `Reflect` function sharing a common name (`get`, `set`, ...) is kept
-//! whenever any kept body looks that name up; its run-time-key use counts
-//! only when the program's own code names it ([`unnamed_reflect`]), and
-//! without a way to reach `%Reflect%` its body is a stub that records no use
-//! at all (DESIGN.md §6.11).
+//! keeps a body that reads or redefines a property chosen by a run-time key
+//! ([`note_runtime_key`]), or that reads the values under the own-key list of
+//! an object that may be a proxy ([`note_listed_values`]): either can reach a
+//! builtin by a name no body mentions. The registry match above is by key
+//! text alone, so a builtin with such a use that shares a common name (`get`,
+//! `set`, `defineProperty`, ...) is kept whenever any kept body looks that
+//! name up; its use counts only when the program can call it with a key of
+//! its choosing ([`unnamed`]), and without a way to reach `%Reflect%` a
+//! `Reflect` body is a stub that records no use at all (DESIGN.md §6.11).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -38,7 +39,7 @@ use std::collections::HashSet;
 use wasm_encoder::{Encode, Function, Instruction};
 use wasmparser::{BinaryReader, FunctionBody, Operator};
 
-use super::realm::{self, Builtin, Entry, Intrinsic, Key, ReflectFn, Value};
+use super::realm::{self, Builtin, Entry, Intrinsic, Key, Value};
 use super::roots::{classify_is_numeric, never_string};
 use super::{Helpers, IMPORT_FUNC_COUNT, IrNode, StrOffsets};
 
@@ -47,6 +48,9 @@ use super::{Helpers, IMPORT_FUNC_COUNT, IrNode, StrOffsets};
 pub(super) struct Uses {
     /// Offsets of the static strings looked up.
     strings: HashSet<i32>,
+    /// The subset of `strings` not looked up as the callee of a call whose
+    /// key argument is a constant ([`constant_key_callee`]).
+    names: HashSet<i32>,
     /// Builtins named by method block, table slot or function index.
     builtins: Vec<Builtin>,
     /// Intrinsics named by address.
@@ -62,12 +66,17 @@ thread_local! {
     static USES: RefCell<Uses> = RefCell::default();
     /// The nesting depth of [`quiet`].
     static QUIET: Cell<u32> = const { Cell::new(0) };
+    /// The nesting depth of [`constant_key_callee`].
+    static CALLEE: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Record a lookup of the static string at `offset`.
 pub(super) fn note_string(offset: i32) {
     USES.with_borrow_mut(|uses| {
         uses.strings.insert(offset);
+        if CALLEE.get() == 0 {
+            uses.names.insert(offset);
+        }
     });
 }
 
@@ -84,11 +93,7 @@ pub(super) fn note_intrinsic(intrinsic: Intrinsic) {
 /// Record the conversion of the run-time value `key` to a property key,
 /// unless inside [`quiet`].
 pub(super) fn note_key(key: &IrNode) {
-    if QUIET.get() == 0
-        && !matches!(key, IrNode::Str(_))
-        && !classify_is_numeric(key)
-        && !never_string(key)
-    {
+    if QUIET.get() == 0 && !constant_key(key) {
         USES.with_borrow_mut(|uses| uses.dynamic_key = true);
     }
 }
@@ -99,6 +104,41 @@ pub(super) fn note_key(key: &IrNode) {
 /// `JSON.stringify`.
 pub(super) fn note_runtime_key() {
     USES.with_borrow_mut(|uses| uses.runtime_key = true);
+}
+
+/// Record that the body being emitted reads, with `[[Get]]`, the value under
+/// each key of the own-key list of an object, and hands it to user code
+/// (`Object.values` / `entries`, `Object.assign`, `CopyDataProperties`, a
+/// `JSON.parse` reviver walk). An ordinary object lists only its enumerable
+/// keys and no builtin is enumerable, but a proxy's `ownKeys` and
+/// `getOwnPropertyDescriptor` traps can list any key of its target as
+/// enumerable, whose value the `[[Get]]` then forwards: a use only while the
+/// program can hold a proxy (DESIGN.md §6.11).
+pub(super) fn note_listed_values(helpers: Helpers<'_>) {
+    if helpers.proxies() {
+        note_runtime_key();
+    }
+}
+
+/// The method names of the builtins whose run-time key is their second
+/// argument: `Reflect.get`, `Reflect` / `Object.getOwnPropertyDescriptor`,
+/// `Reflect` / `Object.defineProperty`.
+pub(super) const KEY_SECOND: [&str; 3] = ["get", "getOwnPropertyDescriptor", "defineProperty"];
+
+/// Whether `node`, as a property key, is a constant [`note_key`] does not
+/// record.
+pub(super) fn constant_key(node: &IrNode) -> bool {
+    matches!(node, IrNode::Str(_)) || classify_is_numeric(node) || never_string(node)
+}
+
+/// Run `emit`, the lookup of the callee `o.m` of a call `o.m(a, key, ..)`
+/// whose `m` is one of [`KEY_SECOND`] and whose `key` is a [`constant_key`]:
+/// the strings it looks up keep their realm entries but do not name them for
+/// [`unnamed`] (`Reflect.get(o, 'x')` shakes like `o.x`).
+pub(super) fn constant_key_callee(emit: impl FnOnce()) {
+    CALLEE.set(CALLEE.get() + 1);
+    emit();
+    CALLEE.set(CALLEE.get() - 1);
 }
 
 /// Run `emit`, whose keys are locals holding a key already recorded.
@@ -218,34 +258,58 @@ impl Shaker<'_> {
     }
 }
 
-/// The body slots of the `Reflect` functions the program's own code never
-/// names (no `main` / user body looks up the function's name or references
-/// it). Such a function is kept only because some runtime body looks up a
-/// property of that common name (`__proxy_*` trap names, a `Map`
-/// constructor's `"set"`, the descriptor fields `"get"` / `"set"`) on an
-/// object of its own: the key it would be handed then comes from the
-/// program's own (already recorded) keys, so its run-time-key use does not
-/// leave the module whole (DESIGN.md §6.11).
-fn unnamed_reflect(
+/// The body slots of the builtins whose run-time-key uses do not count: a
+/// builtin installed in the realm under a string key (not a callable
+/// intrinsic) that no kept body references (by method block, table slot or
+/// call) and whose keys the program's own code (`main` / user bodies) never
+/// looks up, except as the callee of a constant-key call
+/// ([`constant_key_callee`]). Such a builtin is kept only because a kept
+/// runtime body looks up a property of that common name (a proxy trap name,
+/// the `Map` constructor's `"set"`, a descriptor field) on an object of its
+/// own; it runs only if that object is its home object handed over by the
+/// program (`new Proxy(t, Reflect)`), and then with keys the runtime body
+/// chose: the program's own (already recorded) keys, or the keys of an
+/// own-key list, whose values reach user code only through a body that
+/// records [`note_listed_values`] (DESIGN.md §4.2, §6.11).
+fn unnamed(
     uses: &[Uses],
+    kept: &[bool],
     user_count: usize,
     helpers: Helpers<'_>,
     strings: &StrOffsets,
 ) -> Vec<usize> {
+    let registry = realm::registry();
     let own = &uses[..uses.len().min(user_count + 1)];
-    ReflectFn::ALL
+    let referenced: Vec<Builtin> = uses
+        .iter()
+        .zip(kept)
+        .filter(|(_, kept)| **kept)
+        .flat_map(|(uses, _)| uses.builtins.iter().copied())
+        .collect();
+    Builtin::ALL
         .into_iter()
-        .filter(|op| {
-            let builtin = Builtin::Reflect(*op);
-            let name = strings.peek(op.name());
-            !own.iter().any(|uses| {
-                uses.builtins.contains(&builtin)
-                    || name.is_some_and(|offset| uses.strings.contains(&offset))
-            })
+        .filter(|builtin| {
+            !referenced.contains(builtin)
+                && !realm::intrinsics().any(|intrinsic| intrinsic.call() == Some(*builtin))
         })
-        .filter_map(|op| {
-            let index = helpers.builtin_index(Builtin::Reflect(op));
-            index
+        .filter(|builtin| {
+            let keys: Vec<&str> = registry
+                .iter()
+                .filter_map(|entry| match entry.key {
+                    Key::Str(key) if entry.value == Value::Method(*builtin) => Some(key),
+                    _ => None,
+                })
+                .collect();
+            !keys.is_empty()
+                && !keys.iter().any(|key| {
+                    strings
+                        .peek(key)
+                        .is_some_and(|offset| own.iter().any(|uses| uses.names.contains(&offset)))
+                })
+        })
+        .filter_map(|builtin| {
+            helpers
+                .builtin_index(builtin)
                 .checked_sub(IMPORT_FUNC_COUNT)
                 .map(|slot| slot as usize)
         })
@@ -325,7 +389,7 @@ pub(super) fn shake(
         }
     }
     let kept = shaker.kept;
-    let unnamed = unnamed_reflect(uses, user_count, helpers, strings);
+    let unnamed = unnamed(uses, &kept, user_count, helpers, strings);
     if kept
         .iter()
         .zip(uses)

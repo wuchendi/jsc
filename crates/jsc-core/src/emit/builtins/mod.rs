@@ -342,11 +342,20 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(typed_array::strings())
         .chain(typed_array_methods::strings())
         .chain(data_view::strings())
-        .chain(proxy::strings())
-        .chain(reflect::strings())
+        .chain(proxy_strings())
         .chain(bigint::STRINGS)
         .chain(base64::strings())
         .chain([TYPE_ERROR_STACK_PREFIX])
+}
+
+/// The static strings only the `Proxy` builtins (with `proxies` open) and the
+/// `Reflect` functions (with `reflect` open) look up: a gated-off body is an
+/// `unreachable` stub that looks up none ([`gated_off`]), so a program that
+/// cannot reach the family does not carry them.
+pub(super) fn gated_strings(proxies: bool, reflect: bool) -> impl Iterator<Item = &'static str> {
+    let proxy = proxies.then(proxy::strings).into_iter().flatten();
+    let reflect = reflect.then(reflect::strings).into_iter().flatten();
+    proxy.chain(reflect)
 }
 
 /// Emit the body of `builtin`.
