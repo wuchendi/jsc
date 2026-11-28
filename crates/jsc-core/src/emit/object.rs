@@ -2932,7 +2932,8 @@ pub(super) fn emit_nullish_guard(
 /// `TypeError` for a member read (`set == 0`) or write (`set == 1`) on a
 /// `null`/`undefined` `recv`, stash it in `$exc_value`, set the pending flag and
 /// clear any routed completion. The message is spliced from the
-/// [`NULLISH_ERROR_STRS`] fragments plus `String(key)`:
+/// [`NULLISH_ERROR_STRS`] fragments plus the key's text (`ToString` for a
+/// `BigInt`, so `null[1n]` reads '1'; `__msg_str` otherwise):
 /// `Cannot read properties of null (reading 'x')`, with `.stack` prefixed
 /// `TypeError: `.
 pub(super) fn emit_nullish_throw(
@@ -2971,8 +2972,15 @@ pub(super) fn emit_nullish_throw(
     // The partial message sits under the conversion's safepoint.
     let mark = function.temp_mark();
     function.root_temp(TempClass::Base);
+    // A BigInt key names its property key, ToString (`1n` reads '1').
+    bigint::emit_is_bigint(&mut function, key);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(key));
+    function.instruction(&Instruction::Call(helpers.prim_str()));
+    function.instruction(&Instruction::Else);
     function.instruction(&Instruction::LocalGet(key));
     function.instruction(&Instruction::Call(helpers.msg_str()));
+    function.instruction(&Instruction::End);
     concat(&mut function);
     function.release_temps(mark);
     function.instruction(&Instruction::I32Const(at(NULLISH_SUFFIX)));

@@ -1137,7 +1137,7 @@ here reports the conflict instead of picking a different design.
 
 | type byte | kind |
 |---|---|
-| `20`..`23` | **reserved** for the parallel phase-5b workstreams (Proxy, BigInt); never used here |
+| `20`..`23` | `21` is `TYPE_BIGINT` (§6.10); the rest **reserved** for the parallel phase-5b Proxy workstream; never used here |
 | `24` `TYPE_ARRAYBUFFER` | an `ArrayBuffer` object |
 | `25` `TYPE_TYPEDARRAY` | an instance of any of the concrete typed-array constructors |
 | `26` `TYPE_DATAVIEW` | a `DataView` object |
@@ -2377,14 +2377,11 @@ them.
 
 ### 6.10 BigInt
 
-> **Partly implemented** (phase 5b, workstream L2-B). Stages B2a (the value,
-> literals, conversions, equality, hashing, property keys, JSON, the wrapper
-> and `%BigInt.prototype%`), B2b (the operators, §6.10.4–6.10.6) and B3 (the
-> `BigInt` builtins, `Number(1n)`, the 64-bit boundary helpers) are
-> implemented as described; the closeout (B4) is still the design (table at
-> the end). Each stage turns its part of this text into
-> a description of the implementation and drops the "lands in" notes it
-> fulfils. ECMA-262 §6.1.6.2 (the BigInt
+> **Implemented** (phase 5b): the value, literals, conversions, equality,
+> hashing, property keys, JSON, the wrapper and `%BigInt.prototype%`, the
+> operators (§6.10.4–6.10.6), the `BigInt` builtins, `Number(1n)` and the
+> 64-bit boundary helpers, as described below; the stage table at the end
+> records how it was built. ECMA-262 §6.1.6.2 (the BigInt
 > type), §7.1 (conversions), §13 (operators), §21.2 (the BigInt object).
 
 #### 6.10.1 Value and block layout
@@ -2491,6 +2488,8 @@ heap kind is needed.
   `__bigint_to_string(v, 10)` followed by `__out_str`; its allocation may
   run out of memory like the render buffers (§6.9). `__msg_str` (error
   message text) appends the `n` too; `__prim_str` (ToString) has no `n`.
+  The `null` / `undefined` member error names a BigInt key by its property
+  key (`__nullish_throw` uses `__prim_str` for it: `null[1n]` reads `'1'`).
 
 #### 6.10.3 Conversions
 
@@ -2811,27 +2810,25 @@ literal and literal-key diagnostics are gone; their `tests/pattern_keys.rs`
 cases are positive tests); every BigInt error is a run-time `TypeError` /
 `RangeError` / `SyntaxError` as listed above.
 
-**Conformance.** `BigInt` leaves `tests/test262/unsupported-features.txt`
-in B4. Of the ≈ 1 500 tests tagged `BigInt`, about 325 become eligible on
-their own (146 `language/expressions`, 69 `built-ins/BigInt`, 59
-`language/literals/bigint`, the rest in `Object`, `JSON`, `String`, `Map`,
-`Set`, `Promise`, `Array`, `Number`; 39 of them negative, mostly literal
-syntax errors); the other ≈ 1 180 also need `TypedArray*` / `DataView*` /
-`Atomics*` / `Temporal` and stay skipped until those land (L2-T's typed
-arrays then reuse `__bigint_to_i64` / `__bigint_from_i64`). Expected
-remaining failures: tests that combine BigInt with still-unsupported
-features without tagging them, `toLocaleString` locale expectations, and
-very large exponent / shift tests that hit the 2^24-bit cap where V8 allows
-2^30.
+**Conformance.** `BigInt` is not in `tests/test262/unsupported-features.txt`.
+Of the 1 506 tests tagged `BigInt`, 395 are eligible (146
+`language/expressions`, 69 `built-ins/BigInt`, 59 `language/literals/bigint`,
+57 `DataView` BigInt accessors, 19 `BigInt64Array` / `BigUint64Array` and
+`%TypedArray%` tag tests not tagged `TypedArray`, 10 `intl402`, the rest in
+`Object`, `JSON`, `String`, `Map`, `Set`, `Promise`, `Array`, `Number`,
+`ArrayBuffer`, `Error`, annex B and `harness`; 39 negative, all literal
+syntax errors); the other 1 111 also need `TypedArray*` / `Atomics*` /
+`SharedArrayBuffer` / `Temporal` / `Reflect*` / `Intl*` or a skipped flag.
+Remaining BigInt limitations are in §13.
 
 #### 6.10.9 Stages
 
 | stage | scope | files | tests (written per the no-local-run rule; CI runs them) |
 |---|---|---|---|
 | **B2a** value | `abi.rs` (`TYPE_BIGINT`, `BIGINT_*`, `CLASS_BIGINT`, `TYPEOF_STRINGS[7]`, `BIGINT_ZERO`); literals (`IrNode::BigInt`, static blocks, `-` folding); `__bigint_new` / `trim` / `eq` / `cmp` / `hash` / `to_string` / `string_to_bigint` / `to_f64` / `from_f64`; ToBoolean, `typeof`, ToNumber `TypeError`, ToString, ToPrimitive, `__to_numeric`, `__to_bigint`; the `TYPE_SYMBOL`-site audit (primitive vs object), primitive receivers, `CLASS_BIGINT` wrapper + empty `%BigInt.prototype%` skeleton, `__to_object`; renderer, `__msg_str`; strict equality, SameValue(Zero), `__array_search`, Map hash, loose equality; property keys (literal and `__to_key`); JSON `TypeError`; §4.1 / §5.2 / §5.7 / §6.9 / §7.2 / §8 text | `abi.rs`, `ir.rs`, `codegen/{expr,stmt}.rs`, `emit/{bigint,sections,registry,shake,roots,value,expr,stmt,render,dtoa,strtod,convert,runtime,props,realm,gc}.rs`, `emit/props/descriptor.rs`, `emit/builtins/{json,mod,map_set,array}.rs` | new `tests/bigint.rs` (literals, `typeof`, truthiness, rendering incl. nested and wrapper, ToString of multi-limb values in radix 10, equality / SameValueZero / Map keys, loose equality vs number / string incl. `NaN`, `±Infinity`, values above `2^64`, property keys, JSON `TypeError`, ToNumber `TypeError` through `+x` / `Math.abs`); `pattern_keys.rs` rewrites; `abi_drift_tests.rs` `TYPEOF_STRINGS[7]` |
-| **B2b** operators (implemented) | `BinOp::Exp`, `Negate`, `BitNot`, `ToNumeric`, `NumericStep`; `emit_numeric_binary`, `__numeric_op`, `__numeric_unary`; every kernel of §6.10.4 except `as_n`; `__add` BigInt path; relational `__compare`; `emit_inc_dec`; root classification and `yields_number`; opcount reasons | `ir.rs`, `codegen/{expr,generator}.rs`, `emit/{numeric,bigint,convert,expr,roots}.rs`, `tests/opcount/snapshot.tsv` | new `tests/bigint_ops.rs` (every operator and compound form, relational operators vs number / string incl. `NaN`, `±Infinity`, non-integral numbers and unparsable strings, mixed-type `TypeError`s, `>>>` / unary `+` `TypeError`, division / remainder signs and `RangeError`, `**` negative exponent, bitwise and shifts on negatives across limb boundaries, huge shift counts, `++`/`--` on locals, cells, globals, members, generator slots, multi-limb `*` and `/` cross-checked against known products); a `gc_stress` variant module in the same file (`CompileOptions::gc_stress = 1`) over multi-limb loops (factorial of 200, a Fibonacci accumulator, divmod round trips) so every allocation collects while operands are live |
+| **B2b** operators | `BinOp::Exp`, `Negate`, `BitNot`, `ToNumeric`, `NumericStep`; `emit_numeric_binary`, `__numeric_op`, `__numeric_unary`; every kernel of §6.10.4 except `as_n`; `__add` BigInt path; relational `__compare`; `emit_inc_dec`; root classification and `yields_number`; opcount reasons | `ir.rs`, `codegen/{expr,generator}.rs`, `emit/{numeric,bigint,convert,expr,roots}.rs`, `tests/opcount/snapshot.tsv` | new `tests/bigint_ops.rs` (every operator and compound form, relational operators vs number / string incl. `NaN`, `±Infinity`, non-integral numbers and unparsable strings, mixed-type `TypeError`s, `>>>` / unary `+` `TypeError`, division / remainder signs and `RangeError`, `**` negative exponent, bitwise and shifts on negatives across limb boundaries, huge shift counts, `++`/`--` on locals, cells, globals, members, generator slots, multi-limb `*` and `/` cross-checked against known products); a `gc_stress` variant module in the same file (`CompileOptions::gc_stress = 1`) over multi-limb loops (factorial of 200, a Fibonacci accumulator, divmod round trips) so every allocation collects while operands are live |
 | **B3** built-ins | `BigInt` ctor, `asIntN` / `asUintN` (`__bigint_as_n`), `%BigInt.prototype%` methods and `@@toStringTag`, `toString(radix)`, `Number(1n)` (`ConvertOp::NumberCall`), `__bigint_to_i64` / `__bigint_from_i64` | `ir.rs`, `codegen/*` (the `Number(..)` inline call), `emit/realm.rs`, new `emit/builtins/bigint.rs`, `emit/builtins/{mod,number}.rs`, `emit/bigint.rs` | new `tests/bigint_builtins.rs` (constructor coercions incl. strings in every radix, whitespace, syntax errors, `new BigInt` `TypeError`, `RangeError` for non-integers, `asIntN` / `asUintN` edge widths 0 / 1 / 64 / 65 and negative inputs, `toString` radices 2..36 on multi-limb values, `thisBigIntValue` errors, `Number(2n**1024n)` = `Infinity`, round-half-even at `2^53 + 1`), with a `gc_stress` variant for the radix conversions |
-| **B4** closeout | remove `BigInt` from `unsupported-features.txt`; delete the §13 BigInt lines (the `RegExp, BigInt, ..` "not available" line, the limitation-table row, the BigInt property-key line, the §14 roadmap mention); test262 baseline / history from CI; fold this section's design notes into present-tense text | `tests/test262/*`, `DESIGN.md` | test262 delta recorded (target ≈ +300 of the 325 newly eligible) |
+| **B4** closeout | `BigInt` out of `unsupported-features.txt`; the §13 / §14 BigInt lines; `null[1n]` names the key `'1'` | `tests/test262/unsupported-features.txt`, `emit/object.rs`, `DESIGN.md` | `tests/bigint.rs` nullish-key message; a `gc_stress` bitwise / `++` `--` test in `tests/bigint_ops.rs` |
 ### 6.11 Proxy and Reflect (phase 5b, planned)
 
 **Status: design only (phase 5b P1).** Nothing in this subsection is
@@ -4309,6 +4306,7 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | `Promise` | §6.7, §7.8; `then` / `finally` create their result through `SpeciesConstructor(this, %Promise%)` (`get [Symbol.species]` on `%Promise%`); `Promise.resolve` / `Promise.reject` construct from `this` (`PromiseResolve(C, x)` / `NewPromiseCapability(C)`; a non-constructor `this` throws `TypeError`); `Promise.all`, `allSettled`, `any` (all rejected: an `AggregateError` with `errors`), `race` over any iterable (§6.7) |
 | `Date` | `new Date()`, `new Date(value)` (a Date's time value, else `ToPrimitive(value)`: a string is parsed as by `Date.parse`, anything else `ToNumber`), `new Date(year, month[, date, hours, minutes, seconds, ms])` (UTC fields: `MakeDay` / `MakeTime`, `TimeClip`), `Date()` (current time as a string), `Date.now()`, `Date.UTC(year[, month, ..])`, `Date.parse(string)` (`ToString`, then a guest-side parser of exactly the Date Time String Format — `YYYY[-MM[-DD]]` or `±YYYYYY` (not `-000000`), optional `THH:mm[:ss[.sss]]` and `Z` / `±HH:mm`, range-checked fields, `24:00` only as `24:00:00.000`; date-only forms are UTC, a date-time without offset is local time = UTC — and the `toString` (`Www Mmm DD YYYY HH:mm:ss GMT±hhmm[ (..)]`) / `toUTCString` outputs; anything else is `NaN`, the result `TimeClip`ped); `getTime`, `valueOf`, `getFullYear`, `getMonth`, `getDate`, `getDay`, `getHours`, `getMinutes`, `getSeconds`, `getMilliseconds`, the `getUTC*` twins, `getTimezoneOffset` (`0`), Annex B `getYear`; `setMilliseconds`, `setSeconds`, `setMinutes`, `setHours`, `setDate`, `setMonth`, `setFullYear`, the `setUTC*` twins (same body, distinct functions), `setTime`, Annex B `setYear` (`thisTimeValue` first, then `ToNumber` of every argument in order, then a `NaN` time value returns `NaN` unstored — `setFullYear` / `setYear` start from `+0` — else `TimeClip` is stored and returned); `toISOString` (`RangeError` on an invalid date; expanded `±YYYYYY` years), `toJSON`, `toString` (`Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)`), `toDateString` (`Thu Jan 01 1970`), `toTimeString` (`00:00:00 GMT+0000 (Coordinated Universal Time)`), `toUTCString` (`Thu, 01 Jan 1970 00:00:00 GMT`; Annex B `toGMTString` is the same function object), `toLocaleString` / `toLocaleDateString` / `toLocaleTimeString` (the `toString` / `toDateString` / `toTimeString` texts) — the string forms sign a negative year and pad it to four digits (`-0001`) and render an invalid date as `Invalid Date` —, `[@@toPrimitive]` (configurable only) — local time is UTC (`LocalTZA = 0`), computed in wasm |
 | `Symbol` | `Symbol(desc)` (a fresh symbol; `new Symbol()` throws `TypeError`, though `Symbol` is a constructor for `IsConstructor`), `Symbol.for` / `Symbol.keyFor` (the hidden registry; `keyFor` of a non-symbol throws), the 13 well-known symbols (non-writable, non-enumerable, non-configurable); `Symbol.prototype.toString` (`Symbol(desc)`), `valueOf`, the `description` getter (a program that names `description` compiles the accessor dispatch of `__get`), `[@@toPrimitive]`, `[@@toStringTag]` `"Symbol"` (both configurable only), each over `thisSymbolValue` (a symbol or a `CLASS_SYMBOL` wrapper) |
+| `BigInt` | §6.10: `BigInt(v)` (a number must be integral, else `RangeError`; strings in every `StringIntegerLiteral` radix, else `SyntaxError`; `new BigInt()` throws `TypeError`, though `BigInt` is a constructor for `IsConstructor`), `BigInt.asIntN` / `asUintN`; `BigInt.prototype.toString(radix)`, `toLocaleString` (`toString()`, no locale data), `valueOf`, `@@toStringTag`; `Number(1n)`; every arithmetic, bitwise, shift, relational, equality and update operator on BigInts (§7.2) |
 | errors | §7.7 |
 | generators | `%GeneratorPrototype%` `next`, `return`, `throw` |
 | iterators | `%IteratorPrototype%[@@iterator]`, `%AsyncIteratorPrototype%[@@asyncIterator]` (both return `this`); the `next` of the Array, String, Map and Set Iterator prototypes (a receiver that is not an iterator of the family throws `TypeError: next method called on incompatible receiver`); `Iterator` (abstract: calling it, or `new` with `new.target === Iterator`, throws `TypeError`; a subclass constructs), `Iterator.prototype` (`%IteratorPrototype%`, non-writable) with `constructor` (`%Iterator%`) and `@@toStringTag` (`"Iterator"`) accessors whose setters are `SetterThatIgnoresPrototypeProperties` (a `TypeError` on a non-object or on `Iterator.prototype` itself; an own data property on any other receiver); `Iterator.from(O)` (`GetIteratorFlattenable`: strings are iterated, other primitives throw `TypeError`; an iterator inheriting `Iterator.prototype` is returned as is, any other is wrapped in a `CLASS_ITERATOR` object of kind `16` over `%WrapForValidIteratorPrototype%`, whose `next` / `return` forward to the wrapped record, `next` read once); the lazy helpers `Iterator.prototype.map` / `filter` / `take` / `drop` / `flatMap` (`this` must be an object; the argument is validated first — a non-callable callback is a `TypeError`, a `take` / `drop` limit goes through `ToNumber` and `NaN` or a negative integer is a `RangeError` — closing `this` on failure; then `next` is read once and a helper object is returned without stepping). A helper's `next` steps the underlying iterator only on demand; a throwing callback, or a `flatMap` result that is not an object (a string included) or not iterable, closes the underlying iterator; `take` closes it once the limit is reached; a `next` / `return` while the helper runs throws `TypeError`; `return()` closes the underlying iterator (and a `flatMap`'s open inner one first) and completes the helper. The eager helpers `reduce` / `toArray` / `forEach` / `some` / `every` / `find` validate `this` and the callback the same way, read `next` once and consume the iterator, passing a counter as the callback's last argument (`reduce` without an initial value starts from the first value with counter `1`, and throws `TypeError` on an empty iterator); a throwing callback closes the iterator under its throw, `some` / `every` / `find` close it on an early result, and a throw from `next` or a result's `value` propagates without closing. A program that names `Iterator`, `constructor`, `getPrototypeOf` or `setPrototypeOf` compiles the accessor dispatch of `__get` / `__set` |
@@ -4411,7 +4409,8 @@ Errors are printed to stderr.
   `doneprintHandle.js`). A test flagged both `raw` and `async` is skipped as
   `flag:async`: a raw source leaves no place to prepend `$DONE`.
   `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` and
-  `symbols-as-weakmap-keys` are not listed (phase 4); `host-gc-required`
+  `symbols-as-weakmap-keys` are not listed (phase 4), nor is `BigInt`
+  (phase 5b, §6.10); `host-gc-required`
   stays, because a test cannot force a collection without a host hook
   (`$262.gc`), which jsc does not provide.
 - **Assembly** (`assemble.rs`). `raw` tests run byte-for-byte; all others are
@@ -4627,11 +4626,15 @@ Each item below is current behaviour of this tree.
 - `Symbol.iterator` and the other `Symbol.*` statics are not folded at
   compile time: a sealed `Symbol` compiles to the intrinsic's address, and the
   member is an ordinary `__get` on it.
-- Not available: `RegExp` (literals and constructor), `BigInt`, `Proxy`, `Reflect`,
+- Not available: `RegExp` (literals and constructor), `Proxy`, `Reflect`,
   typed arrays, `Intl`, `eval`. `Proxy` and `Reflect` are
   phase 5b work in progress: designed (§6.11), not implemented, and their
   test262 features are still skipped.
   The `Function` constructor throws `TypeError`.
+- A BigInt holds at most `2^24` bits (`RangeError: Maximum BigInt size
+  exceeded`, §6.10.1; V8 allows `2^30`), and `BigInt.prototype.toLocaleString` ignores its locales
+  and options (no `Intl`): the 6 locale tests of
+  `intl402/BigInt/prototype/toLocaleString` fail (§6.10).
 - The builtin library is exactly §7.9.
 - Binary data has no `SharedArrayBuffer`, `Atomics` or immutable buffers
   (`transferToImmutable`, `sliceToImmutable`), and no host detach outside
@@ -4665,7 +4668,7 @@ Each item below is current behaviour of this tree.
   |---|---|---|---|---|---|---|---|
   | `RegExp` | phase 5b | 28 | 131 | 3 | | | |
   | `Function` constructor | unsupported (§14 open decisions) | | 4 | 124 | | | 1 |
-  | `eval` / `Proxy` / `BigInt` / `ArrayBuffer` | `eval` unsupported; the rest phase 5b | 21 | 19 | 4 | 1 | | |
+  | `eval` / `Proxy` / `ArrayBuffer` | `eval` unsupported; the rest phase 5b | 21 | 19 | 4 | 1 | | |
   | `String.prototype` / `Number.prototype` are not exotic (above) | object model | | 3 | | | 4 | |
   | `Array.fromAsync` over an array-like of length `2^53 - 1` (timeout) | — | 1 | | | | | |
   | strict `caller` access (`caller/prop-desc`) | — | | | 1 | | | |
@@ -4821,11 +4824,11 @@ steps.
 - All remaining early errors.
 - ES modules: `import`/`export` across files, bundled at compile time into one
   module.
-- `RegExp`, `BigInt`, typed arrays, `ArrayBuffer`, `DataView`, `Proxy`,
-  `Reflect`.
+- `RegExp`, typed arrays, `ArrayBuffer`, `DataView`, `Proxy`,
+  `Reflect`; `BigInt` (phase 5b, done: §6.10).
 - Phase 5b binary data (`ArrayBuffer`, typed arrays, `DataView`): designed
-  in §5.8 (type tags `24`..`26`; `20`..`23` reserved for the Proxy and BigInt
-  workstreams), implemented in stages T2, T3a, T4, T3b, T5a, T5b, T6
+  in §5.8 (type tags `24`..`26`; `21` is `TYPE_BIGINT`, `20` / `22` / `23`
+  reserved for the Proxy workstream), implemented in stages T2, T3a, T4, T3b, T5a, T5b, T6
   (§5.8.10).
   `Reflect` (phase 5b; the `Proxy` / `Reflect` design is §6.11, stages
   P2a-P4).
