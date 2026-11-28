@@ -28,7 +28,7 @@ use wasm_encoder::{Encode, Function, Instruction};
 use wasmparser::{BinaryReader, FunctionBody, Operator};
 
 use super::realm::{self, Builtin, Intrinsic, Key, Value};
-use super::roots::classify_is_numeric;
+use super::roots::{classify_is_numeric, never_string};
 use super::{Helpers, IMPORT_FUNC_COUNT, IrNode, StrOffsets};
 
 /// What the emission of one body (or one family of bodies) used.
@@ -73,7 +73,11 @@ pub(super) fn note_intrinsic(intrinsic: Intrinsic) {
 /// Record the conversion of the run-time value `key` to a property key,
 /// unless inside [`quiet`].
 pub(super) fn note_key(key: &IrNode) {
-    if QUIET.get() == 0 && !matches!(key, IrNode::Str(_)) && !classify_is_numeric(key) {
+    if QUIET.get() == 0
+        && !matches!(key, IrNode::Str(_))
+        && !classify_is_numeric(key)
+        && !never_string(key)
+    {
         USES.with_borrow_mut(|uses| uses.dynamic_key = true);
     }
 }

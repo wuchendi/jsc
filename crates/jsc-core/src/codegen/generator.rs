@@ -1919,26 +1919,23 @@ fn remap_node(node: &mut IrNode, map: &HashMap<u32, u32>) {
         IrNode::Local(_) => slot_get(slot),
         IrNode::Assign { value, .. } => slot_set(slot, *value),
         IrNode::IncDec { inc, prefix, .. } => {
-            let delta = if inc { 1.0 } else { -1.0 };
             let store = slot_set(
                 slot,
-                IrNode::Binary {
-                    op: BinOp::Add,
-                    lhs: Box::new(IrNode::ConvertCall {
-                        op: ConvertOp::ToNumber,
+                IrNode::NumericStep {
+                    arg: Box::new(IrNode::ConvertCall {
+                        op: ConvertOp::ToNumeric,
                         arg: Box::new(slot_get(slot)),
                         radix: None,
                     }),
-                    rhs: Box::new(IrNode::Num(delta)),
+                    inc,
                 },
             );
             if prefix {
                 store
             } else {
-                IrNode::Binary {
-                    op: BinOp::Sub,
-                    lhs: Box::new(store),
-                    rhs: Box::new(IrNode::Num(delta)),
+                IrNode::NumericStep {
+                    arg: Box::new(store),
+                    inc: !inc,
                 }
             }
         }

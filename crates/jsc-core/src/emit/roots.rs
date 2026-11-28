@@ -229,18 +229,20 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
         | IrNode::IsHole(_)
         | IrNode::IsObject(_)
         | IrNode::IsArray(_)
-        | IrNode::IncDec { .. }
         | IrNode::MathCall { .. }
         | IrNode::MathSpread { .. }
         | IrNode::ConvertCall {
             op: ConvertOp::ToNumber | ConvertOp::NumberCall,
             ..
-        }
-        | IrNode::Binary { .. }
-            if !matches!(node, IrNode::Binary { op: BinOp::Add, .. }) =>
-        {
-            ValueClass::numeric()
-        }
+        } => ValueClass::numeric(),
+        // `>>>`, the relational and the equality operators never yield a
+        // `BigInt`; every other arithmetic operator may (DESIGN.md §6.10.5).
+        IrNode::Binary { op, .. } if !is_numeric_op(*op) => ValueClass::numeric(),
+        // `++` / `--` of a local: numeric iff the local is.
+        IrNode::IncDec { local, .. } => ValueClass {
+            numeric: Some(vec![*local]),
+            noroot: Some((vec![*local], vec![])),
+        },
         IrNode::Str(_)
         | IrNode::BigInt { .. }
         | IrNode::TypeOf(_)
@@ -251,11 +253,18 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
             noroot: Some((vec![], vec![*local])),
         },
         IrNode::Assign { value, .. } => classify(value),
-        IrNode::Binary {
-            op: BinOp::Add,
-            lhs,
-            rhs,
-        } => match (classify(lhs).numeric, classify(rhs).numeric) {
+        // Numeric iff every operand is (a number, boolean, `null` or
+        // `undefined` operand yields a number, or throws).
+        IrNode::Negate(arg) | IrNode::BitNot(arg) | IrNode::NumericStep { arg, .. } => {
+            match classify(arg).numeric {
+                Some(deps) => ValueClass {
+                    numeric: Some(deps.clone()),
+                    noroot: Some((deps, vec![])),
+                },
+                None => ValueClass::default(),
+            }
+        }
+        IrNode::Binary { lhs, rhs, .. } => match (classify(lhs).numeric, classify(rhs).numeric) {
             (Some(mut deps), Some(rhs)) => {
                 deps.extend(rhs);
                 ValueClass {
@@ -266,6 +275,39 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
             _ => ValueClass::default(),
         },
         _ => ValueClass::default(),
+    }
+}
+
+/// Whether `op` is an arithmetic operator whose result may be a `BigInt`
+/// (or, for `+`, a string).
+fn is_numeric_op(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::Exp
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
+    )
+}
+
+/// Whether `node` never evaluates to a string (it may still be a `BigInt`,
+/// whose property key is a canonical numeric string): the numeric
+/// operators other than `+`.
+pub(super) fn never_string(node: &IrNode) -> bool {
+    match node {
+        IrNode::Binary { op, .. } => *op != BinOp::Add,
+        IrNode::Negate(_)
+        | IrNode::BitNot(_)
+        | IrNode::NumericStep { .. }
+        | IrNode::IncDec { .. } => true,
+        _ => false,
     }
 }
 

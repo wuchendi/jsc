@@ -8,8 +8,9 @@ use jsc_core::emit::CompileOptions;
 /// Programs that keep different slices of the runtime: the trivial ones every
 /// program pays for, the `BigInt` paths (literal, `typeof`, `===`, `==`, a
 /// `Map` key, rendering, error messages), a dynamic key (which disables
-/// shaking) and binary data (whose collector and renderer arms are gated).
-const PROGRAMS: [&str; 14] = [
+/// shaking), binary data (whose collector and renderer arms are gated),
+/// the numeric operators on `BigInts` and numbers, and the `BigInt` built-ins.
+const PROGRAMS: [&str; 17] = [
     "1",
     "console.log(1)",
     "1n",
@@ -22,6 +23,9 @@ const PROGRAMS: [&str; 14] = [
     "const o = { a: 1 }; const k = 'a'; console.log(o[k])",
     "console.log(new ArrayBuffer(8).byteLength)",
     "const v = new DataView(new ArrayBuffer(8)); v.setFloat64(0, 1.5); console.log(v.getFloat64(0), v)",
+    "let x = 2n ** 64n; x++; console.log(x / 3n, x % 3n, -x, ~x, x << 3n, x >> 3n, x & -5n, x < 2 ** 64, x > '1')",
+    "let a = 1; a = -a; a++; a--; console.log(a ** 2, a >>> 1, ~a, a % 3, a - 1, a * 2, a / 2)",
+    "const o = { v: 1n }; o.v **= 3n; o.v--; globalThis.g = 1n; g++; let c = 1n; (() => c++)(); console.log(o.v, g, c)",
     "console.log(BigInt('0x1F').toString(36), BigInt.asIntN(8, 255n), BigInt.asUintN(65, -1n), Number(2n))",
     "try { new BigInt(1) } catch (e) { console.log(e.message, BigInt(1.5)) }",
 ];
