@@ -1,4 +1,4 @@
-//! `DataView` (DESIGN.md §5.8): the constructor and the
+//! `DataView` (DESIGN.md §6.2): the constructor and the
 //! `%DataView.prototype%` getters (`buffer`, `byteLength`, `byteOffset`) and
 //! get / set methods of the number and `BigInt` element kinds.
 //!
@@ -297,7 +297,7 @@ pub(super) fn emit(
     }
 }
 
-/// `DataView(buffer, byteOffset, byteLength)` (DESIGN.md §5.8.7): the
+/// `DataView(buffer, byteOffset, byteLength)` (DESIGN.md §7.9): the
 /// "requires 'new'" `TypeError` when called; a non-`ArrayBuffer` `buffer`
 /// throws; `ToIndex(byteOffset)`; a detached buffer throws; an offset past
 /// the buffer is a `RangeError`; an `undefined` `byteLength` takes the rest
@@ -472,7 +472,7 @@ fn emit_getter(
     wasm!(function; F64ConvertI32U, I64ReinterpretF64);
 }
 
-/// `GetViewValue` / `SetViewValue` (DESIGN.md §5.8.7) for a get / set
+/// `GetViewValue` / `SetViewValue` (DESIGN.md §7.9) for a get / set
 /// method: the receiver check, `ToIndex(requestIndex)`, a setter's
 /// `ToNumber(value)` (`ToBigInt(value)` for a `BigInt` kind),
 /// `ToBoolean(littleEndian)`, then an out-of-bounds or

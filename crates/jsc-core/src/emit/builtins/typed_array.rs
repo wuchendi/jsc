@@ -1,4 +1,4 @@
-//! Typed arrays (DESIGN.md §5.8): the concrete constructors (`Int8Array` ..
+//! Typed arrays (DESIGN.md §6.2): the concrete constructors (`Int8Array` ..
 //! `BigUint64Array`, every overload of `TypedArray(...args)`), the
 //! `%TypedArray%` statics `from` / `of`, and the `%TypedArray.prototype%`
 //! getters (`buffer`, `byteLength`, `byteOffset`, `length`,
@@ -44,7 +44,7 @@ macro_rules! alignment_errors {
     };
 }
 
-/// The alignment `RangeError`s of each kind (DESIGN.md §5.8.7).
+/// The alignment `RangeError`s of each kind (DESIGN.md §7.9).
 const ALIGNMENT: [[CalleeErrorText<'static>; 2]; 12] = alignment_errors![
     "Int8Array" => "1",
     "Uint8Array" => "1",
@@ -148,7 +148,7 @@ const RECEIVER_NAMES: [(TypedArrayOp, &str); 7] = [
 ];
 
 /// The name of `%ArrayIteratorPrototype%.next` in its out-of-bounds
-/// `TypeError` (DESIGN.md §5.8.7).
+/// `TypeError` (DESIGN.md §7.9).
 pub(super) const ITERATOR_NEXT: &str = "%ArrayIteratorPrototype%.next";
 
 /// `2^53 - 1`, the largest `ToIndex` / `ToLength` result.
@@ -377,7 +377,7 @@ struct View {
 }
 
 /// A fresh `kind` typed array over `view` into i64 `out` (DESIGN.md
-/// §5.8.3).
+/// §5.2).
 fn new_typed_array(
     function: &mut FnBuilder<'_>,
     frame: Frame,
@@ -404,7 +404,7 @@ fn new_typed_array(
 
 /// `AllocateTypedArray("Uint8Array", %Uint8Array%, %Uint8Array.prototype%,
 /// n)` for the byte count in i32 `n` into i64 `out` (the base64 / hex
-/// statics, DESIGN.md §5.8.7): a fresh fixed buffer and a view over all of
+/// statics, DESIGN.md §7.9): a fresh fixed buffer and a view over all of
 /// it; no user code runs, and out of memory returns with the `RangeError`
 /// pending. `buffer` / `proto` are i64 temps, `data` / `zero` i32 temps.
 pub(super) fn new_uint8_array(
@@ -583,7 +583,7 @@ pub(super) fn emit(
     }
 }
 
-/// `<Kind>Array(...args)` (DESIGN.md §5.8.7): the "requires 'new'"
+/// `<Kind>Array(...args)` (DESIGN.md §7.9): the "requires 'new'"
 /// `TypeError` when called; then by the first argument — an object takes
 /// `GetPrototypeFromConstructor` first and is a typed array (a copy of its
 /// current elements), an `ArrayBuffer` (a view) or any other object (its
@@ -690,9 +690,15 @@ fn from_typed_array(
     );
     count_loop(function, c.k, c.n, |function| {
         wasm!(function;
-            LocalGet(c.out), I32WrapI64, LocalGet(c.k),
-            LocalGet(src), I32WrapI64, LocalGet(c.k), Call(helpers.ta_get()),
-            Call(helpers.ta_set()),
+            LocalGet(src), I32WrapI64, LocalGet(c.k), Call(helpers.ta_get()), LocalSet(c.v),
+        );
+        // A `BigInt` element read allocates; out of memory leaves the
+        // `RangeError` pending, so nothing is stored.
+        if c.kind.is_bigint() {
+            return_if_pending(function);
+        }
+        wasm!(function;
+            LocalGet(c.out), I32WrapI64, LocalGet(c.k), LocalGet(c.v), Call(helpers.ta_set()),
         );
     });
     wasm!(function; End, LocalGet(c.out), Return);
@@ -1048,7 +1054,7 @@ const SPECIES_TEXTS: [CalleeErrorText<'static>; 3] = [
     SPECIES_CONTENT_TYPE,
 ];
 
-/// The first `BigInt` element kind (DESIGN.md §5.8.6): a kind at or past it
+/// The first `BigInt` element kind (DESIGN.md §6.2): a kind at or past it
 /// has the `BigInt` content type.
 const FIRST_BIGINT_KIND: i32 = 10;
 
@@ -1305,7 +1311,7 @@ fn emit_to_string_tag(function: &mut FnBuilder<'_>, frame: Frame, strings: &StrO
 
 /// `keys` / `values` / `entries`: `ValidateTypedArray(this)` (a receiver
 /// that is not a typed array, or an out-of-bounds or detached one, throws),
-/// then an Array Iterator of `kind` over it (DESIGN.md §5.8.7).
+/// then an Array Iterator of `kind` over it (DESIGN.md §7.9).
 fn emit_iter(
     op: TypedArrayOp,
     kind: IterKind,
