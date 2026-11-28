@@ -193,6 +193,7 @@ fn emit_define_entry(
             function.instruction(&Instruction::I32Const(static_str_key(strings, name)));
         }
         PropKey::Computed(expr) | PropKey::HiddenComputed(expr) => {
+            shake::note_key(expr);
             emit_node(expr, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32Const(1));
             function.instruction(&Instruction::Call(helpers.to_key));
@@ -2271,6 +2272,7 @@ pub(super) fn emit_index_node(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    shake::note_key(index);
     let s0 = scratch + 17;
     let s1 = scratch + 18;
     // Evaluate the operand and the index jsval (the operand rides the operand
@@ -2481,6 +2483,7 @@ pub(super) fn emit_index_set_node(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    shake::note_key(index);
     let s0 = scratch + 14;
     let s1 = scratch + 15;
     let sval = scratch + 16;
@@ -2760,15 +2763,18 @@ pub(super) fn emit_index_op_set_node(
     // new = current_member op rhs. The member read reuses the runtime type-byte
     // dispatch, reads its operands from the stable temps, and is staged in
     // `new_local` (before `rhs` runs) so the combine reads it back as a `Local`.
-    emit_index_node(
-        &IrNode::Local(obj_local),
-        &IrNode::Local(idx_local),
-        false,
-        function,
-        scratch,
-        strings,
-        helpers,
-    );
+    shake::note_key(index);
+    shake::quiet(|| {
+        emit_index_node(
+            &IrNode::Local(obj_local),
+            &IrNode::Local(idx_local),
+            false,
+            function,
+            scratch,
+            strings,
+            helpers,
+        );
+    });
     function.instruction(&Instruction::LocalSet(new_local));
     let new_value = IrNode::Binary {
         op,
@@ -2788,15 +2794,17 @@ pub(super) fn emit_index_op_set_node(
     // A postfix update yields the OLD numeric value: store `old op rhs`, then drop
     // the stored value in favour of `new_local`.
     if *kind == OpSetKind::PostfixUpdate {
-        emit_index_set_node(
-            &IrNode::Local(obj_local),
-            &IrNode::Local(idx_local),
-            &new_value,
-            function,
-            scratch,
-            strings,
-            helpers,
-        );
+        shake::quiet(|| {
+            emit_index_set_node(
+                &IrNode::Local(obj_local),
+                &IrNode::Local(idx_local),
+                &new_value,
+                function,
+                scratch,
+                strings,
+                helpers,
+            );
+        });
         function.instruction(&Instruction::Drop);
         function.instruction(&Instruction::LocalGet(new_local));
         return;
@@ -2806,15 +2814,17 @@ pub(super) fn emit_index_op_set_node(
 
     // Store back into the same member, reusing the plain-store dispatch. All three
     // operands are `Local` reads, so evaluating them does not disturb scratch.
-    emit_index_set_node(
-        &IrNode::Local(obj_local),
-        &IrNode::Local(idx_local),
-        &IrNode::Local(new_local),
-        function,
-        scratch,
-        strings,
-        helpers,
-    );
+    shake::quiet(|| {
+        emit_index_set_node(
+            &IrNode::Local(obj_local),
+            &IrNode::Local(idx_local),
+            &IrNode::Local(new_local),
+            function,
+            scratch,
+            strings,
+            helpers,
+        );
+    });
 }
 
 /// Whether `node` provably evaluates to an object/array/function heap value (a

@@ -564,6 +564,7 @@ fn emit_node_inner(
             function.instruction(&Instruction::LocalGet(scratch + 22));
         }
         IrNode::ToPropertyKey(operand) => {
+            shake::note_key(operand);
             emit_node(operand, function, scratch, strings, helpers);
             function.instruction(&Instruction::I32Const(1));
             function.instruction(&Instruction::Call(helpers.to_key));

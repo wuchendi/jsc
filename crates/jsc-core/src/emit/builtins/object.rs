@@ -344,6 +344,7 @@ pub(super) fn emit_lookup_accessor(
     frame.arg(function, 0);
     wasm!(function; I32Const(0), Call(helpers.to_key), LocalSet(key));
     return_if_pending(function);
+    shake::note_runtime_key();
     let half = static_key(strings, if set { "set" } else { "get" });
     wasm!(function;
         Block(BlockType::Empty), Loop(BlockType::Empty),

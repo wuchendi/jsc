@@ -3,7 +3,10 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 mod common;
-use common::{assert_number, assert_output, assert_uncaught, compile, fails};
+use common::{
+    assert_eval, assert_number, assert_output, assert_uncaught, compile, compile_with, fails,
+};
+use jsc_core::emit::CompileOptions;
 use wasmparser::{Operator, Parser, Payload};
 use wasmtime::{Config, Engine, Linker, Module, Store, Trap};
 
@@ -406,9 +409,14 @@ const ONE_SLOT_RECURSION: &str = "function r(a) { r(a); return a; } r(1)";
 const NATIVE_STACK: usize = 240 << 20;
 
 /// Run `src` until it traps; the trap and the first 16 bytes of its memory.
-/// Imports are stubbed: no program here reaches one before trapping.
+/// Imports are stubbed: no program here reaches one before trapping. The
+/// call-stack guard is left out so the recursion reaches the stack floor.
 fn exhaust(src: &str) -> (Trap, Vec<u8>) {
-    let wasm = compile(src, false).expect("compiles");
+    let options = CompileOptions {
+        no_stack_guard: true,
+        ..CompileOptions::default()
+    };
+    let wasm = compile_with(src, options).expect("compiles");
     std::thread::Builder::new()
         .stack_size(NATIVE_STACK + (16 << 20))
         .spawn(move || {
@@ -454,4 +462,103 @@ fn first_push_past_floor_traps() {
     assert_eq!(trap, Trap::MemoryOutOfBounds);
     // `$fp = 0` wrote slot 0 at address 8, so the trap was the very next push.
     assert_eq!(memory[8..16], 1.0_f64.to_bits().to_le_bytes());
+}
+
+/// The call-stack guard: unbounded recursion throws a catchable `RangeError`.
+#[test]
+fn stack_overflow_is_a_catchable_range_error() {
+    assert_eval(
+        "function f() { return f() }
+         let r; try { f() } catch (e) { r = (e instanceof RangeError) + ':' + e.message } r",
+        "true:Maximum call stack size exceeded",
+    );
+    assert_uncaught(
+        "function f() { return f() } f()",
+        "RangeError: Maximum call stack size exceeded",
+    );
+    // Arrows, methods and calls through a builtin callback are guarded too.
+    assert_eval(
+        "const f = n => [n].map(x => f(x + 1))[0];
+         let r = 0; try { f(0) } catch (e) { r = e instanceof RangeError } r",
+        "true",
+    );
+    assert_eval(
+        "class A { m() { return this.m() } }
+         let r = 0; try { new A().m() } catch (e) { r = e instanceof RangeError } r",
+        "true",
+    );
+    assert_eval(
+        "function* g() { yield* g() }
+         let r = 0; try { [...g()] } catch (e) { r = e instanceof RangeError } r",
+        "true",
+    );
+}
+
+/// Recursion below the limit runs, and the depth is counted back out on every
+/// exit: plain returns, throws, `finally` and generator steps.
+#[test]
+fn call_depth_is_balanced() {
+    assert_eval(
+        "function d(n) { return n ? 1 + d(n - 1) : 0 } d(9000)",
+        "9000",
+    );
+    assert_eval(
+        "function d(n) { return n ? 1 + d(n - 1) : 0 }
+         function boom() { throw 1 }
+         function fin() { try { return 1 } finally { boom2() } }
+         function boom2() {}
+         function* gen() { yield 1; yield 2 }
+         for (let i = 0; i < 20000; i++) {
+           try { boom() } catch (e) {}
+           fin();
+           for (const v of gen()) {}
+         }
+         function f() { return f() }
+         for (let i = 0; i < 3; i++) { try { f() } catch (e) {} }
+         d(9000)",
+        "9000",
+    );
+}
+
+/// A recursion with a large frame stops at the shadow-stack margin with the
+/// same `RangeError` instead of running into the stack floor.
+#[test]
+fn large_frames_overflow_as_range_error() {
+    let names: Vec<String> = (0..40).map(|i| format!("v{i}")).collect();
+    let locals = names.join(" = [n], ");
+    let uses = names.join(".length + ");
+    assert_eval(
+        &format!(
+            "function f(n) {{ const {locals} = [n]; return f(n + 1) + {uses}.length }}
+             let r = 0; try {{ f(0) }} catch (e) {{ r = e instanceof RangeError }} r"
+        ),
+        "true",
+    );
+}
+
+/// A generator or async body that ends by throwing counts itself out too.
+#[test]
+fn call_depth_is_balanced_through_state_machine_throws() {
+    assert_eval(
+        "function* g() { yield 1; throw 1 }
+         function* h() { try { yield 1 } finally {} }
+         for (let i = 0; i < 12000; i++) {
+           const a = g(); a.next(); try { a.next() } catch (e) {}
+           const b = h(); b.next(); try { b.throw(new Error('x')) } catch (e) {}
+         }
+         function d(n) { return n ? 1 + d(n - 1) : 0 }
+         d(9000)",
+        "9000",
+    );
+    assert_output(
+        "async function f() { throw 1 }
+         async function w() { await Promise.reject(2) }
+         async function* ag() { throw 3 }
+         for (let i = 0; i < 12000; i++) {
+           f().catch(() => {}); w().catch(() => {}); ag().next().catch(() => {});
+         }
+         function d(n) { return n ? 1 + d(n - 1) : 0 }
+         Promise.resolve().then(() => console.log(d(9000)))",
+        "9000\n",
+    );
 }

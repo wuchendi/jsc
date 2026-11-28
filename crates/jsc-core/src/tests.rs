@@ -16,6 +16,8 @@ fn compile_and_run_evaluates_numeric_expression() {
         CompileOptions {
             print_completion: true,
             gc_stress: crate::emit::gc_stress_from_env(),
+            no_stack_guard: false,
+            full_runtime: false,
         },
     );
     let capture = Capture::new();

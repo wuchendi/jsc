@@ -17,6 +17,8 @@ fn print_completion_matches_cli_p() {
             CompileOptions {
                 print_completion: true,
                 gc_stress: 0,
+                no_stack_guard: false,
+                full_runtime: false,
             },
         );
         let capture = Capture::new();

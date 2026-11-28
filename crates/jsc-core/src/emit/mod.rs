@@ -245,11 +245,16 @@ const KEPT_OBJECTS_GLOBAL: u32 = 44;
 /// registry list.
 const FIN_JOBS_GLOBAL: u32 = 45;
 
+/// The number of active user-function calls (`$__call_depth`, i32, init 0):
+/// the call-stack guard ([`function::emit_stack_guard`]) counts it up on
+/// entry and every return counts it down.
+const CALL_DEPTH_GLOBAL: u32 = 46;
+
 /// The wasm global index of module cell `0` (`IrNode::ModuleCell`); module cell
 /// `n` is global `MODULE_CELL_GLOBAL_BASE + n` (i64 cell pointers, appended after
 /// the renderer, RNG, promise-engine and collector globals and set in `main`'s
 /// prologue).
-const MODULE_CELL_GLOBAL_BASE: u32 = 46;
+const MODULE_CELL_GLOBAL_BASE: u32 = 47;
 
 /// An array hole (see [`abi::HOLE`]): the element-slot bit pattern of a
 /// missing element. Every element read maps it to `undefined`.
@@ -640,6 +645,12 @@ const ARRAY_LENGTH_MSG: &str = "Invalid array length";
 /// See [`ARRAY_LENGTH_MSG`].
 const ARRAY_LENGTH_STACK: &str = "RangeError: Invalid array length";
 
+/// The `.message` and `.stack` of the `RangeError` the call-stack guard
+/// raises.
+const STACK_OVERFLOW_MSG: &str = "Maximum call stack size exceeded";
+/// See [`STACK_OVERFLOW_MSG`].
+const STACK_OVERFLOW_STACK: &str = "RangeError: Maximum call stack size exceeded";
+
 /// The message fragments `__prop_throw` splices into the strict-mode
 /// `TypeError` raised by a member store on a primitive receiver:
 /// `Cannot create property '<key>' on <number|string|boolean> '<String(recv)>'`.
@@ -887,6 +898,9 @@ impl Unwind {
 
 #[derive(Clone, Copy)]
 struct Helpers<'a> {
+    /// The call-depth limit of the call-stack guard
+    /// ([`function::emit_stack_guard`]); `None` leaves the guard out.
+    stack_guard: Option<u32>,
     /// Per-function exception-unwinding state: the active `try` handler
     /// landing pads and the current control-nesting depth. A shared `&RefCell`
     /// so the `Copy` `Helpers` threaded through emission can still mutate it in
@@ -899,9 +913,6 @@ struct Helpers<'a> {
     /// `__now() -> f64`, the WASI clock in ms since the Unix epoch (backing
     /// `Date`); `__random` follows it (see [`Self::random`]).
     now: u32,
-    /// `__num_unit`, the first of the [`strtod`] number parsers; the others
-    /// follow it (see the accessors).
-    strtod: u32,
     /// `__gen_to_array(gen: i64) -> i64`: drive a generator to
     /// exhaustion via `call_indirect`, collecting its yielded values into a fresh
     /// array — the drain backing `[...gen]` / `f(...gen)` spread. Emitted just
@@ -925,14 +936,6 @@ struct Helpers<'a> {
     /// through `__to_primitive`; see [`value::emit_to_number_helper`]).
     /// Call sites skip it for number operands (see [`value::emit_coerce_number`]).
     to_number: u32,
-    /// `__invoke1(fn: i64, arg: i64) -> i64`: the callback trampoline
-    /// `__run_job` calls to run a reaction's callback.
-    invoke1: u32,
-    /// `__async_step(gen: i64, sent: i64) -> i64`: the generator
-    /// single-step trampoline `__async_drive` calls to advance an
-    /// `async function` body's state machine by one suspend. Appended right after
-    /// `invoke1` (index `invoke1 + 1`).
-    async_step: u32,
     /// The funcref-TABLE slots of the two `new Promise` settler functions:
     /// `resolve` (fulfills the bound promise) and `reject`. A `new Promise`
     /// executor receives function values pointing at these slots with the target
@@ -1097,77 +1100,77 @@ struct Helpers<'a> {
 impl Helpers<'_> {
     /// `__num_unit(data: i32, i: i32) -> i32`: a code unit behind a tagged pointer.
     fn num_unit(self) -> u32 {
-        self.strtod
+        self.tail(registry::Tail::NumUnit)
     }
 
     /// `__str_ws(c: i32) -> i32`: whether a unit is a `StrWhiteSpaceChar`.
     fn str_ws(self) -> u32 {
-        self.strtod + 1
+        self.tail(registry::Tail::StrWs)
     }
 
     /// `__dec_parse(data: i32, start: i32, end: i32) -> f64`: the longest `StrDecimalLiteral` prefix, correctly rounded.
     fn dec_parse(self) -> u32 {
-        self.strtod + 2
+        self.tail(registry::Tail::DecParse)
     }
 
     /// `__dec_slow() -> i64`: Simple Decimal Conversion of the digit buffer.
     fn dec_slow(self) -> u32 {
-        self.strtod + 3
+        self.tail(registry::Tail::DecSlow)
     }
 
     /// `__dec_round() -> i64`: the digit buffer's integer part, rounded.
     fn dec_round(self) -> u32 {
-        self.strtod + 4
+        self.tail(registry::Tail::DecRound)
     }
 
     /// `__dec_left(shift: i32)`: multiply the digit buffer by `2^shift`.
     fn dec_left(self) -> u32 {
-        self.strtod + 5
+        self.tail(registry::Tail::DecLeft)
     }
 
     /// `__dec_right(shift: i32)`: divide the digit buffer by `2^shift`.
     fn dec_right(self) -> u32 {
-        self.strtod + 6
+        self.tail(registry::Tail::DecRight)
     }
 
     /// `__digit_span(data, start, end, radix) -> i32`: the end of a digit run.
     fn digit_span(self) -> u32 {
-        self.strtod + 7
+        self.tail(registry::Tail::DigitSpan)
     }
 
     /// `__radix_pow2(data, start, end, bits) -> f64`: exact power-of-two radix.
     fn radix_pow2(self) -> u32 {
-        self.strtod + 8
+        self.tail(registry::Tail::RadixPow2)
     }
 
     /// `__radix_fold(data, start, end, radix) -> f64`: `f64` digit accumulation.
     fn radix_fold(self) -> u32 {
-        self.strtod + 9
+        self.tail(registry::Tail::RadixFold)
     }
 
     /// `__string_to_number(s: i32) -> f64`: `StringToNumber`.
     fn string_to_number(self) -> u32 {
-        self.strtod + 10
+        self.tail(registry::Tail::StringToNumber)
     }
 
     /// `__to_number_prim(v: i64) -> i64`: `ToNumber` of a non-symbol primitive.
     fn to_number_prim(self) -> u32 {
-        self.strtod + 11
+        self.tail(registry::Tail::ToNumberPrim)
     }
 
     /// `__parse_float(v: i64) -> i64`: `parseFloat` of a string jsval.
     fn parse_float(self) -> u32 {
-        self.strtod + 12
+        self.tail(registry::Tail::ParseFloat)
     }
 
     /// `__random() -> f64`, the `Math.random` generator (right after `__now`).
     fn random(self) -> u32 {
-        self.now + 1
+        self.tail(registry::Tail::Random)
     }
 
     /// `__parse_int(v: i64, radix: i32) -> i64`: `parseInt` of a string jsval.
     fn parse_int(self) -> u32 {
-        self.strtod + 13
+        self.tail(registry::Tail::ParseInt)
     }
 
     /// Base address of the realm image (see [`realm`]): right after the
@@ -1179,13 +1182,19 @@ impl Helpers<'_> {
     /// `__has_own(key, obj) -> i32`: whether `obj` has the own property `key`
     /// (see [`props::emit_has_own`]), right after `__new_array`.
     fn has_own(self) -> u32 {
-        self.new_string + 2
+        self.ctor(registry::Ctor::HasOwn)
     }
 
     /// The wasm function index of `builtin`'s body; the bodies follow
     /// `__has_own` in [`Builtin::ALL`] order.
     fn builtin(self, builtin: Builtin) -> u32 {
-        self.new_string + 3 + builtin.index()
+        shake::note_builtin(builtin);
+        self.builtin_index(builtin)
+    }
+
+    /// [`Self::builtin`] without recording the reference for [`shake`].
+    fn builtin_index(self, builtin: Builtin) -> u32 {
+        self.group(registry::Group::Builtins) + builtin.index()
     }
 
     /// `__umul128(a, b) -> (low, high)`.
@@ -1251,159 +1260,160 @@ impl Helpers<'_> {
     /// `__to_primitive(v, hint) -> i64` (see [`convert::emit_to_primitive`]):
     /// the first of the conversion helpers, which follow the builtin bodies.
     fn to_primitive(self) -> u32 {
-        self.builtin(Builtin::ALL[Builtin::ALL.len() - 1]) + 1
+        self.conv(registry::Conv::ToPrimitive)
     }
 
     /// `__to_string(v) -> i32` (see [`convert::emit_to_string`]).
     fn to_str(self) -> u32 {
-        self.to_primitive() + 1
+        self.conv(registry::Conv::ToStr)
     }
 
     /// `__add(a, b) -> i64` (see [`convert::emit_add_helper`]).
     fn add_slow(self) -> u32 {
-        self.to_primitive() + 2
+        self.conv(registry::Conv::Add)
     }
 
     /// `__compare(a, b, op) -> i32` (see [`convert::emit_compare`]).
     fn compare(self) -> u32 {
-        self.to_primitive() + 3
+        self.conv(registry::Conv::Compare)
     }
 
     /// `__array_join(recv, sep) -> i64` (see [`convert::emit_array_join`]).
     fn array_join(self) -> u32 {
-        self.to_primitive() + 4
+        self.conv(registry::Conv::ArrayJoin)
     }
 
     /// `__to_object(v) -> i64` (see [`builtins::emit_to_object`]), right
     /// after `__array_join`.
     fn to_object(self) -> u32 {
-        self.to_primitive() + 5
+        self.conv(registry::Conv::ToObject)
     }
 
     /// `__json_rep(holder, key, value, replacer, list, stack) -> i64` (see
     /// [`builtins::emit_json_rep`]), right after `__to_object`.
     fn json_rep(self) -> u32 {
-        self.to_primitive() + 6
+        self.conv(registry::Conv::JsonRep)
     }
 
     /// `__json_indent(s, gap) -> i32` (see [`builtins::emit_json_indent`]).
     fn json_indent(self) -> u32 {
-        self.to_primitive() + 7
+        self.conv(registry::Conv::JsonIndent)
     }
 
     /// `__json_revive(holder, key, reviver) -> i64` (see
     /// [`builtins::emit_json_revive`]).
     fn json_revive(self) -> u32 {
-        self.to_primitive() + 8
+        self.conv(registry::Conv::JsonRevive)
     }
 
     /// `__define_own(o, key, desc, value, get, set) -> i32` (see
     /// [`props::emit_define_own`]), right after `__json_revive`.
     fn define_own(self) -> u32 {
-        self.to_primitive() + 9
+        self.conv(registry::Conv::DefineOwn)
     }
 
     /// `__to_desc(attrs, list)` (see [`props::emit_to_desc`]).
     fn to_desc(self) -> u32 {
-        self.to_primitive() + 10
+        self.conv(registry::Conv::ToDesc)
     }
 
     /// `__own_desc(obj, key) -> i64` (see [`props::emit_own_desc`]).
     fn own_desc(self) -> u32 {
-        self.to_primitive() + 11
+        self.conv(registry::Conv::OwnDesc)
     }
 
     /// `__set_integrity(obj, level)` (see [`props::emit_set_integrity`]).
     fn set_integrity(self) -> u32 {
-        self.to_primitive() + 12
+        self.conv(registry::Conv::SetIntegrity)
     }
 
     /// `__test_integrity(obj, level) -> i32` (see
     /// [`props::emit_test_integrity`]).
     fn test_integrity(self) -> u32 {
-        self.to_primitive() + 13
+        self.conv(registry::Conv::TestIntegrity)
     }
 
     /// `__own_enum(obj, key) -> i32` (see [`props::emit_own_enum`]).
     fn own_enum(self) -> u32 {
-        self.to_primitive() + 14
+        self.conv(registry::Conv::OwnEnum)
     }
 
     /// `__set_proto(o, proto) -> i32` (see [`props::emit_set_proto`]).
     fn set_proto(self) -> u32 {
-        self.to_primitive() + 15
+        self.conv(registry::Conv::SetProto)
     }
 
     /// The self-resolution `TypeError` constructor `() -> i64` (see
     /// [`builtins::emit_promise_self_error`]).
     fn promise_self_error(self) -> u32 {
-        self.to_primitive() + 16
+        self.conv(registry::Conv::PromiseSelfError)
     }
 
     /// `__symbol_get(v, sym) -> i64` (see [`props::emit_symbol_get`]).
     fn symbol_get(self) -> u32 {
-        self.to_primitive() + 17
+        self.conv(registry::Conv::SymbolGet)
     }
 
     /// `__super_get(home, key, recv) -> i64` (see [`props::emit_super_get`]).
     fn super_get(self) -> u32 {
-        self.to_primitive() + 18
+        self.conv(registry::Conv::SuperGet)
     }
 
     /// `__super_set(home, key, v, recv)` (see [`props::emit_super_set`]).
     fn super_set(self) -> u32 {
-        self.to_primitive() + 19
+        self.conv(registry::Conv::SuperSet)
     }
 
     /// `__private_find(o, key) -> i32` (see [`props::emit_private_find`]).
     fn private_find(self) -> u32 {
-        self.to_primitive() + 20
+        self.conv(registry::Conv::PrivateFind)
     }
 
     /// `__private_add(o, key, v, attrs, name)` (see
     /// [`props::emit_private_add`]).
     fn private_add(self) -> u32 {
-        self.to_primitive() + 21
+        self.conv(registry::Conv::PrivateAdd)
     }
 
     /// `__private_get(o, key, name) -> i64` (see [`props::emit_private_get`]).
     fn private_get(self) -> u32 {
-        self.to_primitive() + 22
+        self.conv(registry::Conv::PrivateGet)
     }
 
     /// `__private_set(o, key, v, name) -> i64` (see
     /// [`props::emit_private_set`]).
     fn private_set(self) -> u32 {
-        self.to_primitive() + 23
+        self.conv(registry::Conv::PrivateSet)
     }
 
     /// `__private_brand(o, v, brand, name, mode) -> i64` (see
     /// [`props::emit_private_brand`]).
     fn private_brand(self) -> u32 {
-        self.to_primitive() + 24
+        self.conv(registry::Conv::PrivateBrand)
     }
 
     /// `__private_in(o, brand, name) -> i64` (see [`props::emit_private_in`]).
     fn private_in(self) -> u32 {
-        self.to_primitive() + 25
+        self.conv(registry::Conv::PrivateIn)
     }
 
     /// The funcref-table slot of `builtin`'s body: the builtins follow the
     /// user functions and the two settlers.
     fn builtin_slot(self, builtin: Builtin) -> u32 {
+        shake::note_builtin(builtin);
         self.settle_resolve_slot + 2 + builtin.index()
     }
 
     /// `__new_array(len) -> i32`: the array constructor, right after
     /// `new_string`.
     fn new_array(self) -> u32 {
-        self.new_string + 1
+        self.ctor(registry::Ctor::NewArray)
     }
 
     /// `__str_exotic_index(o, key) -> i32`: the `String` wrapper own index
     /// `key` names on `o`, else `-1`; right after `__index_string`.
     fn str_exotic_index(self) -> u32 {
-        self.index_string + 1
+        self.core(registry::Core::StrExoticIndex)
     }
 
     /// `__array_reserve(base, need)`: grow the array handle's element store to
@@ -1411,7 +1421,7 @@ impl Helpers<'_> {
     /// the `len` live slots and repointing `elems`; the handle never moves. It
     /// is the helper right before `__array_push`.
     fn array_reserve(self) -> u32 {
-        self.array_push - 1
+        self.core(registry::Core::ArrayReserve)
     }
 
     /// `__array_set(recv, key, v)`: the slow path of a member store on an
@@ -1419,35 +1429,35 @@ impl Helpers<'_> {
     /// [`props::emit_array_set`]); may leave an exception pending. It is the
     /// helper right after `__array_concat`.
     fn array_set(self) -> u32 {
-        self.array_concat + 1
+        self.core(registry::Core::ArraySet)
     }
 
     /// `__array_set_length(arr, v)`: the `length` write on the array handle
     /// `arr` (see [`props::emit_array_set_length`]); may leave a `RangeError`
     /// pending. It is the helper right after `__array_set`.
     fn array_set_length(self) -> u32 {
-        self.array_concat + 2
+        self.core(registry::Core::ArraySetLength)
     }
 
     /// `__sparse_get(arr, i) -> i64`: element `i` (or [`HOLE_BITS`]) of a
     /// `SPARSE` array (see [`props::emit_sparse_get`]). It is the helper right
     /// after `__array_set_length`.
     fn sparse_get(self) -> u32 {
-        self.array_concat + 3
+        self.core(registry::Core::SparseGet)
     }
 
     /// `__sparse_set(arr, i, v)`: store element `i` of a `SPARSE` array,
     /// raising `length` past `i` (see [`props::emit_sparse_set`]). It is the
     /// helper right after `__sparse_get`.
     fn sparse_set(self) -> u32 {
-        self.array_concat + 4
+        self.core(registry::Core::SparseSet)
     }
 
     /// `__protos_indexless(o) -> i32`: whether no prototype of `o` can hold an
     /// integer-index property (see [`props::emit_protos_indexless`]). It is
     /// the helper right after `__sparse_set`.
     fn protos_indexless(self) -> u32 {
-        self.array_concat + 5
+        self.core(registry::Core::ProtosIndexless)
     }
 
     /// `__proto_elem(o, i) -> i64`: element `i` that `o` does not own, read
@@ -1455,27 +1465,27 @@ impl Helpers<'_> {
     /// [`props::emit_proto_elem`]). It is the helper right after
     /// `__protos_indexless`.
     fn proto_elem(self) -> u32 {
-        self.array_concat + 6
+        self.core(registry::Core::ProtoElem)
     }
 
     /// `__proto_set(o, i, v) -> i32`: the inherited half of a store to an
     /// element `o` does not own (see [`props::emit_proto_set`]). It is the
     /// helper right after `__proto_elem`.
     fn proto_set(self) -> u32 {
-        self.array_concat + 7
+        self.core(registry::Core::ProtoSet)
     }
 
     /// `__array_define(recv, key, v)`: `__array_set` without the prototype
     /// chain, for `CreateDataPropertyOrThrow` (see [`props::emit_array_set`]).
     /// It is the helper right after `__proto_set`.
     fn array_define(self) -> u32 {
-        self.array_concat + 8
+        self.core(registry::Core::ArrayDefine)
     }
 
     /// `__sparse_define(o, i, v)`: the `SPARSE` arm of `__array_define` (see
     /// [`props::emit_sparse_set`]), right after `__array_define`.
     fn sparse_define(self) -> u32 {
-        self.array_concat + 9
+        self.core(registry::Core::SparseDefine)
     }
 }
 
@@ -1540,10 +1550,12 @@ mod object;
 mod promise_engine;
 mod props;
 mod realm;
+mod registry;
 mod render;
 mod roots;
 mod runtime;
 mod sections;
+mod shake;
 mod stmt;
 mod strtod;
 #[cfg(test)]
@@ -1593,6 +1605,12 @@ pub struct CompileOptions {
     /// [`GC_STRESS_PREFIX`] collections of a run, then at every `N`th
     /// allocation.
     pub gc_stress: u32,
+    /// Test only: omit the call-stack guard, so recursion runs until the
+    /// host stack or the shadow stack traps.
+    pub no_stack_guard: bool,
+    /// Emit every runtime body, also the ones the program cannot reach
+    /// ([`shake`]).
+    pub full_runtime: bool,
 }
 
 /// The number of collections a `gc_stress` run with an interval `N > 1`
@@ -1658,11 +1676,11 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // Per-function exception-unwinding state, reset at each function body.
     // Owned here so it outlives every `emit_main`/`emit_function` call below.
     let unwind = RefCell::new(Unwind::default());
-    let (mut types, mut functions, helpers, import_types) =
+    let (types, functions, mut helpers, import_types) =
         build_type_and_function_sections(program, &unwind, layout);
-    libm::register(&mut types, &mut functions);
-    promise_engine::register(&mut types, &mut functions);
-    gc::register(&mut types, &mut functions);
+    if options.no_stack_guard {
+        helpers.stack_guard = None;
+    }
     module.section(&types);
 
     // Import section: exactly the four WASI functions (indices 0..=3).
@@ -1731,9 +1749,9 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // The two `new Promise` settler functions fill slots `n`/`n + 1`; they are
     // the DEFINED functions right after the `__invoke1` and `__async_step`
     // trampolines. The builtin bodies fill the slots after them.
-    func_indices.push(helpers.async_step + 1);
-    func_indices.push(helpers.async_step + 2);
-    func_indices.extend(Builtin::ALL.map(|b| helpers.builtin(b)));
+    let settlers = helpers.group(registry::Group::Settlers);
+    func_indices.extend([settlers, settlers + 1]);
+    func_indices.extend(Builtin::ALL.map(|b| helpers.builtin_index(b)));
     let mut elements = ElementSection::new();
     elements.active(
         None,
@@ -1746,184 +1764,39 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     // helpers last (mirroring the function-index order above).
     let mut code = CodeSection::new();
     let leaves = roots::leaf_set(helpers);
-    code.function(&emit_main(program, &offsets, helpers, &leaves));
+    // Every body with what its emission used, for the shake.
+    let mut bodies = Vec::new();
+    let mut uses = Vec::new();
+    shake::take();
+    bodies.push(emit_main(program, &offsets, helpers, &leaves));
+    uses.push(shake::take());
     for func in &program.functions {
         // A generator state machine emits a `switch (gen.state)` dispatch
         // over its segments rather than a straight-line body.
-        if func.machine.is_some() {
-            code.function(&generator::emit_generator_sm(
-                func, &offsets, helpers, &leaves,
-            ));
+        bodies.push(if func.machine.is_some() {
+            generator::emit_generator_sm(func, &offsets, helpers, &leaves)
         } else {
-            code.function(&emit_function(func, &offsets, helpers, &leaves));
-        }
+            emit_function(func, &offsets, helpers, &leaves)
+        });
+        uses.push(shake::take());
     }
-    code.function(&emit_alloc(helpers, &leaves, options.gc_stress, false));
-    code.function(&emit_concat(helpers.alloc, &leaves));
-    code.function(&emit_str_eq(&leaves));
-    code.function(&emit_str_cmp(&leaves));
-    code.function(&emit_str_index(helpers.alloc, &leaves));
-    code.function(&emit_str_hash(&leaves));
-    code.function(&emit_intern_slot(helpers, &leaves));
-    code.function(&emit_intern_find(helpers, &leaves));
-    code.function(&emit_intern(helpers, &leaves));
-    code.function(&emit_index_value(&leaves));
-    code.function(&emit_index_string(helpers, &leaves));
-    code.function(&emit_str_exotic_index(helpers, &leaves));
-    code.function(&emit_to_key(&offsets, helpers, &leaves));
-    code.function(&emit_prop_find(helpers, &leaves));
-    code.function(&emit_define(helpers, &leaves));
-    code.function(&emit_fn_materialize(&offsets, helpers, &leaves));
-    code.function(&emit_get(&offsets, helpers, &leaves));
-    code.function(&emit_set(helpers, &leaves));
-    code.function(&emit_has(&offsets, helpers, &leaves));
-    code.function(&emit_delete(&offsets, helpers, &leaves));
-    code.function(&emit_own_keys(helpers, &leaves));
-    code.function(&emit_for_in_keys(helpers, &leaves));
-    code.function(&emit_copy_data(helpers, &leaves));
-    code.function(&emit_array_reserve(helpers.alloc, &leaves));
-    code.function(&emit_array_push(
-        helpers.array_reserve(),
-        helpers.sparse_define(),
-        &leaves,
-    ));
-    code.function(&emit_array_concat(
-        helpers.array_reserve(),
-        helpers.sparse_get(),
-        helpers.proto_elem(),
-        &leaves,
-    ));
-    code.function(&emit_array_set(&offsets, helpers, false, &leaves));
-    code.function(&emit_array_set_length(&offsets, helpers, &leaves));
-    code.function(&emit_sparse_get(helpers, &leaves));
-    code.function(&emit_sparse_set(helpers, false, &leaves));
-    code.function(&emit_protos_indexless(&leaves));
-    code.function(&emit_proto_elem(helpers, &leaves));
-    code.function(&emit_proto_set(helpers, &leaves));
-    code.function(&emit_array_set(&offsets, helpers, true, &leaves));
-    code.function(&emit_sparse_set(helpers, true, &leaves));
-    code.function(&emit_json_escape(helpers.alloc, &leaves));
-    code.function(&emit_json_str(
-        helpers.num_to_str(),
-        helpers.json_escape,
-        JsonTokens::resolve(&offsets),
-        &leaves,
-    ));
-    code.function(&emit_same_value_zero(helpers.str_eq, &leaves));
-    code.function(&builtins::emit_array_search(helpers, &leaves));
-    code.function(&emit_map_find(helpers.same_value_zero, &leaves));
-    code.function(&emit_map_set(helpers.map_find, helpers.array_push, &leaves));
-    code.function(&emit_map_get(helpers.map_find, &leaves));
-    code.function(&emit_map_has(helpers.map_find, &leaves));
-    code.function(&emit_map_delete(helpers.map_find, &leaves));
-    // `__loose_eq` (loose `==`) and `__str_to_array` (string spread) follow the
-    // Map/Set helpers.
-    code.function(&emit_loose_eq(helpers, &leaves));
-    code.function(&emit_str_to_array(
-        helpers.new_array(),
-        helpers.str_index,
-        helpers.alloc,
-        &leaves,
-    ));
-    // The in-wasm `JSON.parse` family, in the order their indices were assigned.
-    code.function(&emit_json_ws(&leaves));
-    code.function(&emit_json_throw(&offsets, helpers, &leaves));
-    code.function(&emit_json_string(helpers.alloc, helpers, &leaves));
-    code.function(&emit_json_number(helpers, &leaves));
-    code.function(&emit_json_value(helpers, &leaves));
-    code.function(&emit_json_array(helpers, &leaves));
-    code.function(&emit_json_object(helpers, &leaves));
-    code.function(&emit_json_parse(helpers, &leaves));
-    // `__gen_to_array` — the generator-spread drain — precedes the
-    // trampoline so every later index stays stable.
-    code.function(&generator::emit_gen_to_array(helpers, &leaves));
-    code.function(&emit_nullish_throw(&offsets, helpers, &leaves));
-    code.function(&emit_prop_throw(&offsets, helpers, &leaves));
-    // The `__invoke1` callback trampoline is appended after every helper so
-    // every helper index stays stable; the `__async_step` trampoline
-    // follows it, then the two `new Promise` settler functions.
-    code.function(&emit_box_f64_helper(&leaves));
-    code.function(&emit_to_number_helper(&offsets, helpers, &leaves));
-    for helper in dtoa::emit_helpers(&offsets, helpers, &leaves) {
-        code.function(&helper);
-    }
-    code.function(&strtod::emit_num_unit(&leaves));
-    code.function(&strtod::emit_str_ws(&leaves));
-    code.function(&strtod::emit_dec_parse(helpers, &leaves));
-    code.function(&strtod::emit_dec_slow(helpers, &leaves));
-    code.function(&strtod::emit_dec_round(&leaves));
-    code.function(&strtod::emit_dec_left(&leaves));
-    code.function(&strtod::emit_dec_right(&leaves));
-    code.function(&strtod::emit_digit_span(helpers, &leaves));
-    code.function(&strtod::emit_radix_pow2(helpers, &leaves));
-    code.function(&strtod::emit_radix_fold(helpers, &leaves));
-    code.function(&strtod::emit_string_to_number(helpers, &leaves));
-    code.function(&strtod::emit_to_number_prim(helpers, &leaves));
-    code.function(&strtod::emit_parse_float(helpers, &leaves));
-    code.function(&strtod::emit_parse_int(helpers, &leaves));
-    code.function(&numeric::emit_now(&leaves));
-    code.function(&numeric::emit_random(&leaves));
-    code.function(&emit_invoke1(helpers, &leaves));
-    code.function(&generator::emit_async_step(helpers, &leaves));
-    code.function(&emit_settler(abi::PROMISE_FULFILLED, helpers, &leaves));
-    code.function(&emit_settler(abi::PROMISE_REJECTED, helpers, &leaves));
-    code.function(&emit_new_string(helpers.alloc, &leaves));
-    code.function(&emit_new_array(
+    let cx = registry::Cx {
+        strings: &offsets,
         helpers,
-        intrinsic_bits(Intrinsic::Prototype(BuiltinCtor::Array), helpers),
-        &leaves,
-    ));
-    // The realm: `__has_own`, then the builtin bodies.
-    code.function(&emit_has_own(&offsets, helpers, &leaves));
-    for builtin in Builtin::ALL {
-        code.function(&builtins::emit_builtin(builtin, &offsets, helpers, &leaves));
+        leaves: &leaves,
+        options,
+        gc: gc_layout,
+    };
+    registry::bodies(&cx, &mut |unit| {
+        let unit_uses = shake::take();
+        uses.extend(std::iter::repeat_n(unit_uses, unit.len()));
+        bodies.extend(unit);
+    });
+    if !options.full_runtime {
+        shake::shake(&mut bodies, &uses, n, helpers, &offsets);
     }
-    // The conversion helpers follow the builtin bodies.
-    code.function(&emit_to_primitive(&offsets, helpers, &leaves));
-    code.function(&convert::emit_to_string(&offsets, helpers, &leaves));
-    code.function(&emit_add_helper(helpers, &leaves));
-    code.function(&emit_compare(helpers, &leaves));
-    code.function(&emit_array_join(&offsets, helpers, &leaves));
-    code.function(&builtins::emit_to_object(&offsets, helpers, &leaves));
-    code.function(&builtins::emit_json_rep(&offsets, helpers, &leaves));
-    code.function(&builtins::emit_json_indent(helpers, &leaves));
-    code.function(&builtins::emit_json_revive(helpers, &leaves));
-    code.function(&emit_define_own(&offsets, helpers, &leaves));
-    code.function(&emit_to_desc(&offsets, helpers, &leaves));
-    code.function(&emit_own_desc(&offsets, helpers, &leaves));
-    code.function(&emit_set_integrity(helpers, &leaves));
-    code.function(&emit_test_integrity(&leaves));
-    code.function(&emit_own_enum(&offsets, helpers, &leaves));
-    code.function(&emit_set_proto(helpers, &leaves));
-    code.function(&builtins::emit_promise_self_error(
-        &offsets, helpers, &leaves,
-    ));
-    code.function(&emit_symbol_get(helpers, &leaves));
-    code.function(&emit_super_get(&offsets, helpers, &leaves));
-    code.function(&emit_super_set(&offsets, helpers, &leaves));
-    code.function(&emit_private_find(helpers, &leaves));
-    code.function(&emit_private_add(helpers, &leaves));
-    code.function(&emit_private_get(helpers, &leaves));
-    code.function(&emit_private_set(helpers, &leaves));
-    code.function(&emit_private_brand(helpers, &leaves));
-    code.function(&emit_private_in(&offsets, helpers, &leaves));
-    for helper in render::emit_helpers(&offsets, helpers, &leaves) {
-        code.function(&helper);
-    }
-    code.function(&emit_start(&offsets, helpers, options, &leaves));
-    // The families after `_start`, in index order: Unicode, libm, the
-    // promise engine, then the allocator and collector.
-    for helper in unicode::emit_helpers(helpers, &leaves) {
-        code.function(&helper);
-    }
-    for helper in libm::emit_helpers(helpers, &leaves) {
-        code.function(&helper);
-    }
-    for helper in promise_engine::emit_helpers(&offsets, helpers, &leaves) {
-        code.function(&helper);
-    }
-    for helper in gc::emit_helpers(helpers, &leaves, gc_layout) {
-        code.function(&helper);
+    for body in &bodies {
+        code.function(body);
     }
     module.section(&code);
 

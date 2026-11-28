@@ -180,6 +180,8 @@ pub(super) struct FnBuilder<'a> {
     defs: Vec<(u32, ValueClass)>,
     open_temps: u32,
     error: Option<BuilderError>,
+    /// An `i32` global every `Return` decrements first ([`Self::count_exits`]).
+    exit_counter: Option<u32>,
 }
 
 impl<'a> FnBuilder<'a> {
@@ -194,6 +196,7 @@ impl<'a> FnBuilder<'a> {
             defs: Vec::new(),
             open_temps: 0,
             error: None,
+            exit_counter: None,
         }
     }
 
@@ -214,6 +217,21 @@ impl<'a> FnBuilder<'a> {
         for _ in 0..count {
             self.local(class);
         }
+    }
+
+    /// Decrement the `i32` global `counter` before every later `Return`.
+    pub(super) fn count_exits(&mut self, counter: u32) {
+        self.exit_counter = Some(counter);
+    }
+
+    /// Call `callee` on a path that returns without reading a local again:
+    /// not a safepoint for this function's roots.
+    pub(super) fn call_then_exit(&mut self, callee: u32) {
+        Instruction::Call(callee).encode(&mut self.bytes);
+        self.ops.push(Op::Instr {
+            kind: Kind::Other,
+            end: self.bytes.len(),
+        });
     }
 
     /// Open the shrink-wrapped frame region at the current position.
@@ -243,6 +261,14 @@ impl<'a> FnBuilder<'a> {
 
 impl Sink for FnBuilder<'_> {
     fn instruction(&mut self, instruction: &Instruction<'_>) -> &mut Self {
+        if let (Instruction::Return, Some(counter)) = (instruction, self.exit_counter) {
+            self.exit_counter = None;
+            self.instruction(&Instruction::GlobalGet(counter));
+            self.instruction(&Instruction::I32Const(1));
+            self.instruction(&Instruction::I32Sub);
+            self.instruction(&Instruction::GlobalSet(counter));
+            self.exit_counter = Some(counter);
+        }
         let kind = match instruction {
             Instruction::LocalGet(l) => {
                 self.check_local(*l);

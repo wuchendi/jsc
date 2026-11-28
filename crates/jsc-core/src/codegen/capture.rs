@@ -618,12 +618,9 @@ impl CaptureResolver {
                 self.arrow_or_fn(&a.params, body);
             }
             Expr::Fn(f) => {
-                // A generator/async expression binds its own name in a scope
-                // around its body (see `LowerCtx::lower_fn_expr`).
-                let own_name = f
-                    .ident
-                    .as_ref()
-                    .filter(|_| f.function.is_generator || f.function.is_async);
+                // A function expression binds its own name in a scope around
+                // its body (see `LowerCtx::lower_fn_expr`).
+                let own_name = f.ident.as_ref();
                 if let Some(ident) = own_name {
                     self.push_scope();
                     self.declare(ident.sym.as_ref(), ident.span.lo.0);

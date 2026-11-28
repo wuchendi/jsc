@@ -114,7 +114,7 @@ pub(super) const TYPES: [(&[ValType], &[ValType]); 9] = {
 impl Helpers<'_> {
     /// The first helper of this module, right after `_start`.
     fn unicode_find(self) -> u32 {
-        self.start() + 1
+        self.group(super::registry::Group::Unicode)
     }
     fn unicode_in(self) -> u32 {
         self.unicode_find() + 1

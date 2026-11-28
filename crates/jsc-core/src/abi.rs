@@ -305,6 +305,14 @@ pub(crate) const FUNC_FLAG_ASYNC: u8 = 2;
 /// (`$__sp` starts at `SHADOW_STACK_SIZE - SHADOW_FP_BIAS`). See DESIGN.md §4.2.
 pub(crate) const SHADOW_STACK_SIZE: u32 = 1 << 20;
 
+/// The most user-function calls active at once: one more throws the
+/// `RangeError` of the call-stack guard.
+pub(crate) const CALL_DEPTH_LIMIT: u32 = 10_000;
+
+/// The shadow-stack bytes the call-stack guard keeps free below a user
+/// function's own frame, for the runtime helpers it calls.
+pub(crate) const SHADOW_STACK_MARGIN: u32 = 1 << 16;
+
 /// Frame-pointer bias: slot `k` is at `$fp + SHADOW_FP_BIAS + 8k`, so addresses
 /// `0..8` never hold stack data and a raw ref of `0` always reads zero.
 pub(crate) const SHADOW_FP_BIAS: u32 = 8;
@@ -352,6 +360,17 @@ pub(crate) const TYPE_SET: u8 = 7;
 /// Byte offset (from a [`TYPE_MAP`] / [`TYPE_SET`] block base) of the u32
 /// logical entry count.
 pub(crate) const MAP_SIZE_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_MAP`] / [`TYPE_SET`] block base) of the u32
+/// `index`: a raw ref to the hash index, a [`TYPE_RAW`] block
+/// `[used: u32 @8][cap: u32 @12][slot: u32 x cap @16]` whose slot holds a
+/// backing key slot index plus one (`0` = empty), or `0` while the backing is
+/// short enough to scan.
+pub(crate) const MAP_INDEX_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
+/// The backing slot count (two per entry) from which a Map / Set gets its
+/// hash index.
+pub(crate) const MAP_INDEX_MIN_SLOTS: u32 = 16;
 
 /// Byte offset (from a [`TYPE_MAP`] / [`TYPE_SET`] block base) of the i64
 /// `entries` backing-array jsval.

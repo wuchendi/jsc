@@ -377,6 +377,8 @@ pub(in crate::emit) fn emit_json_rep(
     leaves: &LeafSet,
 ) -> Function {
     use LocalClass::{Base, Jsval, Raw};
+    // The property list's keys are read off every serialized object.
+    shake::note_runtime_key();
     let int = Raw(ValType::I32);
     let mut f = FnBuilder::new(leaves);
     let [holder, key, value, rep, list] = [(); 5].map(|()| f.param(Jsval));

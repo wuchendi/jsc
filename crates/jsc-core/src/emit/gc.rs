@@ -32,9 +32,7 @@
 //! `$__gc_reserve`) if an out-of-memory released it. No collector helper
 //! allocates or runs user code, and a collection never nests (`$__gc_busy`).
 
-use wasm_encoder::{
-    BlockType, Function, FunctionSection, Instruction, MemArg, TypeSection, ValType,
-};
+use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
 use super::{
     CF_VALUE_GLOBAL, EXC_PENDING_GLOBAL, EXC_VALUE_GLOBAL, FD_WRITE_IMPORT, FIN_JOBS_GLOBAL,
@@ -45,7 +43,7 @@ use super::{
     JOB_TAIL_GLOBAL, KEPT_OBJECTS_GLOBAL, LeafSet, MODULE_CELL_GLOBAL_BASE, NEW_TARGET_GLOBAL,
     OUT_BUF_GLOBAL, PATH_BUF_GLOBAL, PROC_EXIT_IMPORT, RAW_I32, RAW_I64, REFS_BUF_GLOBAL,
     REJECTED_HEAD_GLOBAL, SP_GLOBAL, SPREAD_ARGS_GLOBAL, Sink, THIS_GLOBAL, UNDEFINED_BITS, abi,
-    finish_builder, helper_builder, promise_engine, realm,
+    finish_builder, helper_builder, realm,
 };
 
 /// Emit each listed instruction in order: `wasm!(function; LocalGet(0), ..)`.
@@ -100,22 +98,26 @@ pub(super) const TYPES: [(&[ValType], &[ValType]); 9] = [
     (&[I32], &[I32]),   // __alloc_fixed(size) -> base
 ];
 
-/// Append the allocator helpers' types and function entries (after the
-/// promise engine's).
-pub(super) fn register(types: &mut TypeSection, functions: &mut FunctionSection) {
-    for (params, results) in TYPES {
-        let index = types.len();
-        types
-            .ty()
-            .function(params.iter().copied(), results.iter().copied());
-        functions.function(index);
-    }
-}
-
 impl Helpers<'_> {
+    /// `__stack_overflow()` ([`super::function::emit_stack_overflow`]): it
+    /// follows the allocator helpers.
+    pub(super) fn stack_overflow(self) -> u32 {
+        self.extra(super::registry::Extra::StackOverflow)
+    }
+
+    /// `__map_hash(key: i64) -> i32` ([`super::runtime::emit_map_hash`]).
+    pub(super) fn map_hash(self) -> u32 {
+        self.extra(super::registry::Extra::MapHash)
+    }
+
+    /// `__map_reindex(handle: i32)` ([`super::runtime::emit_map_reindex`]).
+    pub(super) fn map_reindex(self) -> u32 {
+        self.extra(super::registry::Extra::MapReindex)
+    }
+
     /// The first allocator helper: they follow the promise engine.
     fn gc_base(self) -> u32 {
-        self.promise_new() + u32::try_from(promise_engine::TYPES.len()).unwrap_or(0)
+        self.group(super::registry::Group::Gc)
     }
     /// `__alloc_small(class: i32) -> i32`: a zeroed slot of small class
     /// `class` (`1..=GC_CLASS_COUNT`), the per-class entry of constant-size
@@ -1435,6 +1437,7 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         LocalGet(ty), I32Const(i32::from(abi::TYPE_MAP)), I32Sub, I32Const(1), I32LeU,
         If(BlockType::Empty),
     );
+    raw(&mut f, abi::MAP_INDEX_OFFSET);
     jsval(&mut f, abi::MAP_ENTRIES_OFFSET);
     wasm!(f; Return, End);
     is(&mut f, abi::TYPE_PROMISE);

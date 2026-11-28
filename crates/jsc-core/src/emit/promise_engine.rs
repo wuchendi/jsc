@@ -32,11 +32,10 @@
 //! microtasks it queued before the next (design/runtime-memory.md §6.3,
 //! §6.4).
 
-use wasm_encoder::{
-    BlockType, Function, FunctionSection, Instruction, MemArg, TypeSection, ValType,
-};
+use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
 use super::realm::SpeciesOp;
+use super::registry::Tail;
 use super::{
     Builtin, BuiltinCtor, EXC_PENDING_GLOBAL, EXC_VALUE_GLOBAL, FALSE_BITS, FIN_JOBS_GLOBAL,
     FnBuilder, HEAP_BITS, HOLE_BITS, Helpers, Intrinsic, JOB_HEAD_GLOBAL, JOB_TAIL_GLOBAL,
@@ -44,7 +43,7 @@ use super::{
     REJECTED_HEAD_GLOBAL, ROOT_BASE, ROOT_JS, SPREAD_ARGS_GLOBAL, Sink, StrOffsets, THIS_GLOBAL,
     TRUE_BITS, UNDEFINED_BITS, abi, elem_slot, emit_alloc_const, emit_argc, emit_array_elems,
     emit_is_function, emit_is_object, emit_is_pointer, emit_load_type_byte, emit_settler_value,
-    finish_builder, helper_builder, intrinsic_bits, libm, static_key, unicode,
+    finish_builder, helper_builder, intrinsic_bits, static_key,
 };
 
 /// Emit each listed instruction in order.
@@ -129,22 +128,10 @@ pub(super) const TYPES: [(&[ValType], &[ValType]); 15] = [
     (&[I64, I64, I64], &[]),           // __async_drive(gen, result, sent)
 ];
 
-/// Append the engine helpers' types and function entries (after libm's).
-pub(super) fn register(types: &mut TypeSection, functions: &mut FunctionSection) {
-    for (params, results) in TYPES {
-        let index = types.len();
-        types
-            .ty()
-            .function(params.iter().copied(), results.iter().copied());
-        functions.function(index);
-    }
-}
-
 impl Helpers<'_> {
     /// The first engine helper: they follow the libm helpers.
     fn engine_base(self) -> u32 {
-        let before = unicode::TYPES.len() + libm::HELPER_COUNT;
-        self.start() + 1 + u32::try_from(before).unwrap_or(0)
+        self.group(super::registry::Group::Engine)
     }
     /// `__promise_new(proto: i64) -> i32`: a fresh pending promise block.
     pub(super) fn promise_new(self) -> u32 {
@@ -707,7 +694,7 @@ fn emit_run_job(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         LocalGet(result), LocalGet(state), LocalGet(value), Call(helpers.promise_settle()),
         Return,
         End,
-        LocalGet(callback), LocalGet(value), Call(helpers.invoke1), LocalSet(out),
+        LocalGet(callback), LocalGet(value), Call(helpers.tail(Tail::Invoke1)), LocalSet(out),
         GlobalGet(EXC_PENDING_GLOBAL),
         If(BlockType::Empty),
         GlobalGet(EXC_VALUE_GLOBAL), LocalSet(out),
@@ -859,7 +846,7 @@ fn emit_drain(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> F
         LocalGet(next), I64Const(UNDEFINED_BITS), I64Store(m64(8)),
         LocalGet(next), I64Const(UNDEFINED_BITS), I64Store(m64(16)),
         LocalGet(rec), I64Load(m64(abi::FINREG_CLEANUP_OFFSET)), LocalGet(held),
-        Call(helpers.invoke1), Drop,
+        Call(helpers.tail(Tail::Invoke1)), Drop,
         GlobalGet(EXC_PENDING_GLOBAL),
         If(BlockType::Empty),
         I32Const(2), I32Const(static_key(strings, "Uncaught ")), GlobalGet(EXC_VALUE_GLOBAL),
@@ -996,7 +983,7 @@ fn emit_async_drive(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let (generator, result, sent, value) = (0, 1, 2, 3);
     wasm!(f;
         Loop(BlockType::Empty),
-        LocalGet(generator), LocalGet(sent), Call(helpers.async_step), LocalSet(value),
+        LocalGet(generator), LocalGet(sent), Call(helpers.tail(Tail::AsyncStep)), LocalSet(value),
         GlobalGet(EXC_PENDING_GLOBAL),
         If(BlockType::Empty),
         GlobalGet(EXC_VALUE_GLOBAL), LocalSet(value),

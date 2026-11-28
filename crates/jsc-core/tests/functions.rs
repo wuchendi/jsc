@@ -248,3 +248,38 @@ fn arity_scan_yield_operand() {
         "7",
     );
 }
+
+/// A named function expression binds its own name inside its body.
+#[test]
+fn named_function_expression_binds_its_own_name() {
+    assert_eval(
+        "const g = function f(n) { return n ? n + f(n - 1) : 0 }; g(4)",
+        "10",
+    );
+    assert_eval("(function f() { return typeof f })()", "function");
+    assert_eval("const g = function f() { return f === g }; g()", "true");
+    // The name is not visible outside the expression.
+    assert_eval("const g = function f() {}; typeof f", "undefined");
+    // A parameter or a body declaration of the same name shadows it.
+    assert_eval("(function f(f) { return f })(7)", "7");
+    assert_eval("(function f() { var f = 3; return f })()", "3");
+    // A closure inside the body still sees the function.
+    assert_eval(
+        "const g = function f(n) { return [n].map(x => x ? f(x - 1) + 1 : 0)[0] }; g(3)",
+        "3",
+    );
+    // Constructing through the expression keeps the binding.
+    assert_eval(
+        "const C = function K() { this.same = K === C }; new C().same",
+        "true",
+    );
+}
+
+/// Assigning to a function expression own name is rejected like any constant.
+#[test]
+fn named_function_expression_name_is_read_only() {
+    assert!(
+        common::compile_error("(function f() { f = 1 })()")
+            .contains("cannot assign to constant binding: f")
+    );
+}
