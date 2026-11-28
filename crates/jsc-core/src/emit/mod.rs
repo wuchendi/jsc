@@ -532,7 +532,7 @@ const NULLISH_ERROR_STRS: [&str; 9] = [
 
 /// The `(prefix, suffix)` fragments `__prop_throw` wraps around `String(key)`
 /// for each keyed `TypeError` mode, indexed by mode.
-const PROP_KEYED_MSGS: [(i32, &str, &str); 25] = [
+const PROP_KEYED_MSGS: [(i32, &str, &str); 30] = [
     (
         PROP_THROW_READ_ONLY,
         "Cannot assign to read only property '",
@@ -638,6 +638,27 @@ const PROP_KEYED_MSGS: [(i32, &str, &str); 25] = [
         "Cannot use 'in' operator to search for '",
         "",
     ),
+    (
+        PROP_THROW_PROXY_REVOKED,
+        "Cannot perform '",
+        "' on a proxy that has been revoked",
+    ),
+    (PROP_THROW_PROXY_TRAP, "proxy trap '", "' is not a function"),
+    (
+        PROP_THROW_PROXY_FALSISH,
+        "proxy trap returned falsish for property '",
+        "'",
+    ),
+    (
+        PROP_THROW_PROXY_INVARIANT,
+        "proxy trap result for '",
+        "' violates an invariant",
+    ),
+    (
+        PROP_THROW_PROXY_FALSISH_OP,
+        "'",
+        "' on proxy: trap returned falsish",
+    ),
 ];
 /// The `.message` and `.stack` of the `RangeError` `__array_set_length` raises
 /// for a `length` write whose value is not a valid array length.
@@ -737,6 +758,24 @@ const PROP_THROW_PRIVATE_METHOD_WRITE: i32 = 26;
 /// `__prop_throw`'s `mode` argument: `#x in o` on a non-object `o` (the `key`
 /// is `"#x' in " + String(o)`, built by `__private_in`).
 const PROP_THROW_PRIVATE_IN: i32 = 27;
+/// `__prop_throw`'s `mode` argument: a trap of a revoked proxy (the `key` is
+/// the trap name, DESIGN.md §6.11).
+const PROP_THROW_PROXY_REVOKED: i32 = 28;
+/// `__prop_throw`'s `mode` argument: a proxy trap that is neither callable
+/// nor `undefined` / `null` (the `key` is the trap name).
+const PROP_THROW_PROXY_TRAP: i32 = 29;
+/// `__prop_throw`'s `mode` argument: a falsish `set` / `defineProperty` /
+/// `deleteProperty` trap result where the operation must throw (the `key` is
+/// the property key).
+const PROP_THROW_PROXY_FALSISH: i32 = 30;
+/// `__prop_throw`'s `mode` argument: a proxy trap result that violates an
+/// invariant of ECMA-262 §10.5 (the `key` is the property key, or the trap
+/// name for a trap without one).
+const PROP_THROW_PROXY_INVARIANT: i32 = 31;
+/// `__prop_throw`'s `mode` argument: a falsish `setPrototypeOf` /
+/// `preventExtensions` trap result where the operation must throw (the `key`
+/// is the trap name).
+const PROP_THROW_PROXY_FALSISH_OP: i32 = 32;
 /// The fragment `__private_in` splices between `#x` and `String(o)`.
 const PRIVATE_IN_MID: &str = "' in ";
 
@@ -894,6 +933,18 @@ impl Unwind {
         self.finalizers.clear();
         self.labels.clear();
     }
+}
+
+/// The DESIGN.md §6.11 reachability gate: whether the program can create a
+/// proxy — it names `Proxy` (an identifier, a member or property name, a
+/// string) or reaches the global object. When closed, the property helpers
+/// emit no proxy arm and `__to_key` keeps its lookup-only mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProxyGate {
+    /// No proxy can exist.
+    Closed,
+    /// A proxy may exist.
+    Open,
 }
 
 #[derive(Clone, Copy)]
@@ -1089,6 +1140,9 @@ struct Helpers<'a> {
     /// Whether the program tests an intrinsics dirty bit (DESIGN.md §6.4). When
     /// `false`, `__set` / `__define` / `__delete` do not set the bits.
     dirty_tracking: bool,
+    /// Whether the program can create a proxy (DESIGN.md §6.11 reachability
+    /// gate; see [`Helpers::proxies`]).
+    proxy_gate: ProxyGate,
     /// Base address of the Unicode tables (see [`unicode`]).
     unicode: i32,
     /// Base address of the `__fn_info` table (see [`FnLayout`]). The static

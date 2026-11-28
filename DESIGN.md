@@ -2749,13 +2749,14 @@ very large exponent / shift tests that hit the 2^24-bit cap where V8 allows
 | **B2b** operators | `BinOp::Exp`, `Negate`, `BitNot`, `ToNumeric`, `NumericStep`; `emit_numeric_operands`, `__numeric_op`, `__numeric_unary`, `__numeric_step`; every kernel of §6.10.4 except `as_n`; `__add` BigInt path; relational `__compare`; `emit_inc_dec`; root classification and `yields_number`; opcount reasons | `ir.rs`, `codegen/{expr,generator}.rs`, `emit/{numeric,bigint,convert,expr,roots}.rs`, `tests/opcount/snapshot.tsv` | new `tests/bigint_ops.rs` (every operator and compound form, relational operators vs number / string incl. `NaN`, `±Infinity`, non-integral numbers and unparsable strings, mixed-type `TypeError`s, `>>>` / unary `+` `TypeError`, division / remainder signs and `RangeError`, `**` negative exponent, bitwise and shifts on negatives across limb boundaries, huge shift counts, `++`/`--` on locals, cells, globals, members, generator slots, multi-limb `*` and `/` cross-checked against known products); a `gc_stress` variant module in the same file (`CompileOptions::gc_stress = 1`) over multi-limb loops (factorial of 200, a Fibonacci accumulator, divmod round trips) so every allocation collects while operands are live |
 | **B3** built-ins | `BigInt` ctor, `asIntN` / `asUintN` (`__bigint_as_n`), `%BigInt.prototype%` methods and `@@toStringTag`, `toString(radix)`, `Number(1n)` (`ConvertOp::NumberCall`), `__bigint_to_i64` / `__bigint_from_i64` | `ir.rs`, `codegen/*` (the `Number(..)` inline call), `emit/realm.rs`, new `emit/builtins/bigint.rs`, `emit/builtins/{mod,number}.rs`, `emit/bigint.rs` | new `tests/bigint_builtins.rs` (constructor coercions incl. strings in every radix, whitespace, syntax errors, `new BigInt` `TypeError`, `RangeError` for non-integers, `asIntN` / `asUintN` edge widths 0 / 1 / 64 / 65 and negative inputs, `toString` radices 2..36 on multi-limb values, `thisBigIntValue` errors, `Number(2n**1024n)` = `Infinity`, round-half-even at `2^53 + 1`), with a `gc_stress` variant for the radix conversions |
 | **B4** closeout | remove `BigInt` from `unsupported-features.txt`; delete the §13 BigInt lines (the `RegExp, BigInt, ..` "not available" line, the limitation-table row, the BigInt property-key line, the §14 roadmap mention); test262 baseline / history from CI; fold this section's design notes into present-tense text | `tests/test262/*`, `DESIGN.md` | test262 delta recorded (target ≈ +300 of the 325 newly eligible) |
-### 6.11 Proxy and Reflect (phase 5b, planned)
+### 6.11 Proxy and Reflect (phase 5b, in progress)
 
-**Status: design only (phase 5b P1).** Nothing in this subsection is
-implemented yet; the stages below (P2a, P2b, P3, P4) build it in order, and
-until P4 the test262 runner keeps skipping the `Proxy`,
-`proxy-missing-checks` and `Reflect*` features (§10). The subsection names
-the code that changes so an implementer does not have to re-derive it.
+**Status: P2a implemented** (the proxy block, `%Proxy%`, `Proxy.revocable`
+and the eleven object internal methods with their invariants, below); P2b,
+P3 and P4 are still design. Until P4 the test262 runner keeps skipping the
+`Proxy`, `proxy-missing-checks` and `Reflect*` features (§10). The
+subsection names the code that changes so an implementer does not have to
+re-derive it; "Stages" records where P2a departed from the plan.
 
 **Scope.** ECMA-262 Proxy exotic objects (§10.5: all thirteen internal
 methods with every invariant check, `ProxyCreate`, `Proxy.revocable`) and the
@@ -2816,14 +2817,17 @@ so a revoked callable proxy is still callable for `typeof` and `IsCallable`
 
 **Reachability gate.** A proxy exists only after `new Proxy` or
 `Proxy.revocable` ran, so every proxy arm below is emitted only under a new
-compile-time fact `proxies` (`Helpers::proxies`, set from
-`codegen/globals.rs`): the program mentions `Proxy` as an identifier, a
-member or property name, or a string literal, or it reaches the global
-object by anything but static `globalThis.k` reads and calls (`GlobalUse::Open`
-or escaping `globalThis` / top-level `this`, which can find `Proxy` by a
-run-time key). Without it the emitted code is byte-for-byte what it is today
-(no opcount change), and the `__proxy_*` helpers are never called, so runtime
-shaking (§4.2) stubs them.
+compile-time fact (`Helpers::proxies()`, the `ProxyGate` field set by
+`emit/sections.rs::program_has_proxies` from the IR): the program names
+`Proxy` (a global read or write, or the string `"Proxy"`, which covers a
+member or property name and a string literal) or holds the global object at
+all (`IrNode::Intrinsic(Global)`: `globalThis` or a top-level `this`, which
+can find `Proxy` by a run-time key; a superset of `GlobalUse::Open`, kept
+simple because no opcount program uses `globalThis`). Without it the emitted
+code is byte-for-byte what it is today (no opcount change), and the
+`__proxy_*` helpers are never called, so runtime shaking (§4.2) stubs them.
+With it `has_accessors` is forced on: a trap runs user code at any property
+access, so every member access keeps its post-call exception check.
 
 **Keys reach traps intact.** Today a lookup-only key conversion
 (`__to_key(v, 0)`) returns `0` for a string no table ever used, and `__get`,
@@ -2850,24 +2854,35 @@ appended to the end of `registry::Extra` (no other group moves). Each
    throws `TypeError: proxy trap '<name>' is not a function`;
 3. on `undefined` forwards to the target's internal method (the generic
    helper, which is itself proxy-aware, so proxy chains recurse);
-4. otherwise calls the trap with `this = handler` through `push_call`
-   (`emit/builtins/array.rs`), passing **every** argument (up to four:
+4. otherwise calls the trap with `this = handler` through `call_spilling`
+   (`emit/builtins/array.rs`, `push_call`'s core), passing **every**
+   argument (up to four:
    `target, key, value, receiver`), so under a small `K` the surplus goes in
    a fresh spread argument array, never dropped (the phase-4 args-past-`K`
    bug class);
 5. checks the invariants below, each failure a `TypeError`.
 
-The messages are four new keyed `__prop_throw` modes (`emit/mod.rs`
-`PROP_KEYED_MSGS`; `28`..`31` unless a parallel stage took them, then the
-next free numbers): `PROP_THROW_PROXY_REVOKED` (key = the trap name),
-`PROP_THROW_PROXY_TRAP` (key = the trap name), `PROP_THROW_PROXY_FALSISH`
-(`'<trap>' on proxy: trap returned falsish for property '<key>'`; the
-non-keyed traps pass the trap name), `PROP_THROW_PROXY_INVARIANT`
-(`proxy trap result for '<key>' violates an invariant`). Every helper here
+The messages are five keyed `__prop_throw` modes (`emit/mod.rs`
+`PROP_KEYED_MSGS`; L1 allotted `28`..`35` to this workstream):
+`28` `PROP_THROW_PROXY_REVOKED` (key = the trap name: `Cannot perform
+'<trap>' on a proxy that has been revoked`), `29` `PROP_THROW_PROXY_TRAP`
+(key = the trap name: `proxy trap '<trap>' is not a function`), `30`
+`PROP_THROW_PROXY_FALSISH` (key = the property: `proxy trap returned
+falsish for property '<key>'`, a refusing `set` / `defineProperty` /
+`deleteProperty` in a throwing context), `31` `PROP_THROW_PROXY_INVARIANT`
+(`proxy trap result for '<key>' violates an invariant`; the traps without a
+key, `ownKeys` included, pass the trap name), `32`
+`PROP_THROW_PROXY_FALSISH_OP` (key = the trap name: `'<trap>' on proxy:
+trap returned falsish`, a refusing `setPrototypeOf` / `preventExtensions`;
+one fragment pair cannot hold both a trap and a key, hence two falsish
+modes). Every helper here
 is a safepoint (it runs user code and allocates): its locals follow the
-`FnBuilder` root classes (§5.7), and `emit/roots.rs::helper_graph` loses
-the leaf declaration of `__test_integrity` (its proxy arm calls traps);
-`__protos_indexless` stays a leaf (its proxy arm only returns `0`).
+`FnBuilder` root classes (§5.7), and `emit/roots.rs::helper_graph` declares
+`__test_integrity` a leaf only without the gate (with it, its callee
+`__proxy_is_extensible` is undeclared, so it is a safepoint);
+`__protos_indexless` stays a leaf (its proxy arm only returns `0`). A helper
+returning `i32` returns `0`, one returning `i64` `undefined`, with an
+exception pending; callers test `$exc_pending`.
 
 **New generic helpers** (`emit/props.rs` / `emit/props/descriptor.rs`; each
 answers for any object and takes the proxy path on kind `20`):
@@ -2881,11 +2896,16 @@ answers for any object and takes the proxy path on kind `20`):
 | `__set_bool(target: i64, key: i32, v: i64, recv: i64) -> i32` | `target.[[Set]](P, V, Receiver)` returning the boolean: a third body of `emit_set_from` (the `__super_set` shape) in a non-throwing mode, where each failure of the receiver step (`emit_receiver_set`: a primitive receiver, an own accessor or read-only property, a rejected define) returns `0` | `Reflect.set`, the trap-less `[[Set]]` of a proxy |
 
 `__own_prop`'s ordinary arm reads the same state as `__own_desc` (one
-emitter shared by both); `__desc_compatible` reuses `__define_own`'s rejection
-rules (its validation block is factored into one Rust function emitting into
-both helpers, so the rules have one source). Records follow the descriptor
-encoding of §6.3; "complete" means all three presence bits plus value or
-`get` / `set` (`CompletePropertyDescriptor`).
+emitter, `descriptor.rs::emit_own_lookup`, shared by both). `__desc_compatible`
+(`descriptor.rs`, an `Extra` row, `__get_proto` / `__own_prop` / `__set_bool`
+too) restates `__define_own`'s non-configurable rejection rules over two
+records: a record argument is the address `x` whose fields sit at `x +
+ELEMS_DATA_OFFSET + 8k` (element store base plus `32 * index`). Factoring
+`__define_own`'s validation block, which works on a table entry and
+interleaves the array `length` and dictionary-mode paths, was not worth the
+churn in a shared helper. Records follow the descriptor encoding of §6.3;
+"complete" means all three presence bits plus value or `get` / `set`
+(`CompletePropertyDescriptor`).
 
 **Internal methods.** For each, the proxy helper, the existing helpers that
 hand off to it, the trap-less forward, and the invariant checks (each a
@@ -2976,9 +2996,9 @@ hand off to it, the trap-less forward, and the invariant checks (each a
   `JSON.parse` reviver, which return the boolean); forward `__delete(target,
   key, 0)`. On a true result, a non-configurable target property throws, and
   so does a present one on a non-extensible target (`proxy-missing-checks`).
-- **[[OwnPropertyKeys]]** — `__proxy_own_keys(p) -> i64` (a fresh dense
-  array); hook: the entry of `__own_keys`; forward `__own_keys(target,
-  OWN_ALL_KEYS)`. `CreateListFromArrayLike(trapResult, « String, Symbol »)`: a
+- **[[OwnPropertyKeys]]** — `__proxy_own_keys(p, mode) -> i64` (a fresh dense
+  array, already filtered by the `__own_keys` `mode` below); hook: the entry
+  of `__own_keys`; forward `__own_keys(target, OWN_ALL_KEYS)`. `CreateListFromArrayLike(trapResult, « String, Symbol »)`: a
   non-object throws; `ToLength(Get(r, "length"))` then `Get(r, i)` per index;
   an element that is neither a string nor a symbol throws; strings are
   interned (`__intern`), so the keys compare by address and the array is a
@@ -2988,7 +3008,7 @@ hand off to it, the trap-less forward, and the invariant checks (each a
   extensible target with no non-configurable key returns the list; every
   non-configurable key must be in it; for a non-extensible target every
   target key must be in it and nothing else may be.
-  `__own_keys` then filters by `mode`: `OWN_ALL` the strings, `OWN_SYMBOLS`
+  `__proxy_own_keys` then filters by `mode`: `OWN_ALL` the strings, `OWN_SYMBOLS`
   the symbols, `OWN_ALL_KEYS` everything (trap order, not sorted);
   `OWN_KEYS` / `OWN_VALUES` / `OWN_ENTRIES` are `EnumerableOwnProperties`:
   per string key one `__proxy_own_prop` (kept when present and enumerable)
@@ -3037,7 +3057,7 @@ with the result ignored), `iterator.rs` (`SetterThatIgnoresPrototypeProperties`:
 
 **Callable and constructor proxies.** `new Proxy(target, handler)` with a
 callable target stores the funcref slot of the new internal builtin
-`Builtin::ProxyCall` (a trampoline like `BoundCall`, `emit/builtins/proxy.rs`)
+`Builtin::Proxy(ProxyOp::Call)` (a trampoline like `BoundCall`, `emit/builtins/proxy.rs`)
 in `func_idx` and the proxy in `env`. Every call site kind reaches it through
 the unchanged `call_indirect` sequence once its callability test accepts the
 proxy: direct-value and method calls (`emit_call_indirect`, the method call
@@ -3084,24 +3104,27 @@ stay invisible. A base constructor returning a proxy lets a derived class
 install fields: public ones through `__define` (the `defineProperty` trap),
 private ones on the proxy's table.
 
-**Revocation.** `Proxy.revocable(target, handler)` (`Builtin::ProxyRevocable`)
-runs `ProxyCreate`, makes the revoke function — a `TYPE_FUNCTION` with the
-funcref slot of the internal `Builtin::ProxyRevoke` and `env` = the proxy
+**Revocation.** `Proxy.revocable(target, handler)`
+(`Builtin::Proxy(ProxyOp::Revocable)`) runs `ProxyCreate`, makes the revoke
+function — a `TYPE_FUNCTION` with the funcref slot of the internal
+`Builtin::Proxy(ProxyOp::Revoke)` and `env` = the proxy
 (`emit_settler_value`, as the promise combinators make their element
 functions), info name `""`, `length` 0, not a constructor — and returns a
 fresh ordinary object with own `proxy` then `revoke` (`CreateDataProperty`).
-`ProxyRevoke` writes `null` into the proxy's `target` and `handler` and
+The revoke function writes `null` into the proxy's `target` and `handler` and
 returns `undefined`; a second call writes them again (idempotent; the spec
 clears `[[RevocableProxy]]`, which only frees the 48-byte block earlier).
 Every trap on a revoked proxy throws `PROXY_REVOKED` from `__proxy_trap`,
 `IsArray` of one throws, and the renderer prints it as `<Revoked Proxy>`.
 
-**`ProxyCreate`** (`Builtin::ProxyCtor`, `SELF_ALLOC`): called without `new`
+**`ProxyCreate`** (`Builtin::Proxy(ProxyOp::Ctor)`, `SELF_ALLOC`): called without `new`
 throws `TypeError: Constructor Proxy requires 'new'`; a non-object target or
 handler throws `TypeError: Cannot create proxy with a non-object as target or
 handler` (a revoked proxy is an acceptable target or handler); then the block
 above (`gc::emit_alloc_const`, 48 bytes), callable / constructor bits from
-`emit_is_function` / `emit_is_constructor` of the target. Both arguments are
+`emit_is_function` / `emit_is_constructor` of the target, or the same bits
+of a proxy target (`builtins/proxy.rs::proxy_bits`, until P2b widens those
+tests). Both arguments are
 read before any user code runs (there is none), so no snapshot.
 
 **Integration paths.**
@@ -3245,19 +3268,21 @@ image order; no watch bit; not inline namespaces):
 
 - `%Proxy%` — a new `Intrinsic::Proxy`, not a `BuiltinCtor` (it has no
   `prototype`): a static `TYPE_FUNCTION` block, `CONSTRUCTOR | SELF_ALLOC`,
-  `func_idx` = the `Builtin::ProxyCtor` slot, `proto` `%Function.prototype%`;
-  own `length` 2, `name` `"Proxy"` (configurable only), `revocable`
-  (`Builtin::ProxyRevocable`, `length` 2, a method).
+  `func_idx` = the `Builtin::Proxy(ProxyOp::Ctor)` slot, `proto`
+  `%Function.prototype%`; own `length` 2, `name` `"Proxy"` (configurable
+  only), `revocable` (`Builtin::Proxy(ProxyOp::Revocable)`, `length` 2, a
+  method).
 - `%Reflect%` — a new `Intrinsic::Reflect`, `CLASS_ORDINARY`, `proto`
   `%Object.prototype%`; the thirteen methods (`Builtin::Reflect(ReflectFn)`)
   and `@@toStringTag` `"Reflect"` (`{writable: false, enumerable: false,
   configurable: true}`).
 - Global object: `Proxy` and `Reflect`, writable, configurable, not
   enumerable.
-- `Builtin::ProxyCall` and `Builtin::ProxyRevoke` are internal (installed
-  nowhere; kept by shaking because the bodies that name their slots are).
-  All four `Builtin` variants and the `ReflectFn` bodies dispatch from
-  `builtins/mod.rs`.
+- The proxy builtins are one variant `Builtin::Proxy(ProxyOp)` (`Ctor`,
+  `Revocable`, `Revoke`; P2b adds the call trampoline as another `ProxyOp`)
+  dispatched by `builtins/proxy.rs::emit`. The revoke function and the
+  trampoline are internal (installed nowhere, so shaking keeps them). The
+  `ReflectFn` bodies dispatch from `builtins/mod.rs`.
 
 **Stages** (files in scope per stage; each adds, never reorganizes, in the
 shared files):
@@ -3273,13 +3298,32 @@ shared files):
   `codegen/globals.rs` (the `proxies` fact), `emit/gc.rs` (trace arm),
   `emit/render.rs` (unwrap / `<Revoked Proxy>`), `emit/realm.rs` +
   `emit/builtins/proxy.rs` (new) + `builtins/mod.rs` (`%Proxy%`,
-  `ProxyCtor`, `ProxyRevocable`, `ProxyRevoke`; a callable target already
+  `ProxyOp::{Ctor, Revocable, Revoke}`; a callable target already
   sets the class byte but calls throw until P2b), the `Object` statics and
   `Object.prototype` methods that switch to the new helpers
   (`builtins/object_static.rs`, `builtins/object.rs`), the three
   `__prop_find` callers, and `emit/expr.rs` for `typeof`.
+  **Delivered**, with these departures: the gate is computed in
+  `emit/sections.rs` (not `codegen/globals.rs`) and also forces
+  `has_accessors`; the builtins are `Builtin::Proxy(ProxyOp)`;
+  `__proxy_own_keys` takes the `mode` and filters; `__desc_compatible`
+  restates the rejection rules instead of sharing `__define_own`'s block;
+  five `__prop_throw` modes (`28`..`32`) instead of four. The `__prop_find`
+  callers: `json.rs`'s reviver probe became `__delete(.., 0)` (no probe
+  left), `iterator.rs`'s ignoring setter asks `__own_prop` under the gate,
+  `array.rs`'s `CreateDataPropertyOrThrow` takes `__define_own` on a proxy.
+  Callers of helpers that a trap can now make throw test `$exc_pending`
+  under the gate (`for-in`, `Object.keys`, `defineProperties`,
+  `getOwnPropertyDescriptors`, `assign`, `JSON.stringify`'s object branch,
+  `__copy_data`, whose exclusion test also moves before the
+  `[[GetOwnProperty]]` under the gate). An object proxy in
+  `JSON.stringify` already serializes through `__own_keys` and `__get`
+  (traps); `Object.prototype.toString`, `Array.isArray`, `instanceof` and
+  calls still see the raw block until P2b. `src/abi_drift_tests.rs`,
+  `tests/proxy.rs`, `tests/shake.rs` and `tests/wasi_shell.rs` carry the
+  tests.
 - **P2b — callable / constructor proxies and integration paths.**
-  `Builtin::ProxyCall` (`builtins/proxy.rs`), `emit_is_function` /
+  the call trampoline (`Builtin::Proxy(ProxyOp::Call)`, `builtins/proxy.rs`), `emit_is_function` /
   `emit_is_function_block` / `emit_is_constructor` (`emit/value.rs`,
   `emit/expr.rs`) and the five internals-reading sites, `__is_array` and its
   users (`emit/expr.rs` `IsArray`, `builtins/array.rs`, `builtins/json.rs`,

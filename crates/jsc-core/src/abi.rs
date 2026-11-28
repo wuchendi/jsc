@@ -717,6 +717,36 @@ pub(crate) const TYPE_SYMBOL: u8 = 14;
 /// output, path and ref buffers). Never a user value.
 pub(crate) const TYPE_RAW: u8 = 19;
 
+/// TYPE BYTE of a Proxy exotic object (DESIGN.md §6.11): `[type=20][gc]
+/// [flags][class][props:u32 @4][proto:i64 @8 = null][func_idx:u32 @16]
+/// [reserved:u32][env:i64 @24][target:i64 @32][handler:i64 @40]`. The
+/// flags are [`FUNC_FLAG_CONSTRUCTOR`] and [`FUNC_FLAG_SELF_ALLOC`] when the
+/// target is a constructor; the class byte is [`PROXY_CLASS_CALLABLE`] when
+/// it is callable. `props` holds private-name entries only; `target` and
+/// `handler` are `null` once revoked. Not in the object family: every
+/// property helper takes its proxy path first. Maps to `typeof` "object"
+/// ("function" when callable).
+pub(crate) const TYPE_PROXY: u8 = 20;
+
+/// Byte offset (from a [`TYPE_PROXY`] block base) of the `[[ProxyTarget]]`
+/// jsval.
+pub(crate) const PROXY_TARGET_OFFSET: u32 = 32;
+
+/// Byte offset (from a [`TYPE_PROXY`] block base) of the `[[ProxyHandler]]`
+/// jsval.
+pub(crate) const PROXY_HANDLER_OFFSET: u32 = 40;
+
+/// The byte size of a [`TYPE_PROXY`] block.
+pub(crate) const PROXY_BLOCK_SIZE: u32 = 48;
+
+/// [`TYPE_PROXY`] class byte (offset [`HEADER_CLASS_OFFSET`]): the target was
+/// callable at creation.
+pub(crate) const PROXY_CLASS_CALLABLE: u8 = 1;
+
+// A proxy keeps a function's call fields where `call_indirect` reads them.
+const _: () = assert!(FUNC_INDEX_OFFSET == 16 && FUNC_ENV_OFFSET == 24);
+const _: () = assert!(PROXY_HANDLER_OFFSET + 8 == PROXY_BLOCK_SIZE);
+
 /// TYPE BYTE of a `WeakMap` handle (design/runtime-memory.md §6.2): the
 /// object-family prefix, then `[weak_next:u32 @16][entries:u32 @20]
 /// [live:u32 @24][pad:u32]`. `weak_next` is collector scratch (the link of

@@ -1419,6 +1419,15 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     );
     link(&mut f, GC_WEAK_REGS_GLOBAL);
     wasm!(f; Return, End);
+    // A proxy: its private-entry table, the `null` prototype, `env` (itself
+    // or `undefined`), the target and the handler (`null` once revoked).
+    is(&mut f, abi::TYPE_PROXY);
+    raw(&mut f, abi::OBJ_PROPS_OFFSET);
+    jsval(&mut f, abi::OBJ_PROTO_OFFSET);
+    jsval(&mut f, abi::FUNC_ENV_OFFSET);
+    jsval(&mut f, abi::PROXY_TARGET_OFFSET);
+    jsval(&mut f, abi::PROXY_HANDLER_OFFSET);
+    wasm!(f; Return, End);
     // Strings, raw buffers and free slots are leaves; the rest of the object
     // family (`1..=3`, `6..=10`) starts with `props` and `proto`.
     wasm!(f;

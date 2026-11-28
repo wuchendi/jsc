@@ -491,7 +491,16 @@ pub(in crate::emit) fn emit_json_rep(
         Else,
         LocalGet(value), I32Const(OWN_KEYS), Call(helpers.own_keys), I32WrapI64,
         End,
-        LocalTee(keys), I32Load(ARR_LEN), LocalSet(n),
+        LocalTee(keys),
+    );
+    if helpers.proxies() {
+        // A proxy's traps may throw (DESIGN.md §6.11).
+        wasm!(f;
+            GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+        );
+    }
+    wasm!(f;
+        I32Load(ARR_LEN), LocalSet(n),
         I32Const(tok("{")), LocalSet(acc),
         I32Const(1), LocalSet(first),
         I32Const(0), LocalSet(i),
@@ -687,7 +696,7 @@ pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>, leaves: &LeafSet) 
     let ptr = f.local(Base);
     let [n, i] = [(); 2].map(|()| f.local(int));
     let k = f.local(Base);
-    let [array, e] = [(); 2].map(|()| f.local(int));
+    let array = f.local(int);
     let spread = f.local(Jsval);
     wasm!(f; LocalGet(holder), LocalGet(key), Call(helpers.get), LocalSet(val));
     return_if_pending(&mut f);
@@ -726,13 +735,7 @@ pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>, leaves: &LeafSet) 
         LocalGet(result), I64Const(UNDEFINED_BITS), I64Eq,
         If(BlockType::Empty),
         // `[[Delete]]`: a non-configurable property stays (no throw).
-        LocalGet(val), I32WrapI64, LocalGet(k), Call(helpers.prop_find), LocalTee(e),
-        If(BlockType::Result(ValType::I32)),
-        LocalGet(e), I32Load(MemArg { offset: u64::from(abi::PROP_ATTRS_OFFSET), align: 2, memory_index: 0 }),
-        I32Const(abi::ATTR_CONFIGURABLE.cast_signed()), I32And,
-        Else, I32Const(1),
-        End,
-        If(BlockType::Empty), LocalGet(val), LocalGet(k), Call(helpers.delete), End,
+        LocalGet(val), LocalGet(k), I32Const(0), Call(helpers.delete), Drop,
         Else,
         // `CreateDataProperty` (an array index included): a rejection is
         // ignored.

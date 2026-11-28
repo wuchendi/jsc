@@ -1232,7 +1232,7 @@ fn construct(frame: Frame, c: u32, len: Option<u32>, what: &str) -> IrNode {
 
 /// One argument of a [`call_fn`] call.
 #[derive(Clone, Copy)]
-pub(super) enum CallArg {
+pub(in crate::emit) enum CallArg {
     /// The jsval in an i64 local.
     Val(u32),
     /// The i32 index in a local, as a number.
@@ -1262,7 +1262,7 @@ pub(super) fn push_call(
 /// for the callee; when that allocation runs out of memory the callee is
 /// not called and `undefined` is left with the `RangeError` pending. With at
 /// most `k`, only the positional slots are pushed.
-pub(super) fn call_spilling(
+pub(in crate::emit) fn call_spilling(
     function: &mut FnBuilder<'_>,
     k: u32,
     spread: u32,
@@ -1512,6 +1512,31 @@ fn create_data_property(
     wasm!(function;
         Else,
         LocalGet(key), I32Const(1), Call(helpers.to_key), LocalSet(k),
+    );
+    // A proxy defines through its `defineProperty` trap (DESIGN.md §6.11).
+    let proxies = helpers.proxies();
+    if proxies {
+        wasm!(function;
+            LocalGet(a), I32WrapI64, I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }),
+            I32Const(TYPE_PROXY), I32Eq,
+            If(BlockType::Empty),
+            LocalGet(a), I32WrapI64, LocalGet(k), I32Const(DESC_DATA_DEFAULT), LocalGet(v),
+            I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS), Call(helpers.define_own()),
+            LocalSet(entry),
+        );
+        enter_frame(helpers);
+        enter_frame(helpers);
+        emit_propagate_if_pending(function, helpers);
+        wasm!(function; LocalGet(entry), I32Const(DEFINE_OK), I32Ne, If(BlockType::Empty));
+        enter_frame(helpers);
+        throw_type_error(function, frame, CANNOT_DEFINE, strings, helpers);
+        leave_frame(helpers);
+        leave_frame(helpers);
+        leave_frame(helpers);
+        wasm!(function; End, Else);
+        enter_frame(helpers);
+    }
+    wasm!(function;
         LocalGet(a), I32WrapI64, LocalGet(k), Call(helpers.prop_find), LocalTee(entry),
         If(BlockType::Result(ValType::I32)),
         LocalGet(entry),
@@ -1534,8 +1559,12 @@ fn create_data_property(
         End,
         LocalGet(a), I32WrapI64, LocalGet(k), LocalGet(v),
         I32Const(abi::ATTRS_DEFAULT.cast_signed()), Call(helpers.define),
-        End,
     );
+    if proxies {
+        leave_frame(helpers);
+        wasm!(function; End);
+    }
+    wasm!(function; End);
 }
 
 /// `Set(a, "length", len, true)` over i64 locals.

@@ -38,12 +38,13 @@ mod number;
 mod object;
 mod object_static;
 mod promise;
+mod proxy;
 mod string;
 mod symbol;
 mod weak;
 
 use crate::emit::realm::{ArrayCopyOp, DateBodyOp, DateSetOp};
-pub(super) use array::emit_array_search;
+pub(super) use array::{CallArg, call_spilling, emit_array_search};
 pub(super) use async_iter::{
     emit_async_iterator_complete, emit_async_iterator_next, emit_async_iterator_return,
     emit_iterator_result_check, emit_open_async_iterator,
@@ -327,6 +328,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(iter::strings())
         .chain(async_iter::strings())
         .chain(iterator::STRINGS)
+        .chain(proxy::strings())
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
 
@@ -352,9 +354,6 @@ fn emit_builtin_body(
     helpers: Helpers<'_>,
 ) {
     match builtin {
-        Builtin::WeakOp { .. } | Builtin::WeakCell(_) => {
-            weak::emit(builtin, f, frame, strings, helpers);
-        }
         Builtin::FunctionPrototype => wasm!(f; I64Const(UNDEFINED_BITS)),
         Builtin::HasOwnProperty => object::emit_has_own_property(f, frame, strings, helpers),
         Builtin::ObjectToString => object::emit_to_string(f, frame, strings, helpers),
@@ -364,6 +363,7 @@ fn emit_builtin_body(
         Builtin::ProtoGet => object::emit_proto_get(f, frame, strings, helpers),
         Builtin::ProtoSet => object::emit_proto_set(f, frame, strings, helpers),
         Builtin::ObjectReflect(op) => object_static::emit(op, f, frame, strings, helpers),
+        Builtin::Proxy(op) => proxy::emit(op, f, frame, strings, helpers),
         Builtin::Call
         | Builtin::Apply
         | Builtin::Bind
@@ -439,6 +439,8 @@ fn emit_builtin_body(
         | Builtin::AsyncGeneratorStep
         | Builtin::AsyncGeneratorReaction(_)
         | Builtin::Species(_)
+        | Builtin::WeakOp { .. }
+        | Builtin::WeakCell(_)
         | Builtin::DateBody(_) => emit_object_family(builtin, f, frame, strings, helpers),
         Builtin::JsonStringify => json::emit_stringify(f, frame, strings, helpers),
         Builtin::JsonParse => json::emit_parse(f, frame, strings, helpers),
@@ -516,6 +518,9 @@ fn emit_object_family(
     helpers: Helpers<'_>,
 ) {
     match builtin {
+        Builtin::WeakOp { .. } | Builtin::WeakCell(_) => {
+            weak::emit(builtin, f, frame, strings, helpers);
+        }
         Builtin::PropertyIsEnumerable => {
             object::emit_property_is_enumerable(f, frame, strings, helpers);
         }
