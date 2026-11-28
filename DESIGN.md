@@ -1088,6 +1088,601 @@ and never nests (`$__gc_busy`).
 
   Every `weak_next` link is `0` again after the weak steps.
 
+### 5.8 Binary data: `ArrayBuffer`, typed arrays, `DataView` (target design)
+
+**Status: design, not yet implemented.** This section is the target of the
+phase-5b binary-data workstream (§14, stages T2–T6 in §5.8.10). Nothing here
+exists in the tree yet: every stage implements its part against this text and,
+as it lands, moves the landed facts into the sections that describe the
+current tree (§5.1 family list, §5.2 table, §5.7 tracing table, §6.2 helpers,
+§6.3, §6.4 intrinsics, §6.9, §7.9) and deletes them from here, so this
+section shrinks to nothing by T6. A stage whose code disproves a decision
+here reports the conflict instead of picking a different design.
+
+#### 5.8.1 Type tags
+
+| type byte | kind |
+|---|---|
+| `20`..`23` | **reserved** for the parallel phase-5b workstreams (Proxy, BigInt); never used here |
+| `24` `TYPE_ARRAYBUFFER` | an `ArrayBuffer` object |
+| `25` `TYPE_TYPEDARRAY` | an instance of any of the concrete typed-array constructors |
+| `26` `TYPE_DATAVIEW` | a `DataView` object |
+
+All three join the **object family** (§5.1): the 16-byte prefix (`props`,
+`proto`), so they carry own named and symbol properties, a prototype, the
+`NOT_EXTENSIBLE` flag (bit `1`), and `typeof` is `"object"` (they are neither
+strings nor symbols, so `emit_is_object` already answers `1`). The header
+`class` byte stays `0`; the binary-specific header flags use bits `2` and up
+(below). The byte storage is not a new kind: it is a `TYPE_RAW` block (§5.8.2).
+
+#### 5.8.2 Byte storage
+
+A buffer's bytes live in a **`TYPE_RAW` data block** (`19`, §5.2): header,
+`len: u32 @4` = the block's byte **capacity**, the bytes from `@8`. Reusing
+`TYPE_RAW` instead of a dedicated leaf kind costs nothing and needs no new
+collector or renderer arm: `TYPE_RAW` is already a traced-as-leaf kind, never a
+jsval, and only reachable through a raw `u32` field of its owner.
+
+- **Alignment.** A block base is 8-byte aligned (§5.1), so the data at
+  `block + 8` is 8-byte aligned. A typed array's `byteOffset` is a multiple
+  of its element size (the constructor throws otherwise), so every typed-array
+  element access is naturally aligned. `DataView` accesses take any byte
+  offset. Wasm defines unaligned loads and stores and `MemArg.align` is only
+  a hint, so the shared accessors (§5.8.6) emit `align = 0` for both and are
+  correct on every host.
+- **Zero-fill.** Every allocator block comes back zeroed (§5.6), so a fresh
+  buffer needs no `memory.fill`. Bytes that leave the live range (a shrinking
+  `resize`, a shrinking `transfer`) are zeroed at once with `memory.fill`, so
+  a later growth inside the same capacity reads zeros, as the spec requires.
+- **Maximum length.** `abi::BYTE_LENGTH_MAX = 2^29` (512 MiB, the whole
+  linear-memory cap `MEMORY_MAX_PAGES`, §5.6). Every byte length and offset
+  therefore fits a `u32` with room for `offset + length` arithmetic, and every
+  valid typed-array index is below `2^29` (so it is always a canonical array
+  index, §5.8.5). A requested `byteLength` or `maxByteLength` above it throws
+  `RangeError: Array buffer allocation failed` at the spec's
+  `CreateByteDataBlock` step (after `GetPrototypeFromConstructor`), without
+  allocating.
+- **Allocation.** `__ab_alloc(size) -> block | 0` allocates `TYPE_RAW` of
+  `8 + size` bytes through the variable-size `__alloc` (§5.6) and writes the
+  header and `len = size`; a `size` of `0` allocates nothing and returns `0`.
+  Sizes up to 2040 bytes take a small size class, larger ones a large span.
+  When `__alloc` returns `0` the out-of-memory path has already left the
+  `%OutOfMemoryError%` (a `RangeError`) pending; the caller returns at once
+  (a builtin returns `undefined` with the exception pending), which satisfies
+  the spec's "throw a `RangeError`" for an impossible data block.
+- **No reservation.** A resizable buffer is *not* allocated at
+  `maxByteLength`: its block holds the current length rounded by the size
+  class, and growth reallocates (§5.8.4). Views never cache a data address
+  (they always load `buffer.data`), so a moved block is invisible to them.
+
+#### 5.8.3 Block layouts
+
+Offsets from the block base; all three are 32-byte blocks (size class 2).
+
+**`TYPE_ARRAYBUFFER` (`24`)** — `abi::AB_*`:
+
+| offset | size | field |
+|---|---|---|
+| 0 | 4 | header; flags (byte 2): `1` `NOT_EXTENSIBLE`, `2` `AB_FLAG_RESIZABLE`, `4` `AB_FLAG_DETACHED`; bit `8` is reserved for an immutable buffer (not implemented, §5.8.9) |
+| 4 | 4 | `props` |
+| 8 | 8 | `proto` |
+| 16 | 4 | `data: u32` (`AB_DATA_OFFSET`) → the `TYPE_RAW` block; `0` when detached or when no byte was ever needed (`byte_length` and capacity `0`) |
+| 20 | 4 | `byte_length: u32` (`AB_BYTE_LENGTH_OFFSET`), `0` when detached |
+| 24 | 4 | `max_byte_length: u32` (`AB_MAX_BYTE_LENGTH_OFFSET`); equals `byte_length` for a fixed-length buffer, `0` when detached |
+| 28 | 4 | reserved, `0` |
+
+**`TYPE_TYPEDARRAY` (`25`)** — `abi::TA_*`:
+
+| offset | size | field |
+|---|---|---|
+| 0 | 4 | header; flags: `1` `NOT_EXTENSIBLE`, `2` `TA_FLAG_LENGTH_TRACKING` (`[[ArrayLength]]` is `auto`), `4` `TA_FLAG_RESIZABLE_BUFFER` (the buffer was resizable at construction, so `IsTypedArrayFixedLength` is false; never cleared, a buffer's resizability never changes) |
+| 4 | 4 | `props` |
+| 8 | 8 | `proto` |
+| 16 | 4 | `buffer: u32` (`TA_BUFFER_OFFSET`) → the `TYPE_ARRAYBUFFER` block, never `0` |
+| 20 | 1 | `kind: u8` (`TA_KIND_OFFSET`), the element kind (§5.8.6) |
+| 21 | 1 | `shift: u8` (`TA_SHIFT_OFFSET`), `log2` of the element size (cached from `kind`) |
+| 22 | 2 | reserved, `0` |
+| 24 | 4 | `byte_offset: u32` (`TA_BYTE_OFFSET_OFFSET`) |
+| 28 | 4 | `array_length: u32` (`TA_LENGTH_OFFSET`); ignored (kept `0`) when length-tracking |
+
+`[[ByteLength]]` is not stored: it is `array_length << shift` (or derived from
+the buffer when length-tracking). `[[ContentType]]` is `BigInt` exactly for
+kinds `10` / `11`.
+
+**`TYPE_DATAVIEW` (`26`)** — `abi::DV_*`:
+
+| offset | size | field |
+|---|---|---|
+| 0 | 4 | header; flags: `1` `NOT_EXTENSIBLE`, `2` `DV_FLAG_LENGTH_TRACKING`, `4` `DV_FLAG_RESIZABLE_BUFFER` |
+| 4 | 4 | `props` |
+| 8 | 8 | `proto` |
+| 16 | 4 | `buffer: u32` (`DV_BUFFER_OFFSET`) → the `TYPE_ARRAYBUFFER` block |
+| 20 | 4 | `byte_offset: u32` (`DV_BYTE_OFFSET_OFFSET`) |
+| 24 | 4 | `byte_length: u32` (`DV_BYTE_LENGTH_OFFSET`); ignored when length-tracking |
+| 28 | 4 | reserved, `0` |
+
+**Garbage collection** (§5.7 `__gc_trace`): each is traced like the object
+family (raw `props @4`, jsval `proto @8`), then:
+
+| type | references traced |
+|---|---|
+| `24` `TYPE_ARRAYBUFFER` | raw `data @16` (a `TYPE_RAW` leaf: marked, nothing inside traced) |
+| `25` `TYPE_TYPEDARRAY` | raw `buffer @16` |
+| `26` `TYPE_DATAVIEW` | raw `buffer @16` |
+
+The arms sit in `emit/gc.rs::emit_trace` before the existing "everything past
+`TYPE_DATE` is a leaf" exit, so that exit keeps returning for `19` and the
+reserved `20..=23`. A view keeps its buffer alive; a buffer keeps its block
+alive; nothing points back. There are no weak edges and no finalization.
+
+**Initial prototypes.** `%ArrayBuffer.prototype%`, `%DataView.prototype%`, and
+the concrete `%Int8Array.prototype%` .. `%BigUint64Array.prototype%` (each
+inheriting `%TypedArray.prototype%`), or `GetPrototypeFromConstructor`'s
+result for a subclass or any other `new.target` (the constructors are
+`SELF_ALLOC`, §5.5).
+
+#### 5.8.4 Detach, resize, and out-of-bounds views
+
+Every view reads its buffer's state on every access; nothing is cached across
+a user-observable step.
+
+- **`ArrayBuffer.prototype.resize(n)`** (resizable only, else `TypeError`):
+  `ToIndex(n)`, then a detached buffer throws `TypeError`, then
+  `n > max_byte_length` throws `RangeError: ArrayBuffer.prototype.resize:
+  Invalid length parameter`. Shrinking zeroes `[n, byte_length)` and keeps the
+  block. Growing within the block's capacity just raises `byte_length` (the
+  tail is already zero); beyond it allocates `min(max_byte_length, max(n,
+  2·capacity))` bytes, copies `byte_length` bytes, and rewrites `data` (the
+  old block becomes garbage). An allocation failure leaves the buffer
+  unchanged with the `RangeError` pending.
+- **Detach** (`DetachArrayBuffer`) is reachable only through `transfer` /
+  `transferToFixedLength` (`ArrayBufferCopyAndDetach`): `newLength` is the
+  current length when `undefined`, else `ToIndex`; a detached receiver throws
+  `TypeError`; `transfer` keeps resizability (`newMax = max_byte_length`, and
+  `newLength > newMax` is a `RangeError`), `transferToFixedLength` makes a
+  fixed buffer. The new buffer (from `%ArrayBuffer%`, never a species) takes
+  over the old `data` block **without copying** when `newLength <=`
+  capacity (zeroing `[newLength, byte_length)` when it shrinks), else gets a
+  fresh block and a copy. The old buffer then gets `data = 0`,
+  `byte_length = max_byte_length = 0` and `AB_FLAG_DETACHED`. `slice`
+  never detaches.
+- **The test262 host hook.** `harness/detachArrayBuffer.js` calls
+  `$262.detachArrayBuffer(buffer)`, a host-defined function; jsc has no host
+  detach API. The test262 runner (`crates/jsc-test262/src/assemble.rs`)
+  prepends a runner-owned prelude, like `PRINT_PRELUDE`, to the program of
+  every test whose `includes` list `detachArrayBuffer.js` (only those, so no
+  other test changes):
+
+  ```js
+  var $262 = (function (transfer, detached) {
+    return { detachArrayBuffer: function (buffer) {
+      if (!detached.call(buffer)) transfer.call(buffer);
+      return null;
+    } };
+  })(ArrayBuffer.prototype.transfer,
+     Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "detached").get);
+  ```
+
+  Capturing `transfer` and the `detached` getter first keeps the hook working
+  when a test replaces them; detaching an already detached buffer is a no-op,
+  as for the spec's `DetachArrayBuffer`. The other `$262` members
+  (`createRealm`, `evalScript`, `gc`, `agent`) stay absent; their tests are
+  denied by feature (`cross-realm`, `host-gc-required`, `Atomics`).
+- **Buffer witness.** `__ta_length(o) -> i32` is
+  `TypedArrayLength(MakeTypedArrayWithBufferWitnessRecord(o, seq-cst))` with
+  out-of-bounds folded to `0`: let `b = buffer`, `L = b.byte_length`; a
+  detached `b` is out of bounds; else with `off = byte_offset`, a
+  length-tracking view is out of bounds iff `off > L` and has length
+  `(L - off) >> shift`; a fixed view is out of bounds iff `off + (array_length
+  << shift) > L` and has length `array_length`. `__ta_oob(o) -> i32` is
+  `IsTypedArrayOutOfBounds` (detached included). `__dv_length(o) -> i32`
+  is `GetViewByteLength` with `-1` for `IsViewOutOfBounds` (the same rule over
+  bytes). All three are non-allocating leaves.
+- **Validation.** `__ta_validate(o, msg) -> i32` is `ValidateTypedArray`: a
+  receiver that is not `TYPE_TYPEDARRAY` throws `TypeError: Method <name>
+  called on incompatible receiver`, an out-of-bounds or detached one throws
+  `TypeError: Cannot perform <name> on a detached or out-of-bounds TypedArray`
+  (`msg` selects the static message pair, §5.8.7), else it returns the length.
+- **Re-validation rule.** Every builtin follows its spec step order exactly.
+  After any step that can run user code — `ToNumber` / `ToIntegerOrInfinity`
+  / `ToIndex` of an argument (`valueOf`, `@@toPrimitive`), a callback, a
+  comparator, `SpeciesConstructor`, an iterator step — it re-reads whatever
+  the spec re-reads: the spec's explicit re-validations (`If
+  IsTypedArrayOutOfBounds(taRecord) is true, throw a TypeError`, a re-taken
+  `TypedArrayLength`) are emitted as written, and every element read or write
+  in between goes through `__ta_get` / `__ta_set`, which check
+  `IsValidIntegerIndex` on each access (a read of an invalid index is
+  `undefined`, a write is ignored). So a buffer detached or shrunk by a
+  callback can never make a builtin read or write outside the live bytes.
+  Bulk copies (`set`, `slice`, `copyWithin`, `fill`, the constructor's
+  typed-array overload) re-derive the byte range from the witness taken after
+  the last user-code step and `memory.copy` / `memory.fill` only within it.
+
+#### 5.8.5 Integer-indexed exotic object hooks (§6.3)
+
+A typed array is an integer-indexed exotic object (ECMA-262 §10.4.5). Its
+hooks sit in the existing §6.3 helpers, as one extra arm next to the
+string / array / String-wrapper exotic arms, keyed on the type byte `25` of
+the object being visited (the receiver, or a chain object):
+
+- **Numeric keys.** A key is interned (§5.3). A key flagged `ARRAY_INDEX`
+  (`"0"` .. `"4294967294"`) is an integer index `i`. Any other key is passed to
+  `__ta_canonical(key) -> i32` (`1` iff `CanonicalNumericIndexString(key)`
+  is not `undefined`): a symbol key or a key whose first code unit is not a
+  digit, `-`, `I` or `N` is `0` at once; `"-0"`, `"NaN"`, `"Infinity"` and
+  `"-Infinity"` are `1`; otherwise `n = __string_to_number(key)` and the
+  answer is `ToString(n) === key` (`__num_to_str`, `__str_eq`; so `"1.0"`,
+  `"01"`, `"+1"`, `"1e3"` are `0` and stay ordinary keys, while `"1.5"`,
+  `"-1"`, `"4294967295"`, `"1e+21"` are `1`). Because a valid index is below
+  `2^29` (§5.8.2), every canonical numeric key that is not an
+  `ARRAY_INDEX` key — `-0` included — is an **invalid** integer index. It
+  allocates (`__num_to_str`), so it is not a leaf; it runs only for a
+  typed-array object and a non-index key starting with one of those units.
+- **`IsValidIntegerIndex(o, i)`** is `i < __ta_length(o)` (unsigned; an
+  out-of-bounds view has length `0`). A computed key that was never interned
+  reaches the helpers as `0` (§5.3), which every object treats as absent;
+  that is also the right answer for an invalid numeric key.
+- **`[[GetOwnProperty]]`** (`__own_desc`, `__own_enum`, `__has_own`): a valid
+  index is `{value: element, writable: true, enumerable: true, configurable:
+  true}`; an invalid numeric key is absent and **never reaches the table**.
+- **`[[HasProperty]]`** (`__has`): a numeric key answers
+  `IsValidIntegerIndex` and stops; the chain is not consulted.
+- **`[[Get]]`** (`__get`, `__super_get`, `__proto_elem`): a numeric key
+  returns `__ta_get(o, i)` (`undefined` when invalid) and stops — on the
+  receiver or on any chain object (a typed array used as a prototype answers
+  its own indices). Other keys continue at the table and the chain.
+- **`[[Set]]`** (`__set`, `__super_set`, `__array_set`'s chain consult
+  `__proto_set`), the ES2024 rule: at the first chain object `o` that is a
+  typed array, a numeric key decides. If `o` is the receiver,
+  `TypedArraySetElement`: `ToNumber(v)` (`ToBigInt` for the BigInt kinds)
+  **first** — even for an invalid index — then `__ta_set(o, i, n)` stores
+  when the index is (still) valid; the result is success either way. If `o`
+  is not the receiver and the index is invalid, the set is a silent success
+  (nothing is created). If it is valid, `o` behaves as an own writable data
+  property found on the chain: the existing receiver path of `__set`
+  (`OrdinarySetWithOwnDescriptor`) defines or creates the property on the
+  receiver (a primitive or non-extensible receiver throws as today).
+  `__protos_indexless(o)` (§5.4) answers `0` when a prototype is a typed
+  array, so an array's hole or out-of-range store consults it through
+  `__proto_set` (and an invalid index there creates nothing, per the rule
+  above).
+- **`[[DefineOwnProperty]]`** (`__define_own`, `__define`): a numeric key
+  rejects when invalid, or when the descriptor has `configurable: false`,
+  `enumerable: false`, an accessor field, or `writable: false`; otherwise a
+  present `value` is written by `TypedArraySetElement` and the result is ok.
+  `Object.defineProperty` turns a rejection into its usual `TypeError`
+  (`Cannot redefine property: k`).
+- **`[[Delete]]`** (`__delete`): a numeric key succeeds iff the index is
+  invalid (nothing to remove, the table is not touched); deleting a valid
+  index throws the strict-mode `TypeError` of a non-configurable property.
+- **`[[OwnPropertyKeys]]`** (`__own_keys`, `__for_in_keys`, `__copy_data`):
+  the indices `0 .. __ta_length(o) - 1` ascending (index keys from
+  `__index_string`), then the table's string keys in insertion order, then
+  its symbol keys. Values and entries modes read elements through `__ta_get`
+  (the per-key re-check of §6.3 applies unchanged: a getter that detaches the
+  buffer makes later indices absent).
+- **Extensibility and integrity** (`__set_integrity`, `__test_integrity`):
+  `[[PreventExtensions]]` fails (`TypeError: Cannot prevent extensions on a
+  variable-length TypedArray`) when the view is length-tracking or flagged
+  `TA_FLAG_RESIZABLE_BUFFER`; `seal` / `freeze` of a typed array with length
+  `> 0` throw `TypeError: Cannot seal array buffer views with elements` /
+  `Cannot freeze array buffer views with elements` (an element cannot become
+  non-configurable or non-writable); `isSealed` / `isFrozen` are `false` while
+  the length is `> 0`. Typed arrays never enter dictionary mode; the array
+  helpers (`__dictionize`, `__sparse_*`, `__array_set_length`) never see one.
+- **Everything else is ordinary.** `length`, `byteLength`, `byteOffset`,
+  `buffer` are prototype getters (§5.8.7), not own properties, so a static
+  `ta.length` is `__get` → table miss → `%TypedArray.prototype%`'s getter. No
+  key other than a canonical numeric string is exotic. `ArrayBuffer` and
+  `DataView` objects are ordinary objects with internal slots; they have no
+  exotic hooks.
+
+**Element helpers.** `__ta_get(o, i) -> i64` and `__ta_set(o, i, n: i64)`
+(`n` an already converted number jsval, or a BigInt for kinds `10` / `11`)
+check `IsValidIntegerIndex`, compute `addr = buffer.data + byte_offset + (i <<
+shift)`, and call `__raw_load(addr, kind, swap = 0)` /
+`__raw_store(addr, kind, n, swap = 0)` (§5.8.6). `__ta_set_value(o, i, v)` is
+`TypedArraySetElement` (the conversion, then `__ta_set`); it is the only one
+that can run user code.
+
+**Fast path and gating.** A program that never touches binary data must
+emit and execute exactly what it does today (every `tests/opcount` row
+unchanged). The mechanism is the one `has_accessors` uses (§6.4,
+`emit/sections.rs::program_has_accessors`): a whole-program scan sets
+`Helpers::has_binary` (`emit/mod.rs`), and every arm above, the inline fast
+path below, and the binary branches of the renderer and the iterators are
+emitted only when it is `true`. `program_has_binary` is `true` iff the IR
+names a binary global — `IrNode::Intrinsic(GlobalIntrinsic::Ctor(c))` /
+`GlobalGet` / `GlobalSet` of `ArrayBuffer`, `DataView` or a typed-array
+constructor, or an `IrNode::Str` equal to one of those names (a static
+`globalThis.Uint8Array` or `o["DataView"]`), or `Math.f16round` is named
+(T5a) — or the program uses the global object as a value
+(`IrNode::Intrinsic(GlobalIntrinsic::Global)`: a `globalThis` / top-level
+`this` that could reach a constructor by a computed name). A binary program
+also needs the accessor dispatch of `__get` (the `length` / `buffer` /
+`byteLength` / `byteOffset` getters), so the same names are added to
+`program_has_accessors`. Runtime shaking (§4.2) is unchanged: the builtin
+bodies are realm methods, kept or stubbed by the existing rules; a program
+indexing with computed keys keeps the whole runtime as today.
+
+Inline `ta[k]` (gated): `emit/object.rs::emit_index_dynamic` gains a second
+arm after the `TYPE_ARRAY` arm — type byte `25` and a number key — that
+calls `__ta_index_get(o, k: i64) -> i64`; `emit_index_set_node` gains the same
+arm calling `__ta_index_set(o, k, v)`. A number key on a typed array never
+reaches the chain: `ToPropertyKey` of a number is always a canonical numeric
+string, so an integral `0 <= k < 2^32 - 1` (`-0` is `0`) is index `k`
+(element or `undefined`), and any other number (`1.5`, `-1`, `NaN`,
+`Infinity`, `2^32`) is an invalid index (`undefined`; a store still runs
+`ToNumber(v)` and is then ignored). Every other key or receiver falls
+through to the existing `__get` / `__set` / `__array_set` calls. There is no
+`.length` fast path for typed arrays in this workstream (phase 6).
+
+#### 5.8.6 Element kinds and value conversion
+
+Typed-array storage is little-endian (the wasm memory order; the spec's
+"platform endianness" is chosen little), and so is a `DataView` access with a
+truthy `littleEndian`; a big-endian `DataView` access byte-swaps the integer
+bits after the load / before the store.
+
+| kind | constructor | size | conversion on write | load (bits) | read as number | store |
+|---|---|---|---|---|---|---|
+| `0` | `Int8Array` | 1 | `ToInt8` | `i32.load8_s` | `f64.convert_i32_s` | `i32.store8` |
+| `1` | `Uint8Array` | 1 | `ToUint8` | `i32.load8_u` | `f64.convert_i32_u` | `i32.store8` |
+| `2` | `Uint8ClampedArray` | 1 | `ToUint8Clamp` | `i32.load8_u` | `f64.convert_i32_u` | `i32.store8` |
+| `3` | `Int16Array` | 2 | `ToInt16` | `i32.load16_s` | `f64.convert_i32_s` | `i32.store16` |
+| `4` | `Uint16Array` | 2 | `ToUint16` | `i32.load16_u` | `f64.convert_i32_u` | `i32.store16` |
+| `5` | `Int32Array` | 4 | `ToInt32` | `i32.load` | `f64.convert_i32_s` | `i32.store` |
+| `6` | `Uint32Array` | 4 | `ToUint32` | `i32.load` | `f64.convert_i32_u` | `i32.store` |
+| `7` | `Float16Array` | 2 | `__f16_encode` | `i32.load16_u` | `__f16_decode` | `i32.store16` |
+| `8` | `Float32Array` | 4 | `f32.demote_f64` | `i32.load` | `f64.promote_f32(f32.reinterpret_i32)` → `__box_f64` | `i32.store` of `i32.reinterpret_f32` |
+| `9` | `Float64Array` | 8 | none | `i64.load` | `__box_f64(f64.reinterpret_i64)` | `i64.store` |
+| `10` | `BigInt64Array` | 8 | `ToBigInt64` (T5b) | `i64.load` | a BigInt of the signed value (T5b) | `i64.store` |
+| `11` | `BigUint64Array` | 8 | `ToBigUint64` (T5b) | `i64.load` | a BigInt of the unsigned value (T5b) | `i64.store` |
+
+`shift` is `0, 0, 0, 1, 1, 2, 2, 1, 2, 3, 3, 3`. The kind order is the
+spec's Table 71 order, so `kind` indexes the static per-kind tables (name,
+size, prototype intrinsic).
+
+- **Shared accessors.** `__raw_load(addr, kind, swap) -> i64` loads the
+  kind's width as integer bits (one `br_table` over `kind`), byte-swaps them
+  when `swap`, and converts them by the "read as number" column;
+  `__raw_store(addr, kind, n, swap)` converts the number `n` to the kind's
+  bits, swaps when `swap`, and stores the width. Typed arrays pass `swap = 0`
+  and an aligned `addr`; `DataView` passes `swap = !littleEndian` and any
+  `addr`, so the integer loads use `align = 0` there (two helpers are not
+  needed: the align field is a hint, and the helpers use `align = 0`
+  throughout, which is as fast on aligned addresses). Both are non-allocating
+  leaves for the number kinds; the BigInt kinds (T5b) allocate on read.
+  Swaps: 16-bit `((x & 0xFF) << 8) | (x >> 8 & 0xFF)` (then `i32.extend16_s`
+  for `Int16`), 32-bit and 64-bit by shift-and-mask (`i32.rotl` / `i64.rotl`
+  pairs).
+- **Integer conversions.** `ToInt8` .. `ToUint32` are the `ToInt32` bit
+  pattern of the bitwise operators (`emit/numeric.rs::emit_to_int32`,
+  §7.2) stored at the kind's width: a narrowing store keeps the low bits, which
+  is exactly the spec's modulo-`2^8` / `2^16` reduction for both
+  signednesses.
+- **`ToUint8Clamp`** is `i32.trunc_sat_f64_u(f64.nearest(f64.min(f64.max(n,
+  0), 255)))`: wasm's `f64.nearest` rounds half to even, as the spec
+  requires (`2.5 -> 2`, `3.5 -> 4`), and a `NaN` survives `min` / `max` and
+  saturates to `0`.
+- **NaN canonicalization.** A stored float may carry any NaN payload (a
+  `DataView` write of raw bits, a `Float32` demotion, bytes written through a
+  `Uint8Array` alias). Reads go through `__box_f64` (§4.1), so a NaN read
+  from a buffer is always exactly `QNAN` and can never alias a boolean,
+  `null`, `undefined` or a pointer. Writes store the number's own bits (a jsval
+  NaN is already `QNAN`), which the spec allows (the NaN bit pattern is
+  implementation-defined).
+- **`Float32`** writes use `f32.demote_f64` (IEEE round-to-nearest-even;
+  overflow to `±Infinity`, `-0` kept).
+- **`Float16`** (T5a). `__f16_encode(x: f64) -> i32` rounds **directly from
+  the `f64` bits** (never through `f32`, which would double-round): sign
+  `s`; `NaN` → `0x7E00`; `|x| >= 65520` (the midpoint between the largest
+  finite half `65504` and `2^16`) → `±Infinity` (`0x7C00 | s`); a normal
+  result (`|x| >= 2^-14`) keeps 10 mantissa bits rounded half-to-even from the
+  52 (a carry into the exponent is the correct next binade); a subnormal
+  result shifts the implicit-one mantissa right by the extra exponent with
+  the same rounding; `|x| <= 2^-25` (the half-way point of the smallest
+  subnormal `2^-24`, rounding to even) → `±0`. `__f16_decode(h: i32) -> i64`
+  is exact in `f64`: exponent `0` → `±m · 2^-24`; `31` → `±Infinity` or
+  `QNAN`; else `±(1024 + m) · 2^(e - 25)`. `Math.f16round(x)` is
+  `__f16_decode(__f16_encode(ToNumber(x)))`.
+- **BigInt kinds** (T5b). Storage, element size and loads/stores are fixed
+  now (table above); the value conversion (`ToBigInt64` / `ToBigUint64`, the
+  BigInt read) and the content-type checks (a `Number` / `BigInt` mix in
+  `set`, the constructor's typed-array overload, `TypedArraySpeciesCreate`
+  results, `DataView.prototype.getBigInt64` / `setBigInt64` /
+  `getBigUint64` / `setBigUint64`) land with the BigInt workstream's value
+  representation; until then `BigInt64Array` / `BigUint64Array` are not
+  installed (§5.8.9).
+
+#### 5.8.7 Built-in objects
+
+New intrinsics are appended to the realm image (§6.4) after the existing ones,
+in this order: `%ArrayBuffer%`, `%ArrayBuffer.prototype%`, `%TypedArray%`,
+`%TypedArray.prototype%`, the concrete constructors and their prototypes in
+kind order, `%DataView%`, `%DataView.prototype%`. They are
+`Intrinsic::Ctor` / `Intrinsic::Prototype` of new `BuiltinCtor` variants
+(`ArrayBuffer`, `TypedArray`, `Typed(ElementKind)`, `DataView`; `ElementKind`
+is a new `ir.rs` enum in kind order with its name, size and shift). Every
+constructor is a `TYPE_FUNCTION` with `CONSTRUCTOR | SELF_ALLOC` (§5.5); each
+throws `TypeError: Constructor <Name> requires 'new'` when called (the
+`emit/builtins/ctor.rs` fragment). No new dirty bit is added: no binary
+builtin has a guarded fast path that depends on a prototype staying intact.
+Methods are writable, configurable, not enumerable; getters are accessor
+entries with no setter, configurable, not enumerable.
+
+- **`%ArrayBuffer%`** (`length` 1): `ArrayBuffer(length, options)` —
+  `ToIndex(length)`, then `options.maxByteLength` (`Get` only when `options`
+  is an object; `undefined` means fixed) through `ToIndex`, `length >
+  maxByteLength` is a `RangeError: Invalid array buffer max length`, then
+  `GetPrototypeFromConstructor`, then the allocation (§5.8.2);
+  `ArrayBuffer.isView(v)` (type byte `25` or `26`), `get [@@species]` (the
+  shared builtin returning `this`, as for `%Array%`).
+- **`%ArrayBuffer.prototype%`**: getters `byteLength` (`0` when detached),
+  `maxByteLength` (`byte_length` for a fixed buffer), `resizable`,
+  `detached`; `resize(newLength)`, `slice(start, end)` (relative indices,
+  `SpeciesConstructor(O, %ArrayBuffer%)`, the result must be a different,
+  non-detached, large-enough `ArrayBuffer`, and the source is re-checked for
+  detachment after the constructor runs; the copy is clamped to the source's
+  current length), `transfer(newLength)`, `transferToFixedLength(newLength)`;
+  `@@toStringTag` `"ArrayBuffer"` (configurable only). A receiver that is not
+  `TYPE_ARRAYBUFFER` throws `TypeError: Method ArrayBuffer.prototype.<m>
+  called on incompatible receiver` (a getter too); a detached receiver of
+  `resize` / `slice` / `transfer*` throws `TypeError: Cannot perform
+  ArrayBuffer.prototype.<m> on a detached ArrayBuffer`; `resize` on a fixed
+  buffer is the incompatible-receiver `TypeError`.
+- **`%TypedArray%`** (`length` 0, `name` `"TypedArray"`, not a global):
+  calling or constructing it throws `TypeError: Abstract class TypedArray not
+  directly constructable`; statics `from(source, mapFn, thisArg)` (`this`
+  must be a constructor; an `@@iterator` source is drained to a list first,
+  then `TypedArrayCreateFromConstructor(this, [len])`, then each mapped
+  value is `Set`; else an array-like), `of(...items)`, `get [@@species]`.
+  Each concrete constructor's `[[Prototype]]` is `%TypedArray%`.
+- **Concrete constructors** `%Int8Array%` .. `%BigUint64Array%` (`length` 3,
+  own `BYTES_PER_ELEMENT` non-writable, non-enumerable, non-configurable):
+  one shared builtin body per kind (`Builtin::TypedCtor(kind)`) implementing
+  every overload of `TypedArray(...args)`: no argument or a non-object →
+  `ToIndex(length)` and a fresh zeroed buffer from `%ArrayBuffer%`
+  (`RangeError: Invalid typed array length` past `BYTE_LENGTH_MAX`); a typed
+  array → a copy of its current elements (`TypeError` when out of bounds,
+  same-kind `memory.copy`, else per-element conversion); an `ArrayBuffer` →
+  a view: `ToIndex(byteOffset)` (`RangeError: Start offset of <Name> should
+  be a multiple of <size>`), `ToIndex(length)` unless `undefined`, then a
+  detached buffer is a `TypeError`, then a length-tracking view (resizable
+  buffer, `length` `undefined`) or a fixed one with the spec's
+  `RangeError`s (`Invalid typed array length`, `Byte length of <Name> should
+  be a multiple of <size>`, `Start offset is outside the bounds of the
+  buffer`); any other object → `@@iterator` (`GetMethod`) drained to a list
+  when present, else an array-like (`length`, then `Get` of each index, the
+  conversions running in index order after the allocation).
+  `GetPrototypeFromConstructor` runs at the spec's point of each overload:
+  first for the object overloads, after `ToIndex(length)` for the length
+  overload.
+- **`%TypedArray.prototype%`**: getters `buffer`, `byteLength`,
+  `byteOffset`, `length` (the three numeric ones are `0` when out of bounds
+  or detached; a non-typed-array receiver throws the incompatible-receiver
+  `TypeError`), `get [@@toStringTag]` (the kind's name for a typed array,
+  `undefined` for any other value, never throwing); `constructor`; the
+  methods `at`, `copyWithin`, `entries`, `every`, `fill`, `filter`, `find`,
+  `findIndex`, `findLast`, `findLastIndex`, `forEach`, `includes`, `indexOf`,
+  `join`, `keys`, `lastIndexOf`, `map`, `reduce`, `reduceRight`, `reverse`,
+  `set` (array-like and typed-array sources, overlapping same-buffer copies
+  through a temporary when the kinds differ, `memmove` otherwise), `slice`,
+  `some`, `sort` (numeric order with `-0 < +0` and `NaN` last when no
+  comparator; a comparator sorts a jsval copy with the same stable merge sort
+  as `Array.prototype.sort`, then writes back through `__ta_set`), `subarray`
+  (never validates: an out-of-bounds source counts as length `0`; a
+  length-tracking source with `end` `undefined` yields a length-tracking
+  result), `toLocaleString`, `toReversed`, `toSorted`, `values` (also
+  `[@@iterator]`, the same function object), `with`; `toString` is the same
+  function object as `Array.prototype.toString`. `map` / `filter` / `slice`
+  / `subarray` create their result by `TypedArraySpeciesCreate`
+  (`SpeciesConstructor(O, default)`, then `TypedArrayCreateFromConstructor`:
+  the result is validated, must have at least the requested length —
+  `TypeError` otherwise — and the same content type); `toReversed` /
+  `toSorted` / `with` always create the default kind. Every method starts
+  with `__ta_validate` (§5.8.4) and follows the re-validation rule.
+- **Iteration.** `keys` / `values` / `entries` return `CLASS_ITERATOR`
+  objects of kinds `0`..`2` over `%ArrayIteratorPrototype%` (§5.2), like
+  arrays. `%ArrayIteratorPrototype%.next` gains a gated arm for a typed-array
+  `[[IteratedObject]]`: an out-of-bounds or detached view throws `TypeError:
+  Cannot perform %ArrayIteratorPrototype%.next on a detached or out-of-bounds
+  TypedArray`, else the length comes from `__ta_length` and the element from
+  `__ta_get`. The `GetIterator` fast paths (§6.4) do not cover typed arrays:
+  `for-of` / spread over one take the protocol.
+- **Concrete prototypes**: `constructor`, `BYTES_PER_ELEMENT` (constant
+  attributes); `[[Prototype]]` `%TypedArray.prototype%`.
+- **`%DataView%`** (`length` 1): `DataView(buffer, byteOffset, byteLength)` —
+  a non-`ArrayBuffer` throws `TypeError: First argument to DataView
+  constructor must be an ArrayBuffer`, `ToIndex(byteOffset)`, a detached
+  buffer is a `TypeError`, an offset past the buffer is `RangeError: Start
+  offset is outside the bounds of the buffer`, a `byteLength` of
+  `undefined` takes the rest of the buffer (a length-tracking view when the
+  buffer is resizable), else `ToIndex(byteLength)` and `RangeError: Invalid
+  DataView length` past the buffer's end; then
+  `GetPrototypeFromConstructor`, then the buffer is re-checked (detached:
+  `TypeError`; shrunk below the view: `RangeError`), as the spec orders.
+- **`%DataView.prototype%`**: getters `buffer`, `byteLength`, `byteOffset`
+  (the latter two throw `TypeError` when the view is out of bounds or
+  detached); `getInt8` / `setInt8`, `getUint8` / `setUint8`, `getInt16`,
+  `getUint16`, `getInt32`, `getUint32`, `getFloat32`, `getFloat64` and their
+  setters (T4), `getFloat16` / `setFloat16` (T5a), the BigInt pairs (T5b) —
+  one builtin body per `(kind, get|set)` (`Builtin::DataView(kind, set)`):
+  `ToIndex(requestIndex)`, a setter's `ToNumber(value)`, `ToBoolean
+  (littleEndian)`, then out of bounds or detached → `TypeError: Cannot
+  perform DataView.prototype.<m> on a detached or out-of-bounds DataView`,
+  `index + size > viewSize` → `RangeError: Offset is outside the bounds of
+  the DataView`, then `__raw_load` / `__raw_store` at `data + byte_offset +
+  index` with `swap = !littleEndian`; `@@toStringTag` `"DataView"`.
+- **Base64 / hex** (T5a): `Uint8Array.fromBase64(string, options)`,
+  `Uint8Array.fromHex(string)`, `Uint8Array.prototype.toBase64(options)`,
+  `toHex()`, `setFromBase64(string, options)`, `setFromHex(string)` (the last
+  two return `{ read, written }`), in the guest over code units: a
+  non-string argument is a `TypeError`, an `alphabet` other than `"base64"` /
+  `"base64url"`, a `lastChunkHandling` other than `"loose"` / `"strict"` /
+  `"stop-before-partial"` is a `TypeError`, malformed input is a
+  `SyntaxError` (thrown after writing the bytes decoded before the error, as
+  the spec's `setFrom*` require), `omitPadding` is `ToBoolean`.
+- **`Math.f16round`** (T5a), §5.8.6.
+- **`Object.prototype.toString`** needs no new builtin tag: typed arrays are
+  tagged through `get [@@toStringTag]`, the other two through their
+  prototypes' string `@@toStringTag` (all read by `__symbol_get`, §6.2).
+
+#### 5.8.8 Rendering (§6.9)
+
+The renderer gains gated arms (one helper, `__render_binary(p, depth)`), in
+Node's console style; like arrays, no element list is truncated:
+
+- typed arrays `Uint8Array(3) [ 1, 2, 3 ]`, `Float64Array(0) []` (numbers by
+  the number rule, so `-0` prints `0` and `NaN` prints `NaN`); an
+  out-of-bounds or detached view renders with length `0`; own named
+  properties follow the elements as for arrays (`Int8Array(1) [ 0, foo: 1
+  ]`); a subclass instance renders with its kind's name;
+- `ArrayBuffer { [Uint8Contents]: <01 02 ff>, byteLength: 3 }` (lowercase
+  two-digit hex bytes separated by spaces, `<>` when empty), `ArrayBuffer {
+  (detached), byteLength: 0 }` when detached;
+- `DataView { byteLength: 2, byteOffset: 0, buffer: ArrayBuffer {
+  [Uint8Contents]: <00 00>, byteLength: 2 } }` (out of bounds: `byteLength:
+  0, byteOffset: 0`).
+
+The arms read the blocks directly (no getter runs), allocate only through the
+output buffer, and never throw.
+
+#### 5.8.9 What stays unsupported
+
+- `SharedArrayBuffer` and `Atomics` (no shared memory or agents; features
+  `SharedArrayBuffer`, `Atomics*` stay denied); the `IsSharedArrayBuffer`
+  branches of the spec are dead code and are not emitted.
+- Immutable buffers (`transferToImmutable`, `sliceToImmutable`,
+  `immutable`; feature `immutable-arraybuffer` stays denied). The harness
+  feature-detects `transferToImmutable`, so its absence is not observable to
+  the other tests. Header bit `8` of `TYPE_ARRAYBUFFER` is kept free for it.
+- `BigInt64Array` / `BigUint64Array` and the `DataView` BigInt methods until
+  T5b lands after the BigInt workstream (the globals are absent until then).
+- No `$262.detachArrayBuffer` outside the test262 runner: a program detaches
+  only with `transfer` / `transferToFixedLength`.
+
+#### 5.8.10 Implementation plan
+
+Each stage is one merge; each lists its new (+) and changed (~) files, the
+DESIGN sections it moves facts into, and the denylist lines
+(`tests/test262/unsupported-features.txt`) it deletes. Every stage writes its
+integration tests (with a `JSC_GC_STRESS` variant, as
+`crates/jsc-core/tests/weak_collections.rs`) and keeps every `tests/opcount`
+row unchanged; the realm image grows by the new intrinsics, so a row that
+moves only through the intern-table layout or the static root list (a run
+that collects) must say so in its `reason` cell.
+
+| stage | scope | files | denylist lines deleted |
+|---|---|---|---|
+| **T2** ArrayBuffer | `TYPE_ARRAYBUFFER`, byte block, constructor, prototype getters, `resize`, `slice`, `transfer`, `transferToFixedLength`, `isView` (tests the type bytes `25` / `26`, defined now), `@@species`, rendering, the test262 `$262` prelude | ~`abi.rs` (`TYPE_ARRAYBUFFER`, `TYPE_TYPEDARRAY`, `TYPE_DATAVIEW` constants with the `20..=23` reservation note, `AB_*`, `BYTE_LENGTH_MAX`); ~`ir.rs` (`BuiltinCtor::ArrayBuffer`, `ALL`, `GlobalIntrinsic::from_name`); ~`emit/realm.rs` (intrinsics, `ArrayBufferOp` builtins appended to `Builtin::ALL`, constructor / species / `@@toStringTag` / global entries); +`emit/builtins/array_buffer.rs`; ~`emit/builtins/mod.rs` (module, dispatch); +`emit/binary.rs` (`__ab_alloc`, `__render_binary`), ~`emit/registry.rs` (a new `Group::Binary` appended after `Extra`, so no existing function index moves), ~`emit/mod.rs` (`Helpers` accessors for the group); ~`emit/roots.rs` (helper-graph leaf declarations); ~`emit/gc.rs` (trace arm `24`); ~`emit/render.rs` (dispatch to `__render_binary`, render strings); ~`crates/jsc-test262/src/assemble.rs` (+ its caller in `lib.rs`: the `detachArrayBuffer.js` prelude, unit-tested in `assemble.rs`); +`crates/jsc-core/tests/array_buffer.rs` | `ArrayBuffer`, `arraybuffer-transfer`, `resizable-arraybuffer` |
+| **T3a** TypedArray core | `TYPE_TYPEDARRAY`; `%TypedArray%`, the 11 number-kind constructors except `Float16Array` with every overload, `from`, `of`, `@@species`, `TypedArraySpeciesCreate`, `BYTES_PER_ELEMENT`; prototype getters, `@@toStringTag`, `keys` / `values` / `entries` / `@@iterator`; the §5.8.5 hooks, the `has_binary` gate and the inline fast path; element helpers; iterator `next` arm; rendering | ~`abi.rs` (`TA_*`); ~`ir.rs` (`BuiltinCtor::TypedArray`, `Typed(ElementKind)`, `ElementKind`); ~`emit/realm.rs`; +`emit/builtins/typed_array.rs`; ~`emit/builtins/mod.rs`; ~`emit/binary.rs` (`__ta_length`, `__ta_oob`, `__ta_validate`, `__ta_canonical`, `__ta_get`, `__ta_set`, `__ta_set_value`, `__ta_index_get`, `__ta_index_set`, `__raw_load`, `__raw_store`); ~`emit/registry.rs`, ~`emit/roots.rs`; ~`emit/props.rs` (`__get`, `__super_get`, `__set`, `__super_set`, `__has`, `__has_own`, `__delete`, `__own_keys`, `__own_enum`, `__for_in_keys`, `__copy_data`, `__protos_indexless`, `__proto_elem`, `__proto_set`); ~`emit/props/descriptor.rs` (`__define_own`, `__own_desc`, `__set_integrity`, `__test_integrity`); ~`emit/object.rs` (`emit_index_dynamic`, `emit_index_set_node`); ~`emit/sections.rs` (`program_has_binary`, `program_has_accessors` names), ~`emit/mod.rs` (`Helpers::has_binary`); ~`emit/numeric.rs` (`emit_to_int32` made `pub(super)`); ~`emit/builtins/iter.rs` (`step_array` typed-array arm); ~`emit/gc.rs` (arm `25`); ~`emit/render.rs`; +`crates/jsc-core/tests/typed_arrays.rs` (incl. the §5.8.5 key cases and a resize / detach matrix) | `TypedArray*`, `Int8Array`, `Int16Array`, `Int32Array`, `Uint8Array`, `Uint8ClampedArray`, `Uint16Array`, `Uint32Array`, `Float32Array`, `Float64Array` |
+| **T4** DataView | `TYPE_DATAVIEW`, constructor, getters, the number get / set pairs except Float16, rendering | ~`abi.rs` (`DV_*`); ~`ir.rs` (`BuiltinCtor::DataView`); ~`emit/realm.rs`; +`emit/builtins/data_view.rs`; ~`emit/builtins/mod.rs`; ~`emit/binary.rs` (`__dv_length`, swap paths of `__raw_load` / `__raw_store`, render arm); ~`emit/gc.rs` (arm `26`); ~`emit/render.rs`; +`crates/jsc-core/tests/data_view.rs` | `DataView*` |
+| **T3b** TypedArray methods | every `%TypedArray.prototype%` method of §5.8.7 not in T3a | ~`emit/realm.rs` (`TypedArrayOp` methods); +`emit/builtins/typed_array_methods.rs`; ~`emit/builtins/array.rs` (expose the merge sort and `toLocaleString` / `join` element steps for reuse, no behaviour change); ~`emit/builtins/mod.rs`; ~`emit/binary.rs` (bulk copy helpers if needed); +`crates/jsc-core/tests/typed_array_methods.rs` | `stable-typedarray-sort`, `align-detached-buffer-semantics-with-web-reality` |
+| **T5a** Float16 + base64 / hex | kind `7` (`Float16Array`), `__f16_encode` / `__f16_decode`, `Math.f16round`, `DataView` `getFloat16` / `setFloat16`, `Uint8Array.fromBase64` / `fromHex` / `toBase64` / `toHex` / `setFromBase64` / `setFromHex` | ~`ir.rs`, ~`emit/realm.rs` (Float16 intrinsics, the `Math` entry, the base64 / hex entries); ~`emit/binary.rs`; ~`emit/builtins/typed_array.rs`, ~`emit/builtins/data_view.rs`; ~`emit/sections.rs` (`f16round` in `program_has_binary`); ~the `Math` builtin dispatch (`emit/builtins/namespace.rs` / `emit/numeric.rs` as `MathOp` dictates); +`emit/builtins/base64.rs`; +`crates/jsc-core/tests/float16.rs`, +`crates/jsc-core/tests/base64_hex.rs` | `Float16Array`, `uint8array-base64` |
+| **T5b** BigInt kinds | kinds `10` / `11`, content-type checks, `DataView` BigInt pairs; after the BigInt workstream lands | ~`ir.rs`, ~`emit/realm.rs`, ~`emit/binary.rs` (BigInt arms of `__raw_load` / `__raw_store`, `ToBigInt64` / `ToBigUint64`), ~`emit/builtins/typed_array.rs`, `typed_array_methods.rs`, `data_view.rs`; +`crates/jsc-core/tests/bigint_typed_arrays.rs` | none of its own (`BigInt` belongs to the BigInt workstream; its typed-array tests run once that line is gone) |
+| **T6** closeout | move every remaining fact out of this section into §5.1 / §5.2 / §5.7 / §6.2 / §6.3 / §6.4 / §6.9 / §7.9, delete this section, update §13 (delete the "typed arrays, `ArrayBuffer`" words of the not-available line, keep §5.8.9 as limitations), recount §10 and the §13 failure table from CI | `DESIGN.md`, `tests/test262/` baseline files (from CI) | none |
+
 ---
 
 ## 6. Runtime
@@ -1296,6 +1891,11 @@ tables. Keys are interned `u32`s.
   when visited) whose key is not in the exclusion list, the value read with
   `[[Get]]` (a getter runs). A nullish or non-string primitive source copies
   nothing; a string copies its indices.
+- **Integer-indexed exotic objects** (typed arrays; target design, not yet
+  implemented): every helper above gains one arm for a `TYPE_TYPEDARRAY`
+  object, emitted only in a program that can reach binary data, which
+  answers canonical numeric string keys from the buffer and never lets them
+  reach the table or the chain (§5.8.5).
 
 ### 6.4 Realm, global object, and fast paths
 
@@ -2585,6 +3185,9 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | errors | §7.7 |
 | generators | `%GeneratorPrototype%` `next`, `return`, `throw` |
 | iterators | `%IteratorPrototype%[@@iterator]`, `%AsyncIteratorPrototype%[@@asyncIterator]` (both return `this`); the `next` of the Array, String, Map and Set Iterator prototypes (a receiver that is not an iterator of the family throws `TypeError: next method called on incompatible receiver`); `Iterator` (abstract: calling it, or `new` with `new.target === Iterator`, throws `TypeError`; a subclass constructs), `Iterator.prototype` (`%IteratorPrototype%`, non-writable) with `constructor` (`%Iterator%`) and `@@toStringTag` (`"Iterator"`) accessors whose setters are `SetterThatIgnoresPrototypeProperties` (a `TypeError` on a non-object or on `Iterator.prototype` itself; an own data property on any other receiver); `Iterator.from(O)` (`GetIteratorFlattenable`: strings are iterated, other primitives throw `TypeError`; an iterator inheriting `Iterator.prototype` is returned as is, any other is wrapped in a `CLASS_ITERATOR` object of kind `16` over `%WrapForValidIteratorPrototype%`, whose `next` / `return` forward to the wrapped record, `next` read once); the lazy helpers `Iterator.prototype.map` / `filter` / `take` / `drop` / `flatMap` (`this` must be an object; the argument is validated first — a non-callable callback is a `TypeError`, a `take` / `drop` limit goes through `ToNumber` and `NaN` or a negative integer is a `RangeError` — closing `this` on failure; then `next` is read once and a helper object is returned without stepping). A helper's `next` steps the underlying iterator only on demand; a throwing callback, or a `flatMap` result that is not an object (a string included) or not iterable, closes the underlying iterator; `take` closes it once the limit is reached; a `next` / `return` while the helper runs throws `TypeError`; `return()` closes the underlying iterator (and a `flatMap`'s open inner one first) and completes the helper. The eager helpers `reduce` / `toArray` / `forEach` / `some` / `every` / `find` validate `this` and the callback the same way, read `next` once and consume the iterator, passing a counter as the callback's last argument (`reduce` without an initial value starts from the first value with counter `1`, and throws `TypeError` on an empty iterator); a throwing callback closes the iterator under its throw, `some` / `every` / `find` close it on an early result, and a throw from `next` or a result's `value` propagates without closing. A program that names `Iterator`, `constructor`, `getPrototypeOf` or `setPrototypeOf` compiles the accessor dispatch of `__get` / `__set` |
+| `ArrayBuffer` | **target, not yet available** (§5.8.7, stage T2): `new ArrayBuffer(length, { maxByteLength })`, `ArrayBuffer.isView`, `get [@@species]`; prototype getters `byteLength`, `maxByteLength`, `resizable`, `detached`; `resize`, `slice`, `transfer`, `transferToFixedLength`, `@@toStringTag` |
+| typed arrays | **target, not yet available** (§5.8.7, stages T3a / T3b / T5a / T5b): `%TypedArray%` (abstract) with `from`, `of`, `get [@@species]`; `Int8Array`, `Uint8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float16Array`, `Float32Array`, `Float64Array`, `BigInt64Array`, `BigUint64Array` (every constructor overload, `BYTES_PER_ELEMENT`); `%TypedArray.prototype%` getters `buffer`, `byteLength`, `byteOffset`, `length`, `@@toStringTag` and every ES2025 method; `Uint8Array.fromBase64`, `fromHex`, `Uint8Array.prototype.toBase64`, `toHex`, `setFromBase64`, `setFromHex`; `Math.f16round` |
+| `DataView` | **target, not yet available** (§5.8.7, stages T4 / T5a / T5b): `new DataView(buffer, byteOffset, byteLength)`; getters `buffer`, `byteLength`, `byteOffset`; `get` / `set` of `Int8`, `Uint8`, `Int16`, `Uint16`, `Int32`, `Uint32`, `Float16`, `Float32`, `Float64`, `BigInt64`, `BigUint64`; `@@toStringTag` |
 
 No input produces an invalid wasm module.
 
@@ -2902,6 +3505,12 @@ Each item below is current behaviour of this tree.
   typed arrays, `ArrayBuffer`, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
 - The builtin library is exactly §7.9.
+- Binary data, once the §5.8 target lands, still has no `SharedArrayBuffer`,
+  `Atomics` or immutable buffers (`transferToImmutable`,
+  `sliceToImmutable`), no `BigInt64Array` / `BigUint64Array` / `DataView`
+  BigInt methods before stage T5b, and no host detach outside the test262
+  runner's `$262.detachArrayBuffer` (a program detaches only with
+  `transfer` / `transferToFixedLength`); §5.8.9.
 
 **Object model**
 
@@ -3087,6 +3696,10 @@ steps.
   module.
 - `RegExp`, `BigInt`, typed arrays, `ArrayBuffer`, `DataView`, `Proxy`,
   `Reflect`.
+- Phase 5b binary data (`ArrayBuffer`, typed arrays, `DataView`): designed
+  in §5.8 (type tags `24`..`26`; `20`..`23` reserved for the Proxy and BigInt
+  workstreams), implemented in stages T2, T3a, T4, T3b, T5a, T5b, T6
+  (§5.8.10).
 
 ### Phase 6 — Performance
 
