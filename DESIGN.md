@@ -3424,12 +3424,11 @@ shared files):
   (`object_static.rs::own_key_list`, parameterized by the `__own_keys`
   mode) for the `LAZY` and array-`length` handling. The `ReflectFn` bodies
   dispatch through `builtins/mod.rs::emit_handle_family` (the main dispatch
-  is at its line limit). No registry helper rows. Known gap (P2a's forward,
-  not `Reflect`): a trap-less proxy's `[[OwnPropertyKeys]]` forwards
-  `__own_keys(target, OWN_ALL_KEYS)`, which omits an array target's
-  `length` and a `LAZY` function target's unmaterialized keys, so
-  `Reflect.ownKeys(new Proxy([], {}))` lacks `"length"` and the
-  non-configurable-key invariant does not see it.
+  is at its line limit). No registry helper rows. The array-`length`
+  insertion is `object_static.rs::emit_with_array_length`, which
+  `__proxy_own_keys` also uses: the target's list (trap-less forward and the
+  `ownKeys` invariant check) materializes a `LAZY` function target and
+  includes an array target's `length`.
 - **P4 — closeout.** Remove `Proxy`, `proxy-missing-checks` and `Reflect*`
   from `tests/test262/unsupported-features.txt`; refresh the baseline from CI;
   rewrite this subsection in the present tense (dropping "planned"); update
