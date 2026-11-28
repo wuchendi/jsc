@@ -378,6 +378,51 @@ fn own_keys_invariants() {
     );
 }
 
+/// A trap-less proxy forwards the target's full `[[OwnPropertyKeys]]`: an
+/// array target's `"length"` after its indices, a not-yet-materialized
+/// function target's `length` / `name` / `prototype`, and the same through
+/// a proxy target.
+#[test]
+fn own_keys_forward_full_target_list() {
+    assert_string(
+        "const s = Symbol('s'); const a = [1, 2]; a.x = 3; a[s] = 4;
+         function f(a, b) {}
+         [Reflect.ownKeys(new Proxy([], {})).join(),
+          Reflect.ownKeys(new Proxy(a, {})).map(String).join(),
+          Object.getOwnPropertyNames(new Proxy(f, {})).join(),
+          Object.getOwnPropertyNames(new Proxy(() => 1, {})).join(),
+          Reflect.ownKeys(new Proxy(new Proxy([7], {}), {})).join(),
+          Object.keys(new Proxy([5, 6], {})).join()].join('|')",
+        "length|0,1,length,x,Symbol(s)|length,name,prototype|length,name|0,length|0,1",
+    );
+}
+
+/// The `ownKeys` invariant sees the target's keys that `__own_keys` does
+/// not list: an array's non-configurable `length` and a lazy function's
+/// non-configurable `prototype` must be reported; listing them passes.
+#[test]
+fn own_keys_invariant_sees_hidden_target_keys() {
+    assert_type_errors(
+        "const keys = (r) => ({ ownKeys() { return r; } });
+         function f() {}",
+        &[
+            "Reflect.ownKeys(new Proxy([], keys([])))",
+            "Reflect.ownKeys(new Proxy([1], keys(['0'])))",
+            "Reflect.ownKeys(new Proxy(f, keys(['length', 'name'])))",
+            "Reflect.ownKeys(new Proxy(new Proxy([], {}), keys([])))",
+            "Reflect.ownKeys(new Proxy(Object.preventExtensions([]), keys(['length', 'x'])))",
+        ],
+    );
+    assert_string(
+        "function g() {}
+         [Reflect.ownKeys(new Proxy([1], { ownKeys() { return ['length', '0', 'extra']; } })).join(),
+          Reflect.ownKeys(new Proxy(g, { ownKeys() { return ['prototype']; } })).join(),
+          Reflect.ownKeys(new Proxy(Object.preventExtensions([]),
+            { ownKeys() { return ['length']; } })).join()].join('|')",
+        "length,0,extra|prototype|length",
+    );
+}
+
 // --- prototypes and extensibility -----------------------------------------------------
 
 /// `getPrototypeOf` / `setPrototypeOf` traps and their invariants.
@@ -646,6 +691,14 @@ fn traps_survive_gc_stress() {
          }
          console.log(keep.join());",
         "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19\n",
+    );
+    assert_same_under_gc_stress(
+        "function f(a) {} const arr = [1, 2, 3]; arr.k = 0;
+         const strict = new Proxy(arr, { ownKeys(t) { return Reflect.ownKeys(t); } });
+         console.log(Reflect.ownKeys(new Proxy(arr, {})).join(),
+           Object.getOwnPropertyNames(new Proxy(f, {})).join(),
+           Reflect.ownKeys(strict).join());",
+        "0,1,2,length,k length,name,prototype 0,1,2,length,k\n",
     );
 }
 

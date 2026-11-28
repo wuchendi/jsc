@@ -1649,7 +1649,8 @@ pub enum IrNode {
     /// `console.log(...)` with a spread argument: builds the argument array
     /// (like [`IrNode::ArraySpread`], carried by `args`) then prints its
     /// elements like [`IrNode::ConsoleLog`] prints its arguments; yields
-    /// `undefined`.
+    /// `undefined`. Every argument (the whole spread included) is evaluated
+    /// before anything is printed.
     ConsoleLogSpread {
         /// The argument array to print — an [`IrNode::ArraySpread`].
         args: Box<IrNode>,
@@ -1921,13 +1922,14 @@ pub enum IrNode {
         /// `true` for `+ 1`, `false` for `- 1`.
         inc: bool,
     },
-    /// A `console.log(a0, a1, ..)` call. It is NOT a user-function call:
-    /// it lowers to a sequence of calls to the host `print` import, one per
-    /// argument, then yields the `undefined` jsval (its expression value). The
-    /// backend formats each argument's jsval on the host side (reusing
-    /// `format_value`), separating arguments with a single space and terminating
-    /// the line with a newline. `console.log()` with no arguments prints just a
-    /// newline. Arguments are evaluated left-to-right.
+    /// A `console.log(a0, a1, ..)` call. It is NOT a user-function call: the
+    /// guest renderer formats each argument's jsval into the output buffer,
+    /// separating arguments with a single space and terminating the line with
+    /// a newline, then yields the `undefined` jsval (its expression value).
+    /// `console.log()` with no arguments prints just a newline. Arguments are
+    /// evaluated left-to-right, all of them before anything is printed: a
+    /// throwing argument prints nothing, and each value renders in its state
+    /// after the last argument ran.
     ConsoleLog {
         /// The argument expressions, in source order (0..N).
         args: Vec<IrNode>,

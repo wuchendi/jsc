@@ -2,7 +2,7 @@
 #![allow(clippy::expect_used)]
 
 mod common;
-use common::{assert_eval, assert_output, eval_text};
+use common::{assert_eval, assert_output, assert_same_under_gc_stress, eval_text, exec};
 
 // --- console.log ------------------------------------------------------------
 
@@ -134,4 +134,102 @@ fn console_log_alongside_recursion() {
                console.log(\"start\"); fib(10)";
     assert_output(src, "start\n");
     assert_eval(src, "55");
+}
+
+// --- Argument evaluation before printing ------------------------------------
+
+/// A later argument that throws leaves no partial output: every argument is
+/// evaluated before anything is printed.
+#[test]
+fn console_log_throwing_later_argument_prints_nothing() {
+    assert_output(
+        "try { console.log('a', (() => { throw 1 })()) } catch (e) { console.log('c') }",
+        "c\n",
+    );
+    assert_output(
+        "try { console.log('a', 'b', (() => { throw 1 })(), 'd') } catch (e) { console.log('c') }",
+        "c\n",
+    );
+}
+
+/// An uncaught throw from a later argument prints nothing on stdout.
+#[test]
+fn console_log_uncaught_later_argument_prints_nothing() {
+    let done = exec("console.log('a', (() => { throw 1 })())", false)
+        .expect("program should compile and not trap");
+    assert_eq!(
+        (done.code, done.stdout.as_str(), done.stderr.as_str()),
+        (1, "", "Uncaught 1\n")
+    );
+}
+
+/// An object printed by an earlier argument renders in its state after a
+/// later argument mutated it (the earlier argument is the same reference).
+#[test]
+fn console_log_renders_after_later_argument_side_effects() {
+    assert_output(
+        "const o = { a: 1 }; console.log(o, (o.a = 2, o.b = 3, 'x'))",
+        "{ a: 2, b: 3 } x\n",
+    );
+    assert_output(
+        "const xs = [1]; console.log(xs, xs.push(2))",
+        "[ 1, 2 ] 2\n",
+    );
+}
+
+/// A `console.log` nested in a later argument prints its own line first.
+#[test]
+fn console_log_nested_in_argument_prints_first() {
+    assert_output(
+        "function f() { console.log('inner'); return 2 } console.log('outer', 1, f())",
+        "inner\nouter 1 2\n",
+    );
+}
+
+/// Ordinary multi-argument calls print exactly as before.
+#[test]
+fn console_log_multi_arg_output_unchanged() {
+    assert_output(
+        "let i = 3; console.log('line', i, i * 2, i % 2 === 0)",
+        "line 3 6 false\n",
+    );
+    assert_output(
+        "console.log('done', null, undefined, [1, 2], { a: 1 })",
+        "done null undefined [ 1, 2 ] { a: 1 }\n",
+    );
+    assert_output(
+        "let s = 'v'; console.log(s, 1, true, null)",
+        "v 1 true null\n",
+    );
+}
+
+/// Earlier argument objects stay alive and render correctly while later
+/// arguments allocate, under a collection at every allocation.
+#[test]
+fn console_log_allocating_later_arguments_gc_stress() {
+    assert_same_under_gc_stress(
+        "function mk(n) { const out = []; for (let i = 0; i < n; i++) out.push({ i, s: 'k' + i }); return out.length } \
+         console.log({ a: [1, 2], b: 'x' + 1 }, mk(50), [{ c: 3 }], mk(50), 'end' + mk(5))",
+        "{ a: [ 1, 2 ], b: x1 } 50 [ { c: 3 } ] 50 end5\n",
+    );
+}
+
+/// A spread whose iterator throws midway prints nothing.
+#[test]
+fn console_log_spread_throwing_iterator_prints_nothing() {
+    assert_output(
+        "function* g() { yield 1; yield 2; throw 3 } \
+         try { console.log('a', ...g()) } catch (e) { console.log('c', e) }",
+        "c 3\n",
+    );
+}
+
+/// The spread form under `gc_stress`: elements allocated mid-spread survive.
+#[test]
+fn console_log_spread_allocating_gc_stress() {
+    assert_same_under_gc_stress(
+        "function* g() { for (let i = 0; i < 3; i++) yield { i, s: [i, 'k' + i] } } \
+         console.log({ z: 0 }, ...g(), [9])",
+        "{ z: 0 } { i: 0, s: [ 0, k0 ] } { i: 1, s: [ 1, k1 ] } { i: 2, s: [ 2, k2 ] } [ 9 ]\n",
+    );
 }
