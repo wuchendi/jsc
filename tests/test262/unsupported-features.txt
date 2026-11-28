@@ -17,18 +17,8 @@ regexp-*
 RegExp.escape
 legacy-regexp
 
-# Binary data: typed arrays, buffers, DataView, Atomics (no constructors)
-TypedArray*
-Int8Array
-Int16Array
-Int32Array
-Uint8Array
-Uint8ClampedArray
-Uint16Array
-Uint32Array
+# Binary data: Float16Array, base64, DataView, Atomics (no constructors)
 Float16Array
-Float32Array
-Float64Array
 uint8array-base64
 stable-typedarray-sort
 immutable-arraybuffer

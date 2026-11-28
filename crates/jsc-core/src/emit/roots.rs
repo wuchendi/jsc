@@ -73,7 +73,7 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         // entry, so that call never materializes, but the graph is static).
         (helpers.private_find(), vec![helpers.prop_find]),
         (helpers.json_ws, vec![]),
-        (helpers.test_integrity(), vec![]),
+        (helpers.test_integrity(), binary::integrity_callees(helpers)),
         (helpers.heap_object(), vec![]),
         (helpers.str_of(), vec![]),
         (helpers.fn_name(), vec![helpers.heap_object()]),
@@ -149,6 +149,7 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
     graph.extend(libm::helper_graph(helpers));
     graph.extend(promise_engine::helper_graph(helpers));
     graph.extend(gc::helper_graph(helpers));
+    graph.extend(binary::helper_graph(helpers));
     graph
 }
 

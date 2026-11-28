@@ -225,7 +225,8 @@ impl Helpers<'_> {
     pub(super) fn render_top(self) -> u32 {
         self.render_base() + 9
     }
-    fn render(self) -> u32 {
+    /// `__render(v, depth)`.
+    pub(super) fn render(self) -> u32 {
         self.render_base() + 10
     }
     fn render_heap(self) -> u32 {
@@ -240,7 +241,8 @@ impl Helpers<'_> {
     fn render_function(self) -> u32 {
         self.render_base() + 14
     }
-    fn render_props(self) -> u32 {
+    /// `__render_props(p, array, quote, first, open, depth) -> first`.
+    pub(super) fn render_props(self) -> u32 {
         self.render_base() + 15
     }
     fn render_entry(self) -> u32 {
@@ -541,6 +543,11 @@ fn render_container(f: &mut FnBuilder<'_>, helpers: Helpers<'_>, p: u32, ty: u32
     dispatch(f, TYPE_ARRAY, helpers.render_array());
     dispatch(f, TYPE_OBJECT, helpers.render_object());
     dispatch(f, TYPE_FUNCTION, helpers.render_function());
+    // A typed array lists its elements and own properties like an array
+    // (DESIGN.md §5.8.8), so it takes the cycle guard too.
+    if helpers.has_binary() {
+        dispatch(f, i32::from(abi::TYPE_TYPEDARRAY), helpers.render_binary());
+    }
 }
 
 /// The promise arm of `__render_heap`: `Promise { .. }` by settlement.
@@ -577,8 +584,8 @@ fn render_promise(
     wasm!(f; End, End, End);
 }
 
-/// `__render_heap(p, depth)`: the cycle guard over the four container kinds,
-/// and the leaf kinds. A cycle target's `<ref *N> ` prefix is inserted at the
+/// `__render_heap(p, depth)`: the cycle guard over the four container kinds
+/// (and typed arrays, in a program that can reach them), and the leaf kinds. A cycle target's `<ref *N> ` prefix is inserted at the
 /// container's start offset once its children have been rendered.
 fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(
@@ -608,6 +615,11 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet
         LocalGet(ty), I32Const(TYPE_OBJECT), I32Eq, I32Or,
         LocalGet(ty), I32Const(TYPE_PROMISE), I32Eq, I32Or,
         LocalGet(ty), I32Const(TYPE_FUNCTION), I32Eq, I32Or,
+    );
+    if helpers.has_binary() {
+        wasm!(f; LocalGet(ty), I32Const(i32::from(abi::TYPE_TYPEDARRAY)), I32Eq, I32Or);
+    }
+    wasm!(f;
         LocalSet(cond),
         LocalGet(cond), If(BlockType::Empty),
         I32Const(0), LocalSet(i),

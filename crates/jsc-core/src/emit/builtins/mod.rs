@@ -41,6 +41,7 @@ mod object_static;
 mod promise;
 mod string;
 mod symbol;
+mod typed_array;
 mod weak;
 
 use crate::emit::realm::{ArrayCopyOp, DateBodyOp, DateSetOp};
@@ -103,6 +104,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
     nodes.extend(async_iter::fragments(k));
     nodes.extend(iterator::fragments());
     nodes.extend(array_buffer::fragments(k));
+    nodes.extend(typed_array::fragments(k));
     nodes
 }
 
@@ -330,6 +332,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(async_iter::strings())
         .chain(iterator::STRINGS)
         .chain(array_buffer::strings())
+        .chain(typed_array::strings())
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
 
@@ -358,6 +361,7 @@ fn emit_builtin_body(
         Builtin::WeakOp { .. } | Builtin::WeakCell(_) | Builtin::ArrayBuffer(_) => {
             emit_handle_family(builtin, f, frame, strings, helpers);
         }
+        Builtin::TypedArray(_) => typed_array::emit(builtin, f, frame, strings, helpers),
         Builtin::FunctionPrototype => wasm!(f; I64Const(UNDEFINED_BITS)),
         Builtin::HasOwnProperty => object::emit_has_own_property(f, frame, strings, helpers),
         Builtin::ObjectToString => object::emit_to_string(f, frame, strings, helpers),
@@ -419,8 +423,7 @@ fn emit_builtin_body(
         | Builtin::BooleanToString
         | Builtin::BooleanValueOf
         | Builtin::MathSumPrecise => emit_number_family(builtin, f, frame, strings, helpers),
-        Builtin::Protocol(op) => iter::emit_protocol(op, f, frame, strings, helpers),
-        Builtin::Iter(op) => iter::emit(op, f, frame, strings, helpers),
+        Builtin::Protocol(_) | Builtin::Iter(_) => iter_family(builtin, f, frame, strings, helpers),
         Builtin::PropertyIsEnumerable
         | Builtin::DefineAccessor { .. }
         | Builtin::LookupAccessor { .. }
@@ -456,6 +459,24 @@ fn emit_builtin_body(
     }
 }
 
+/// Emit the body of an internal iteration-protocol builtin
+/// ([`iter::emit_protocol`]) or a builtin iterator method ([`iter::emit`])
+/// into `f`.
+fn iter_family(
+    builtin: Builtin,
+    f: &mut FnBuilder<'_>,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    match builtin {
+        Builtin::Protocol(op) => iter::emit_protocol(op, f, frame, strings, helpers),
+        Builtin::Iter(op) => iter::emit(op, f, frame, strings, helpers),
+        // Only the variants `emit_builtin` routes here reach this match.
+        _ => {}
+    }
+}
+
 /// Emit the body of a weak-collection ([`weak::emit`]) or `ArrayBuffer`
 /// ([`array_buffer::emit`]) method into `f`: the families with a type byte
 /// of their own.
@@ -484,7 +505,8 @@ fn emit_global(builtin: Builtin, f: &mut FnBuilder<'_>, frame: Frame, helpers: H
 
 /// Emit the IR [`fragment`] body of `builtin` into `f`; the weak
 /// constructors (`WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`)
-/// go to [`weak::emit`] instead, `ArrayBuffer` to [`array_buffer::emit`].
+/// go to [`weak::emit`] instead, `ArrayBuffer` to [`array_buffer::emit`],
+/// the concrete typed-array constructors to [`typed_array::emit`].
 fn emit_fragment(
     builtin: Builtin,
     f: &mut FnBuilder<'_>,
@@ -498,6 +520,10 @@ fn emit_fragment(
     }
     if builtin == Builtin::Ctor(BuiltinCtor::ArrayBuffer) {
         array_buffer::emit(builtin, f, frame, strings, helpers);
+        return;
+    }
+    if let Builtin::Ctor(BuiltinCtor::Typed(_)) = builtin {
+        typed_array::emit(builtin, f, frame, strings, helpers);
         return;
     }
     let body = fragment(builtin, frame.k).unwrap_or(IrNode::Undefined);

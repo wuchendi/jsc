@@ -248,6 +248,11 @@ impl Intrinsic {
     pub(super) fn proto(self) -> Option<Intrinsic> {
         match self {
             Self::ObjectPrototype | Self::SymbolRegistry | Self::ArrayUnscopables => None,
+            // The concrete typed-array prototypes inherit from
+            // `%TypedArray.prototype%` (DESIGN.md §5.8.7).
+            Self::Prototype(BuiltinCtor::Typed(_)) => {
+                Some(Self::Prototype(BuiltinCtor::TypedArray))
+            }
             Self::FunctionPrototype
             | Self::ErrorPrototype(ErrorKind::Error)
             | Self::Global
@@ -270,6 +275,9 @@ impl Intrinsic {
             Self::Ctor(BuiltinCtor::Error(kind)) if kind != ErrorKind::Error => {
                 Some(Self::Ctor(BuiltinCtor::Error(ErrorKind::Error)))
             }
+            // The concrete typed-array constructors inherit from
+            // `%TypedArray%` (DESIGN.md §5.8.7).
+            Self::Ctor(BuiltinCtor::Typed(_)) => Some(Self::Ctor(BuiltinCtor::TypedArray)),
             Self::Ctor(_) => Some(Self::FunctionPrototype),
         }
     }
@@ -300,7 +308,9 @@ impl Intrinsic {
                 | BuiltinCtor::WeakSet
                 | BuiltinCtor::WeakRef
                 | BuiltinCtor::FinalizationRegistry
-                | BuiltinCtor::ArrayBuffer,
+                | BuiltinCtor::ArrayBuffer
+                | BuiltinCtor::TypedArray
+                | BuiltinCtor::Typed(_),
             ) => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_SELF_ALLOC,
             Self::Ctor(_) => abi::FUNC_FLAG_CONSTRUCTOR,
             _ => 0,
@@ -425,7 +435,19 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
 
 /// The binary-data constructors (DESIGN.md §5.8.7), whose constructor and
 /// prototype intrinsics follow every other intrinsic in the image.
-const BINARY_CTORS: [BuiltinCtor; 1] = [BuiltinCtor::ArrayBuffer];
+const BINARY_CTORS: [BuiltinCtor; 11] = [
+    BuiltinCtor::ArrayBuffer,
+    BuiltinCtor::TypedArray,
+    BuiltinCtor::Typed(ElementKind::Int8),
+    BuiltinCtor::Typed(ElementKind::Uint8),
+    BuiltinCtor::Typed(ElementKind::Uint8Clamped),
+    BuiltinCtor::Typed(ElementKind::Int16),
+    BuiltinCtor::Typed(ElementKind::Uint16),
+    BuiltinCtor::Typed(ElementKind::Int32),
+    BuiltinCtor::Typed(ElementKind::Uint32),
+    BuiltinCtor::Typed(ElementKind::Float32),
+    BuiltinCtor::Typed(ElementKind::Float64),
+];
 
 /// A builtin function body with the uniform ABI (see [`super::builtins`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -674,6 +696,109 @@ pub(super) enum Builtin {
     /// An `ArrayBuffer` static, `%ArrayBuffer.prototype%` method or getter
     /// (DESIGN.md §5.8.7, `emit/builtins/array_buffer.rs`).
     ArrayBuffer(ArrayBufferOp),
+    /// A `%TypedArray%` static, `%TypedArray.prototype%` getter or iterator
+    /// method (DESIGN.md §5.8.7, `emit/builtins/typed_array.rs`).
+    TypedArray(TypedArrayOp),
+}
+
+/// The `%TypedArray%` builtins of DESIGN.md §5.8.7 other than the
+/// constructors and `get [@@species]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TypedArrayOp {
+    /// `%TypedArray%.from(source, mapFn, thisArg)`.
+    From,
+    /// `%TypedArray%.of(...items)`.
+    Of,
+    /// The getter of `%TypedArray%.prototype.buffer`.
+    Buffer,
+    /// The getter of `%TypedArray%.prototype.byteLength`.
+    ByteLength,
+    /// The getter of `%TypedArray%.prototype.byteOffset`.
+    ByteOffset,
+    /// The getter of `%TypedArray%.prototype.length`.
+    Length,
+    /// The getter of `%TypedArray%.prototype[@@toStringTag]`.
+    ToStringTag,
+    /// `%TypedArray%.prototype.keys()`.
+    Keys,
+    /// `%TypedArray%.prototype.values()` (also `[@@iterator]`).
+    Values,
+    /// `%TypedArray%.prototype.entries()`.
+    Entries,
+}
+
+impl TypedArrayOp {
+    /// Every op, in [`Builtin::ALL`] order.
+    pub(super) const ALL: [TypedArrayOp; 10] = [
+        Self::From,
+        Self::Of,
+        Self::Buffer,
+        Self::ByteLength,
+        Self::ByteOffset,
+        Self::Length,
+        Self::ToStringTag,
+        Self::Keys,
+        Self::Values,
+        Self::Entries,
+    ];
+
+    /// The string-keyed getters, with their property keys, in installation
+    /// order.
+    pub(super) const GETTERS: [(TypedArrayOp, &'static str); 4] = [
+        (Self::Buffer, "buffer"),
+        (Self::ByteLength, "byteLength"),
+        (Self::ByteOffset, "byteOffset"),
+        (Self::Length, "length"),
+    ];
+
+    /// The builtin's `name`.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::From => "from",
+            Self::Of => "of",
+            Self::Buffer => "get buffer",
+            Self::ByteLength => "get byteLength",
+            Self::ByteOffset => "get byteOffset",
+            Self::Length => "get length",
+            Self::ToStringTag => "get [Symbol.toStringTag]",
+            Self::Keys => "keys",
+            Self::Values => "values",
+            Self::Entries => "entries",
+        }
+    }
+
+    /// The builtin's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::From => 1,
+            Self::Of
+            | Self::Buffer
+            | Self::ByteLength
+            | Self::ByteOffset
+            | Self::Length
+            | Self::ToStringTag
+            | Self::Keys
+            | Self::Values
+            | Self::Entries => 0,
+        }
+    }
+
+    /// The prototype holding this builtin as a method, if any (the getters
+    /// are accessor entries, `from` / `of` statics).
+    fn prototype(self) -> Option<Intrinsic> {
+        match self {
+            Self::Keys | Self::Values | Self::Entries => {
+                Some(Intrinsic::Prototype(BuiltinCtor::TypedArray))
+            }
+            Self::From
+            | Self::Of
+            | Self::Buffer
+            | Self::ByteLength
+            | Self::ByteOffset
+            | Self::Length
+            | Self::ToStringTag => None,
+        }
+    }
 }
 
 /// The `ArrayBuffer` builtins of DESIGN.md §5.8.7 other than the
@@ -1802,7 +1927,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 377] = [
+    pub(super) const ALL: [Builtin; 398] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -2276,6 +2401,27 @@ impl Builtin {
         Self::ArrayBuffer(ArrayBufferOp::ALL[7]),
         Self::ArrayBuffer(ArrayBufferOp::ALL[8]),
         Self::Species(SpeciesOp::Getter(BuiltinCtor::ArrayBuffer)),
+        Self::Ctor(BuiltinCtor::TypedArray),
+        Self::Ctor(BuiltinCtor::Typed(ElementKind::Int8)),
+        Self::Ctor(BuiltinCtor::Typed(ElementKind::Uint8)),
+        Self::Ctor(BuiltinCtor::Typed(ElementKind::Uint8Clamped)),
+        Self::Ctor(BuiltinCtor::Typed(ElementKind::Int16)),
+        Self::Ctor(BuiltinCtor::Typed(ElementKind::Uint16)),
+        Self::Ctor(BuiltinCtor::Typed(ElementKind::Int32)),
+        Self::Ctor(BuiltinCtor::Typed(ElementKind::Uint32)),
+        Self::Ctor(BuiltinCtor::Typed(ElementKind::Float32)),
+        Self::Ctor(BuiltinCtor::Typed(ElementKind::Float64)),
+        Self::TypedArray(TypedArrayOp::ALL[0]),
+        Self::TypedArray(TypedArrayOp::ALL[1]),
+        Self::TypedArray(TypedArrayOp::ALL[2]),
+        Self::TypedArray(TypedArrayOp::ALL[3]),
+        Self::TypedArray(TypedArrayOp::ALL[4]),
+        Self::TypedArray(TypedArrayOp::ALL[5]),
+        Self::TypedArray(TypedArrayOp::ALL[6]),
+        Self::TypedArray(TypedArrayOp::ALL[7]),
+        Self::TypedArray(TypedArrayOp::ALL[8]),
+        Self::TypedArray(TypedArrayOp::ALL[9]),
+        Self::Species(SpeciesOp::Getter(BuiltinCtor::TypedArray)),
     ];
 
     /// The function's `name`.
@@ -2295,6 +2441,7 @@ impl Builtin {
             Self::Species(op) => op.name(),
             Self::Iterator(op) => op.name(),
             Self::ArrayBuffer(op) => op.name(),
+            Self::TypedArray(op) => op.name(),
             method => method.method_name(),
         }
     }
@@ -2442,7 +2589,8 @@ impl Builtin {
                 | BuiltinCtor::Symbol
                 | BuiltinCtor::Iterator
                 | BuiltinCtor::WeakMap
-                | BuiltinCtor::WeakSet,
+                | BuiltinCtor::WeakSet
+                | BuiltinCtor::TypedArray,
             ) => 0,
             Self::Iter(op) => op.length(),
             Self::Ctor(BuiltinCtor::Date) | Self::DateBody(DateBodyOp::Utc) => 7,
@@ -2474,7 +2622,8 @@ impl Builtin {
             Self::Species(op) => op.length(),
             Self::Iterator(op) => op.length(),
             Self::ArrayBuffer(op) => op.length(),
-            Self::JsonStringify => 3,
+            Self::TypedArray(op) => op.length(),
+            Self::JsonStringify | Self::Ctor(BuiltinCtor::Typed(_)) => 3,
             // Every other builtin takes one argument.
             _ => 1,
         }
@@ -2538,6 +2687,7 @@ impl Builtin {
             Self::Iter(op) => return op.prototype(),
             Self::Iterator(op) => return op.prototype(),
             Self::ArrayBuffer(op) => return op.prototype(),
+            Self::TypedArray(op) => return op.prototype(),
             _ => None,
         };
         ctor.map(Intrinsic::Prototype)
@@ -2662,7 +2812,7 @@ const NUMBER_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 36] = [
+const GLOBALS: [(&str, u32, Value); 45] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -2815,6 +2965,53 @@ const GLOBALS: [(&str, u32, Value); 36] = [
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::ArrayBuffer)),
     ),
+    (
+        "Int8Array",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::Int8))),
+    ),
+    (
+        "Uint8Array",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::Uint8))),
+    ),
+    (
+        "Uint8ClampedArray",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(
+            ElementKind::Uint8Clamped,
+        ))),
+    ),
+    (
+        "Int16Array",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::Int16))),
+    ),
+    (
+        "Uint16Array",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::Uint16))),
+    ),
+    (
+        "Int32Array",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::Int32))),
+    ),
+    (
+        "Uint32Array",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::Uint32))),
+    ),
+    (
+        "Float32Array",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::Float32))),
+    ),
+    (
+        "Float64Array",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::Float64))),
+    ),
 ];
 
 /// The `%Object.prototype%` methods, in slot order.
@@ -2923,6 +3120,7 @@ pub(super) fn registry() -> Vec<Entry> {
     }
     constructor_entries(&mut entries);
     array_buffer_entries(&mut entries);
+    typed_array_entries(&mut entries);
     entries.extend(GLOBALS.map(|(key, attrs, value)| entry(Intrinsic::Global, key, attrs, value)));
     entries
 }
@@ -3054,6 +3252,69 @@ fn array_buffer_entries(entries: &mut Vec<Entry>) {
             set: None,
         },
     }));
+}
+
+/// The `%TypedArray%` entries past [`constructor_entries`] (DESIGN.md
+/// §5.8.7): its statics `from` / `of` and `get [@@species]`; the `%TypedArray.prototype%` getters,
+/// `get [@@toStringTag]` (configurable, non-enumerable accessors without a
+/// setter) and `[@@iterator]` (the `values` function object); and each
+/// concrete constructor's and prototype's constant `BYTES_PER_ELEMENT`.
+fn typed_array_entries(entries: &mut Vec<Entry>) {
+    let (ctor, proto) = (
+        Intrinsic::Ctor(BuiltinCtor::TypedArray),
+        Intrinsic::Prototype(BuiltinCtor::TypedArray),
+    );
+    let getter = |op| Value::Accessor {
+        get: Builtin::TypedArray(op),
+        set: None,
+    };
+    for op in [TypedArrayOp::From, TypedArrayOp::Of] {
+        let builtin = Builtin::TypedArray(op);
+        entries.push(Entry {
+            intrinsic: ctor,
+            key: Key::Str(builtin.name()),
+            attrs: METHOD_ATTRS,
+            value: Value::Method(builtin),
+        });
+    }
+    entries.push(Entry {
+        intrinsic: ctor,
+        key: Key::Symbol(WellKnown::Species),
+        attrs: ACCESSOR_ATTRS,
+        value: Value::Accessor {
+            get: Builtin::Species(SpeciesOp::Getter(BuiltinCtor::TypedArray)),
+            set: None,
+        },
+    });
+    entries.extend(TypedArrayOp::GETTERS.map(|(op, key)| Entry {
+        intrinsic: proto,
+        key: Key::Str(key),
+        attrs: ACCESSOR_ATTRS,
+        value: getter(op),
+    }));
+    entries.push(Entry {
+        intrinsic: proto,
+        key: Key::Symbol(WellKnown::ToStringTag),
+        attrs: ACCESSOR_ATTRS,
+        value: getter(TypedArrayOp::ToStringTag),
+    });
+    entries.push(Entry {
+        intrinsic: proto,
+        key: Key::Symbol(WellKnown::Iterator),
+        attrs: METHOD_ATTRS,
+        value: Value::Method(Builtin::TypedArray(TypedArrayOp::Values)),
+    });
+    for kind in ElementKind::ALL {
+        let ctor = BuiltinCtor::Typed(kind);
+        for intrinsic in [Intrinsic::Ctor(ctor), Intrinsic::Prototype(ctor)] {
+            entries.push(Entry {
+                intrinsic,
+                key: Key::Str("BYTES_PER_ELEMENT"),
+                attrs: CONST_ATTRS,
+                value: Value::Num(f64::from(kind.size())),
+            });
+        }
+    }
 }
 
 /// The method names `Array.prototype[@@unscopables]` lists.
@@ -3758,12 +4019,14 @@ mod tests {
                         | BuiltinCtor::Promise
                         | BuiltinCtor::Date
                         | BuiltinCtor::ArrayBuffer
+                        | BuiltinCtor::TypedArray
                 ) | Intrinsic::Ctor(
                     BuiltinCtor::Array
                         | BuiltinCtor::Map
                         | BuiltinCtor::Set
                         | BuiltinCtor::Promise
                         | BuiltinCtor::ArrayBuffer
+                        | BuiltinCtor::TypedArray
                 ) | Intrinsic::FunctionPrototype
                     | Intrinsic::IteratorPrototype
                     | Intrinsic::AsyncIteratorPrototype
@@ -3913,7 +4176,8 @@ mod tests {
         let all: Vec<Intrinsic> = intrinsics().collect();
         let ctor = Intrinsic::Ctor(BuiltinCtor::ArrayBuffer);
         let proto = Intrinsic::Prototype(BuiltinCtor::ArrayBuffer);
-        assert_eq!(all[all.len() - 2..], [ctor, proto]);
+        let binary = all.len() - 2 * BINARY_CTORS.len();
+        assert_eq!(all[binary..binary + 2], [ctor, proto]);
         assert_eq!(all.iter().filter(|i| **i == ctor).count(), 1);
         assert_eq!(
             ctor.flags(),
@@ -3981,6 +4245,141 @@ mod tests {
         );
         assert_eq!(ctor.watch_bit(), None);
         assert_eq!(proto.watch_bit(), None);
+    }
+
+    #[test]
+    fn typed_array_intrinsics_follow_array_buffer() {
+        // DESIGN.md §5.8.7: `%TypedArray%`, its prototype, then each concrete
+        // constructor and prototype in kind order, after `%ArrayBuffer%`.
+        let all: Vec<Intrinsic> = intrinsics().collect();
+        let tail: Vec<Intrinsic> = BINARY_CTORS
+            .into_iter()
+            .flat_map(|c| [Intrinsic::Ctor(c), Intrinsic::Prototype(c)])
+            .collect();
+        assert_eq!(all[all.len() - tail.len()..], tail[..]);
+        assert_eq!(BINARY_CTORS[1], BuiltinCtor::TypedArray);
+        let ta = Intrinsic::Ctor(BuiltinCtor::TypedArray);
+        let ta_proto = Intrinsic::Prototype(BuiltinCtor::TypedArray);
+        assert_eq!(ta.proto(), Some(Intrinsic::FunctionPrototype));
+        assert_eq!(ta_proto.proto(), Some(Intrinsic::ObjectPrototype));
+        assert_eq!(Builtin::Ctor(BuiltinCtor::TypedArray).length(), 0);
+        assert_eq!(BuiltinCtor::from_name("TypedArray"), None);
+        let registry = registry();
+        let own = |intrinsic, key| {
+            registry
+                .iter()
+                .filter(|e| e.intrinsic == intrinsic && e.key == key)
+                .map(|e| (e.attrs, e.value))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            own(ta, Key::Str("name")),
+            [(FN_FACT_ATTRS, Value::Str("TypedArray"))]
+        );
+        for op in [TypedArrayOp::From, TypedArrayOp::Of] {
+            let builtin = Builtin::TypedArray(op);
+            assert_eq!(
+                own(ta, Key::Str(builtin.name())),
+                [(METHOD_ATTRS, Value::Method(builtin))]
+            );
+        }
+        assert_eq!(Builtin::TypedArray(TypedArrayOp::From).length(), 1);
+        assert_eq!(Builtin::TypedArray(TypedArrayOp::Of).length(), 0);
+        assert_eq!(
+            own(ta, Key::Symbol(WellKnown::Species)),
+            [(
+                ACCESSOR_ATTRS,
+                Value::Accessor {
+                    get: Builtin::Species(SpeciesOp::Getter(BuiltinCtor::TypedArray)),
+                    set: None,
+                }
+            )]
+        );
+        for (op, key) in TypedArrayOp::GETTERS {
+            assert_eq!(
+                own(ta_proto, Key::Str(key)),
+                [(
+                    ACCESSOR_ATTRS,
+                    Value::Accessor {
+                        get: Builtin::TypedArray(op),
+                        set: None,
+                    }
+                )]
+            );
+            assert_eq!(Builtin::TypedArray(op).name(), format!("get {key}"));
+        }
+        assert_eq!(
+            own(ta_proto, Key::Symbol(WellKnown::ToStringTag)),
+            [(
+                ACCESSOR_ATTRS,
+                Value::Accessor {
+                    get: Builtin::TypedArray(TypedArrayOp::ToStringTag),
+                    set: None,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn typed_array_prototype_entries() {
+        // DESIGN.md §5.8.7: the `%TypedArray.prototype%` iterator methods
+        // (`[@@iterator]` is `values`), and each concrete constructor's facts.
+        let ta = Intrinsic::Ctor(BuiltinCtor::TypedArray);
+        let ta_proto = Intrinsic::Prototype(BuiltinCtor::TypedArray);
+        let registry = registry();
+        let own = |intrinsic, key| {
+            registry
+                .iter()
+                .filter(|e| e.intrinsic == intrinsic && e.key == key)
+                .map(|e| (e.attrs, e.value))
+                .collect::<Vec<_>>()
+        };
+        let values = Builtin::TypedArray(TypedArrayOp::Values);
+        assert_eq!(method_of(ta_proto, "values"), Some(values));
+        assert_eq!(
+            own(ta_proto, Key::Symbol(WellKnown::Iterator)),
+            [(METHOD_ATTRS, Value::Method(values))]
+        );
+        for op in [TypedArrayOp::Keys, TypedArrayOp::Entries] {
+            assert_eq!(
+                method_of(ta_proto, Builtin::TypedArray(op).name()),
+                Some(Builtin::TypedArray(op))
+            );
+        }
+        assert_eq!(
+            own(ta_proto, Key::Str("constructor")),
+            [(METHOD_ATTRS, Value::Intrinsic(ta))]
+        );
+        for kind in ElementKind::ALL {
+            let ctor = BuiltinCtor::Typed(kind);
+            let (c, p) = (Intrinsic::Ctor(ctor), Intrinsic::Prototype(ctor));
+            assert_eq!(c.proto(), Some(ta));
+            assert_eq!(p.proto(), Some(ta_proto));
+            assert_eq!(
+                c.flags(),
+                abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_SELF_ALLOC
+            );
+            assert_eq!(Builtin::Ctor(ctor).length(), 3);
+            assert_eq!(BuiltinCtor::from_name(kind.name()), Some(ctor));
+            let bytes = Value::Num(f64::from(kind.size()));
+            assert_eq!(
+                own(c, Key::Str("BYTES_PER_ELEMENT")),
+                [(CONST_ATTRS, bytes)]
+            );
+            assert_eq!(
+                own(p, Key::Str("BYTES_PER_ELEMENT")),
+                [(CONST_ATTRS, bytes)]
+            );
+            assert_eq!(
+                own(p, Key::Str("constructor")),
+                [(METHOD_ATTRS, Value::Intrinsic(c))]
+            );
+            assert_eq!(
+                own(Intrinsic::Global, Key::Str(kind.name())),
+                [(METHOD_ATTRS, Value::Intrinsic(c))]
+            );
+            assert_eq!(c.watch_bit(), None);
+        }
     }
 
     #[test]

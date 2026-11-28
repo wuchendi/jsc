@@ -504,7 +504,7 @@ const CORE: [Row<Core>; 59] = [
         emit_sparse_set(cx.helpers, false, cx.leaves)
     }),
     (Core::ProtosIndexless, (&[I32], &[I32]), |cx| {
-        emit_protos_indexless(cx.leaves)
+        emit_protos_indexless(cx.helpers, cx.leaves)
     }),
     (Core::ProtoElem, (&[I32, I32], &[I64]), |cx| {
         emit_proto_elem(cx.helpers, cx.leaves)
@@ -728,10 +728,10 @@ const CONV: [Row<Conv>; 26] = [
         emit_own_desc(cx.strings, cx.helpers, cx.leaves)
     }),
     (Conv::SetIntegrity, (&[I64, I32], &[]), |cx| {
-        emit_set_integrity(cx.helpers, cx.leaves)
+        emit_set_integrity(cx.strings, cx.helpers, cx.leaves)
     }),
     (Conv::TestIntegrity, (&[I64, I32], &[I32]), |cx| {
-        emit_test_integrity(cx.leaves)
+        emit_test_integrity(cx.helpers, cx.leaves)
     }),
     (Conv::OwnEnum, (&[I64, I32], &[I32]), |cx| {
         emit_own_enum(cx.strings, cx.helpers, cx.leaves)

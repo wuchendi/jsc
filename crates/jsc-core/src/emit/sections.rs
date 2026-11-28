@@ -1306,8 +1306,9 @@ fn collect_entries<'a>(entries: &'a [(PropKey, IrNode)], strs: &mut Strs<'a>) {
 /// `Object.prototype.__proto__` pair, the `constructor` / `@@toStringTag`
 /// pairs of `%Iterator.prototype%`, which a program reaches only through
 /// `Iterator`, a prototype read or write, or `constructor`, the
-/// `Symbol.prototype.description` getter, the `%ArrayBuffer.prototype%`
-/// getters, which a program reaches only through `ArrayBuffer`): it names them,
+/// `Symbol.prototype.description` getter, the `%ArrayBuffer.prototype%` and
+/// `%TypedArray.prototype%` getters, which a program reaches only through a
+/// binary-data constructor): it names them,
 /// or reads or writes a member under a key computed at run time. Then `__get` / `__set` must
 /// dispatch to getters and setters. (The builtins only read fixed keys:
 /// `length`, indices, `prototype`, `name`, `message`; `Object.assign` writes
@@ -1321,7 +1322,7 @@ fn program_has_accessors(program: &IrProgram) -> bool {
         IrNode::MakeAccessor { .. }
         | IrNode::SizeRead { .. }
         | IrNode::Intrinsic(GlobalIntrinsic::Ctor(
-            BuiltinCtor::Iterator | BuiltinCtor::ArrayBuffer,
+            BuiltinCtor::Iterator | BuiltinCtor::ArrayBuffer | BuiltinCtor::Typed(_),
         )) => true,
         IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
             global.name == "Iterator" || BINARY_NAMES.contains(&global.name.as_str())
@@ -1357,7 +1358,18 @@ fn program_has_accessors(program: &IrProgram) -> bool {
 }
 
 /// The globals of the binary-data constructors (DESIGN.md §5.8.5).
-const BINARY_NAMES: [&str; 1] = ["ArrayBuffer"];
+const BINARY_NAMES: [&str; 10] = [
+    "ArrayBuffer",
+    "Int8Array",
+    "Uint8Array",
+    "Uint8ClampedArray",
+    "Int16Array",
+    "Uint16Array",
+    "Int32Array",
+    "Uint32Array",
+    "Float32Array",
+    "Float64Array",
+];
 
 /// Whether `program` can reach binary data (DESIGN.md §5.8.5): it names a
 /// binary-data constructor (the intrinsic, a global reference, or a string
@@ -1367,7 +1379,8 @@ const BINARY_NAMES: [&str; 1] = ["ArrayBuffer"];
 fn program_has_binary(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
         IrNode::Intrinsic(
-            GlobalIntrinsic::Global | GlobalIntrinsic::Ctor(BuiltinCtor::ArrayBuffer),
+            GlobalIntrinsic::Global
+            | GlobalIntrinsic::Ctor(BuiltinCtor::ArrayBuffer | BuiltinCtor::Typed(_)),
         ) => true,
         IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
             BINARY_NAMES.contains(&global.name.as_str())

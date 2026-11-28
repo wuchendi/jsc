@@ -861,8 +861,7 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         &[ROOT_BASE, ROOT_BASE, ROOT_JS, RAW_I32],
         &DEFINE_LOCALS,
     );
-    let (o, key, v, attrs) = (0, 1, 2, 3);
-    let (e, p, q, n, src, end, cap) = (4, 5, 6, 7, 8, 9, 10);
+    let (o, key, v, attrs, e, p, q, n, src, end, cap) = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
     // Throw the keyed `__prop_throw` TypeError of `mode` for `o` / `key`.
     let throw = |f: &mut FnBuilder<'_>, mode: i32| {
         wasm!(f; LocalGet(o));
@@ -871,6 +870,7 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         emit_box_heap(f);
         wasm!(f; I32Const(mode), Call(helpers.prop_throw), Return);
     };
+    emit_ta_define_arm(&mut f, [o, key, v, attrs, n], helpers);
     wasm!(f;
         LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e), I32Eqz,
         If(BlockType::Empty),
@@ -964,6 +964,29 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     }
     wasm!(f; End);
     finish_builder(f)
+}
+
+/// The typed-array arm of `__define` (DESIGN.md §5.8.5): a numeric key never
+/// reaches the table of the typed array in i32 `o` — a valid index with the
+/// default attributes is `TypedArraySetElement` of `v`, anything else the
+/// redefinition `TypeError` (left pending). `i` is i32 scratch.
+fn emit_ta_define_arm(
+    f: &mut FnBuilder<'_>,
+    [o, key, v, attrs, i]: [u32; 5],
+    helpers: Helpers<'_>,
+) {
+    emit_if_ta_numeric(f, o, key, i, helpers, |f| {
+        emit_ta_valid(f, o, i, helpers);
+        wasm!(f;
+            LocalGet(attrs), I32Const(ATTRS_DEFAULT), I32Eq, I32And,
+            If(BlockType::Empty),
+            LocalGet(o), LocalGet(i), LocalGet(v), Call(helpers.ta_set_value()), Return,
+            End,
+            LocalGet(o), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+            LocalGet(key), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
+            I32Const(PROP_THROW_REDEFINE), Call(helpers.prop_throw), Return,
+        );
+    });
 }
 
 /// `__fn_materialize(o: i32)`: clear the `LAZY` flag of the function block `o`
@@ -1127,6 +1150,55 @@ fn emit_exotic_index(function: &mut impl Sink, key: u32, i: u32, helpers: Helper
     );
 }
 
+/// Kind byte of a typed array (see [`abi::TYPE_TYPEDARRAY`]).
+const TYPE_TYPEDARRAY: i32 = abi::TYPE_TYPEDARRAY as i32;
+
+/// The integer-indexed exotic arm (DESIGN.md §5.8.5), emitted only in a
+/// program that can reach binary data: when the object-family block in i32
+/// local `o` is a typed array and the `key` (i32 local, nonzero; interned or
+/// a fresh index string from `__own_keys`) is a canonical numeric string,
+/// run `body` with its integer index in i32 local `i` — the value of a
+/// canonical array index (`__index_value`, by content), `-1` (never valid)
+/// for any other canonical numeric key (`__ta_canonical`, which allocates)
+/// and for an index past `2^31`, since a valid index is below `2^29`.
+/// `body` decides and leaves the helper; other keys fall through to the
+/// ordinary steps.
+pub(super) fn emit_if_ta_numeric<S: Sink>(
+    function: &mut S,
+    o: u32,
+    key: u32,
+    i: u32,
+    helpers: Helpers<'_>,
+    body: impl FnOnce(&mut S),
+) {
+    if !helpers.has_binary() {
+        return;
+    }
+    wasm!(function;
+        LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_TYPEDARRAY), I32Eq,
+        If(BlockType::Empty),
+        LocalGet(key), I32Load8U(m8(0)), I32Const(TYPE_STRING), I32Eq,
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(key), Call(helpers.index_value), LocalTee(i), I32Const(-1), I32Ne,
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(i), I32Const(-1), LocalGet(i), I32Const(0), I32GeS, Select,
+        Else,
+        I32Const(-1), I32Const(-2), LocalGet(key), Call(helpers.ta_canonical()), Select,
+        End,
+        Else, I32Const(-2), End,
+        LocalTee(i), I32Const(-2), I32Ne,
+        If(BlockType::Empty),
+    );
+    body(function);
+    wasm!(function; End, End);
+}
+
+/// Push `IsValidIntegerIndex` of the typed array in i32 local `o` and the
+/// index in i32 local `i` (unsigned: `-1` is never valid).
+pub(super) fn emit_ta_valid(function: &mut impl Sink, o: u32, i: u32, helpers: Helpers<'_>) {
+    wasm!(function; LocalGet(i), LocalGet(o), Call(helpers.ta_length()), I32LtU);
+}
+
 /// `__get(recv: i64, key: i32) -> i64`: `OrdinaryGet` of the interned `key` on
 /// any jsval. Each object on the way — `recv`, then each `proto` — answers
 /// first from its exotic own keys when it is a string or an array (`length`,
@@ -1204,6 +1276,11 @@ fn emit_get_from(
         Loop(BlockType::Empty),
         LocalGet(o), I32Load8U(m8(0)), LocalSet(t),
     );
+    // A typed array answers a numeric key itself, on the receiver or as a
+    // prototype; the chain is not consulted.
+    emit_if_ta_numeric(&mut f, o, key, i, helpers, |f| {
+        wasm!(f; LocalGet(o), LocalGet(i), Call(helpers.ta_get()), Return);
+    });
     emit_is_string_or_array_kind(&mut f, t);
     wasm!(f; If(BlockType::Empty));
     emit_exotic_get(&mut f, o, t, key, i, e, p, strings, helpers);
@@ -1396,6 +1473,12 @@ fn emit_set_from(
         I32Const(i32::from(receiver.is_none())), LocalSet(own),
         Block(BlockType::Empty), Loop(BlockType::Empty),
     );
+    emit_ta_set_arm(
+        &mut f,
+        [q, key, v, this, own, a, e],
+        receiver.is_some(),
+        helpers,
+    );
     // A String wrapper's index is a read-only data property.
     emit_if_str_exotic(&mut f, q, key, a, helpers, |f| {
         emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
@@ -1462,6 +1545,40 @@ fn emit_set_from(
     emit_receiver_set(&mut f, [this, key, v], [o, e, a], strings, helpers);
     wasm!(f; End);
     finish_builder(f)
+}
+
+/// The typed-array arm of [`emit_set_from`]'s chain walk at the object in
+/// i32 `q` (DESIGN.md §5.8.5): the first typed array on the way decides a
+/// numeric key — the receiver itself (`own` for `__set`; the jsval `this`
+/// for `__super_set`, `receiver`) takes `TypedArraySetElement` of `v`; on the
+/// chain an invalid index is a silent success and a valid one acts as a
+/// writable data property found there (`e = 0`, leaving the walk for the
+/// receiver path). `a` is i32 scratch.
+fn emit_ta_set_arm(
+    f: &mut impl Sink,
+    [q, key, v, this, own, a, e]: [u32; 7],
+    receiver: bool,
+    helpers: Helpers<'_>,
+) {
+    emit_if_ta_numeric(f, q, key, a, helpers, |f| {
+        if receiver {
+            emit_is_pointer(f, this);
+            wasm!(f;
+                If(BlockType::Result(ValType::I32)),
+                LocalGet(q), LocalGet(this), I32WrapI64, I32Eq,
+                Else, I32Const(0), End,
+            );
+        } else {
+            wasm!(f; LocalGet(own));
+        }
+        wasm!(f;
+            If(BlockType::Empty),
+            LocalGet(q), LocalGet(a), LocalGet(v), Call(helpers.ta_set_value()), Return,
+            End,
+        );
+        emit_ta_valid(f, q, a, helpers);
+        wasm!(f; I32Eqz, If(BlockType::Empty), Return, End, I32Const(0), LocalSet(e), Br(3));
+    });
 }
 
 /// The receiver half of [`emit_super_set`] (`OrdinarySetWithOwnDescriptor`
@@ -1595,6 +1712,12 @@ fn emit_has_lookup(
         Loop(BlockType::Empty),
         LocalGet(o), I32Load8U(m8(0)), LocalSet(t),
     );
+    // A typed array's numeric key is `IsValidIntegerIndex`; the chain is not
+    // consulted.
+    emit_if_ta_numeric(&mut f, o, key, i, helpers, |f| {
+        emit_ta_valid(f, o, i, helpers);
+        wasm!(f; Return);
+    });
     emit_is_string_or_array_kind(&mut f, t);
     wasm!(f;
         If(BlockType::Empty),
@@ -1677,6 +1800,16 @@ pub(super) fn emit_delete(
         LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalTee(t),
         I32Const(TYPE_STRING), I32Eq, LocalGet(t), I32Const(TYPE_SYMBOL), I32Eq, I32Or,
         If(BlockType::Empty), Return, End,
+    );
+    // A typed array's valid index is non-configurable; an invalid numeric
+    // key has nothing to delete (the table is not touched).
+    emit_if_ta_numeric(&mut f, o, key, i, helpers, |f| {
+        emit_ta_valid(f, o, i, helpers);
+        wasm!(f; If(BlockType::Empty));
+        emit_prop_throw_return(f, obj, key, PROP_THROW_DELETE, helpers);
+        wasm!(f; End, Return);
+    });
+    wasm!(f;
         LocalGet(t), I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
         LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq,
@@ -2050,7 +2183,7 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>, define: bool, leaves: &LeafS
 /// is absent; else `0`. A dictionary-mode array (`%Array.prototype%`) keeps
 /// every element in its table, so its table flag covers it. The builtins'
 /// array fast paths that read a hole as absent run only under it.
-pub(super) fn emit_protos_indexless(leaves: &LeafSet) -> Function {
+pub(super) fn emit_protos_indexless(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_BASE], &[ROOT_JS, RAW_I32]);
     let (o, p, t) = (0, 1, 2);
     wasm!(f;
@@ -2064,8 +2197,12 @@ pub(super) fn emit_protos_indexless(leaves: &LeafSet) -> Function {
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_DICTIONARY), I32And, I32Eqz, I32And,
     );
     emit_is_string_wrapper(&mut f, o);
+    wasm!(f; I32Or);
+    // A typed-array prototype answers its own indices (DESIGN.md §5.8.5).
+    if helpers.has_binary() {
+        wasm!(f; LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_TYPEDARRAY), I32Eq, I32Or);
+    }
     wasm!(f;
-        I32Or,
         If(BlockType::Empty), I32Const(0), Return, End,
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(t),
         If(BlockType::Empty),
@@ -2139,6 +2276,17 @@ pub(super) fn emit_proto_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
     emit_is_pointer(&mut f, p);
     wasm!(f;
         I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(p), I32WrapI64, LocalSet(q),
+    );
+    // A typed-array prototype decides (DESIGN.md §5.8.5): a valid index is a
+    // writable data property there (the own element is created), an invalid
+    // one a silent success.
+    if helpers.has_binary() {
+        wasm!(f; LocalGet(q), I32Load8U(m8(0)), I32Const(TYPE_TYPEDARRAY), I32Eq, If(BlockType::Empty));
+        emit_ta_valid(&mut f, q, i, helpers);
+        wasm!(f; I32Eqz, Return, End);
+    }
+    wasm!(f;
         // A present store element of an array prototype is a writable data
         // property (an attributed one lives in a dictionary array's table).
         LocalGet(p), I32WrapI64, LocalTee(q), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
@@ -2587,13 +2735,27 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
     wasm!(f;
         Else,
     );
-    // A String wrapper lists its virtual indices `0..n` first.
+    // A String wrapper lists its virtual indices `0..n` first, as does a
+    // typed array (its current length, DESIGN.md §5.8.5).
     emit_is_string_wrapper(&mut f, o);
     wasm!(f;
         If(BlockType::Result(ValType::I32)),
         LocalGet(o), I64Load(m64(u64::from(abi::WRAPPER_VALUE_OFFSET))), I32WrapI64,
         I32Load(m32(STR_LEN_OFFSET)),
-        Else, I32Const(0), End,
+        Else,
+    );
+    if helpers.has_binary() {
+        wasm!(f;
+            LocalGet(t), I32Const(TYPE_TYPEDARRAY), I32Eq,
+            If(BlockType::Result(ValType::I32)),
+            LocalGet(o), Call(helpers.ta_length()),
+            Else, I32Const(0), End,
+        );
+    } else {
+        wasm!(f; I32Const(0));
+    }
+    wasm!(f;
+        End,
         LocalTee(n), I32Eqz,
         LocalGet(p), I32Eqz, I32And,
         If(BlockType::Empty), I32Const(0), Call(new_array),
@@ -2731,14 +2893,32 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
     // `__get`.
     wasm!(f;
         Else,
-        LocalGet(t), I32Const(TYPE_ARRAY), I32Eq, LocalGet(recheck), I32Eqz, I32And,
+        LocalGet(t), I32Const(TYPE_ARRAY), I32Eq,
+    );
+    if helpers.has_binary() {
+        // A typed array's index key (a fresh string) reads its element.
+        wasm!(f; LocalGet(t), I32Const(TYPE_TYPEDARRAY), I32Eq, I32Or);
+    }
+    wasm!(f;
+        LocalGet(recheck), I32Eqz, I32And,
         If(BlockType::Result(ValType::I32)),
         LocalGet(kv), I32WrapI64, Call(helpers.index_value), LocalTee(n), I32Const(-1), I32Ne,
         Else, I32Const(0),
         End,
         If(BlockType::Result(ValType::I64)),
     );
-    emit_elem_load(&mut f, o, n, helpers.sparse_get());
+    if helpers.has_binary() {
+        wasm!(f;
+            LocalGet(t), I32Const(TYPE_TYPEDARRAY), I32Eq,
+            If(BlockType::Result(ValType::I64)),
+            LocalGet(o), LocalGet(n), Call(helpers.ta_get()),
+            Else,
+        );
+        emit_elem_load(&mut f, o, n, helpers.sparse_get());
+        wasm!(f; End);
+    } else {
+        emit_elem_load(&mut f, o, n, helpers.sparse_get());
+    }
     wasm!(f;
         Else,
         LocalGet(obj), LocalGet(kv), I32WrapI64, Call(helpers.get),
@@ -2836,6 +3016,10 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
         LocalGet(cur), I32WrapI64, LocalTee(m), I32Load8U(m8(0)), LocalSet(i),
     );
     emit_is_string_or_array_kind(&mut f, i);
+    if helpers.has_binary() {
+        // A typed array's indices are exotic keys too (DESIGN.md §5.8.5).
+        wasm!(f; LocalGet(i), I32Const(TYPE_TYPEDARRAY), I32Eq, I32Or);
+    }
     wasm!(f;
         If(BlockType::Empty), I32Const(1), LocalSet(j), Br(2), End,
         LocalGet(m), I32Load(m32(OBJ_PROPS)), LocalTee(n),

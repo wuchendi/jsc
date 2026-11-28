@@ -190,7 +190,7 @@ pub(super) fn emit(
 
 /// Push a fresh `CLASS_ITERATOR` object over the jsval in i64 `target`
 /// with `kind` and the `proto` of `family` (`obj` an i32 temp).
-fn create(
+pub(super) fn create(
     function: &mut FnBuilder<'_>,
     target: u32,
     obj: u32,
@@ -473,8 +473,57 @@ fn emit_next(
 }
 
 /// An Array Iterator step into `value`: `LengthOfArrayLike` re-read per
-/// step, then the index (keys), `Get(target, index)` (values) or both.
+/// step, then the index (keys), `Get(target, index)` (values) or both. A
+/// typed-array target (only in a program that can reach one, DESIGN.md
+/// §5.8.7) takes its length from the buffer witness instead (out of bounds
+/// or detached throws, exhausting the iterator) and its elements from
+/// `__ta_get`.
 fn step_array(function: &mut FnBuilder<'_>, st: Step, strings: &StrOffsets, helpers: Helpers<'_>) {
+    if helpers.has_binary() {
+        wasm!(function;
+            LocalGet(st.target), I32WrapI64, I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }),
+            I32Const(i32::from(abi::TYPE_TYPEDARRAY)), I32Eq,
+            If(BlockType::Empty),
+            LocalGet(st.target), I32WrapI64, Call(helpers.ta_oob()),
+            If(BlockType::Empty),
+        );
+        st.exhaust(function);
+        wasm!(function;
+            LocalGet(st.target),
+            I64Const(HEAP_BITS | i64::from(static_key(strings, super::typed_array::ITERATOR_NEXT))),
+            I32Const(PROP_THROW_TA_OUT_OF_BOUNDS), Call(helpers.prop_throw),
+            I64Const(UNDEFINED_BITS), Return,
+            End,
+            LocalGet(st.target), I32WrapI64, Call(helpers.ta_length()), LocalSet(st.len),
+        );
+        st.end_at_len(function, strings, helpers);
+        wasm!(function;
+            LocalGet(st.i), F64ConvertI32U, I64ReinterpretF64, LocalSet(st.item),
+            LocalGet(st.target), I32WrapI64, LocalGet(st.i), Call(helpers.ta_get()), LocalSet(st.value),
+            LocalGet(st.i), I32Const(1), I32Add, LocalSet(st.i),
+        );
+        st.store_index(function);
+        wasm!(function;
+            LocalGet(st.kind), I32Eqz,
+            If(BlockType::Empty), LocalGet(st.item), LocalSet(st.value), End,
+            LocalGet(st.kind), I32Const(2), I32Eq, If(BlockType::Empty),
+        );
+        st.emit(function, &Step::pair(st.item, st.value), strings, helpers);
+        wasm!(function; LocalSet(st.value), End, Else);
+        step_array_like(function, st, strings, helpers);
+        wasm!(function; End);
+    } else {
+        step_array_like(function, st, strings, helpers);
+    }
+}
+
+/// The array-like half of [`step_array`].
+fn step_array_like(
+    function: &mut FnBuilder<'_>,
+    st: Step,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     wasm!(function;
         LocalGet(st.target), I32Const(static_key(strings, INDEX_LENGTH_KEY)), Call(helpers.get),
     );

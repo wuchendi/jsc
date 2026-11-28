@@ -1463,6 +1463,25 @@ fn array_buffer_bodies_validate() {
 }
 
 #[test]
+fn typed_array_bodies_validate() {
+    // A program naming a typed-array constructor carries the §5.8.5 hooks in
+    // the property helpers, the inline `ta[k]` arms, the iterator arm and
+    // the collector and renderer arms; every body must stay valid wasm.
+    validate(&compile(
+        "const b = new ArrayBuffer(8, { maxByteLength: 16 });
+        const t = new Int16Array(b), u = new Uint8Array([1, 2, 300]), f = Float32Array.of(1.5, NaN);
+        const k = 1, s = '1.5';
+        t[k] = 7; u[s] = 2; t[0] = u[k] + t[k];
+        Object.defineProperty(u, '0', { value: 9 });
+        console.log(t.length, t.byteLength, t.byteOffset, t.buffer === b, u, [...f], 0 in u,
+            Object.keys(u), Object.getOwnPropertyDescriptor(u, 1), delete u.x,
+            Uint8ClampedArray.from({ length: 2, 0: 300 }, (v) => v), Object.isFrozen(u),
+            Object.prototype.toString.call(f), new Float64Array(t), [...u.entries()]);
+        for (const i in u) console.log(i);",
+    ));
+}
+
+#[test]
 fn computed_and_numeric_pattern_keys_validate() {
     // Pattern keys converted into locals, in statement and expression
     // position, a generator, a rest exclusion list, and numeric class keys.

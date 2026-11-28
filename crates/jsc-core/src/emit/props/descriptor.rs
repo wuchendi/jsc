@@ -193,6 +193,30 @@ pub(in crate::emit) fn emit_define_own(
         wasm!(f; LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(bit), I32And);
     };
 
+    // A typed array's numeric key (DESIGN.md §5.8.5): an invalid index, or a
+    // descriptor making it non-configurable, non-enumerable, an accessor or
+    // non-writable, rejects; else a present `value` is written by
+    // `TypedArraySetElement` (its conversion may leave an exception pending).
+    emit_if_ta_numeric(&mut f, o, key, i, helpers, |f| {
+        emit_ta_valid(f, o, i, helpers);
+        wasm!(f; I32Eqz);
+        for bit in [ATTR_CONFIGURABLE, ATTR_ENUMERABLE, ATTR_WRITABLE] {
+            let both = (bit << DESC_HAS_SHIFT) | bit;
+            wasm!(f;
+                LocalGet(desc), I32Const(both), I32And, I32Const(bit << DESC_HAS_SHIFT), I32Eq, I32Or,
+            );
+        }
+        emit_flag(f, desc, accessor_desc);
+        wasm!(f;
+            I32Or,
+            If(BlockType::Empty), I32Const(DEFINE_REJECT), Return, End,
+            LocalGet(desc), I32Const(DESC_HAS_VALUE), I32And,
+            If(BlockType::Empty),
+            LocalGet(o), LocalGet(i), LocalGet(value), Call(helpers.ta_set_value()),
+            End,
+            I32Const(DEFINE_OK), Return,
+        );
+    });
     // A String wrapper's index: `IsCompatiblePropertyDescriptor` against its
     // virtual `{value: s[i], writable: false, enumerable: true,
     // configurable: false}`; nothing changes.
@@ -635,10 +659,7 @@ pub(in crate::emit) fn emit_own_desc(
         LocalGet(obj), I32WrapI64, LocalSet(o),
         Block(BlockType::Empty),
     );
-    emit_if_str_exotic(&mut f, o, key, i, helpers, |f| {
-        emit_str_exotic_value(f, o, i, helpers);
-        wasm!(f; LocalSet(v), I32Const(ATTR_ENUMERABLE), LocalSet(a), Br(2));
-    });
+    emit_exotic_own_desc(&mut f, [o, key, i, v, a], helpers);
     wasm!(f;
         LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
@@ -725,6 +746,28 @@ pub(in crate::emit) fn emit_own_desc(
     finish_builder(f)
 }
 
+/// The virtual own properties of `__own_desc`, inside its lookup block (each
+/// found one leaves its value in i64 `v`, its attributes in i32 `a`, and the
+/// block): a typed array's valid index is `{value, writable, enumerable,
+/// configurable: true}` and an invalid numeric key absent (DESIGN.md
+/// §5.8.5); a `String` wrapper's index is `{value: s[i], writable: false,
+/// enumerable: true, configurable: false}`. `i` is i32 scratch.
+fn emit_exotic_own_desc(f: &mut FnBuilder<'_>, [o, key, i, v, a]: [u32; 5], helpers: Helpers<'_>) {
+    emit_if_ta_numeric(f, o, key, i, helpers, |f| {
+        emit_ta_valid(f, o, i, helpers);
+        wasm!(f;
+            I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+            LocalGet(o), LocalGet(i), Call(helpers.ta_get()), LocalSet(v),
+            I32Const(ATTRS_DEFAULT), LocalSet(a),
+            Br(2),
+        );
+    });
+    emit_if_str_exotic(f, o, key, i, helpers, |f| {
+        emit_str_exotic_value(f, o, i, helpers);
+        wasm!(f; LocalSet(v), I32Const(ATTR_ENUMERABLE), LocalSet(a), Br(2));
+    });
+}
+
 /// Walk the live entries of the property table in i32 local `p` (nonzero):
 /// `body` runs with the entry address in i32 local `e` (`end` is i32
 /// scratch).
@@ -762,7 +805,11 @@ fn emit_live_entries<S: Sink>(
 /// dictionary mode first, so its elements are table entries the level
 /// reaches, and a frozen array's `length` becomes read-only. Private entries
 /// are left untouched.
-pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+pub(in crate::emit) fn emit_set_integrity(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
     let mut f = helper_builder(
         leaves,
         &[ROOT_JS, RAW_I32],
@@ -770,6 +817,40 @@ pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>, leaves: &LeafSet
     );
     let (obj, level) = (0, 1);
     let (o, p, e, end, a, t) = (2, 3, 4, 5, 6, 7);
+    if helpers.has_binary() {
+        // A typed array (DESIGN.md §5.8.5): a variable-length one cannot be
+        // made non-extensible; one with elements becomes non-extensible,
+        // then cannot seal or freeze its first element.
+        // Raise the `__prop_throw` mode in i32 `a` and return.
+        let throw = |f: &mut FnBuilder<'_>| {
+            wasm!(f;
+                LocalSet(a),
+                LocalGet(obj), I64Const(HEAP_BITS | i64::from(static_key(strings, ""))),
+                LocalGet(a), Call(helpers.prop_throw), Return,
+            );
+        };
+        wasm!(f;
+            LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_TYPEDARRAY), I32Eq,
+            If(BlockType::Empty),
+            LocalGet(o), I32Load8U(m8(FLAGS)),
+            I32Const(i32::from(abi::TA_FLAG_LENGTH_TRACKING | abi::TA_FLAG_RESIZABLE_BUFFER)), I32And,
+            If(BlockType::Empty),
+            I32Const(PROP_THROW_TA_PREVENT_EXTENSIONS),
+        );
+        throw(&mut f);
+        wasm!(f;
+            End,
+            LocalGet(level), I32Const(0), I32Ne,
+            LocalGet(o), Call(helpers.ta_length()), I32Const(0), I32Ne, I32And,
+            If(BlockType::Empty),
+            LocalGet(o), LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(NOT_EXTENSIBLE), I32Or,
+            I32Store8(m8(FLAGS)),
+            I32Const(PROP_THROW_TA_FREEZE), I32Const(PROP_THROW_TA_SEAL),
+            LocalGet(level), I32Const(INTEGRITY_FROZEN), I32Eq, Select,
+        );
+        throw(&mut f);
+        wasm!(f; End, End);
+    }
     wasm!(f;
         LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq, LocalTee(t),
         If(BlockType::Empty),
@@ -824,7 +905,7 @@ pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>, leaves: &LeafSet
 /// is non-configurable (and, [`INTEGRITY_FROZEN`], every own data property
 /// non-writable, an array's `length` included). A `String` wrapper's virtual
 /// indices are always frozen. Private entries are ignored.
-pub(in crate::emit) fn emit_test_integrity(leaves: &LeafSet) -> Function {
+pub(in crate::emit) fn emit_test_integrity(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(
         leaves,
         &[ROOT_JS, RAW_I32],
@@ -837,6 +918,18 @@ pub(in crate::emit) fn emit_test_integrity(leaves: &LeafSet) -> Function {
         I32Eqz,
         If(BlockType::Empty), LocalGet(level), I32Eqz, Return, End,
         LocalGet(level), I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
+    );
+    if helpers.has_binary() {
+        // A typed array's elements are configurable and writable (DESIGN.md
+        // §5.8.5): it is neither sealed nor frozen while it has any.
+        wasm!(f;
+            LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_TYPEDARRAY), I32Eq,
+            If(BlockType::Empty),
+            LocalGet(o), Call(helpers.ta_length()), If(BlockType::Empty), I32Const(0), Return, End,
+            End,
+        );
+    }
+    wasm!(f;
         LocalGet(level), I32Const(INTEGRITY_FROZEN), I32Eq,
         LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq, I32And,
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_LENGTH_READONLY), I32And, I32Eqz, I32And,
@@ -886,6 +979,11 @@ pub(in crate::emit) fn emit_own_enum(
         LocalGet(key), I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
         LocalGet(obj), I32WrapI64, LocalSet(o),
     );
+    // A typed array's valid index is enumerable; an invalid one is absent.
+    emit_if_ta_numeric(&mut f, o, key, i, helpers, |f| {
+        emit_ta_valid(f, o, i, helpers);
+        wasm!(f; Return);
+    });
     emit_if_str_exotic(
         &mut f,
         o,

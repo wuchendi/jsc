@@ -846,6 +846,37 @@ pub(crate) const AB_FLAG_DETACHED: u8 = 4;
 /// whole linear-memory cap [`MEMORY_MAX_PAGES`].
 pub(crate) const BYTE_LENGTH_MAX: u32 = 1 << 29;
 
+/// Byte offset (from a [`TYPE_TYPEDARRAY`] block base) of the u32 raw ref to
+/// the viewed [`TYPE_ARRAYBUFFER`] block (never `0`).
+pub(crate) const TA_BUFFER_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_TYPEDARRAY`] block base) of the u8 element kind
+/// (DESIGN.md §5.8.6).
+pub(crate) const TA_KIND_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
+/// Byte offset (from a [`TYPE_TYPEDARRAY`] block base) of the u8 `log2` of
+/// the element size.
+pub(crate) const TA_SHIFT_OFFSET: u32 = OBJ_PREFIX_SIZE + 5;
+
+/// Byte offset (from a [`TYPE_TYPEDARRAY`] block base) of the u32
+/// `[[ByteOffset]]`.
+pub(crate) const TA_BYTE_OFFSET_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// Byte offset (from a [`TYPE_TYPEDARRAY`] block base) of the u32
+/// `[[ArrayLength]]` (kept `0` when length-tracking).
+pub(crate) const TA_LENGTH_OFFSET: u32 = OBJ_PREFIX_SIZE + 12;
+
+/// The byte size of a [`TYPE_TYPEDARRAY`] block.
+pub(crate) const TA_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// [`TYPE_TYPEDARRAY`] header `flags` bit: `[[ArrayLength]]` is `auto` (the
+/// view tracks its resizable buffer's length).
+pub(crate) const TA_FLAG_LENGTH_TRACKING: u8 = 2;
+
+/// [`TYPE_TYPEDARRAY`] header `flags` bit: the buffer was resizable at
+/// construction (`IsTypedArrayFixedLength` is false); never cleared.
+pub(crate) const TA_FLAG_RESIZABLE_BUFFER: u8 = 4;
+
 /// Byte offset (from a [`TYPE_SYMBOL`] block base) of the `description` jsval
 /// (an `i64`: a string jsval or `undefined`).
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]

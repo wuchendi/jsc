@@ -321,3 +321,35 @@ fn array_buffer_layout_matches_design() {
     );
     assert_eq!(u64::from(BYTE_LENGTH_MAX), MEMORY_MAX_PAGES * 65_536);
 }
+
+/// Pins the typed-array layout to `DESIGN.md` §5.8.3: a 32 B block with
+/// `buffer` @16, `kind` @20, `shift` @21, `byte_offset` @24, `array_length`
+/// @28; flags `LENGTH_TRACKING` = 2, `RESIZABLE_BUFFER` = 4.
+#[test]
+fn typed_array_layout_matches_design() {
+    use super::{
+        BLOCK_ALIGN, OBJ_FLAG_NOT_EXTENSIBLE, TA_BLOCK_SIZE, TA_BUFFER_OFFSET,
+        TA_BYTE_OFFSET_OFFSET, TA_FLAG_LENGTH_TRACKING, TA_FLAG_RESIZABLE_BUFFER, TA_KIND_OFFSET,
+        TA_LENGTH_OFFSET, TA_SHIFT_OFFSET,
+    };
+    assert_eq!(
+        [
+            TA_BUFFER_OFFSET,
+            TA_KIND_OFFSET,
+            TA_SHIFT_OFFSET,
+            TA_BYTE_OFFSET_OFFSET,
+            TA_LENGTH_OFFSET,
+            TA_BLOCK_SIZE
+        ],
+        [16, 20, 21, 24, 28, 32]
+    );
+    assert_eq!(TA_BLOCK_SIZE % BLOCK_ALIGN, 0);
+    assert_eq!(
+        (
+            OBJ_FLAG_NOT_EXTENSIBLE,
+            TA_FLAG_LENGTH_TRACKING,
+            TA_FLAG_RESIZABLE_BUFFER
+        ),
+        (1, 2, 4)
+    );
+}
