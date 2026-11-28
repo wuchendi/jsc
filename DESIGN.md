@@ -850,7 +850,8 @@ in the data segment (§4.2), so it has one identity for the whole run.
   (callable only with the construct marker; its `prototype` is installed by
   the class definition). `SELF_ALLOC` marks a derived class and the builtin
   constructors that allocate their own object from `new.target` (Array, the
-  Error family, Map, Set, Promise, Date).
+  Error family, Map, Set, Promise, Date, the weak collections, the binary-data
+  constructors, and the `String` / `Number` / `Boolean` wrappers).
 - **No own `caller` / `arguments`.** Every function is strict; both names
   resolve to the `%ThrowTypeError%` accessors on `%Function.prototype%`.
 - **Bound functions.** `Function.prototype.bind` allocates a `BOUND`
@@ -2807,10 +2808,10 @@ very large exponent / shift tests that hit the 2^24-bit cap where V8 allows
 | **B4** closeout | remove `BigInt` from `unsupported-features.txt`; delete the §13 BigInt lines (the `RegExp, BigInt, ..` "not available" line, the limitation-table row, the BigInt property-key line, the §14 roadmap mention); test262 baseline / history from CI; fold this section's design notes into present-tense text | `tests/test262/*`, `DESIGN.md` | test262 delta recorded (target ≈ +300 of the 325 newly eligible) |
 ### 6.11 Proxy and Reflect (phase 5b, in progress)
 
-**Status: P2a and P2b implemented** (the proxy block, `%Proxy%`,
+**Status: P2a, P2b and P3 implemented** (the proxy block, `%Proxy%`,
 `Proxy.revocable`, the eleven object internal methods with their
-invariants, callable / constructor proxies and the integration paths,
-below); P3 and P4 are still design. Until P4 the test262 runner keeps skipping the
+invariants, callable / constructor proxies, the integration paths and the
+`Reflect` namespace, below); P4 is still design. Until P4 the test262 runner keeps skipping the
 `Proxy`, `proxy-missing-checks` and `Reflect*` features (§10). The
 subsection names the code that changes so an implementer does not have to
 re-derive it; "Stages" records where P2a departed from the plan.
@@ -3280,23 +3281,27 @@ into locals at entry, before `ToPropertyKey` or any other user code runs
 | function | `length` | steps |
 |---|---|---|
 | `apply(f, thisArg, args)` | 3 | `IsCallable(f)` else `TypeError`; `CreateListFromArrayLike(args)` (a non-object, `undefined` included, throws); `call_with_array` |
-| `construct(F, args, newTarget = F)` | 2 | `IsConstructor(F)`, `IsConstructor(newTarget)` else `TypeError`; the list; `IrNode::Construct { callee: F, spread: list, new_target: Some(newTarget) }` |
+| `construct(F, args, newTarget = F)` | 2 | `IsConstructor(F)`, `IsConstructor(newTarget)` (when passed, `undefined` included) else `TypeError`; the list; `IrNode::Construct { callee: F, spread: list, new_target: Some(newTarget) }` (`function.rs::bound_construct`) |
 | `defineProperty(t, k, attrs)` | 3 | `__to_key`, `__to_desc`, `__define_own == DEFINE_OK` (no throw on rejection) |
 | `deleteProperty(t, k)` | 2 | `__delete(t, k, 0)` |
-| `get(t, k, receiver = t)` | 2 | `__super_get(t, k, receiver)` |
+| `get(t, k, receiver = t)` | 2 | `__super_get(t, k, receiver)` (the default only when fewer than three arguments are passed) |
 | `getOwnPropertyDescriptor(t, k)` | 2 | `__own_desc` |
 | `getPrototypeOf(t)` | 1 | `__get_proto` |
 | `has(t, k)` | 2 | `__has` |
 | `isExtensible(t)` | 1 | `__test_integrity(t, 0)` |
-| `ownKeys(t)` | 1 | `__own_keys(t, OWN_ALL_KEYS)`: integer keys ascending, then strings, then symbols, each in insertion order (a proxy: the checked trap list) |
+| `ownKeys(t)` | 1 | `__own_keys(t, OWN_ALL_KEYS)`: integer keys ascending, then strings, then symbols, each in insertion order (a proxy: the checked trap list); a `LAZY` function is materialized first and an array's `length` follows its indices (`object_static.rs::own_key_list`, shared with `Object.getOwnPropertyNames`) |
 | `preventExtensions(t)` | 1 | `__set_integrity(t, 0)` status |
-| `set(t, k, v, receiver = t)` | 3 | `__set_bool(t, k, v, receiver)` |
+| `set(t, k, v, receiver = t)` | 3 | `__set_bool(t, k, v, receiver)` (the key interned; the default only when fewer than four arguments are passed) |
 | `setPrototypeOf(t, proto)` | 2 | `proto` an object or `null` else `TypeError`; `__set_proto(t, proto) == 0` |
 
 `CreateListFromArrayLike` for `apply` / `construct` is the list-building part
 of `Function.prototype.apply` (`builtins/function.rs::emit_apply`), factored
-into a shared function in that file (`apply` itself keeps accepting
-`undefined` / `null` as "no arguments").
+into `function.rs::create_list` (`apply` itself keeps accepting
+`undefined` / `null` as "no arguments"). The other error texts are plain
+`TypeError`s (`Reflect.apply target is not a function`, `Reflect.construct
+target is not a constructor` / `newTarget is not a constructor`); `setPrototypeOf`'s
+prototype check is `Object.setPrototypeOf`'s (`PROP_THROW_PROTO_TYPE`), so
+no `__prop_throw` mode is added (`33`..`35` stay free).
 
 **`Reflect.construct` and builtin constructors.** Builtin constructors
 already receive `newTarget` through `$__new_target` and compute
@@ -3311,7 +3316,8 @@ site (`emit_construct`), derived classes pass `newTarget` on through
 `Promise`, `Map` / `Set`, `WeakMap` / `WeakSet` / `WeakRef` /
 `FinalizationRegistry`, `Date`, and `Boolean` / `Number` / `String` (their
 wrapper under `new`) use `Body::proto`; `Object` with a `newTarget` other
-than `%Object%` returns the allocated `this` (`ctor.rs::object`); `Symbol`
+than `%Object%` returns the allocated `this` (`ctor.rs::object`; its
+prototype falls back to `%Object.prototype%`, `Object`'s own); `Symbol`
 throws (`new` is refused); `Function` throws (unsupported); `Iterator` is
 abstract unless `newTarget` differs; a bound function constructs its target
 with `newTarget` per §5.5; a constructor proxy forwards `newTarget` to its
@@ -3409,6 +3415,21 @@ shared files):
   `%Reflect%` in `emit/realm.rs`, `builtins/mod.rs`, the
   `CreateListFromArrayLike` factoring in `builtins/function.rs`. No
   constructor body changes (above).
+  **Delivered**, with these departures: `String` / `Number` / `Boolean` are
+  now `SELF_ALLOC` (`realm.rs::Intrinsic::flags`): their bodies already
+  return a wrapper whose prototype comes from `Body::proto`, and without the
+  flag the construct site also allocated an unused `this` from
+  `Get(newTarget, "prototype")`, reading a user-code `prototype` twice.
+  `Reflect.ownKeys` shares `Object.getOwnPropertyNames`'s body
+  (`object_static.rs::own_key_list`, parameterized by the `__own_keys`
+  mode) for the `LAZY` and array-`length` handling. The `ReflectFn` bodies
+  dispatch through `builtins/mod.rs::emit_handle_family` (the main dispatch
+  is at its line limit). No registry helper rows. Known gap (P2a's forward,
+  not `Reflect`): a trap-less proxy's `[[OwnPropertyKeys]]` forwards
+  `__own_keys(target, OWN_ALL_KEYS)`, which omits an array target's
+  `length` and a `LAZY` function target's unmaterialized keys, so
+  `Reflect.ownKeys(new Proxy([], {}))` lacks `"length"` and the
+  non-configurable-key invariant does not see it.
 - **P4 — closeout.** Remove `Proxy`, `proxy-missing-checks` and `Reflect*`
   from `tests/test262/unsupported-features.txt`; refresh the baseline from CI;
   rewrite this subsection in the present tense (dropping "planned"); update
@@ -3465,7 +3486,9 @@ trampoline, so they review well on their own.
   prototype; `Reflect.construct(Date, [7 fields], nt)`,
   `Reflect.construct(Error, [msg, {cause}], nt)`, `AggregateError`, `Array`
   with more than `K` elements and `Promise` must see their own arguments,
-  not the nested call's (`Body::snapshotted`); with an `assert_same_under_gc_stress`
+  not the nested call's (`Body::snapshotted`), as must a user class with a
+  rest parameter and `Date` under a bound-function `newTarget` whose
+  `prototype` is an accessor; with an `assert_same_under_gc_stress`
   twin.
 - P4 — no new tests; the test262 run is the gate. No opcount row should
   move (the arms are compiled out without `proxies`); a row that moves needs

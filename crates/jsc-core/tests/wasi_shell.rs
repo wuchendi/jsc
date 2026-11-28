@@ -230,7 +230,14 @@ fn oom_in_microtask_rejects_the_job() {
 fn every_compiled_module_validates() {
     for src in [
         "Object.keys({ a: 1 }); Object.defineProperty({}, 'a', { value: 1 })",
-        "Reflect.ownKeys({})",
+        "const o = {}; Reflect.ownKeys(o); Reflect.apply(Math.max, null, [1, 2]);
+         class A {} function NT() {} Reflect.construct(A, [], NT); Reflect.construct(Date, [0], NT);
+         Reflect.defineProperty(o, 'a', { value: 1 }); Reflect.deleteProperty(o, 'a');
+         Reflect.get(o, 'a', o); Reflect.set(o, 'b', 1, o); Reflect.has(o, 'b');
+         Reflect.getOwnPropertyDescriptor(o, 'b'); Reflect.getPrototypeOf(o);
+         Reflect.setPrototypeOf(o, null); Reflect.isExtensible(o); Reflect.preventExtensions(o)",
+        "const p = new Proxy(function () {}, {}); Reflect.apply(p, null, [1]);
+         Reflect.construct(p, [1], p); Reflect.ownKeys(p); Reflect.set(p, 'a', 1)",
         "function f(a) { return a } f.call(null, 1); f.apply(null, [1]); f.bind(null)",
         "[3, 1].sort().map((x) => x).concat([1]).join(); Array.from([1])",
         "'ab'.toUpperCase().padStart(4).split('').concat(String.fromCharCode(65))",
