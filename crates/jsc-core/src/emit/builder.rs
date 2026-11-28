@@ -80,8 +80,6 @@ pub(super) trait Sink {
     fn release_temps(&mut self, mark: u32);
     /// Announce the next write to `local` stores IR value `value`.
     fn note_def(&mut self, local: u32, value: &IrNode);
-    /// Announce the next write to `local` stores a number.
-    fn note_numeric_def(&mut self, local: u32);
 }
 
 impl Sink for Function {
@@ -95,7 +93,6 @@ impl Sink for Function {
     }
     fn release_temps(&mut self, _: u32) {}
     fn note_def(&mut self, _: u32, _: &IrNode) {}
-    fn note_numeric_def(&mut self, _: u32) {}
 }
 
 /// A builder invariant the emitter violated: a compiler bug.
@@ -328,10 +325,6 @@ impl Sink for FnBuilder<'_> {
 
     fn note_def(&mut self, local: u32, value: &IrNode) {
         self.defs.push((local, classify(value)));
-    }
-
-    fn note_numeric_def(&mut self, local: u32) {
-        self.defs.push((local, classify(&IrNode::Num(0.0))));
     }
 }
 

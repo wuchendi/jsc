@@ -119,6 +119,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         } else {
             ProxyGate::Closed
         },
+        bigint_gate: bigint_gate(program),
         unicode: layout.unicode,
         fn_info: layout.info,
     };
@@ -485,6 +486,7 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
         .chain(builtins::strings())
         .chain(convert::strings())
         .chain(bigint::strings())
+        .chain(bigint::op_strings())
         .chain(dtoa::STRINGS)
         .chain(render::STRINGS)
         .chain([STACK_KEY, STACK_OVERFLOW_MSG, STACK_OVERFLOW_STACK])
@@ -800,6 +802,9 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
         }
         IrNode::StrLen(operand)
         | IrNode::Not(operand)
+        | IrNode::Negate(operand)
+        | IrNode::BitNot(operand)
+        | IrNode::NumericStep { arg: operand, .. }
         | IrNode::IsHole(operand)
         | IrNode::IsObject(operand)
         | IrNode::IsArray(operand)
@@ -1487,6 +1492,47 @@ fn program_has_binary(program: &IrProgram) -> bool {
             BINARY_NAMES.contains(&global.name.as_str())
         }
         IrNode::Str(s) => BINARY_NAMES.iter().any(|name| s == name),
+        _ => false,
+    })
+}
+
+/// The names through which a program can obtain a `BigInt` without a
+/// literal (DESIGN.md §6.10.9): the `BigInt` global, the `BigInt` typed
+/// arrays and the `DataView` `BigInt` accessors.
+const BIGINT_NAMES: [&str; 7] = [
+    "BigInt",
+    "BigInt64Array",
+    "BigUint64Array",
+    "getBigInt64",
+    "getBigUint64",
+    "setBigInt64",
+    "setBigUint64",
+];
+
+/// The [`BigIntGate`] of `program` ([`program_has_bigint`]).
+fn bigint_gate(program: &IrProgram) -> BigIntGate {
+    if program_has_bigint(program) {
+        BigIntGate::Open
+    } else {
+        BigIntGate::Closed
+    }
+}
+
+/// Whether `program` can produce a `BigInt` (DESIGN.md §6.10.9): it has a
+/// `BigInt` literal, names a [`BIGINT_NAMES`] source (the intrinsic, a global
+/// reference, or a string such as a static member key), or uses the global
+/// object as a value, which could reach `BigInt` by a computed name. When
+/// not, the numeric operators emit their Number-only code.
+pub(super) fn program_has_bigint(program: &IrProgram) -> bool {
+    program_any(program, |n| match n {
+        IrNode::BigInt { .. }
+        | IrNode::Intrinsic(GlobalIntrinsic::Global | GlobalIntrinsic::Ctor(BuiltinCtor::BigInt)) => {
+            true
+        }
+        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
+            BIGINT_NAMES.contains(&global.name.as_str())
+        }
+        IrNode::Str(s) => BIGINT_NAMES.iter().any(|name| s == name),
         _ => false,
     })
 }

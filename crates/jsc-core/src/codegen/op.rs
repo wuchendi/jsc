@@ -122,7 +122,7 @@ pub(super) const STRING_METHODS: [&str; 13] = [
 pub(super) fn convert_builtin_op(name: &str) -> Option<ConvertOp> {
     Some(match name {
         "String" => ConvertOp::String,
-        "Number" => ConvertOp::ToNumber,
+        "Number" => ConvertOp::NumberCall,
         "Boolean" => ConvertOp::ToBoolean,
         "parseInt" => ConvertOp::ParseInt,
         "parseFloat" => ConvertOp::ParseFloat,
@@ -142,7 +142,7 @@ pub(super) fn convert_arity(op: ConvertOp) -> usize {
 pub(super) fn convert_call(op: ConvertOp, empty: bool, args: Vec<IrNode>) -> IrNode {
     match op {
         ConvertOp::String if empty => return IrNode::Str("".into()),
-        ConvertOp::ToNumber if empty => return IrNode::Num(0.0),
+        ConvertOp::NumberCall if empty => return IrNode::Num(0.0),
         _ => {}
     }
     let mut args = args.into_iter();
