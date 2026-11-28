@@ -3464,6 +3464,7 @@ pub(super) fn emit_copy_data(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
     let (out, src, excl) = (0, 1, 2);
     let (dst, ks, n, i, x, j, m, obj) = (3, 4, 5, 6, 7, 8, 9, 10);
     let k = 11;
+    shake::note_listed_values(helpers);
     wasm!(f; LocalGet(out), I32WrapI64, LocalSet(dst));
     emit_is_object(&mut f, src);
     wasm!(f;

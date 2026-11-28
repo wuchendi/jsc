@@ -467,10 +467,14 @@ pub(super) fn fn_flags(kind: FnKind) -> u8 {
 /// deduplicated onto one offset. Returns the offset map plus the first free
 /// offset after all literal data (8-aligned), where the intern table is placed.
 pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
+    // Without binary data the binary-data builtins are stubs that look up no
+    // strings (DESIGN.md §4.2).
+    let binary = program_has_binary(program);
     let fragments: Vec<IrNode> = Builtin::ALL
         .into_iter()
+        .filter(|b| binary || !b.is_binary())
         .filter_map(|b| builtins::fragment(b, program.arity))
-        .chain(builtins::fragments(program.arity))
+        .chain(builtins::fragments(program.arity, binary))
         .collect();
     // `"length"` is always interned: the property helpers compare a key against
     // it to resolve a string's or array's exotic `length`.
@@ -480,14 +484,18 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
     // `stack` key, a function object's materialized keys and every function's
     // `name`.
     let realm_strs = realm::strings()
-        .chain(builtins::strings())
+        .chain(builtins::strings(binary))
         .chain(convert::strings())
         .chain(bigint::strings())
         .chain(bigint::op_strings())
         .chain(dtoa::STRINGS)
         .chain(render::STRINGS)
         .chain([STACK_KEY, STACK_OVERFLOW_MSG, STACK_OVERFLOW_STACK])
-        .chain(FN_KEYS);
+        .chain(FN_KEYS)
+        .chain(builtins::gated_strings(
+            program_has_proxies(program),
+            program_has_reflect(program),
+        ));
     for text in realm_strs {
         strs.add(text);
     }

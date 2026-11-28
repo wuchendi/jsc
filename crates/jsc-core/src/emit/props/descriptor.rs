@@ -848,7 +848,6 @@ pub(in crate::emit) fn emit_own_prop(
     );
     let (obj, key, list) = (0, 1, 2);
     let (o, e, i, a, v) = (3, 4, 5, 6, 7);
-    shake::note_runtime_key();
     let push = |f: &mut FnBuilder<'_>, value: &dyn Fn(&mut FnBuilder<'_>)| {
         wasm!(f; LocalGet(list));
         value(f);

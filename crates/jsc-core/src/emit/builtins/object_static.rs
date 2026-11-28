@@ -754,6 +754,7 @@ fn emit_assign(
     let (to, from, kv, v) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.i64(3));
     let (n, i, ks, len) = (frame.i32(0), frame.i32(1), frame.base(2), frame.i32(3));
     let (at, spread) = (frame.x32(0), frame.x64(0));
+    shake::note_listed_values(helpers);
     // The spread argument array, before a getter's spread call republishes it.
     wasm!(function; GlobalGet(SPREAD_ARGS_GLOBAL), LocalSet(spread));
     arg_to_object(function, frame, 0, to, strings, helpers);
