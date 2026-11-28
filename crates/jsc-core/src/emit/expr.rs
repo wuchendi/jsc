@@ -566,6 +566,7 @@ fn emit_node_inner(
             function.instruction(&Instruction::LocalTee(scratch + 22));
             function.instruction(&Instruction::I32Const(INTEGRITY_FROZEN));
             function.instruction(&Instruction::Call(helpers.set_integrity()));
+            function.instruction(&Instruction::Drop);
             function.instruction(&Instruction::LocalGet(scratch + 22));
         }
         IrNode::ToPropertyKey(operand) => {
@@ -3169,9 +3170,9 @@ pub(super) fn emit_console_log_spread(
 /// `typeof` splits on whether the value is a heap pointer (single tag `0b101`):
 ///
 /// - **Heap pointer** — read the type byte and map it to the `TYPEOF_STRINGS`
-///   index: `TYPE_STRING` -> 4 ("string"), `TYPE_FUNCTION` -> 5 ("function"),
-///   `TYPE_SYMBOL` -> 6 ("symbol"), `TYPE_BIGINT` -> 7 ("bigint"), every
-///   other kind -> 3 ("object").
+///   index: `TYPE_STRING` -> 4 ("string"), `TYPE_FUNCTION` and a callable
+///   proxy -> 5 ("function"), `TYPE_SYMBOL` -> 6 ("symbol"), `TYPE_BIGINT`
+///   -> 7 ("bigint"), every other kind -> 3 ("object").
 /// - **Immediate** — the NaN-box tag orders boolean(1), null(2), undefined(3),
 ///   while `TYPEOF_STRINGS` orders boolean(1), undefined(2), object(3); booleans
 ///   line up but null/undefined are swapped, so `boxed index = tag ^ ((tag >> 1)
@@ -3208,6 +3209,23 @@ pub(super) fn emit_typeof_node(
     emit_load_type_byte(function, scratch);
     function.instruction(&Instruction::I32Const(TYPE_FUNCTION));
     function.instruction(&Instruction::I32Eq);
+    if helpers.proxies() {
+        // A callable proxy is a function too (DESIGN.md §6.11).
+        let mask = 0xFF | (0xFF << 24);
+        let callable = TYPE_PROXY | (i32::from(abi::PROXY_CLASS_CALLABLE) << 24);
+        function.instruction(&Instruction::LocalGet(scratch));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::I32Load(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        function.instruction(&Instruction::I32Const(mask));
+        function.instruction(&Instruction::I32And);
+        function.instruction(&Instruction::I32Const(callable));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::I32Or);
+    }
     function.instruction(&Instruction::Select); // function ? 5 : 3
     emit_load_type_byte(function, scratch);
     function.instruction(&Instruction::I32Const(TYPE_BIGINT));

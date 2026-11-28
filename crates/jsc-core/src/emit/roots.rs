@@ -73,7 +73,7 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         // entry, so that call never materializes, but the graph is static).
         (helpers.private_find(), vec![helpers.prop_find]),
         (helpers.json_ws, vec![]),
-        (helpers.test_integrity(), vec![]),
+        (helpers.test_integrity(), integrity_callees(helpers)),
         (helpers.heap_object(), vec![]),
         (helpers.str_of(), vec![]),
         (helpers.fn_name(), vec![helpers.heap_object()]),
@@ -147,6 +147,17 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
     ];
     graph.extend(module_graphs(helpers));
     graph
+}
+
+/// The callees of `__test_integrity` the leaf solver must see: none, or the
+/// proxy trap helper (not itself declared, so a safepoint) when the program
+/// can hold proxies (DESIGN.md §6.11).
+fn integrity_callees(helpers: Helpers<'_>) -> Vec<u32> {
+    if helpers.proxies() {
+        vec![helpers.proxy_is_extensible()]
+    } else {
+        vec![]
+    }
 }
 
 /// The leaf-graph declarations of the runtime modules, in group order.

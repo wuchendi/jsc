@@ -85,6 +85,9 @@ pub(super) enum Intrinsic {
     /// receiver and of its `CLASS_BIGINT` wrapper; an empty ordinary object
     /// until the `BigInt` builtins land.
     BigIntPrototype,
+    /// `%Proxy%` (DESIGN.md §6.11): a constructor without `prototype`, its
+    /// one static `revocable`.
+    Proxy,
 }
 
 /// A builtin iterator family: the receivers of one iterator prototype's
@@ -275,7 +278,7 @@ impl Intrinsic {
             Self::Ctor(BuiltinCtor::Error(kind)) if kind != ErrorKind::Error => {
                 Some(Self::Ctor(BuiltinCtor::Error(ErrorKind::Error)))
             }
-            Self::Ctor(_) => Some(Self::FunctionPrototype),
+            Self::Ctor(_) | Self::Proxy => Some(Self::FunctionPrototype),
         }
     }
 
@@ -285,6 +288,7 @@ impl Intrinsic {
         match self {
             Self::FunctionPrototype => Some(Builtin::FunctionPrototype),
             Self::Ctor(ctor) => Some(Builtin::Ctor(ctor)),
+            Self::Proxy => Some(Builtin::Proxy(ProxyOp::Ctor)),
             _ => None,
         }
     }
@@ -307,7 +311,8 @@ impl Intrinsic {
                 | BuiltinCtor::FinalizationRegistry
                 | BuiltinCtor::ArrayBuffer
                 | BuiltinCtor::DataView,
-            ) => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_SELF_ALLOC,
+            )
+            | Self::Proxy => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_SELF_ALLOC,
             Self::Ctor(_) => abi::FUNC_FLAG_CONSTRUCTOR,
             _ => 0,
         }
@@ -421,6 +426,7 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
             Intrinsic::WrapForValidIteratorPrototype,
             Intrinsic::IteratorHelperPrototype,
             Intrinsic::OutOfMemoryError,
+            Intrinsic::Proxy,
         ])
         .chain(
             BINARY_CTORS
@@ -685,6 +691,8 @@ pub(super) enum Builtin {
     /// A `%DataView.prototype%` method or getter (DESIGN.md §5.8.7,
     /// `emit/builtins/data_view.rs`).
     DataView(DataViewOp),
+    /// A `Proxy` builtin (DESIGN.md §6.11).
+    Proxy(ProxyOp),
 }
 
 /// The `DataView` builtins of DESIGN.md §5.8.7 other than the constructor.
@@ -850,6 +858,18 @@ impl ArrayBufferOp {
             | Self::Detached => None,
         }
     }
+}
+
+/// The `Proxy` builtins of DESIGN.md §6.11.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProxyOp {
+    /// `%Proxy%` itself: `ProxyCreate`.
+    Ctor,
+    /// `Proxy.revocable`.
+    Revocable,
+    /// The revoke function `Proxy.revocable` makes (`env` is the proxy). Not
+    /// installed on any intrinsic.
+    Revoke,
 }
 
 /// The `Iterator` builtins of DESIGN.md §7.9.
@@ -1887,7 +1907,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 397] = [
+    pub(super) const ALL: [Builtin; 400] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -2381,6 +2401,9 @@ impl Builtin {
         Self::DataView(DataViewOp::Set(8)),
         Self::DataView(DataViewOp::Get(9)),
         Self::DataView(DataViewOp::Set(9)),
+        Self::Proxy(ProxyOp::Ctor),
+        Self::Proxy(ProxyOp::Revocable),
+        Self::Proxy(ProxyOp::Revoke),
     ];
 
     /// The function's `name`.
@@ -2393,7 +2416,8 @@ impl Builtin {
             | Self::Protocol(_)
             | Self::AsyncGeneratorDrain
             | Self::AsyncGeneratorStep
-            | Self::AsyncGeneratorReaction(_) => "",
+            | Self::AsyncGeneratorReaction(_)
+            | Self::Proxy(ProxyOp::Revoke) => "",
             Self::ProtoGet => "get __proto__",
             Self::ProtoSet => "set __proto__",
             Self::CollectionSize { .. } => "get size",
@@ -2470,6 +2494,8 @@ impl Builtin {
             Self::ArrayFrom => "from",
             Self::PromiseStatic(op) => op.name(),
             Self::MathSumPrecise => "sumPrecise",
+            Self::Proxy(ProxyOp::Ctor) => "Proxy",
+            Self::Proxy(ProxyOp::Revocable) => "revocable",
             Self::DateNow => "now",
             Self::ArrayPush => "push",
             Self::ArrayPop => "pop",
@@ -2513,6 +2539,7 @@ impl Builtin {
             | Self::Protocol(_)
             | Self::AsyncGeneratorDrain
             | Self::AsyncGeneratorStep
+            | Self::Proxy(ProxyOp::Revoke)
             | Self::FunctionToString
             | Self::StringToString
             | Self::StringValueOf
@@ -2573,7 +2600,8 @@ impl Builtin {
             | Self::WeakOp { op: MapOp::Set, .. }
             | Self::WeakCell(WeakCellOp::Register)
             | Self::PromiseThen
-            | Self::DefineAccessor { .. } => 2,
+            | Self::DefineAccessor { .. }
+            | Self::Proxy(ProxyOp::Ctor | ProxyOp::Revocable) => 2,
             Self::StringMethod(op) => op.length(),
             Self::ObjectReflect(op) => op.length(),
             Self::Symbol(op) => op.length(),
@@ -2770,7 +2798,7 @@ const NUMBER_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 37] = [
+const GLOBALS: [(&str, u32, Value); 38] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -2928,6 +2956,7 @@ const GLOBALS: [(&str, u32, Value); 37] = [
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::DataView)),
     ),
+    ("Proxy", METHOD_ATTRS, Value::Intrinsic(Intrinsic::Proxy)),
 ];
 
 /// The `%Object.prototype%` methods, in slot order.
@@ -3037,6 +3066,7 @@ pub(super) fn registry() -> Vec<Entry> {
     constructor_entries(&mut entries);
     array_buffer_entries(&mut entries);
     data_view_entries(&mut entries);
+    proxy_entries(&mut entries);
     entries.extend(GLOBALS.map(|(key, attrs, value)| entry(Intrinsic::Global, key, attrs, value)));
     entries
 }
@@ -3147,6 +3177,25 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
     iterator_prototype_entries(entries);
     well_known_entries(entries);
     species_entries(entries);
+}
+
+/// The own properties of `%Proxy%` (DESIGN.md §6.11).
+fn proxy_entries(entries: &mut Vec<Entry>) {
+    let entry = |key, attrs, value| Entry {
+        intrinsic: Intrinsic::Proxy,
+        key: Key::Str(key),
+        attrs,
+        value,
+    };
+    entries.extend([
+        entry("length", FN_FACT_ATTRS, Value::Num(2.0)),
+        entry("name", FN_FACT_ATTRS, Value::Str("Proxy")),
+        entry(
+            "revocable",
+            METHOD_ATTRS,
+            Value::Method(Builtin::Proxy(ProxyOp::Revocable)),
+        ),
+    ]);
 }
 
 /// `ArrayBuffer.isView` and the `%ArrayBuffer.prototype%` getters

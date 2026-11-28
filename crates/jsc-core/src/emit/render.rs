@@ -91,7 +91,7 @@ const OPEN_TRAILING: &str = " { ";
 const CLOSE_OBJECT: &str = " }";
 
 /// The static strings the renderer writes or looks properties up by.
-pub(super) const STRINGS: [&str; 61] = [
+pub(super) const STRINGS: [&str; 62] = [
     "",
     "true",
     "false",
@@ -141,6 +141,7 @@ pub(super) const STRINGS: [&str; 61] = [
     "WeakSet { <items unknown> }",
     "WeakRef {}",
     "FinalizationRegistry {}",
+    REVOKED_PROXY,
     "Uncaught ",
     "Uncaught (in promise) ",
     INVALID_DATE,
@@ -578,9 +579,14 @@ fn render_promise(
     wasm!(f; End, End, End);
 }
 
+/// How a revoked proxy renders (DESIGN.md §6.11).
+const REVOKED_PROXY: &str = "<Revoked Proxy>";
+
 /// `__render_heap(p, depth)`: the cycle guard over the four container kinds,
 /// and the leaf kinds. A cycle target's `<ref *N> ` prefix is inserted at the
-/// container's start offset once its children have been rendered.
+/// container's start offset once its children have been rendered. A proxy
+/// renders as its target (unwrapped through proxy chains, no trap runs); a
+/// revoked one as `<Revoked Proxy>`.
 fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(
         leaves,
@@ -604,6 +610,22 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet
             Br(0), End, End,
         );
     };
+    if helpers.proxies() {
+        wasm!(f;
+            Block(BlockType::Empty), Loop(BlockType::Empty),
+            LocalGet(p), I32Load8U(m8(0)), I32Const(i32::from(abi::TYPE_PROXY)), I32Ne, BrIf(1),
+            LocalGet(p), I64Load(m64(abi::PROXY_TARGET_OFFSET)), I64Const(abi::NULL.cast_signed()), I64Eq,
+            If(BlockType::Empty),
+        );
+        lit(&mut f, strings, helpers, REVOKED_PROXY);
+        wasm!(f;
+            Return,
+            End,
+            LocalGet(p), I64Load(m64(abi::PROXY_TARGET_OFFSET)), I32WrapI64, LocalSet(p),
+            Br(0),
+            End, End,
+        );
+    }
     wasm!(f;
         LocalGet(p), I32Load8U(m8(0)), LocalTee(ty), I32Const(TYPE_ARRAY), I32Eq,
         LocalGet(ty), I32Const(TYPE_OBJECT), I32Eq, I32Or,
