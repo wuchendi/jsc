@@ -681,7 +681,7 @@ fn species_constructor(
     return_if_pending(function);
     emit_is_nullish(function, c);
     wasm!(function; If(BlockType::Empty), I64Const(default), LocalSet(c), Else);
-    emit_is_constructor(function, c);
+    emit_is_constructor(function, c, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, SPECIES_NOT_CTOR, strings, helpers);
     wasm!(function; End, End, End);

@@ -115,7 +115,7 @@ fn this_callable(
     helpers: Helpers<'_>,
 ) {
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(target));
-    emit_is_function(function, target);
+    emit_is_function(function, target, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, text, strings, helpers);
     wasm!(function; End);
@@ -125,7 +125,7 @@ fn this_callable(
 /// and the elements of the fresh dense array (i32 base `args`, i32 length
 /// `len`) as its arguments, exactly like a spread call: the first `K` fill the
 /// slots and the array is published for a callee gathering the rest.
-fn call_with_array(
+pub(super) fn call_with_array(
     function: &mut FnBuilder<'_>,
     target: u32,
     this: u32,
@@ -312,7 +312,7 @@ pub(super) fn emit_method_call(
         LocalGet(recv), LocalGet(env), I32WrapI64, Call(helpers.get), LocalSet(method),
     );
     return_if_pending(function);
-    emit_is_function(function, method);
+    emit_is_function(function, method, helpers);
     wasm!(function;
         I32Eqz, If(BlockType::Empty),
         LocalGet(env), I64Const(32), I64ShrU, I64Const(HEAP_BITS), I64Or, LocalTee(msg),
@@ -344,7 +344,7 @@ pub(super) fn emit_method_call(
 /// `dst`) at element `i + shift` (i32 local `shift`). Uses i32 `i` and i64
 /// `tmp`; `n` holds the decoded argument count.
 #[allow(clippy::too_many_arguments)]
-fn store_args(
+pub(super) fn store_args(
     function: &mut FnBuilder<'_>,
     frame: Frame,
     dst: u32,
@@ -416,6 +416,12 @@ pub(super) fn emit_bind(
     let (shift, nb) = (frame.x32(0), frame.x32(1));
     let len = frame.f64(0);
     this_callable(function, frame, target, BIND_NOT_CALLABLE, strings, helpers);
+    let proto = frame.i64(3);
+    if helpers.proxies() {
+        // `Target.[[GetPrototypeOf]]()` first: a proxy target's trap.
+        wasm!(function; LocalGet(target), Call(helpers.get_proto()), LocalSet(proto));
+        return_if_pending(function);
+    }
     // nb = max(n - 1, 0); rec = [target, thisArg, ...args].
     wasm!(function;
         LocalGet(frame.argc()), F64ReinterpretI64, I32TruncSatF64U, LocalTee(n),
@@ -442,8 +448,17 @@ pub(super) fn emit_bind(
         I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }),
         LocalGet(f), I32Const(0),
         I32Store(MemArg { offset: u64::from(abi::OBJ_PROPS_OFFSET), align: 2, memory_index: 0 }),
-        LocalGet(f), LocalGet(target), I32WrapI64,
-        I64Load(MemArg { offset: u64::from(abi::OBJ_PROTO_OFFSET), align: 3, memory_index: 0 }),
+        LocalGet(f),
+    );
+    if helpers.proxies() {
+        wasm!(function; LocalGet(proto));
+    } else {
+        wasm!(function;
+            LocalGet(target), I32WrapI64,
+            I64Load(MemArg { offset: u64::from(abi::OBJ_PROTO_OFFSET), align: 3, memory_index: 0 }),
+        );
+    }
+    wasm!(function;
         I64Store(MemArg { offset: u64::from(abi::OBJ_PROTO_OFFSET), align: 3, memory_index: 0 }),
         LocalGet(f), I32Const(helpers.builtin_slot(Builtin::BoundCall).cast_signed()),
         I32Store(MemArg { offset: FUNC_INDEX_OFFSET, align: 2, memory_index: 0 }),
@@ -494,7 +509,7 @@ pub(super) fn emit_bind(
 
 /// The `[[Construct]]` of a bound function: construct the target (i64 temp
 /// 0) with the argument array (i64 temp 2) and `new.target` (i64 temp 3).
-fn bound_construct(frame: Frame) -> IrNode {
+pub(super) fn bound_construct(frame: Frame) -> IrNode {
     IrNode::Construct {
         callee: Box::new(IrNode::Local(frame.i64(0))),
         args: Vec::new(),
@@ -565,7 +580,7 @@ pub(super) fn emit_bound_call(
         If(BlockType::Empty),
         GlobalGet(NEW_TARGET_GLOBAL), LocalSet(nt),
     );
-    emit_is_function(function, nt);
+    emit_is_function_block(function, nt);
     wasm!(function;
         If(BlockType::Empty),
         LocalGet(nt), I32WrapI64,
@@ -614,6 +629,18 @@ pub(super) fn emit_to_string(
         strings,
         helpers,
     );
+    if helpers.proxies() {
+        // A callable proxy has no info-table name: `function () { [native
+        // code] }` (DESIGN.md §6.11).
+        wasm!(function;
+            LocalGet(target), I32WrapI64, I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }),
+            I32Const(TYPE_PROXY), I32Eq,
+            If(BlockType::Empty),
+            I32Const(static_key(strings, NATIVE_HEAD)), I32Const(static_key(strings, NATIVE_TAIL)),
+            Call(helpers.concat), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Return,
+            End,
+        );
+    }
     let get_ = i32::from_le_bytes(*b"get ");
     let set_ = i32::from_le_bytes(*b"set ");
     // The same prefixes as two-byte units.

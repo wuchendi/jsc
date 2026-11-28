@@ -410,7 +410,7 @@ fn emit_open_body(
         return_if_pending(function);
     };
     let require_callable = |function: &mut FnBuilder<'_>| {
-        emit_is_function(function, method);
+        emit_is_function(function, method, helpers);
         wasm!(function; I32Eqz, If(BlockType::Empty));
         throw_and_return(
             function,
@@ -484,7 +484,7 @@ fn emit_step_body(
 ) {
     let (it, r, tmp, next) = (frame.i64(0), frame.i64(1), frame.i64(2), frame.k);
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(it));
-    emit_is_function(function, next);
+    emit_is_function(function, next, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_and_return(
         function,
@@ -515,7 +515,7 @@ fn emit_return_body(
     return_if_pending(function);
     emit_is_nullish(function, method);
     wasm!(function; If(BlockType::Empty), I64Const(HOLE_BITS), Return, End);
-    emit_is_function(function, method);
+    emit_is_function(function, method, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_and_return(
         function,
@@ -646,7 +646,7 @@ impl Wrap {
     /// `result = Call(method, sync, « value »)` (no argument when the
     /// method itself got none): a `TypeError` unless `method` is callable.
     fn call(self, function: &mut FnBuilder<'_>, strings: &StrOffsets, helpers: Helpers<'_>) {
-        emit_is_function(function, self.method);
+        emit_is_function(function, self.method, helpers);
         self.throw_unless(
             function,
             &not_a_function(self.method, self.tmp),

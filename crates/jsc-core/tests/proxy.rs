@@ -1,8 +1,11 @@
-//! Integration tests: Proxy exotic objects (DESIGN.md §6.11, stage P2a) —
-//! `new Proxy`, `Proxy.revocable`, the eleven object internal-method traps
-//! with their invariant checks, proxies on prototype chains and as
+//! Integration tests: Proxy exotic objects (DESIGN.md §6.11, stages P2a and
+//! P2b) — `new Proxy`, `Proxy.revocable`, the eleven object internal-method
+//! traps with their invariant checks, proxies on prototype chains and as
 //! receivers, the generic algorithms over proxies (`Object.keys`, spread,
-//! `for-in`, integrity levels) and the renderer.
+//! `for-in`, integrity levels), the renderer, callable and constructor
+//! proxies from every call-site kind, and the integration paths (`IsArray`,
+//! `instanceof`, `Object.prototype.toString`, `JSON`, `concat`,
+//! `Function.prototype.toString` / `bind`).
 
 #![allow(clippy::expect_used)]
 
@@ -643,5 +646,366 @@ fn traps_survive_gc_stress() {
          }
          console.log(keep.join());",
         "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19\n",
+    );
+}
+
+// --- callable proxies (P2b) ---------------------------------------------------------------
+
+/// A proxy over a function is callable (`typeof` `"function"`); without an
+/// `apply` trap a call forwards `this` and every argument to the target;
+/// the trap receives `(target, thisArgument, argsArray)` with `this` the
+/// handler.
+#[test]
+fn apply_trap_and_forwarding() {
+    assert_string(
+        "function f(a, b) { return [this === undefined ? 'u' : this.n, a, b].join(':'); }
+         const p = new Proxy(f, {});
+         [typeof p, typeof new Proxy({}, {}), p(1, 2), p.call({ n: 'o' }, 3, 4)].join()",
+        "function,object,u:1:2,o:3:4",
+    );
+    assert_string(
+        "const handler = { apply(t, thisArg, args) {
+             return [this === handler, t === f, String(thisArg), Array.isArray(args), args.join('/')].join(':');
+           } };
+         function f() {}
+         const p = new Proxy(f, handler);
+         p(1, 2, 3)",
+        "true:true:undefined:true:1/2/3",
+    );
+}
+
+/// A construct trap receives `(target, argsArray, newTarget)` and its result
+/// must be an object; without one `new` constructs the target with the
+/// proxy as `new.target`. A proxy over a non-constructor is not a
+/// constructor; a proxy over an object is not callable.
+#[test]
+fn construct_trap_and_forwarding() {
+    assert_string(
+        "class C { constructor(a, b) { this.v = a + b; this.nt = new.target === p; } }
+         const p = new Proxy(C, {});
+         const o = new p(1, 2);
+         [o.v, o.nt, o instanceof C].join()",
+        "3,true,true",
+    );
+    assert_string(
+        "function F() {}
+         const handler = { construct(t, args, nt) {
+             return { same: this === handler && t === F && nt === p, args: args.join('/') };
+           } };
+         const p = new Proxy(F, handler);
+         const o = new p(1, 2, 3);
+         [o.same, o.args].join()",
+        "true,1/2/3",
+    );
+    assert_uncaught(
+        "const p = new Proxy(function () {}, { construct() { return 1; } }); new p()",
+        "TypeError: proxy [[Construct]] must return an object",
+    );
+    assert_type_errors(
+        "",
+        &[
+            "new (new Proxy(() => 1, {}))()",
+            "new (new Proxy(function () {}, { construct() { return null; } }))()",
+            "new Proxy({}, {})()",
+            "new (new Proxy({}, {}))()",
+        ],
+    );
+}
+
+/// Every call-site kind reaches a callable proxy: a plain call, a method
+/// call (`this` the receiver), a spread call with more arguments than the
+/// positional slots, `Function.prototype.call` / `apply`, an
+/// `Array.prototype.map` callback, a bound proxy, a getter, a
+/// `@@toPrimitive` method, a JSON replacer and a promise reaction.
+#[test]
+fn call_site_kinds() {
+    assert_string(
+        "const log = [];
+         const p = new Proxy(function (...a) { return a.length; }, {
+           apply(t, thisArg, args) { log.push(args.length); return Reflect_apply(t, thisArg, args); } });
+         function Reflect_apply(t, th, a) { return t.apply(th, a); }
+         const o = { m: p };
+         p(1); o.m(1, 2); p(...[1, 2, 3, 4, 5, 6, 7, 8]); p.call(null, 1, 2, 3); p.apply(null, [1, 2, 3, 4]);
+         [1, 2].map(p); p.bind(null, 1)(2);
+         log.join()",
+        "1,2,8,3,4,3,3,2",
+    );
+    assert_string(
+        "const p = new Proxy(function () { return this; }, {});
+         const o = { m: p };
+         [o.m() === o, p.call(o) === o, p.bind(o)() === o].join()",
+        "true,true,true",
+    );
+    assert_string(
+        "const getter = new Proxy(function () { return this.x * 2; }, {});
+         const o = { x: 21 }; Object.defineProperty(o, 'y', { get: getter });
+         const prim = { [Symbol.toPrimitive]: new Proxy(function (hint) { return hint; }, {}) };
+         const rep = new Proxy(function (k, v) { return typeof v === 'number' ? v + 1 : v; }, {});
+         [o.y, `${prim}`, prim + '', JSON.stringify({ a: 1 }, rep)].join()",
+        "42,string,default,{\"a\":2}",
+    );
+    assert_output(
+        "const onOk = new Proxy(function (v) { console.log('then', v); }, {});
+         Promise.resolve(7).then(onOk);",
+        "then 7\n",
+    );
+}
+
+/// The spread path past the positional slots keeps every argument, also when
+/// the trap itself makes a nested spread call before reading them.
+#[test]
+fn apply_trap_args_past_k() {
+    assert_string(
+        "function sum(...a) { return a.reduce((x, y) => x + y, 0); }
+         const p = new Proxy(sum, { apply(t, th, args) {
+             const inner = sum(...[100, 200, 300, 400, 500, 600]);
+             return inner + ':' + args.join('/');
+           } });
+         p(...[1, 2, 3, 4, 5, 6, 7])",
+        "2100:1/2/3/4/5/6/7",
+    );
+    assert_string(
+        "function C(...a) { this.a = a.join('/'); }
+         const p = new Proxy(C, {});
+         new p(...[1, 2, 3, 4, 5, 6, 7]).a",
+        "1/2/3/4/5/6/7",
+    );
+}
+
+/// `new.target` inside the target is the construct site's: the proxy for
+/// `new P()`, the derived class for `super(..)` in `class B extends P`.
+#[test]
+fn new_target_and_super() {
+    assert_string(
+        "class A { constructor(x) { this.x = x; this.nt = new.target; } }
+         const log = [];
+         const P = new Proxy(A, { construct(t, args, nt) { log.push(nt === B); return Reflect_construct(t, args, nt); } });
+         function Reflect_construct(t, args, nt) { const o = new t(...args); Object.setPrototypeOf(o, nt.prototype); return o; }
+         class B extends P { constructor() { super(5); this.y = 6; } }
+         const b = new B();
+         [b.x, b.y, b instanceof B, log.join()].join()",
+        "5,6,true,true",
+    );
+    assert_string(
+        "class A { constructor() { this.nt = new.target; } }
+         const P = new Proxy(A, {});
+         class B extends P {}
+         const b = new B(); const a = new P();
+         [b.nt === B, b instanceof A, a.nt === P, Object.getPrototypeOf(B) === P].join()",
+        "true,true,true,true",
+    );
+}
+
+/// A revoked callable proxy is still `typeof` `"function"`; calling or
+/// constructing it throws.
+#[test]
+fn revoked_callable_proxy() {
+    assert_string(
+        "const r = Proxy.revocable(function () {}, {}); r.revoke();
+         typeof r.proxy",
+        "function",
+    );
+    assert_uncaught(
+        "const r = Proxy.revocable(function () {}, {}); r.revoke(); r.proxy()",
+        "TypeError: Cannot perform 'apply' on a proxy that has been revoked",
+    );
+    assert_uncaught(
+        "const r = Proxy.revocable(class {}, {}); r.revoke(); new r.proxy()",
+        "TypeError: Cannot perform 'construct' on a proxy that has been revoked",
+    );
+}
+
+/// A callable proxy can be an `apply` / `construct` trap, and a trap that
+/// throws propagates out of the call.
+#[test]
+fn callable_proxy_as_trap_and_throwing_traps() {
+    assert_string(
+        "const trap = new Proxy(function (t, th, args) { return 'via:' + args[0]; }, {});
+         new Proxy(function () {}, { apply: trap })(9)",
+        "via:9",
+    );
+    assert_string(
+        "const p = new Proxy(function () {}, { apply() { throw new RangeError('boom'); } });
+         (function () { try { p(); return 'no'; } catch (e) { return e instanceof RangeError ? e.message : 'other'; } })()",
+        "boom",
+    );
+}
+
+// --- integration paths (P2b) ---------------------------------------------------------------
+
+/// `Array.isArray` sees through proxies (chains included) and throws on a
+/// revoked one; `Array.isArray` as a callback too.
+#[test]
+fn is_array_through_proxies() {
+    assert_string(
+        "const a = new Proxy([], {}); const o = new Proxy({}, {});
+         [Array.isArray(a), Array.isArray(o), Array.isArray(new Proxy(a, {})),
+          [a, o].map(Array.isArray).join('/')].join()",
+        "true,false,true,true/false",
+    );
+    assert_uncaught(
+        "const r = Proxy.revocable([], {}); r.revoke(); Array.isArray(r.proxy)",
+        "TypeError: Cannot perform 'IsArray' on a proxy that has been revoked",
+    );
+}
+
+/// `Object.prototype.toString` computes a proxy's builtin tag (Array,
+/// Function, Object) before reading `@@toStringTag` through the `get` trap.
+#[test]
+fn object_to_string_of_proxies() {
+    assert_string(
+        "const ts = (v) => Object.prototype.toString.call(v);
+         const log = [];
+         const tagged = new Proxy({}, { get(t, k) { log.push(typeof k); return k === Symbol.toStringTag ? 'X' : undefined; } });
+         [ts(new Proxy([], {})), ts(new Proxy(function () {}, {})), ts(new Proxy({}, {})),
+          ts(new Proxy(new Error('e'), {})), ts(tagged), log.join('/')].join()",
+        "[object Array],[object Function],[object Object],[object Object],[object X],symbol",
+    );
+    assert_type_errors(
+        "const r = Proxy.revocable([], {}); r.revoke(); const p = r.proxy;",
+        &["Object.prototype.toString.call(p)"],
+    );
+}
+
+/// `JSON.stringify` serializes an array proxy through `length` and index
+/// `get`s, an object proxy through `ownKeys` / `getOwnPropertyDescriptor` /
+/// `get`, omits a callable proxy, uses a proxy array as the replacer's
+/// property list, and throws on a revoked proxy.
+#[test]
+fn json_stringify_through_proxies() {
+    assert_string(
+        "const log = [];
+         const a = new Proxy([1, 2], { get(t, k) { log.push(String(k)); return t[k]; } });
+         [JSON.stringify(a), log.join('/')].join('|')",
+        "[1,2]|toJSON/length/0/1",
+    );
+    assert_string(
+        "const o = new Proxy({ a: 1, b: [2] }, {});
+         const f = new Proxy(function () {}, {});
+         [JSON.stringify(o), JSON.stringify({ f, g: 1 }), JSON.stringify([f]), String(JSON.stringify(f)),
+          JSON.stringify({ a: 1, b: 2, c: 3 }, new Proxy(['c', 'a'], {})),
+          JSON.stringify([new Proxy([1, [2]], {})])].join()",
+        "{\"a\":1,\"b\":[2]},{\"g\":1},[null],undefined,{\"c\":3,\"a\":1},[[1,[2]]]",
+    );
+    assert_type_errors(
+        "const r = Proxy.revocable([], {}); r.revoke(); const p = r.proxy;",
+        &[
+            "JSON.stringify(p)",
+            "JSON.stringify({}, p)",
+            "JSON.stringify([p])",
+        ],
+    );
+}
+
+/// The `JSON.parse` reviver walks a proxy value (here one a reviver
+/// installed) through its traps: `IsArray`, `length`, then each index.
+#[test]
+fn json_parse_reviver_walks_proxies() {
+    assert_string(
+        "const seen = [];
+         const r = JSON.parse('{\"a\":1,\"b\":2}', function (k, v) {
+           seen.push(k);
+           if (k === 'a') this.b = new Proxy([5, 6], {});
+           return v;
+         });
+         [seen.join('/'), JSON.stringify(r)].join('|')",
+        "a/0/1/b/|{\"a\":1,\"b\":[5,6]}",
+    );
+}
+
+/// `instanceof` walks the left operand's chain through `getPrototypeOf`
+/// traps, reads `prototype` and `@@hasInstance` of a callable proxy through
+/// its `get` trap; `isPrototypeOf` walks the same way.
+#[test]
+fn instanceof_through_proxies() {
+    assert_string(
+        "class C {}
+         const lhs = new Proxy({}, { getPrototypeOf() { return C.prototype; } });
+         const arr = new Proxy({}, { getPrototypeOf() { return Array.prototype; } });
+         const P = new Proxy(C, {});
+         const H = new Proxy(function () {}, { get(t, k) { return k === Symbol.hasInstance ? () => true : t[k]; } });
+         [lhs instanceof C, arr instanceof Array, arr instanceof Object, new C() instanceof P,
+          1 instanceof H, C.prototype.isPrototypeOf(lhs), Array.prototype.isPrototypeOf(arr),
+          Object.create(lhs) instanceof C].join()",
+        "true,true,true,true,true,true,true,true",
+    );
+    assert_uncaught(
+        "class C {}
+         const lhs = new Proxy({}, { getPrototypeOf() { throw new RangeError('gp'); } });
+         lhs instanceof C",
+        "RangeError: gp",
+    );
+}
+
+/// `concat` spreads a proxy of an array (`IsArray`) and an object proxy whose
+/// `get` trap answers `@@isConcatSpreadable`; `flat` descends into a proxy
+/// of an array; `ArraySpeciesCreate` sees a proxy receiver as an array.
+#[test]
+fn array_methods_through_proxies() {
+    assert_string(
+        "const spreadable = new Proxy({ length: 2, 0: 'x', 1: 'y' }, {
+           get(t, k) { return k === Symbol.isConcatSpreadable ? true : t[k]; } });
+         [[0].concat(new Proxy([1, 2], {})).join('/'), [0].concat(spreadable).join('/'),
+          [[0], new Proxy([1, [2]], {})].flat().length,
+          Array.prototype.map.call(new Proxy([1, 2], {}), (x) => x * 2).join('/')].join()",
+        "0/1/2,0/x/y,3,2/4",
+    );
+    assert_type_errors(
+        "const r = Proxy.revocable([], {}); r.revoke(); const p = r.proxy;",
+        &["[].concat(p)", "[p].flat()"],
+    );
+    assert_string(
+        "const r = Proxy.revocable([], {}); r.revoke(); [r.proxy].flat(0).length",
+        "1",
+    );
+}
+
+/// `Function.prototype.toString` of a callable proxy is the anonymous
+/// native form; a non-callable proxy throws. `bind` of a callable proxy
+/// reads the target's prototype through `getPrototypeOf`, then `length` and
+/// `name` through the traps (after the `get` of `bind` itself).
+#[test]
+fn function_to_string_and_bind_of_proxies() {
+    assert_string(
+        "Function.prototype.toString.call(new Proxy(function f() {}, {}))",
+        "function () { [native code] }",
+    );
+    assert_type_errors("", &["Function.prototype.toString.call(new Proxy({}, {}))"]);
+    assert_string(
+        "const log = [];
+         function f(a, b, c) { return [this.n, a, b, c].join(); }
+         const p = new Proxy(f, {
+           getPrototypeOf(t) { log.push('proto'); return Object.getPrototypeOf(t); },
+           getOwnPropertyDescriptor(t, k) { log.push('gopd:' + k); return Object.getOwnPropertyDescriptor(t, k); },
+           get(t, k) { log.push('get:' + String(k)); return t[k]; } });
+         const b = p.bind({ n: 'o' }, 1);
+         [b(2, 3), b.name, b.length, log.join(' ')].join('|')",
+        "o,1,2,3|bound f|2|get:bind proto gopd:length get:length get:name",
+    );
+    assert_string(
+        "class C { constructor(a) { this.a = a; } }
+         const B = new Proxy(C, {}).bind(null, 4);
+         const o = new B();
+         [o.a, o instanceof C].join()",
+        "4,true",
+    );
+}
+
+/// The trampoline's argument array and the construct path stay correct with
+/// a collection at every allocation.
+#[test]
+fn callable_proxies_survive_gc_stress() {
+    assert_same_under_gc_stress(
+        "function f(...a) { return a.map((x) => [x]).length; }
+         class C { constructor(...a) { this.a = a.map(String); } }
+         const p = new Proxy(f, { apply(t, th, args) { return t(...args.concat(['z'])); } });
+         const q = new Proxy(C, { construct(t, args, nt) { return new t(...args, 'w'); } });
+         const r = new Proxy(C, {});
+         const out = [];
+         for (let i = 0; i < 10; i++) {
+           out.push(p(...[i, 1, 2, 3, 4, 5, 6, 7]), new q(i, 1).a.join(''), new r(...[i, 2, 3, 4, 5, 6]).a.length);
+         }
+         console.log(out.join(), Array.isArray(new Proxy([], {})), JSON.stringify(new Proxy([1, { a: 2 }], {})));",
+        "9,01w,6,9,11w,6,9,21w,6,9,31w,6,9,41w,6,9,51w,6,9,61w,6,9,71w,6,9,81w,6,9,91w,6 true [1,{\"a\":2}]\n",
     );
 }

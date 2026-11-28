@@ -409,7 +409,7 @@ fn emit_settle(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> 
         I32Const(REJECTED), LocalSet(state),
         Else,
     );
-    emit_is_function(&mut f, then);
+    emit_is_function(&mut f, then, helpers);
     wasm!(f;
         If(BlockType::Empty),
     );
@@ -539,7 +539,7 @@ fn emit_finally(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         LocalGet(on_finally), LocalSet(then_finally),
         LocalGet(on_finally), LocalSet(catch_finally),
     );
-    emit_is_function(&mut f, on_finally);
+    emit_is_function(&mut f, on_finally, helpers);
     wasm!(f;
         If(BlockType::Empty),
         I32Const(2), Call(helpers.new_array()), LocalSet(dst),
@@ -687,7 +687,7 @@ fn emit_run_job(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         End,
         LocalSet(callback),
     );
-    emit_is_function(&mut f, callback);
+    emit_is_function(&mut f, callback, helpers);
     wasm!(f;
         I32Eqz,
         If(BlockType::Empty),
