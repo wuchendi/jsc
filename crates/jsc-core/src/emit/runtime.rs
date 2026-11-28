@@ -804,8 +804,9 @@ pub(super) fn emit_str_index(alloc_index: u32, leaves: &LeafSet) -> Function {
 ///
 /// When the array handle's capacity (the `cap` of its [`TYPE_ELEMS`] store, `0`
 /// with no store) is below `need`, it allocates a fresh store of
-/// `cap' = max(need, 4, 2 * cap)` slots, `memory.copy`s the `len` live slots
-/// into it, and repoints the handle's `elems`; the handle never moves. Locals
+/// `cap' = max(need, 4, 2 * cap)` slots, `memory.copy`s the `min(len, cap)`
+/// live slots into it (a `SPARSE` array's `len` may exceed its store), and
+/// repoints the handle's `elems`; the handle never moves. Locals
 /// 0/1 are the params; extra `i32` locals hold the old store, `cap`, and the
 /// new store.
 pub(super) fn emit_array_reserve(alloc_index: u32, leaves: &LeafSet) -> Function {
@@ -861,7 +862,7 @@ pub(super) fn emit_array_reserve(alloc_index: u32, leaves: &LeafSet) -> Function
         &[Instruction::Return],
     );
 
-    // if old: memory.copy(store + 8, old + 8, 8 * len).
+    // if old: memory.copy(store + 8, old + 8, 8 * min(len, old.cap)).
     function.instruction(&Instruction::LocalGet(old));
     function.instruction(&Instruction::If(BlockType::Empty));
     function.instruction(&Instruction::LocalGet(store));
@@ -872,6 +873,14 @@ pub(super) fn emit_array_reserve(alloc_index: u32, leaves: &LeafSet) -> Function
     function.instruction(&Instruction::I32Add);
     function.instruction(&Instruction::LocalGet(base));
     function.instruction(&Instruction::I32Load(mem32(ARRAY_LEN_OFFSET)));
+    function.instruction(&Instruction::LocalTee(cap));
+    function.instruction(&Instruction::LocalGet(old));
+    function.instruction(&Instruction::I32Load(mem32(ELEMS_CAP_OFFSET)));
+    function.instruction(&Instruction::LocalGet(cap));
+    function.instruction(&Instruction::LocalGet(old));
+    function.instruction(&Instruction::I32Load(mem32(ELEMS_CAP_OFFSET)));
+    function.instruction(&Instruction::I32LtU);
+    function.instruction(&Instruction::Select);
     function.instruction(&Instruction::I32Const(3));
     function.instruction(&Instruction::I32Shl);
     function.instruction(&Instruction::MemoryCopy {
