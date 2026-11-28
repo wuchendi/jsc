@@ -222,14 +222,19 @@ fn async_paths_are_kept() {
     }
 }
 
-/// The shaken `console.log("hi")` module: 432 056 bytes at 11ca248, plus
-/// about 20 KB of `BigInt` code and data, a few KB of `Proxy` / `Reflect`
-/// strings and gated arms, and the binary-data strings (data segments are
-/// not shaken; the binary-data bodies are, DESIGN.md §5.8.5): about 470 KB,
-/// bounded with headroom for `gc_stress`. The `Reflect` merge had left every
-/// program at the full runtime (~1.2 MB): the renderer's `"constructor"`
-/// lookup keeps the `Map` constructor, its `"set"` lookup kept `Reflect.set`,
-/// and that body's run-time-key use left the module whole (DESIGN.md §6.11).
+/// The shaken `console.log("hi")` module: 432 056 bytes at 11ca248 and
+/// 487 068 after the phase-5b merges. The data segments are not shaken: the
+/// growth is mostly the binary-data message strings (~270 new static strings,
+/// ~19 KB), the intern table doubling to 4096 slots (16 KB) once the string
+/// count passed 1024, ~7 KB of realm image (method blocks, property entries,
+/// intrinsic blocks of the new constructors and prototypes) and function-info
+/// entries, a few KB of `BigInt` strings and gated-arm residue, and the
+/// `Proxy` property-error strings. The `Proxy` builtins' and `Reflect`
+/// functions' own strings (~2 KB) exist only when their gate is open. Bounded
+/// with headroom for `gc_stress`. The `Reflect` merge had left every program
+/// at the full runtime (~1.2 MB): the renderer's `"constructor"` lookup keeps
+/// the `Map` constructor, its `"set"` lookup kept `Reflect.set`, and that
+/// body's run-time-key use left the module whole (DESIGN.md §6.11).
 const HELLO_BOUND: usize = 520_000;
 
 #[test]
@@ -299,4 +304,111 @@ fn reflect_handler_proxy_runs_shaken() {
         "const p = new Proxy({ a: 1 }, Reflect); p.b = 2; ('a' in p) + p.a + p.b",
         "4",
     );
+}
+
+/// A get- and set-trap proxy shakes: the proxy helpers hand descriptors and
+/// key lists only to attribute checks and invariant tests, and the
+/// `Object` / `Reflect` functions kept by the trap-name lookups cannot be
+/// called with a key the program does not write (DESIGN.md §4.2, §6.11).
+#[test]
+fn trap_proxy_still_shakes() {
+    let src = "const seen = [];
+               const p = new Proxy({}, {
+                 get(t, k) { return k === 'x' ? 1 : 2 },
+                 set(t, k, v) { seen.push(v); return true },
+               });
+               p.y = 5;
+               [p.x + p.y, seen.length, seen[0]].join()";
+    let (shaken, full) = (size(src, false), size(src, true));
+    assert!(shaken * 3 < full * 2, "{shaken} vs {full}");
+    same(src, "3,1,5");
+    // The traps see the forwarded key and receiver; no trap forwards.
+    let src = "const p = new Proxy({ a: 1 }, {});
+               p.b = 2;
+               ('a' in p) + p.a + p.b + (delete p.a) + ('a' in p)";
+    let (shaken, full) = (size(src, false), size(src, true));
+    assert!(shaken * 3 < full * 2, "{shaken} vs {full}");
+    same(src, "5");
+}
+
+/// Descriptor and key-list reflection on a proxy works (the module may be
+/// whole): the trap's descriptor reaches `Object.getOwnPropertyDescriptor`
+/// and makes `a` enumerable for `Object.keys`.
+#[test]
+fn proxy_descriptor_reflection_runs() {
+    same(
+        "const p = new Proxy({ a: 1 }, {
+           getOwnPropertyDescriptor(t, k) { return { value: 7, enumerable: true, configurable: true } },
+         });
+         const d = Object.getOwnPropertyDescriptor(p, 'a');
+         [d.value, d.enumerable, Object.keys(p).join()].join()",
+        "7,true,a",
+    );
+    same(
+        "const p = new Proxy({ a: 1, b: 2 }, { ownKeys(t) { return ['b', 'a'] } });
+         Object.keys(p).join() + Object.values(p).join() + JSON.stringify({ ...p })",
+        "b,a2,1{\"b\":2,\"a\":1}",
+    );
+}
+
+/// A lying `getOwnPropertyDescriptor` trap makes a target's builtin look
+/// enumerable: `Object.values` / `Object.assign` / spread then hand it out,
+/// so with `Proxy` in the program they keep the runtime whole.
+#[test]
+fn proxy_listed_values_keep_the_runtime() {
+    let proxy = "const p = new Proxy(Object.prototype, {
+                   ownKeys(t) { return [['is', 'Prototype', 'Of'].join('')] },
+                   getOwnPropertyDescriptor(t, k) {
+                     return { value: 0, writable: true, enumerable: true, configurable: true }
+                   },
+                 });";
+    for (tail, expected) in [
+        ("Object.values(p)[0].call(Object.prototype, {})", "true"),
+        (
+            "Object.values(Object.assign({}, p))[0].call(Object.prototype, {})",
+            "true",
+        ),
+        (
+            "Object.values({ ...p })[0].call(Object.prototype, {})",
+            "true",
+        ),
+    ] {
+        let src = format!("{proxy} {tail}");
+        assert_eq!(size(&src, false), size(&src, true), "{tail}");
+        same(&src, expected);
+    }
+}
+
+/// `Reflect.get(o, 'x')` / `Object.getOwnPropertyDescriptor(o, 'x')` with a
+/// constant key shake like `o.x`; the same function under a run-time key, or
+/// read as a value, keeps the runtime whole.
+#[test]
+fn constant_key_reflection_still_shakes() {
+    for (src, expected) in [
+        (
+            "const o = { x: 4 }; Reflect.get(o, 'x') + Reflect.get([5], 0)",
+            "9",
+        ),
+        (
+            "const d = Object.getOwnPropertyDescriptor({ x: 3 }, 'x'); d.value + d.writable",
+            "4",
+        ),
+        (
+            "const o = {}; Reflect.defineProperty(o, 'x', { value: 6 }); o.x",
+            "6",
+        ),
+    ] {
+        let (shaken, full) = (size(src, false), size(src, true));
+        assert!(shaken * 3 < full * 2, "`{src}`: {shaken} vs {full}");
+        same(src, expected);
+    }
+    for src in [
+        "const k = ['m', 'a', 'p'].join(''); \
+         Reflect.get({ x: 1 }, 'x') + Reflect.get(Array.prototype, k).call([1, 2], x => x * 2).join()",
+        "const k = ['m', 'a', 'p'].join(''); const get = Reflect.get; \
+         Reflect.get({ x: 1 }, 'x') + get(Array.prototype, k).call([1, 2], x => x * 2).join()",
+    ] {
+        assert_eq!(size(src, false), size(src, true), "`{src}`");
+        same(src, "12,4");
+    }
 }
