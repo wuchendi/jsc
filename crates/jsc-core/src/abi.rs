@@ -830,6 +830,75 @@ pub(crate) const FINREG_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 24;
 /// (a cleanup job is queued).
 pub(crate) const FINREG_FLAG_JOB_QUEUED: u32 = 1;
 
+// Type bytes `20..=23` are reserved for the parallel Proxy and BigInt
+// workstreams (DESIGN.md §5.8.1); the binary-data kinds start at `24`.
+
+/// TYPE BYTE of an `ArrayBuffer` (DESIGN.md §5.8.3): the object-family
+/// prefix, then `[data:u32 @16][byte_length:u32 @20][max_byte_length:u32
+/// @24][reserved:u32]`. `data` is a raw ref to the [`TYPE_RAW`] block holding
+/// the bytes (its `len` is the capacity), `0` when detached or never needed;
+/// a fixed-length buffer has `max_byte_length == byte_length`; a detached one
+/// has all three `0` and [`AB_FLAG_DETACHED`]. Maps to `typeof` "object".
+pub(crate) const TYPE_ARRAYBUFFER: u8 = 24;
+
+/// TYPE BYTE of a typed array (DESIGN.md §5.8.3); `ArrayBuffer.isView` tests
+/// it.
+pub(crate) const TYPE_TYPEDARRAY: u8 = 25;
+
+/// TYPE BYTE of a `DataView` (DESIGN.md §5.8.3); `ArrayBuffer.isView` tests
+/// it.
+pub(crate) const TYPE_DATAVIEW: u8 = 26;
+
+/// Byte offset (from a [`TYPE_ARRAYBUFFER`] block base) of the u32 raw ref
+/// to the byte block.
+pub(crate) const AB_DATA_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_ARRAYBUFFER`] block base) of the u32 byte
+/// length.
+pub(crate) const AB_BYTE_LENGTH_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
+/// Byte offset (from a [`TYPE_ARRAYBUFFER`] block base) of the u32 maximum
+/// byte length.
+pub(crate) const AB_MAX_BYTE_LENGTH_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_ARRAYBUFFER`] block.
+pub(crate) const AB_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// [`TYPE_ARRAYBUFFER`] header `flags` bit (byte [`HEADER_FLAGS_OFFSET`]):
+/// the buffer is resizable (never cleared, a detached resizable buffer stays
+/// resizable).
+pub(crate) const AB_FLAG_RESIZABLE: u8 = 2;
+
+/// [`TYPE_ARRAYBUFFER`] header `flags` bit: the buffer is detached.
+pub(crate) const AB_FLAG_DETACHED: u8 = 4;
+
+/// The largest `ArrayBuffer` byte length (and `maxByteLength`): `2^29`, the
+/// whole linear-memory cap [`MEMORY_MAX_PAGES`].
+pub(crate) const BYTE_LENGTH_MAX: u32 = 1 << 29;
+
+/// Byte offset (from a [`TYPE_DATAVIEW`] block base) of the u32 raw ref to
+/// the viewed [`TYPE_ARRAYBUFFER`] block (DESIGN.md §5.8.3).
+pub(crate) const DV_BUFFER_OFFSET: u32 = OBJ_PREFIX_SIZE;
+
+/// Byte offset (from a [`TYPE_DATAVIEW`] block base) of the u32 byte offset
+/// into the buffer.
+pub(crate) const DV_BYTE_OFFSET_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
+
+/// Byte offset (from a [`TYPE_DATAVIEW`] block base) of the u32 byte length
+/// (`0`, ignored, when length-tracking).
+pub(crate) const DV_BYTE_LENGTH_OFFSET: u32 = OBJ_PREFIX_SIZE + 8;
+
+/// The byte size of a [`TYPE_DATAVIEW`] block.
+pub(crate) const DV_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 16;
+
+/// [`TYPE_DATAVIEW`] header `flags` bit: the view tracks its buffer's length
+/// (`[[ByteLength]]` is `auto`).
+pub(crate) const DV_FLAG_LENGTH_TRACKING: u8 = 2;
+
+/// [`TYPE_DATAVIEW`] header `flags` bit: the buffer was resizable at
+/// construction (never cleared).
+pub(crate) const DV_FLAG_RESIZABLE_BUFFER: u8 = 4;
+
 /// Byte offset (from a [`TYPE_SYMBOL`] block base) of the `description` jsval
 /// (an `i64`: a string jsval or `undefined`).
 #[cfg_attr(not(feature = "native-run"), allow(dead_code))]

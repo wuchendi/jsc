@@ -61,11 +61,13 @@ pub(super) enum Group {
     Gc,
     /// [`Extra`].
     Extra,
+    /// The binary-data helpers ([`binary::TYPES`]).
+    Binary,
 }
 
 impl Group {
     /// Every group, in function-index order.
-    const ALL: [Group; 13] = [
+    const ALL: [Group; 14] = [
         Self::Core,
         Self::Dtoa,
         Self::Tail,
@@ -79,6 +81,7 @@ impl Group {
         Self::Engine,
         Self::Gc,
         Self::Extra,
+        Self::Binary,
     ];
 
     /// The number of functions in the group.
@@ -97,6 +100,7 @@ impl Group {
             Self::Engine => promise_engine::TYPES.len(),
             Self::Gc => gc::TYPES.len(),
             Self::Extra => EXTRA.len(),
+            Self::Binary => binary::TYPES.len(),
         }
     }
 
@@ -118,6 +122,7 @@ impl Group {
             Self::Engine => promise_engine::TYPES.to_vec(),
             Self::Gc => gc::TYPES.to_vec(),
             Self::Extra => of(&EXTRA),
+            Self::Binary => binary::TYPES.to_vec(),
             Self::Settlers | Self::Builtins => return None,
         })
     }
@@ -164,6 +169,7 @@ impl Group {
             Self::Engine => sink(promise_engine::emit_helpers(strings, helpers, leaves)),
             Self::Gc => sink(gc::emit_helpers(helpers, leaves, gc)),
             Self::Extra => of(&EXTRA, cx, sink),
+            Self::Binary => sink(binary::emit_helpers(strings, helpers, leaves)),
         }
     }
 

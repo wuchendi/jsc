@@ -314,3 +314,58 @@ fn allocator_layout_matches_design() {
     assert_eq!(HEADER_GC_OFFSET, 1);
     assert_eq!(GC_MIN_BUDGET, 4 << 20);
 }
+
+/// Pins the binary-data type bytes and the `ArrayBuffer` layout to
+/// `DESIGN.md` §5.8: type bytes 24 / 25 / 26 (20..=23 stay reserved); a
+/// 32 B buffer with `data` @16, `byte_length` @20, `max_byte_length` @24;
+/// flags `RESIZABLE` = 2, `DETACHED` = 4; byte lengths up to 2^29.
+#[test]
+fn array_buffer_layout_matches_design() {
+    use super::{
+        AB_BLOCK_SIZE, AB_BYTE_LENGTH_OFFSET, AB_DATA_OFFSET, AB_FLAG_DETACHED, AB_FLAG_RESIZABLE,
+        AB_MAX_BYTE_LENGTH_OFFSET, BLOCK_ALIGN, BYTE_LENGTH_MAX, MEMORY_MAX_PAGES,
+        OBJ_FLAG_NOT_EXTENSIBLE, TYPE_ARRAYBUFFER, TYPE_DATAVIEW, TYPE_RAW, TYPE_TYPEDARRAY,
+    };
+    assert_eq!(
+        (TYPE_ARRAYBUFFER, TYPE_TYPEDARRAY, TYPE_DATAVIEW),
+        (24, 25, 26)
+    );
+    assert_eq!(TYPE_RAW, 19);
+    assert_eq!(
+        [
+            AB_DATA_OFFSET,
+            AB_BYTE_LENGTH_OFFSET,
+            AB_MAX_BYTE_LENGTH_OFFSET,
+            AB_BLOCK_SIZE
+        ],
+        [16, 20, 24, 32]
+    );
+    assert_eq!(AB_BLOCK_SIZE % BLOCK_ALIGN, 0);
+    assert_eq!(
+        (OBJ_FLAG_NOT_EXTENSIBLE, AB_FLAG_RESIZABLE, AB_FLAG_DETACHED),
+        (1, 2, 4)
+    );
+    assert_eq!(u64::from(BYTE_LENGTH_MAX), MEMORY_MAX_PAGES * 65_536);
+}
+
+/// Pins the `DataView` layout to `DESIGN.md` §5.8.3: a 32 B view with
+/// `buffer` @16, `byte_offset` @20, `byte_length` @24; flags
+/// `LENGTH_TRACKING` = 2, `RESIZABLE_BUFFER` = 4.
+#[test]
+fn data_view_layout_matches_design() {
+    use super::{
+        BLOCK_ALIGN, DV_BLOCK_SIZE, DV_BUFFER_OFFSET, DV_BYTE_LENGTH_OFFSET, DV_BYTE_OFFSET_OFFSET,
+        DV_FLAG_LENGTH_TRACKING, DV_FLAG_RESIZABLE_BUFFER,
+    };
+    assert_eq!(
+        [
+            DV_BUFFER_OFFSET,
+            DV_BYTE_OFFSET_OFFSET,
+            DV_BYTE_LENGTH_OFFSET,
+            DV_BLOCK_SIZE
+        ],
+        [16, 20, 24, 32]
+    );
+    assert_eq!(DV_BLOCK_SIZE % BLOCK_ALIGN, 0);
+    assert_eq!((DV_FLAG_LENGTH_TRACKING, DV_FLAG_RESIZABLE_BUFFER), (2, 4));
+}
