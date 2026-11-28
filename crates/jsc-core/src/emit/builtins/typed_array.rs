@@ -1,5 +1,5 @@
 //! Typed arrays (DESIGN.md §5.8): the concrete constructors (`Int8Array` ..
-//! `Float64Array`, every overload of `TypedArray(...args)`), the
+//! `BigUint64Array`, every overload of `TypedArray(...args)`), the
 //! `%TypedArray%` statics `from` / `of`, and the `%TypedArray.prototype%`
 //! getters (`buffer`, `byteLength`, `byteOffset`, `length`,
 //! `[@@toStringTag]`) and iterator methods (`keys`, `values`, `entries`).
@@ -45,7 +45,7 @@ macro_rules! alignment_errors {
 }
 
 /// The alignment `RangeError`s of each kind (DESIGN.md §5.8.7).
-const ALIGNMENT: [[CalleeErrorText<'static>; 2]; 9] = alignment_errors![
+const ALIGNMENT: [[CalleeErrorText<'static>; 2]; 11] = alignment_errors![
     "Int8Array" => "1",
     "Uint8Array" => "1",
     "Uint8ClampedArray" => "1",
@@ -55,6 +55,8 @@ const ALIGNMENT: [[CalleeErrorText<'static>; 2]; 9] = alignment_errors![
     "Uint32Array" => "4",
     "Float32Array" => "4",
     "Float64Array" => "8",
+    "BigInt64Array" => "8",
+    "BigUint64Array" => "8",
 ];
 
 /// A length that is not a valid index, or whose byte length cannot be
@@ -103,8 +105,12 @@ const CREATE_OUT_OF_BOUNDS: CalleeErrorText<'static> =
 const CREATE_TOO_SHORT: CalleeErrorText<'static> =
     type_error!("The TypedArray constructor returned a too short TypedArray");
 
+/// The typed-array overload over a source of the other content type.
+const CONTENT_TYPE: CalleeErrorText<'static> =
+    type_error!("Cannot mix BigInt and other types, use explicit conversions");
+
 /// The fixed `TypeError` and `RangeError` texts of this family.
-const TEXTS: [CalleeErrorText<'static>; 11] = [
+const TEXTS: [CalleeErrorText<'static>; 12] = [
     INVALID_LENGTH,
     OFFSET_OUT_OF_BOUNDS,
     DETACHED_BUFFER,
@@ -116,6 +122,7 @@ const TEXTS: [CalleeErrorText<'static>; 11] = [
     CREATE_NOT_TYPED_ARRAY,
     CREATE_OUT_OF_BOUNDS,
     CREATE_TOO_SHORT,
+    CONTENT_TYPE,
 ];
 
 /// The source name of `Construct(C, [len])` in `TypedArrayCreateFromConstructor`.
@@ -605,9 +612,11 @@ fn emit_ctor(
 }
 
 /// `InitializeTypedArrayFromTypedArray`: an out-of-bounds or detached source
-/// throws; a fresh buffer of the source's current length, filled by one
-/// `memory.copy` when the kinds match, else element by element (each read
-/// and converted by the source's and the target's kind). Returns `out`.
+/// throws; a fresh buffer of the source's current length (allocated first,
+/// as the spec orders), then a source of the other content type (Number /
+/// `BigInt`) throws a `TypeError`; the buffer is filled by one `memory.copy`
+/// when the kinds match, else element by element (each read and converted
+/// by the source's and the target's kind). Returns `out`.
 fn from_typed_array(
     function: &mut FnBuilder<'_>,
     c: Ctor,
@@ -621,6 +630,16 @@ fn from_typed_array(
         LocalGet(src), I32WrapI64, Call(helpers.ta_length()), F64ConvertI32U, LocalSet(c.len),
     );
     c.allocate(function, strings, helpers);
+    wasm!(function;
+        LocalGet(src), I32WrapI64, I32Load8U(m8(abi::TA_KIND_OFFSET)),
+        I32Const(FIRST_BIGINT_KIND),
+    );
+    if c.kind.is_bigint() {
+        wasm!(function; I32LtU);
+    } else {
+        wasm!(function; I32GeU);
+    }
+    type_error_if(function, c.frame, CONTENT_TYPE, strings, helpers);
     // No user code ran since the witness: the source is unchanged.
     wasm!(function;
         LocalGet(src), I32WrapI64, I32Load8U(m8(abi::TA_KIND_OFFSET)),
