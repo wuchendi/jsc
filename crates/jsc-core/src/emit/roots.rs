@@ -22,7 +22,40 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+
+thread_local! {
+    /// Whether the program being emitted can produce a `BigInt`
+    /// ([`Helpers::bigints`], DESIGN.md §6.10.9), for the emitters that
+    /// take no [`Helpers`]: [`classify`] and [`emit_is_object`]. `true`
+    /// outside [`BigIntScope`], the sound default.
+    static BIGINTS: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Whether the program being emitted can produce a `BigInt` (see
+/// [`BIGINTS`]).
+pub(super) fn bigints_reachable() -> bool {
+    BIGINTS.get()
+}
+
+/// Publishes [`Helpers::bigints`] to [`bigints_reachable`] for the
+/// emission of one module; dropping it restores the sound default.
+pub(super) struct BigIntScope;
+
+impl BigIntScope {
+    /// Enter the emission of a module whose gate is `reachable`.
+    pub(super) fn enter(reachable: bool) -> Self {
+        BIGINTS.set(reachable);
+        Self
+    }
+}
+
+impl Drop for BigIntScope {
+    fn drop(&mut self) {
+        BIGINTS.set(true);
+    }
+}
 
 /// The non-allocating leaf helpers, as wasm function indices. WASI imports
 /// never call back; the remaining `env` imports do and are not leaves.
@@ -46,6 +79,8 @@ const WASI_IMPORT_COUNT: u32 = 4;
 
 /// Each candidate leaf helper and its declared callees.
 pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
+    use registry::Big;
+    let big = |h| helpers.bigint(h);
     let mut graph = vec![
         (helpers.str_eq, vec![]),
         (helpers.str_cmp, vec![]),
@@ -54,12 +89,12 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         (helpers.intern_find, vec![helpers.intern_slot]),
         (helpers.index_value, vec![]),
         (helpers.str_exotic_index(), vec![helpers.index_value]),
-        (helpers.same_value_zero, vec![helpers.str_eq]),
+        (helpers.same_value_zero, vec![helpers.str_eq, big(Big::Eq)]),
         (
             helpers.array_search,
             vec![helpers.same_value_zero, helpers.index_value],
         ),
-        (helpers.map_hash(), vec![helpers.str_hash]),
+        (helpers.map_hash(), vec![helpers.str_hash, big(Big::Hash)]),
         (
             helpers.map_find,
             vec![helpers.same_value_zero, helpers.map_hash()],
@@ -153,11 +188,11 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
 /// proxy trap helper (not itself declared, so a safepoint) when the program
 /// can hold proxies (DESIGN.md §6.11).
 fn integrity_callees(helpers: Helpers<'_>) -> Vec<u32> {
+    let mut callees = binary::integrity_callees(helpers);
     if helpers.proxies() {
-        vec![helpers.proxy_is_extensible()]
-    } else {
-        vec![]
+        callees.push(helpers.proxy_is_extensible());
     }
+    callees
 }
 
 /// The leaf-graph declarations of the runtime modules, in group order.
@@ -247,8 +282,15 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
             ..
         } => ValueClass::numeric(),
         // `>>>`, the relational and the equality operators never yield a
-        // `BigInt`; every other arithmetic operator may (DESIGN.md §6.10.5).
-        IrNode::Binary { op, .. } if !is_numeric_op(*op) => ValueClass::numeric(),
+        // `BigInt`; every other arithmetic operator may (DESIGN.md §6.10.5),
+        // unless the program can produce none (§6.10.9): then only `+`
+        // (a string) may be a heap value, and `++` / `--` is a number.
+        IrNode::Binary { op, .. }
+            if !is_numeric_op(*op) || (*op != BinOp::Add && !bigints_reachable()) =>
+        {
+            ValueClass::numeric()
+        }
+        IrNode::IncDec { .. } if !bigints_reachable() => ValueClass::numeric(),
         // `++` / `--` of a local: numeric iff the local is.
         IrNode::IncDec { local, .. } => ValueClass {
             numeric: Some(vec![*local]),

@@ -9,9 +9,11 @@ use jsc_core::emit::CompileOptions;
 /// program pays for, the `BigInt` paths (literal, `typeof`, `===`, `==`, a
 /// `Map` key, rendering, error messages), a dynamic key (which disables
 /// shaking), binary data (whose collector and renderer arms are gated),
-/// the numeric operators on `BigInts` and numbers, the `BigInt` built-ins, and
-/// `BigInt` keys and values through a proxy.
-const PROGRAMS: [&str; 18] = [
+/// the numeric operators on `BigInts` and numbers, the `BigInt` built-ins,
+/// `BigInt` keys and values through a proxy, and the `BigInt` gate
+/// (DESIGN.md §6.10.9): every gated operator site with the gate closed, and
+/// with it opened by the global object or a name only.
+const PROGRAMS: [&str; 22] = [
     "1",
     "console.log(1)",
     "1n",
@@ -30,6 +32,16 @@ const PROGRAMS: [&str; 18] = [
     "console.log(BigInt('0x1F').toString(36), BigInt.asIntN(8, 255n), BigInt.asUintN(65, -1n), Number(2n))",
     "try { new BigInt(1) } catch (e) { console.log(e.message, BigInt(1.5)) }",
     "const p = new Proxy({}, {}); p[1n] = 2n; console.log(p[1n], typeof p, delete p[1n])",
+    "const o = { n: 1 }; let c = 3; (() => c++)(); o.n++; --o['n']; o.n **= 2; let a = -o.n; a = ~a; \
+     a = a ** 2 - '2' * 3 / 4 % 5; a = (a & 1) | (a ^ 2) << 1 >> 1 >>> 0; \
+     class K { #p = 1; inc() { return this.#p++; } } function* g() { let i = 0; i++; yield i; } \
+     console.log(a < '3', a >= 1, a + 'x', typeof a, !!a, a === 1, Number('4'), c, new K().inc(), [...g()])",
+    "class A { get x() { return 1; } set x(v) {} } \
+     class B extends A { m() { super.x++; return --super.x; } } \
+     let x = 1; x--; console.log(new B().m(), x > 0, 1 / 0, -0 === 0, typeof x)",
+    "const k = 'Big' + 'Int'; const B = globalThis[k]; let x = B(5); x++; \
+     console.log(-x, ~x, x ** 2n, x < 7, typeof x, !!x, x === 6n, Number(x))",
+    "const o = { BigInt: 1 }; let a = 1; a++; console.log(-a, ~a, a ** 2, a < 3, o.BigInt)",
 ];
 
 fn validate(src: &str, full_runtime: bool, gc_stress: u32) {

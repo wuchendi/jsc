@@ -2465,11 +2465,33 @@ fn emit_index_dynamic(
     function.instruction(&Instruction::Br(4));
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
+    if helpers.has_binary() {
+        // TYPED ARRAY (DESIGN.md §5.8.5): a number key is the element or
+        // `undefined`, never the chain (`__ta_index_get`).
+        emit_typed_array_number_key(function, s0, s1);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        function.instruction(&Instruction::LocalGet(s0));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::LocalGet(s1));
+        function.instruction(&Instruction::Call(helpers.ta_index_get()));
+        function.instruction(&Instruction::Br(3));
+        function.instruction(&Instruction::End);
+    }
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     // Every other key or receiver: the generic property read.
     emit_get_dynamic(function, s0, s1, helpers);
     function.instruction(&Instruction::End);
+}
+
+/// Push `1` when the heap receiver in `s0` is a typed array and the key
+/// jsval in `s1` a number (the inline `ta[k]` arms, DESIGN.md §5.8.5).
+fn emit_typed_array_number_key(function: &mut impl Sink, s0: u32, s1: u32) {
+    emit_load_type_byte(function, s0);
+    function.instruction(&Instruction::I32Const(i32::from(abi::TYPE_TYPEDARRAY)));
+    function.instruction(&Instruction::I32Eq);
+    emit_is_number(function, s1);
+    function.instruction(&Instruction::I32And);
 }
 
 /// Push `__get(s0, ToPropertyKey(s1))` for the receiver in `s0` and the key
@@ -2571,7 +2593,25 @@ pub(super) fn emit_index_set_node(
     enter_frame(helpers);
     emit_index_set_array(function, s0, s1, sval, helpers);
     function.instruction(&Instruction::Else);
-    emit_set_call(function, s0, index, s1, sval, strings, helpers);
+    if helpers.has_binary() {
+        // A typed array under a number key: `__ta_index_set` (the value's
+        // `ToNumber` first, then the checked store; DESIGN.md §5.8.5).
+        emit_typed_array_number_key(function, s0, s1);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        function.instruction(&Instruction::LocalGet(s0));
+        function.instruction(&Instruction::I32WrapI64);
+        function.instruction(&Instruction::LocalGet(s1));
+        function.instruction(&Instruction::LocalGet(sval));
+        function.instruction(&Instruction::Call(helpers.ta_index_set()));
+        emit_propagate_if_pending(function, helpers);
+        function.instruction(&Instruction::Else);
+        emit_set_call(function, s0, index, s1, sval, strings, helpers);
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
+    } else {
+        emit_set_call(function, s0, index, s1, sval, strings, helpers);
+    }
     leave_frame(helpers);
     function.instruction(&Instruction::End);
 
@@ -2806,8 +2846,9 @@ pub(super) fn emit_index_op_set_node(
     });
     function.instruction(&Instruction::LocalSet(new_local));
     // A member `++`/`--` (`rhs` is the step `±1`) converts the current value
-    // with ToNumeric first and steps it in its own type.
-    let new_value = if *kind == OpSetKind::Compound {
+    // with ToNumeric first and steps it in its own type; without a reachable
+    // `BigInt` (DESIGN.md §6.10.9) that is `ToNumber`, then `+ rhs`.
+    let new_value = if *kind == OpSetKind::Compound || !helpers.bigints() {
         IrNode::Binary {
             op,
             lhs: Box::new(IrNode::Local(new_local)),
@@ -2821,7 +2862,11 @@ pub(super) fn emit_index_op_set_node(
     };
     if *kind != OpSetKind::Compound {
         let old_num = IrNode::ConvertCall {
-            op: ConvertOp::ToNumeric,
+            op: if helpers.bigints() {
+                ConvertOp::ToNumeric
+            } else {
+                ConvertOp::ToNumber
+            },
             arg: Box::new(IrNode::Local(new_local)),
             radix: None,
         };

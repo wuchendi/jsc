@@ -524,3 +524,35 @@ mod gc_stress {
         );
     }
 }
+
+/// The compile-time gate (DESIGN.md §6.10.9): a `BigInt` reached only through
+/// the global object (no literal, no `BigInt` name) still goes through every
+/// `BigInt` operator path, and a Number-only program keeps its results.
+#[test]
+fn gate_opened_by_the_global_object() {
+    let big = "const k = 'Big' + 'Int'; const B = globalThis[k]; let x = B(5);";
+    table(&[
+        (&format!("{big} x++; x"), "6n"),
+        (
+            &format!("{big} [-x, ~x, x * x, x ** 2n, x - 1n]"),
+            "[ -5n, -6n, 25n, 25n, 4n ]",
+        ),
+        (&format!("{big} const o = {{ v: x }}; o.v--; o.v"), "4n"),
+        (
+            &format!("{big} [x < 6, x > '4', typeof x, !!x, x === B(5)]"),
+            "[ true, true, 'bigint', true, true ]",
+        ),
+        (&format!("{big} Number(x) + 1"), "6"),
+    ]);
+    throws(&format!("{big} x + 1"), "TypeError", MIX);
+    table(&[
+        (
+            "let a = 1; a++; const o = { n: 1 }; o.n--; [-a, ~a, a ** 3, a % 3, o.n, a > '1']",
+            "[ -2, -3, 8, 2, 0, true ]",
+        ),
+        (
+            "let s = '4'; s++; let t = '4'; t--; [s, t, -'3', ~'1', '2' ** 3, Number('7')]",
+            "[ 5, 3, -3, -2, 8, 7 ]",
+        ),
+    ]);
+}

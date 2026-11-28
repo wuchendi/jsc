@@ -1421,12 +1421,18 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     wasm!(f; Return, End);
     // An ArrayBuffer (DESIGN.md §5.8.3): the prefix and its byte block (a
     // `TYPE_RAW` leaf: marked, nothing inside traced). Only a program that
-    // can reach binary data carries the arm.
+    // can reach binary data carries the arms.
     if helpers.has_binary() {
         is(&mut f, abi::TYPE_ARRAYBUFFER);
         raw(&mut f, abi::OBJ_PROPS_OFFSET);
         jsval(&mut f, abi::OBJ_PROTO_OFFSET);
         raw(&mut f, abi::AB_DATA_OFFSET);
+        wasm!(f; Return, End);
+        // A typed array: the prefix and its buffer (DESIGN.md §5.8.3).
+        is(&mut f, abi::TYPE_TYPEDARRAY);
+        raw(&mut f, abi::OBJ_PROPS_OFFSET);
+        jsval(&mut f, abi::OBJ_PROTO_OFFSET);
+        raw(&mut f, abi::TA_BUFFER_OFFSET);
         wasm!(f; Return, End);
         // A DataView: the prefix and its buffer.
         is(&mut f, abi::TYPE_DATAVIEW);

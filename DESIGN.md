@@ -1099,33 +1099,45 @@ and never nests (`$__gc_busy`).
 
 ### 5.8 Binary data: `ArrayBuffer`, typed arrays, `DataView` (target design)
 
-**Status: stages T2 (`ArrayBuffer`) and T4 (`DataView`) implemented, the
-rest is design.** This
+**Status: stages T2 (`ArrayBuffer`), T3a (typed-array core) and T4
+(`DataView`) implemented, the rest is design.** This
 section is the target of the phase-5b binary-data workstream (§14, stages
-T2–T6 in §5.8.10). In the tree now: the three type constants and the
-`ArrayBuffer` layout (`abi::TYPE_*`, `AB_*`, `BYTE_LENGTH_MAX`), the
-`TYPE_ARRAYBUFFER` part of §5.8.2–§5.8.4 (byte blocks from `__ab_alloc`,
-`resize`, `transfer` / `transferToFixedLength` and detaching), its
-collector arm (§5.8.3), the `%ArrayBuffer%` / `%ArrayBuffer.prototype%`
-part of §5.8.7 (`emit/builtins/array_buffer.rs`), its rendering (§5.8.8,
-`emit/binary.rs`, the `Group::Binary` helpers), and the test262 `$262`
-prelude. A byte block's `len` (its capacity) is exactly the size requested
-from `__ab_alloc`, not rounded up to the size class. `DataView` is in the
-tree too: the `TYPE_DATAVIEW` layout (`abi::DV_*`), its collector arm, the
-`%DataView%` / `%DataView.prototype%` part of §5.8.7
+T2–T6 in §5.8.10). In the tree now: the three type constants and the three
+layouts (`abi::TYPE_*`, `AB_*`, `TA_*`, `DV_*`, `BYTE_LENGTH_MAX`), the
+§5.8.2–§5.8.4 byte blocks from `__ab_alloc`, `resize`, `transfer` /
+`transferToFixedLength` and detaching, the buffer witnesses `__ta_length`
+/ `__ta_oob` / `__dv_length` and `__ta_validate`, the collector arms
+(§5.8.3), every §5.8.5 hook with `__ta_canonical`, the element helpers and
+the inline `ta[k]` arms, the number kinds of §5.8.6 through the shared
+element accessors `__raw_load(addr, kind, swap)` / `__raw_store(addr, kind,
+n, swap)` (both typed arrays, with `swap = 0`, and `DataView`, with `swap
+= !littleEndian`, call them; the byte swap is implemented), the
+`%ArrayBuffer%` / `%ArrayBuffer.prototype%` part of §5.8.7
+(`emit/builtins/array_buffer.rs`), its `%TypedArray%` part except the T3b
+methods — the nine constructors `Int8Array` .. `Float64Array` (each
+`Builtin::Ctor(BuiltinCtor::Typed(kind))`), `from`, `of`, `get
+[@@species]`, the prototype getters, `get [@@toStringTag]`, `keys` /
+`values` / `entries` / `[@@iterator]` and the Array Iterator `next` arm
+(`emit/builtins/typed_array.rs`; `TypedArrayCreateFromConstructor` is there,
+`TypedArraySpeciesCreate` lands with its first user in T3b) — and its
+`%DataView%` part except `Float16` and the BigInt pairs
 (`emit/builtins/data_view.rs`; the get / set bodies are
-`Builtin::DataView(DataViewOp::Get(kind) | DataViewOp::Set(kind))` over the
-§5.8.6 kind numbers), its rendering (§5.8.8), and the `Group::Binary`
-helpers `__dv_length` (§5.8.4) and `__dv_get(addr, kind, swap) -> i64` /
-`__dv_set(addr, kind, n, swap)`, which are §5.8.6's `__raw_load` /
-`__raw_store` restricted to the number kinds `DataView` uses (they give way
-to the shared accessors when stage T3a lands them). The `has_binary` gate of
+`Builtin::DataView(DataViewOp::Get(kind) | DataViewOp::Set(kind))` over
+`ir::ElementKind`), the rendering of all three (§5.8.8, `emit/binary.rs`,
+the `Group::Binary` helpers), and the test262 `$262` prelude. A byte
+block's `len` (its capacity) is exactly the size requested from
+`__ab_alloc`, not rounded up to the size class. The `has_binary` gate of
 §5.8.5 exists (`Helpers::has_binary`, `sections.rs::program_has_binary`,
-naming only `ArrayBuffer`, `DataView` and the global object so far) and keeps
-the collector and renderer arms out of a program that cannot reach binary
-data; `ArrayBuffer` and `DataView` are also `program_has_accessors` names.
-Typed arrays, the §5.8.5 hooks and the typed-array element helpers do not
-exist yet:
+naming `ArrayBuffer`, `DataView`, the nine typed-array constructors and the
+global object so far) and keeps every binary arm out of a program that
+cannot reach binary data; the same names are `program_has_accessors`' too.
+The typed-array `__prop_throw` modes are `44` (incompatible receiver), `45`
+(out of bounds or detached), `46` (`[[PreventExtensions]]` of a
+variable-length view; `__set_integrity` itself returns status `0` without
+throwing, `Object.preventExtensions` / `seal` / `freeze` raise mode `46`),
+`47` / `48` (`seal` / `freeze` with elements, left pending by
+`__set_integrity`). `Float16Array`, the BigInt kinds and the
+`%TypedArray%.prototype` methods of T3b do not exist yet:
 every stage implements its part against this text and,
 as it lands, moves the landed facts into the sections that describe the
 current tree (§5.1 family list, §5.2 table, §5.7 tracing table, §6.2 helpers,
@@ -1312,11 +1324,12 @@ a user-observable step.
   `IsTypedArrayOutOfBounds` (detached included). `__dv_length(o) -> i32`
   is `GetViewByteLength` with `-1` for `IsViewOutOfBounds` (the same rule over
   bytes). All three are non-allocating leaves.
-- **Validation.** `__ta_validate(o, msg) -> i32` is `ValidateTypedArray`: a
+- **Validation.** `__ta_validate(o, name) -> i32` is `ValidateTypedArray`: a
   receiver that is not `TYPE_TYPEDARRAY` throws `TypeError: Method <name>
   called on incompatible receiver`, an out-of-bounds or detached one throws
   `TypeError: Cannot perform <name> on a detached or out-of-bounds TypedArray`
-  (`msg` selects the static message pair, §5.8.7), else it returns the length.
+  (`name` is the builtin's static name string, spliced in by `__prop_throw`
+  modes `44` / `45`), else it returns the length.
 - **Re-validation rule.** Every builtin follows its spec step order exactly.
   After any step that can run user code — `ToNumber` / `ToIntegerOrInfinity`
   / `ToIndex` of an argument (`valueOf`, `@@toPrimitive`), a callback, a
@@ -1574,7 +1587,7 @@ entries with no setter, configurable, not enumerable.
   Each concrete constructor's `[[Prototype]]` is `%TypedArray%`.
 - **Concrete constructors** `%Int8Array%` .. `%BigUint64Array%` (`length` 3,
   own `BYTES_PER_ELEMENT` non-writable, non-enumerable, non-configurable):
-  one shared builtin body per kind (`Builtin::TypedCtor(kind)`) implementing
+  one shared builtin body per kind (`Builtin::Ctor(BuiltinCtor::Typed(kind))`) implementing
   every overload of `TypedArray(...args)`: no argument or a non-object →
   `ToIndex(length)` and a fresh zeroed buffer from `%ArrayBuffer%`
   (`RangeError: Invalid typed array length` past `BYTE_LENGTH_MAX`); a typed
@@ -1929,11 +1942,10 @@ hands the operation to its traps.
   when visited) whose key is not in the exclusion list, the value read with
   `[[Get]]` (a getter runs). A nullish or non-string primitive source copies
   nothing; a string copies its indices.
-- **Integer-indexed exotic objects** (typed arrays; target design, not yet
-  implemented): every helper above gains one arm for a `TYPE_TYPEDARRAY`
-  object, emitted only in a program that can reach binary data, which
-  answers canonical numeric string keys from the buffer and never lets them
-  reach the table or the chain (§5.8.5).
+- **Integer-indexed exotic objects** (typed arrays): every helper above has
+  one arm for a `TYPE_TYPEDARRAY` object, emitted only in a program that can
+  reach binary data, which answers canonical numeric string keys from the
+  buffer and never lets them reach the table or the chain (§5.8.5).
 
 ### 6.4 Realm, global object, and fast paths
 
@@ -2456,6 +2468,9 @@ heap kind is needed.
 
 #### 6.10.2 Type tests, `typeof`, ToBoolean, rendering
 
+The `typeof`, ToBoolean, strict-equality and `emit_is_object` tests below
+are emitted only when the program can produce a BigInt (§6.10.9).
+
 - **Primitive, not object.** Every site that tells a symbol (a heap
   primitive) from an object also tells a BigInt (`emit_is_bigint(local)` in
   `emit/bigint.rs`, the shape of `emit_is_symbol`): `emit_is_object` tests
@@ -2495,12 +2510,13 @@ heap kind is needed.
 
 All conversion helpers live in `emit/bigint.rs` (the `Big` group of
 `emit/registry.rs`, the last helper group, tree-shaken by `emit/shake.rs`
-like every helper). The shaker follows static calls: the cold arm of every
+like every helper). The shaker follows static calls: when the program can
+produce a BigInt (the `bigints` gate, §6.10.9) the cold arm of every
 numeric operator calls `__numeric_op` / `__numeric_unary` /
-`__bigint_add_small` (§6.10.5), so a program with any of `- * / % ** & | ^
-<< >> >>>`, unary `-` / `~` or `++` / `--` keeps the operator kernels and
-the conversions they reach; a program with none of them, no BigInt literal
-and no `BigInt` reference emits none of them.
+`__bigint_add_small` (§6.10.5), so the operator kernels and the conversions
+they reach are kept. With the gate closed no operator, `ToNumeric` or
+`Number(x)` site references a BigInt kernel; the kernels still reached are
+the B2a ones called from always-present runtime helpers (§6.10.9).
 
 | operation | helper / site | rule |
 |---|---|---|
@@ -2570,7 +2586,9 @@ compare.
 
 Codegen decides nothing about BigInt statically except literals: every
 operator keeps its Number fast path inline and reaches BigInt only on the
-path where an operand is already known not to be a number.
+path where an operand is already known not to be a number. Everything in
+this section applies only when the program can produce a BigInt; with the
+`bigints` gate closed the operators emit their Number-only code (§6.10.9).
 
 **New IR** (`ir.rs`, lowered in `codegen/expr.rs`):
 
@@ -2677,7 +2695,9 @@ argument (`Math.floor(a - b)` with BigInts must throw). The shaker's
 dynamic-key test (`shake::note_key`) treats the numeric operators other than
 `+` as never yielding a string (`roots::never_string`): a BigInt key is a
 canonical numeric string, which names no builtin, so `a[i - 1]` still
-shakes.
+shakes. With the `bigints` gate closed `classify` and `yields_number` are
+the Number-only ones again: every arithmetic operator but `+` and every
+`IncDec` is unconditionally numeric (§6.10.9).
 
 #### 6.10.6 Equality, comparison, hashing
 
@@ -2776,10 +2796,16 @@ shakes.
 
 #### 6.10.8 Opcount, diagnostics, conformance
 
-**Opcount** (`tests/opcount/snapshot.tsv`). The Number fast paths execute
-the same instructions as before (the new `block` / `end` and the cold arms
-cost no fuel unless taken), but four mechanical changes move rows, and each
-moved row gets a reason cell in the stage that moves it:
+**Opcount** (`tests/opcount/snapshot.tsv`). The `bigints` gate (§6.10.9)
+confines the changes below to programs that can produce a BigInt: a program
+with the gate closed emits the pre-B2b operator, `ToNumeric` and
+`Number(x)` code and the pre-B2a `typeof`, ToBoolean, strict-equality and
+`IsObject` code, so its rows move only by the always-present guest tests of
+item 3 and by static-address shifts. In a program with the gate open the
+Number fast paths execute the same instructions as before (the new `block`
+/ `end` and the cold arms cost no fuel unless taken), but four mechanical
+changes move rows, and each moved row gets a reason cell in the stage that
+moves it:
 
 1. B2b: the cold arms of every `- * / % ** & | ^ << >> >>>`, unary `-` /
    `~` and `++` / `--` site grow (a `__numeric_op` call and a `br` instead
@@ -2821,7 +2847,109 @@ syntax errors); the other 1 111 also need `TypedArray*` / `Atomics*` /
 `SharedArrayBuffer` / `Temporal` / `Reflect*` / `Intl*` or a skipped flag.
 Remaining BigInt limitations are in §13.
 
-#### 6.10.9 Stages
+#### 6.10.9 Compile-time gate (`bigints`)
+
+Most programs can never produce a BigInt, and they must not pay for one:
+not in module size (the operator cold arms would keep the kernels alive
+through static calls), not in opcount (cold arms, the `++` / `--` block,
+the extra rooting of arithmetic results). `Helpers::bigints`
+(`emit/mod.rs`, field `bigint_gate: BigIntGate::{Closed, Open}` next to
+`binary` and `proxy_gate`), computed once per program by
+`sections.rs::program_has_bigint` next to `program_has_binary` (§5.8) and
+`program_has_proxies` (§6.11), says whether a BigInt can exist.
+
+**Triggers.** The gate is open iff the program
+
+- has a BigInt literal (`IrNode::BigInt`, including a folded `-1n`);
+- names one of `BIGINT_NAMES` (`sections.rs`, next to `BINARY_NAMES`) as a
+  global reference (`GlobalGet` / `GlobalSet`), an intrinsic
+  (`GlobalIntrinsic::Ctor(BuiltinCtor::BigInt)`) or a string constant (a
+  static member key or any string literal, which a computed access could
+  use): `BigInt`, `BigInt64Array`, `BigUint64Array`, `getBigInt64`,
+  `getBigUint64`, `setBigInt64`, `setBigUint64`;
+- uses the global object as a value (`GlobalIntrinsic::Global`:
+  `globalThis` in any form, top-level `this`), which reaches `BigInt` by a
+  computed name or by reflection — the rule of the binary-data gate (§5.8)
+  and of the Proxy gate (§6.11).
+
+These are every source of a BigInt value on this base: a literal; the
+`BigInt` function (`BigInt(v)`, and `asIntN` / `asUintN`, reachable only
+through it); the `%BigInt.prototype%` methods and the operators, which need
+a BigInt operand first; `__to_object`'s wrapper, likewise. `JSON.parse`,
+`Number`, `parseInt` and every other builtin produce no BigInt, the realm
+reaches `BigInt` only through the global object (a reflective walk such as
+`Object.getOwnPropertyDescriptors(globalThis)` names `globalThis`), and
+strict mode leaves no other path to the global object. The typed arrays
+of §5.8 (T3a) install only the nine Number kinds (`ElementKind` has no
+`BigInt64` / `BigUint64`, kinds `10` / `11` stay reserved) and `DataView`
+has no `get/setBig(U)Int64`, so binary data produces no BigInt yet. The
+typed-array and `DataView` names in `BIGINT_NAMES` are for L2-T's BigInt
+kinds. When those land, a `BigInt64Array` / `BigUint64Array` constructor is
+reachable only by its name or through the global object (`%TypedArray%`
+lists no subclasses), but a `DataView` reached by reflection
+(`Object.getOwnPropertyDescriptors(DataView.prototype)`) can call
+`getBigInt64` without naming it, so that stage must add `DataView` to
+`BIGINT_NAMES`.
+
+**What it switches.** With the gate closed `emit` first rewrites the IR to
+its Number-only shapes (`numeric.rs::lower_number_only`, on a copy of the
+program): `a ** b` (`BinOp::Exp`) becomes `MathCall Pow`, `Negate(x)` `-0 -
+x`, `BitNot(x)` `x ^ -1`, `ConvertOp::ToNumeric` / `NumberCall`
+`ToNumber`, and `NumericStep { arg, inc }` `arg + ±1` — or, for a postfix
+update's old value (`arg` is the store: `Assign`, `CellSet`, `GlobalSet`),
+`store - ±1` —, exactly the IR codegen produced before B2b. The emitters
+then branch on the flag:
+
+| site | gate closed | file |
+|---|---|---|
+| `- * / % & \| ^ << >> >>>` | `emit_number_binary`: stash, `emit_coerce_operands`, `emit_number_op` (the old `emit_arith` / `emit_mod` / `emit_bitwise` code) | `emit/numeric.rs` |
+| `++` / `--` of a local | `emit_coerce_number`, two numeric definitions, the inline step (no block, no `__to_numeric` / `__bigint_add_small` arm) | `emit/numeric.rs` |
+| member `++` / `--` | `ToNumber` read, `Binary(op, old, ±1)` step | `emit/object.rs` |
+| `ToNumeric`, `Number(x)` (also the `Number` constructor body) | the `ToNumber` path of `emit_convert_call` | `emit/numeric.rs` |
+| `+` with a heap operand | `__add` without the BigInt arm | `emit/convert.rs` |
+| relational | `__compare` without the BigInt arm and its three locals | `emit/convert.rs` |
+| `typeof` | no `bigint` select; the word fold stops at `symbol` | `emit/expr.rs` |
+| ToBoolean | the non-string heap arm is the constant `1` | `emit/stmt.rs` |
+| strict equality | `emit_is_string` tests and `__str_eq` only | `emit/numeric.rs` |
+| `IsObject` | no `TYPE_BIGINT` test | `emit/expr.rs` |
+| root classification, `yields_number` | every arithmetic operator but `+`, and `IncDec`, unconditionally numeric | `emit/roots.rs`, `emit/numeric.rs` |
+
+`classify` and `emit_is_object` take no `Helpers`, so `emit` also publishes
+the flag for the duration of the module through `roots::BigIntScope`
+(a thread-local, `true` outside an `emit`, the sound default). The
+shaker's `note_key` needs no change: on the Number-only IR the numeric
+operators are numeric for `classify_is_numeric`, as before B2b. With the
+gate closed no emitted body references `__numeric_op`, `__numeric_unary`,
+`__bigint_add_small`, `__to_numeric` or `__number_value`, so they and the
+kernels only they reach are shaken out; with it open everything is as
+§6.10.3–6.10.8 describe.
+
+**Soundness.** With the gate closed no BigInt can exist at run time: none
+of the sources above appears, and every other operation that returns a
+BigInt needs a BigInt operand. So the Number-only operator code is exact
+(no operand can take the BigInt arm it lacks), the pre-B2b rooting is
+sound (an arithmetic result or a stepped local is always a number and
+never needs a root), and the missing `typeof`, ToBoolean, equality and
+`IsObject` tests could only have been taken by a BigInt. With the gate open
+the operators, their rooting and the GC behave exactly as §6.10.5
+describes.
+
+**Cost model.** A gate-closed program pays nothing in user code relative to
+the pre-B2a emission. The runtime helpers that every program may keep stay
+shared and keep their B2a BigInt tests, rather than emitting two variants
+of each body: `__same_value_zero`, `__map_hash`, `__loose_eq`,
+`__to_number`, `__prim_str`, `__msg_str`, `__to_object`, `__json_rep`, the
+renderer, `__get`'s primitive-receiver dispatch, `__prop_throw`'s receiver
+kind and the `__own_keys` / `__has_own` / `__delete` / `__for_in_keys`
+guards. Each costs one `emit_is_bigint` test (a pointer test, then a
+type-byte load: about 15 instructions) plus an `if`, executed only on the
+call path that reaches it (a non-string operand of `__same_value_zero`, a
+non-string key in `__map_hash`, a heap primitive in the others). They keep
+the B2a kernels they call (`__bigint_eq`, `__bigint_hash`,
+`__bigint_loose_eq`, `__bigint_to_string`) in modules that keep those
+helpers.
+
+#### 6.10.10 Stages
 
 | stage | scope | files | tests (written per the no-local-run rule; CI runs them) |
 |---|---|---|---|
@@ -4374,8 +4502,8 @@ extra ones ignored). Inline code is only a guarded fast path over them.
 | errors | §7.7 |
 | generators | `%GeneratorPrototype%` `next`, `return`, `throw` |
 | iterators | `%IteratorPrototype%[@@iterator]`, `%AsyncIteratorPrototype%[@@asyncIterator]` (both return `this`); the `next` of the Array, String, Map and Set Iterator prototypes (a receiver that is not an iterator of the family throws `TypeError: next method called on incompatible receiver`); `Iterator` (abstract: calling it, or `new` with `new.target === Iterator`, throws `TypeError`; a subclass constructs), `Iterator.prototype` (`%IteratorPrototype%`, non-writable) with `constructor` (`%Iterator%`) and `@@toStringTag` (`"Iterator"`) accessors whose setters are `SetterThatIgnoresPrototypeProperties` (a `TypeError` on a non-object or on `Iterator.prototype` itself; an own data property on any other receiver); `Iterator.from(O)` (`GetIteratorFlattenable`: strings are iterated, other primitives throw `TypeError`; an iterator inheriting `Iterator.prototype` is returned as is, any other is wrapped in a `CLASS_ITERATOR` object of kind `16` over `%WrapForValidIteratorPrototype%`, whose `next` / `return` forward to the wrapped record, `next` read once); the lazy helpers `Iterator.prototype.map` / `filter` / `take` / `drop` / `flatMap` (`this` must be an object; the argument is validated first — a non-callable callback is a `TypeError`, a `take` / `drop` limit goes through `ToNumber` and `NaN` or a negative integer is a `RangeError` — closing `this` on failure; then `next` is read once and a helper object is returned without stepping). A helper's `next` steps the underlying iterator only on demand; a throwing callback, or a `flatMap` result that is not an object (a string included) or not iterable, closes the underlying iterator; `take` closes it once the limit is reached; a `next` / `return` while the helper runs throws `TypeError`; `return()` closes the underlying iterator (and a `flatMap`'s open inner one first) and completes the helper. The eager helpers `reduce` / `toArray` / `forEach` / `some` / `every` / `find` validate `this` and the callback the same way, read `next` once and consume the iterator, passing a counter as the callback's last argument (`reduce` without an initial value starts from the first value with counter `1`, and throws `TypeError` on an empty iterator); a throwing callback closes the iterator under its throw, `some` / `every` / `find` close it on an early result, and a throw from `next` or a result's `value` propagates without closing. A program that names `Iterator`, `constructor`, `getPrototypeOf` or `setPrototypeOf` compiles the accessor dispatch of `__get` / `__set` |
-| `ArrayBuffer` | §5.8.7: `new ArrayBuffer(length, { maxByteLength })` (calling it without `new` is a `TypeError`; `ToIndex` `RangeError`s, a length or maximum past `2^29` is `RangeError: Array buffer allocation failed`; subclassable through `new.target`), `ArrayBuffer.isView` (`true` only for a typed array or `DataView`; typed arrays do not exist yet), `get [@@species]`; prototype getters `byteLength`, `maxByteLength`, `resizable`, `detached`; `resize`, `slice` (through `SpeciesConstructor`), `transfer`, `transferToFixedLength` (both detach the receiver), `@@toStringTag`; rendered as `ArrayBuffer { [Uint8Contents]: <..>, byteLength: n }` (§5.8.8). No immutable buffers, no `SharedArrayBuffer` (§5.8.9) |
-| typed arrays | **target, not yet available** (§5.8.7, stages T3a / T3b / T5a / T5b): `%TypedArray%` (abstract) with `from`, `of`, `get [@@species]`; `Int8Array`, `Uint8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float16Array`, `Float32Array`, `Float64Array`, `BigInt64Array`, `BigUint64Array` (every constructor overload, `BYTES_PER_ELEMENT`); `%TypedArray.prototype%` getters `buffer`, `byteLength`, `byteOffset`, `length`, `@@toStringTag` and every ES2025 method; `Uint8Array.fromBase64`, `fromHex`, `Uint8Array.prototype.toBase64`, `toHex`, `setFromBase64`, `setFromHex`; `Math.f16round` |
+| `ArrayBuffer` | §5.8.7: `new ArrayBuffer(length, { maxByteLength })` (calling it without `new` is a `TypeError`; `ToIndex` `RangeError`s, a length or maximum past `2^29` is `RangeError: Array buffer allocation failed`; subclassable through `new.target`), `ArrayBuffer.isView` (`true` only for a typed array or `DataView`), `get [@@species]`; prototype getters `byteLength`, `maxByteLength`, `resizable`, `detached`; `resize`, `slice` (through `SpeciesConstructor`), `transfer`, `transferToFixedLength` (both detach the receiver), `@@toStringTag`; rendered as `ArrayBuffer { [Uint8Contents]: <..>, byteLength: n }` (§5.8.8). No immutable buffers, no `SharedArrayBuffer` (§5.8.9) |
+| typed arrays | §5.8.7, stage T3a: `%TypedArray%` (abstract: calling or constructing it is a `TypeError`) with `from`, `of`, `get [@@species]`; `Int8Array`, `Uint8Array`, `Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`, `Float32Array`, `Float64Array` (every constructor overload incl. length-tracking views over resizable buffers, `BYTES_PER_ELEMENT`, subclassable through `new.target`); `%TypedArray.prototype%` getters `buffer`, `byteLength`, `byteOffset`, `length`, `get [@@toStringTag]`, and `keys` / `values` / `entries` / `[@@iterator]`; the integer-indexed exotic hooks (§5.8.5); rendered as `Uint8Array(3) [ 1, 2, 3 ]` (§5.8.8). **Target, not yet available** (stages T3b / T5a / T5b): every other `%TypedArray.prototype%` method, `Float16Array`, `BigInt64Array`, `BigUint64Array`, `Uint8Array.fromBase64`, `fromHex`, `Uint8Array.prototype.toBase64`, `toHex`, `setFromBase64`, `setFromHex`; `Math.f16round` |
 | `DataView` | §5.8.7: `new DataView(buffer, byteOffset, byteLength)` (calling it without `new` is a `TypeError`; a non-`ArrayBuffer` `buffer` or a detached one is a `TypeError`, an offset or length outside the buffer a `RangeError`, re-checked after `GetPrototypeFromConstructor`; an `undefined` `byteLength` over a resizable buffer makes a length-tracking view; subclassable through `new.target`); getters `buffer`, `byteLength`, `byteOffset` (the last two throw `TypeError` on an out-of-bounds or detached view); `get` / `set` of `Int8`, `Uint8`, `Int16`, `Uint16`, `Int32`, `Uint32`, `Float32`, `Float64` (big-endian unless `littleEndian` is truthy; `ToIndex(byteOffset)`, the setter's `ToNumber(value)`, `ToBoolean(littleEndian)`, then the out-of-bounds `TypeError` and the range `RangeError`; a NaN reads as the canonical NaN); `@@toStringTag`; rendered as `DataView { byteLength: n, byteOffset: n, buffer: ArrayBuffer { .. } }` (§5.8.8). `getFloat16` / `setFloat16` arrive with stage T5a, the BigInt pairs with T5b (§5.8.9) |
 
 No input produces an invalid wasm module.
@@ -4691,9 +4819,10 @@ Each item below is current behaviour of this tree.
   compile time: a sealed `Symbol` compiles to the intrinsic's address, and the
   member is an ordinary `__get` on it.
 - Not available: `RegExp` (literals and constructor), `Proxy`, `Reflect`,
-  typed arrays, `Intl`, `eval`. `Proxy` and `Reflect` are
-  phase 5b work in progress: designed (§6.11), not implemented, and their
-  test262 features are still skipped.
+  the `%TypedArray%.prototype` methods other than the getters and iterators,
+  `Float16Array`, the BigInt typed arrays, `Intl`, `eval`. `Proxy` and
+  `Reflect` are phase 5b work in progress: designed (§6.11), not
+  implemented, and their test262 features are still skipped.
   The `Function` constructor throws `TypeError`.
 - A BigInt holds at most `2^24` bits (`RangeError: Maximum BigInt size
   exceeded`, §6.10.1; V8 allows `2^30`), and `BigInt.prototype.toLocaleString` ignores its locales

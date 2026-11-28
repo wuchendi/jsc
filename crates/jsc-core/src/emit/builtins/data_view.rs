@@ -5,8 +5,9 @@
 //! A view is a [`abi::TYPE_DATAVIEW`] block over an `ArrayBuffer`. It caches
 //! nothing: every access re-reads the buffer's state through `__dv_length`
 //! (`-1` when out of bounds or detached) and the buffer's `data` block, and
-//! loads or stores the element through `__dv_get` / `__dv_set`, which
-//! byte-swap for a big-endian access.
+//! loads or stores the element through the element accessors it shares with
+//! typed arrays, `__raw_load` / `__raw_store`, which byte-swap for a
+//! big-endian access.
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
@@ -468,7 +469,7 @@ fn emit_getter(
 /// method: the receiver check, `ToIndex(requestIndex)`, a setter's
 /// `ToNumber(value)`, `ToBoolean(littleEndian)`, then an out-of-bounds or
 /// detached view throws a `TypeError`, an element past the view's end a
-/// `RangeError`, else `__dv_get` / `__dv_set` at `data + byte_offset +
+/// `RangeError`, else `__raw_load` / `__raw_store` at `data + byte_offset +
 /// index` with `swap = !littleEndian`. The arguments are read on entry,
 /// before any user code runs.
 fn emit_access(
@@ -483,10 +484,7 @@ fn emit_access(
         DataViewOp::Get(kind) => (false, kind),
         _ => return,
     };
-    let size = DataViewOp::KINDS
-        .iter()
-        .find(|entry| entry.0 == kind)
-        .map_or(1, |entry| entry.3);
+    let size = kind.size();
     let (this, index_v, value_v, little_v, value) = (
         frame.y64(0),
         frame.y64(1),
@@ -542,14 +540,14 @@ fn emit_access(
     wasm!(function;
         I32Add,
         LocalGet(index), I32TruncF64U, I32Add,
-        I32Const(i32::from(kind)),
+        I32Const(i32::from(kind.kind())),
     );
     if set {
         wasm!(function;
-            LocalGet(value), LocalGet(little), I32Eqz, Call(helpers.dv_set()),
+            LocalGet(value), LocalGet(little), I32Eqz, Call(helpers.raw_store()),
             I64Const(UNDEFINED_BITS),
         );
     } else {
-        wasm!(function; LocalGet(little), I32Eqz, Call(helpers.dv_get()));
+        wasm!(function; LocalGet(little), I32Eqz, Call(helpers.raw_load()));
     }
 }

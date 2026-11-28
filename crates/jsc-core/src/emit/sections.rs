@@ -119,6 +119,7 @@ pub(super) fn build_type_and_function_sections<'a>(
         } else {
             ProxyGate::Closed
         },
+        bigint_gate: bigint_gate(program),
         unicode: layout.unicode,
         fn_info: layout.info,
     };
@@ -1392,8 +1393,8 @@ fn collect_entries<'a>(entries: &'a [(PropKey, IrNode)], strs: &mut Strs<'a>) {
 /// pairs of `%Iterator.prototype%`, which a program reaches only through
 /// `Iterator`, a prototype read or write, or `constructor`, the
 /// `Symbol.prototype.description` getter, the `%ArrayBuffer.prototype%` and
-/// `%DataView.prototype%` getters, which a program reaches only through
-/// `ArrayBuffer` / `DataView`): it names them,
+/// `%DataView.prototype%` and `%TypedArray.prototype%` getters, which a
+/// program reaches only through a binary-data constructor): it names them,
 /// or reads or writes a member under a key computed at run time. Then `__get` / `__set` must
 /// dispatch to getters and setters. (The builtins only read fixed keys:
 /// `length`, indices, `prototype`, `name`, `message`; `Object.assign` writes
@@ -1421,7 +1422,10 @@ fn program_has_accessors(program: &IrProgram) -> bool {
         IrNode::MakeAccessor { .. }
         | IrNode::SizeRead { .. }
         | IrNode::Intrinsic(GlobalIntrinsic::Ctor(
-            BuiltinCtor::Iterator | BuiltinCtor::ArrayBuffer | BuiltinCtor::DataView,
+            BuiltinCtor::Iterator
+            | BuiltinCtor::ArrayBuffer
+            | BuiltinCtor::DataView
+            | BuiltinCtor::Typed(_),
         )) => true,
         IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
             global.name == "Iterator" || BINARY_NAMES.contains(&global.name.as_str())
@@ -1457,7 +1461,19 @@ fn program_has_accessors(program: &IrProgram) -> bool {
 }
 
 /// The globals of the binary-data constructors (DESIGN.md §5.8.5).
-const BINARY_NAMES: [&str; 2] = ["ArrayBuffer", "DataView"];
+const BINARY_NAMES: [&str; 11] = [
+    "ArrayBuffer",
+    "DataView",
+    "Int8Array",
+    "Uint8Array",
+    "Uint8ClampedArray",
+    "Int16Array",
+    "Uint16Array",
+    "Int32Array",
+    "Uint32Array",
+    "Float32Array",
+    "Float64Array",
+];
 
 /// Whether `program` can reach binary data (DESIGN.md §5.8.5): it names a
 /// binary-data constructor (the intrinsic, a global reference, or a string
@@ -1468,12 +1484,55 @@ fn program_has_binary(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
         IrNode::Intrinsic(
             GlobalIntrinsic::Global
-            | GlobalIntrinsic::Ctor(BuiltinCtor::ArrayBuffer | BuiltinCtor::DataView),
+            | GlobalIntrinsic::Ctor(
+                BuiltinCtor::ArrayBuffer | BuiltinCtor::DataView | BuiltinCtor::Typed(_),
+            ),
         ) => true,
         IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
             BINARY_NAMES.contains(&global.name.as_str())
         }
         IrNode::Str(s) => BINARY_NAMES.iter().any(|name| s == name),
+        _ => false,
+    })
+}
+
+/// The names through which a program can obtain a `BigInt` without a
+/// literal (DESIGN.md §6.10.9): the `BigInt` global, the `BigInt` typed
+/// arrays and the `DataView` `BigInt` accessors.
+const BIGINT_NAMES: [&str; 7] = [
+    "BigInt",
+    "BigInt64Array",
+    "BigUint64Array",
+    "getBigInt64",
+    "getBigUint64",
+    "setBigInt64",
+    "setBigUint64",
+];
+
+/// The [`BigIntGate`] of `program` ([`program_has_bigint`]).
+fn bigint_gate(program: &IrProgram) -> BigIntGate {
+    if program_has_bigint(program) {
+        BigIntGate::Open
+    } else {
+        BigIntGate::Closed
+    }
+}
+
+/// Whether `program` can produce a `BigInt` (DESIGN.md §6.10.9): it has a
+/// `BigInt` literal, names a [`BIGINT_NAMES`] source (the intrinsic, a global
+/// reference, or a string such as a static member key), or uses the global
+/// object as a value, which could reach `BigInt` by a computed name. When
+/// not, the numeric operators emit their Number-only code.
+pub(super) fn program_has_bigint(program: &IrProgram) -> bool {
+    program_any(program, |n| match n {
+        IrNode::BigInt { .. }
+        | IrNode::Intrinsic(GlobalIntrinsic::Global | GlobalIntrinsic::Ctor(BuiltinCtor::BigInt)) => {
+            true
+        }
+        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
+            BIGINT_NAMES.contains(&global.name.as_str())
+        }
+        IrNode::Str(s) => BIGINT_NAMES.iter().any(|name| s == name),
         _ => false,
     })
 }

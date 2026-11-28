@@ -247,9 +247,14 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
         | BuiltinCtor::FinalizationRegistry => body.requires_new(ctor, body.proto(ctor)),
         // The "requires 'new'" check only: `array_buffer::emit_ctor` and
         // `data_view::emit_ctor` convert the arguments before they read the
-        // prototype.
-        BuiltinCtor::ArrayBuffer | BuiltinCtor::DataView => {
+        // prototype, `typed_array::emit_ctor` runs the overloads (DESIGN.md
+        // §5.8.7).
+        BuiltinCtor::ArrayBuffer | BuiltinCtor::DataView | BuiltinCtor::Typed(_) => {
             body.requires_new(ctor, IrNode::Undefined)
+        }
+        // Abstract: calling or constructing it always throws.
+        BuiltinCtor::TypedArray => {
+            throw_type_error("Abstract class TypedArray not directly constructable")
         }
         // Under `K = 0` the executor of a spread construct (a subclass's
         // implicit `super(...args)`, a species construct) is in the spread
