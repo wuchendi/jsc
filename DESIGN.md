@@ -402,8 +402,11 @@ None is exported.
 unhandled rejection (`__first_unhandled()`, the oldest by creation `seq`)
 is reported as `Uncaught (in promise) <value>` the same way. On a clean finish, a module compiled with `CompileOptions::print_completion`
 renders the completion value as one line on fd 1 (`jsc -p`, §9); the default
-emit discards it. Finally `_start` flushes a line left unfinished on fd 1 by a
-throwing `console.log` argument, and returns (exit code `0`).
+emit discards it. Finally `_start` flushes a line left unfinished on fd 1 and
+returns (exit code `0`). Every `console.log` argument is evaluated before
+anything is printed, so a throwing argument never leaves a partial line; the
+flush is for a line the renderer itself cut short (the out-of-memory
+`RangeError`, or the depth `RangeError` while streaming the arguments).
 
 **Shadow stack.** `[0, abi::SHADOW_STACK_SIZE)` (1 MiB, 16 pages) holds the
 shadow stack, growing down from its end (§5.7). Its body is `[8, SS_SIZE)`:
