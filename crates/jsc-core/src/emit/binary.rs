@@ -1,4 +1,4 @@
-//! The binary-data helpers (DESIGN.md §5.8): the byte-block allocator
+//! The binary-data helpers (DESIGN.md §6.2): the byte-block allocator
 //! `__ab_alloc`, the console renderer arm `__render_binary`, the `DataView`
 //! view length `__dv_length`, and the typed-array helpers (the buffer witness `__ta_length` / `__ta_oob`,
 //! `__ta_validate`, `CanonicalNumericIndexString` `__ta_canonical`, the
@@ -54,7 +54,7 @@ pub(super) const TYPES: [(&[ValType], &[ValType]); 16] = [
 /// The data offset of a `TYPE_RAW` block (after the header and `len`).
 pub(super) const RAW_DATA: u32 = abi::HEADER_SIZE + 4;
 
-/// The `ArrayBuffer` rendering's static strings (DESIGN.md §5.8.8).
+/// The `ArrayBuffer` rendering's static strings (DESIGN.md §6.9).
 const OPEN: &str = "ArrayBuffer { ";
 const DETACHED: &str = "(detached)";
 const CONTENTS: &str = "[Uint8Contents]: <";
@@ -62,7 +62,7 @@ const CONTENTS_END: &str = ">";
 const BYTE_LENGTH: &str = ", byteLength: ";
 const CLOSE: &str = " }";
 
-/// The typed-array rendering's static strings (DESIGN.md §5.8.8).
+/// The typed-array rendering's static strings (DESIGN.md §6.9).
 const TA_LENGTH_OPEN: &str = "(";
 const TA_LENGTH_CLOSE: &str = ") ";
 const TA_OPEN: &str = "[ ";
@@ -143,7 +143,7 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
 }
 
 /// The callees of `__test_integrity`: a typed array's elements decide its
-/// integrity (`__ta_length`, DESIGN.md §5.8.5) in a program that can reach
+/// integrity (`__ta_length`, DESIGN.md §6.3) in a program that can reach
 /// one.
 pub(super) fn integrity_callees(helpers: Helpers<'_>) -> Vec<u32> {
     if helpers.has_binary() {
@@ -192,7 +192,7 @@ pub(super) fn emit_helpers(
     ]
 }
 
-/// `__ab_alloc(size) -> block | 0` (DESIGN.md §5.8.2): a zeroed `TYPE_RAW`
+/// `__ab_alloc(size) -> block | 0` (DESIGN.md §6.2): a zeroed `TYPE_RAW`
 /// block of `8 + size` bytes with `len = size` from the variable-size
 /// `__alloc`; a `size` of `0` allocates nothing and returns `0`, as does an
 /// out-of-memory `__alloc`, which leaves the `RangeError` pending.
@@ -225,7 +225,7 @@ fn hex_digit(f: &mut FnBuilder<'_>, helpers: Helpers<'_>, d: u32) {
     );
 }
 
-/// `__render_binary(p, depth)` (DESIGN.md §5.8.8): the console form of the
+/// `__render_binary(p, depth)` (DESIGN.md §6.9): the console form of the
 /// binary-data block `p`, read directly (no getter runs): a `DataView` by
 /// [`render_data_view`], a typed array by [`render_typed_array`], else
 /// `ArrayBuffer { [Uint8Contents]: <01 02 ff>,
@@ -235,10 +235,11 @@ fn emit_render_binary(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafS
     let mut function = helper_builder(
         leaves,
         &[ROOT_BASE, RAW_I32],
-        &[RAW_I32, RAW_I32, RAW_I32, RAW_I32],
+        &[RAW_I32, RAW_I32, RAW_I32, RAW_I32, RAW_I64, RAW_I64],
     );
     let (block, at, count, nibble) = (0, 2, 3, 4);
     let (depth, first) = (1, 5);
+    let digits = [6, 7];
     render_data_view(
         &mut function,
         strings,
@@ -254,6 +255,7 @@ fn emit_render_binary(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafS
         strings,
         helpers,
         [block, depth, at, count, first],
+        digits,
     );
     wasm!(function; Return, End);
     lit(&mut function, strings, helpers, OPEN);
@@ -293,17 +295,19 @@ fn emit_render_binary(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafS
     finish_builder(function)
 }
 
-/// The typed-array arm of `__render_binary` (DESIGN.md §5.8.8): `<Kind>(n) [
+/// The typed-array arm of `__render_binary` (DESIGN.md §6.9): `<Kind>(n) [
 /// e0, e1, .., name: v ]` with the kind's constructor name (so a subclass
 /// instance renders as its kind), the current length (`0` when out of
 /// bounds or detached), each element by the number rule (a `BigInt` element
-/// as `1n`; reading one allocates it), then the own named properties as for
-/// an array; `<Kind>(0) []` when there is nothing to list.
+/// as `1n`, printed from its bits by [`render_bigint_element`] without
+/// allocating it), then the own named properties as for an array;
+/// `<Kind>(0) []` when there is nothing to list.
 fn render_typed_array(
     f: &mut FnBuilder<'_>,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
     [p, depth, i, n, first]: [u32; 5],
+    digits: [u32; 2],
 ) {
     // The kind's name: a `select` chain over the kind byte.
     let [head, rest @ ..] = ElementKind::ALL;
@@ -335,9 +339,24 @@ fn render_typed_array(
     wasm!(f;
         End,
         I32Const(0), LocalSet(first),
+    );
+    if helpers.bigints() {
+        wasm!(f;
+            LocalGet(p), I32Load8U(m8(abi::TA_KIND_OFFSET)), I32Const(FIRST_BIGINT_KIND), I32GeU,
+            If(BlockType::Empty),
+        );
+        render_bigint_element(f, helpers, [p, i], digits);
+        wasm!(f; Else);
+    }
+    wasm!(f;
         // Re-read through the witness: nothing here runs user code, so the
         // length cannot change, but the element read stays checked.
         LocalGet(p), LocalGet(i), Call(helpers.ta_get()), LocalGet(depth), Call(helpers.render()),
+    );
+    if helpers.bigints() {
+        wasm!(f; End);
+    }
+    wasm!(f;
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0), End, End,
         LocalGet(p), I32Const(1), I32Const(0), LocalGet(first),
@@ -351,10 +370,52 @@ fn render_typed_array(
     wasm!(f; End);
 }
 
-// The `DataView` helpers (DESIGN.md §5.8.4, §5.8.8): the view length, the
+/// `10^19`, the largest power of ten below `2^64`.
+const TEN_POW_19: u64 = 10_000_000_000_000_000_000;
+
+/// Append element `i` (a valid index, i32 local) of the `BigInt` typed array
+/// in i32 local `p` as `1n` / `-1n`: the decimal digits of its 64 bits (read
+/// as `i64` for `BigInt64Array`, `u64` for `BigUint64Array`), straight from
+/// the bytes, so rendering never allocates a `BigInt` (and cannot run out of
+/// memory producing a wrong digit string). `[v, pow]` are i64 scratch.
+fn render_bigint_element(
+    f: &mut FnBuilder<'_>,
+    helpers: Helpers<'_>,
+    [p, i]: [u32; 2],
+    [v, pow]: [u32; 2],
+) {
+    element_addr(f, p, i);
+    wasm!(f;
+        I64Load(MemArg { offset: 0, align: 0, memory_index: 0 }), LocalSet(v),
+        // A negative `i64`: the sign, then the magnitude as a `u64`
+        // (`i64::MIN` negates to itself, which is `2^63` unsigned).
+        LocalGet(p), I32Load8U(m8(abi::TA_KIND_OFFSET)), I32Const(FIRST_BIGINT_KIND), I32Eq,
+        LocalGet(v), I64Const(0), I64LtS, I32And,
+        If(BlockType::Empty),
+        I32Const(0x2D), Call(helpers.out_byte()),
+        I64Const(0), LocalGet(v), I64Sub, LocalSet(v),
+        End,
+        // pow = the largest power of ten <= v (1 for 0).
+        I64Const(TEN_POW_19.cast_signed()), LocalSet(pow),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(pow), I64Const(1), I64Eq, LocalGet(v), LocalGet(pow), I64GeU, I32Or, BrIf(1),
+        LocalGet(pow), I64Const(10), I64DivU, LocalSet(pow),
+        Br(0), End, End,
+        // One digit per power, most significant first.
+        Loop(BlockType::Empty),
+        LocalGet(v), LocalGet(pow), I64DivU, I32WrapI64, I32Const(0x30), I32Add,
+        Call(helpers.out_byte()),
+        LocalGet(v), LocalGet(pow), I64RemU, LocalSet(v),
+        LocalGet(pow), I64Const(10), I64DivU, LocalTee(pow), I64Eqz, I32Eqz, BrIf(0),
+        End,
+        I32Const(0x6E), Call(helpers.out_byte()),
+    );
+}
+
+// The `DataView` helpers (DESIGN.md §6.2, §6.9): the view length, the
 // rendering arm, and the byte swaps of [`emit_raw_load`] / [`emit_raw_store`].
 
-/// The `DataView` rendering's static strings (DESIGN.md §5.8.8).
+/// The `DataView` rendering's static strings (DESIGN.md §6.9).
 const DV_OPEN: &str = "DataView { byteLength: ";
 const DV_BYTE_OFFSET: &str = ", byteOffset: ";
 const DV_BUFFER: &str = ", buffer: ";
@@ -405,7 +466,7 @@ fn block_flag(function: &mut FnBuilder<'_>, block: u32, flag: u8) {
     );
 }
 
-/// `__dv_length(view) -> i32` (DESIGN.md §5.8.4): `GetViewByteLength` of the
+/// `__dv_length(view) -> i32` (DESIGN.md §6.2): `GetViewByteLength` of the
 /// `DataView` block `view`, `-1` when `IsViewOutOfBounds` (a detached buffer
 /// included). A length-tracking view spans `byte_length - byte_offset` of
 /// its buffer; a fixed one is out of bounds when it ends past the buffer.
@@ -487,7 +548,7 @@ fn ma(offset: u32) -> MemArg {
 }
 
 /// `__ta_length(o) -> i32` (`oob` = `false`) / `__ta_oob(o) -> i32` (`oob`)
-/// (DESIGN.md §5.8.4): `TypedArrayLength` of the buffer witness with out of
+/// (DESIGN.md §6.2): `TypedArrayLength` of the buffer witness with out of
 /// bounds folded to `0`, or `IsTypedArrayOutOfBounds`. A detached buffer is
 /// out of bounds; a length-tracking view is out of bounds iff its offset is
 /// past the buffer's length and has length `(L - off) >> shift`; a fixed one
@@ -532,7 +593,7 @@ fn emit_ta_length(oob: bool, leaves: &LeafSet) -> Function {
 }
 
 /// `__ta_validate(o: i64, name: i32) -> i32`: `ValidateTypedArray`
-/// (DESIGN.md §5.8.4) — a receiver that is not a typed array throws
+/// (DESIGN.md §6.2) — a receiver that is not a typed array throws
 /// `TypeError: Method <name> called on incompatible receiver`, an out of
 /// bounds or detached one `TypeError: Cannot perform <name> on a detached or
 /// out-of-bounds TypedArray` (`name` an interned static string; the
@@ -561,7 +622,7 @@ fn emit_ta_validate(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     finish_builder(f)
 }
 
-/// `__ta_canonical(key: i32) -> i32` (DESIGN.md §5.8.5): `1` iff
+/// `__ta_canonical(key: i32) -> i32` (DESIGN.md §6.3): `1` iff
 /// `CanonicalNumericIndexString(key)` is not `undefined`. A symbol, an empty
 /// or two-byte string (a canonical numeric string is ASCII, and an all-Latin-1
 /// string is always one-byte) or one whose first unit is not a digit, `-`,
@@ -606,7 +667,7 @@ fn element_addr(f: &mut impl Sink, o: u32, i: u32) {
     );
 }
 
-/// `__ta_get(o, i) -> i64` (DESIGN.md §5.8.5): element `i` of the typed
+/// `__ta_get(o, i) -> i64` (DESIGN.md §6.3): element `i` of the typed
 /// array `o` as a number (a fresh `BigInt` for the `BigInt` kinds), or
 /// `undefined` when `IsValidIntegerIndex` fails. A non-allocating leaf for
 /// the Number kinds only.
@@ -625,7 +686,7 @@ fn emit_ta_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     finish_builder(f)
 }
 
-/// `__ta_set(o, i, n)` (DESIGN.md §5.8.5): store the number `n` (already
+/// `__ta_set(o, i, n)` (DESIGN.md §6.3): store the number `n` (already
 /// converted; a `BigInt` for the `BigInt` kinds) as element `i` of the typed
 /// array `o` when `IsValidIntegerIndex` holds (re-checked here, after any
 /// conversion), else nothing. A non-allocating leaf.
@@ -647,7 +708,7 @@ fn emit_ta_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 
 /// The conversion of `TypedArraySetElement` of the jsval in local `v` for
 /// the typed array in i32 local `o` into the i64 local `n`: `ToBigInt(v)`
-/// for a `BigInt` kind (DESIGN.md §5.8.6; only when the program's `BigInt`
+/// for a `BigInt` kind (DESIGN.md §6.2; only when the program's `BigInt`
 /// gate is open, as no `BigInt` typed array exists otherwise), else
 /// `ToNumber(v)` (a number as is); a throw leaves the exception pending and
 /// returns from the helper.
@@ -669,10 +730,10 @@ fn to_element_or_return(f: &mut FnBuilder<'_>, o: u32, v: u32, n: u32, helpers: 
     );
 }
 
-/// The first `BigInt` element kind (DESIGN.md §5.8.6).
+/// The first `BigInt` element kind (DESIGN.md §6.2).
 const FIRST_BIGINT_KIND: i32 = 10;
 
-/// `__ta_set_value(o, i, v)`: `TypedArraySetElement` (DESIGN.md §5.8.5) —
+/// `__ta_set_value(o, i, v)`: `TypedArraySetElement` (DESIGN.md §6.3) —
 /// `ToNumber(v)` (`ToBigInt(v)` for a `BigInt` kind) first (a user `valueOf` may run, detach or shrink the buffer,
 /// or throw: the exception is left pending), then [`emit_ta_set`]'s checked
 /// store of element `i` (`-1` for an invalid canonical numeric key, which
@@ -698,7 +759,7 @@ fn is_index_number(f: &mut impl Sink, d: u32) {
     );
 }
 
-/// `__ta_index_get(o, k: i64) -> i64` (DESIGN.md §5.8.5, the inline `ta[k]`
+/// `__ta_index_get(o, k: i64) -> i64` (DESIGN.md §6.3, the inline `ta[k]`
 /// read for a number `k`): an array-index number is the element (or
 /// `undefined` past the length); any other number is an invalid integer
 /// index (`undefined`). The chain is never consulted. A non-allocating leaf
@@ -717,7 +778,7 @@ fn emit_ta_index_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     finish_builder(f)
 }
 
-/// `__ta_index_set(o, k: i64, v)` (DESIGN.md §5.8.5, the inline `ta[k] = v`
+/// `__ta_index_set(o, k: i64, v)` (DESIGN.md §6.3, the inline `ta[k] = v`
 /// store for a number `k`): `ToNumber(v)` (`ToBigInt(v)` for a `BigInt`
 /// kind) first (a throw is left pending),
 /// then an array-index number stores through [`emit_ta_set`] (checked); any
@@ -737,7 +798,7 @@ fn emit_ta_index_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     finish_builder(f)
 }
 
-/// The number of element kinds the `kind` byte can name (DESIGN.md §5.8.6).
+/// The number of element kinds the `kind` byte can name (DESIGN.md §6.2).
 const KIND_COUNT: u32 = 12;
 
 /// Emit a `br_table` switch over the i32 local `kind` with one arm per kind
@@ -759,7 +820,7 @@ fn kind_switch<S: Sink>(f: &mut S, kind: u32, result: BlockType, mut arm: impl F
     wasm!(f; End);
 }
 
-/// `__raw_load(addr, kind, swap) -> i64` (DESIGN.md §5.8.6): the kind's
+/// `__raw_load(addr, kind, swap) -> i64` (DESIGN.md §6.2): the kind's
 /// width loaded at `addr` (unaligned) as integer bits, byte-swapped when
 /// `swap` (a big-endian `DataView` read; typed arrays pass `0`), and read as
 /// a number by the kind's rule; a float goes through `__box_f64`, so a
@@ -833,7 +894,7 @@ fn emit_raw_load(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     finish_builder(f)
 }
 
-/// `__raw_store(addr, kind, n, swap)` (DESIGN.md §5.8.6): the number `n`
+/// `__raw_store(addr, kind, n, swap)` (DESIGN.md §6.2): the number `n`
 /// converted to the kind's bits — the low bits of the `ToInt32` pattern for
 /// the integer kinds (`ToInt8` .. `ToUint32`), `Uint8Clamped` rounding half
 /// to even after clamping to `0 .. 255` (`NaN` is `0`), `Float16` through
@@ -917,7 +978,7 @@ const F16_OVERFLOW_BITS: i64 = 0x40EF_FE00_0000_0000;
 /// The `f64` bits of `2^-14`, the smallest normal binary16 magnitude.
 const F16_MIN_NORMAL_BITS: i64 = 0x3F10_0000_0000_0000;
 
-/// `__f16_encode(x: f64) -> i32` (DESIGN.md §5.8.6): the IEEE binary16 bits
+/// `__f16_encode(x: f64) -> i32` (DESIGN.md §6.2): the IEEE binary16 bits
 /// of `x` rounded half to even directly from the `f64` bits (never through
 /// `f32`, which would round twice). `NaN` is the canonical quiet `0x7E00`;
 /// `|x| >= 65520` is `±Infinity`; a normal result keeps the top 10 of the
@@ -960,7 +1021,7 @@ fn emit_f16_encode(leaves: &LeafSet) -> Function {
     finish_builder(f)
 }
 
-/// `__f16_decode(h: i32) -> i64` (DESIGN.md §5.8.6): the number jsval of
+/// `__f16_decode(h: i32) -> i64` (DESIGN.md §6.2): the number jsval of
 /// the binary16 bits `h`, exact in `f64`: exponent `0` is `±m · 2^-24`,
 /// `31` is `±Infinity` or the canonical `NaN`, else the `f64` with the
 /// exponent rebiased (15 -> 1023) and the mantissa shifted up by 42. A
