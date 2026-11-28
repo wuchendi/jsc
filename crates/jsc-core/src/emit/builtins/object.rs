@@ -327,8 +327,9 @@ pub(super) fn emit_define_accessor(
 
 /// `Object.prototype.__lookupGetter__(P)` / `__lookupSetter__(P)` (Annex
 /// B.2.2.4-5): `ToObject(this)`, `ToPropertyKey(P)`, then the first own
-/// property `P` up the `proto` chain decides: an accessor's `get` / `set`,
-/// else (a data property or none) `undefined`.
+/// property `P` up the `[[GetPrototypeOf]]` chain decides: an accessor's
+/// `get` / `set`, else (a data property or none) `undefined` (a proxy level
+/// answers through its traps, DESIGN.md §6.11).
 pub(super) fn emit_lookup_accessor(
     set: bool,
     function: &mut FnBuilder<'_>,
@@ -348,8 +349,11 @@ pub(super) fn emit_lookup_accessor(
     let half = static_key(strings, if set { "set" } else { "get" });
     wasm!(function;
         Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(o), LocalGet(key), Call(helpers.own_desc()), LocalTee(desc),
-        I64Const(UNDEFINED_BITS), I64Ne,
+        LocalGet(o), LocalGet(key), Call(helpers.own_desc()), LocalSet(desc),
+    );
+    return_if_pending(function);
+    wasm!(function;
+        LocalGet(desc), I64Const(UNDEFINED_BITS), I64Ne,
         // A data descriptor has no own `get` / `set` (one inherited from
         // `%Object.prototype%` must not be read).
         If(BlockType::Empty),
@@ -359,16 +363,19 @@ pub(super) fn emit_lookup_accessor(
         Else, I64Const(UNDEFINED_BITS), End,
         Return,
         End,
-        LocalGet(o), I32WrapI64, I64Load(MemArg { offset: OBJ_PROTO_OFFSET, align: 3, memory_index: 0 }),
-        LocalTee(o), I64Const(NULL_BITS), I64Eq, BrIf(1),
+        LocalGet(o), Call(helpers.get_proto()), LocalSet(o),
+    );
+    return_if_pending(function);
+    wasm!(function;
+        LocalGet(o), I64Const(NULL_BITS), I64Eq, BrIf(1),
         Br(0),
         End, End,
         I64Const(UNDEFINED_BITS),
     );
 }
 
-/// The getter of `Object.prototype.__proto__`: the `proto` of
-/// `ToObject(this)`.
+/// The getter of `Object.prototype.__proto__`: `[[GetPrototypeOf]]` of
+/// `ToObject(this)` (a proxy's trap, DESIGN.md §6.11).
 pub(super) fn emit_proto_get(
     function: &mut FnBuilder<'_>,
     frame: Frame,
@@ -378,10 +385,7 @@ pub(super) fn emit_proto_get(
     let this = frame.i64(0);
     wasm!(function; GlobalGet(THIS_GLOBAL), LocalSet(this));
     require_object_coercible(function, frame, this, strings, helpers);
-    wasm!(function;
-        LocalGet(this), Call(helpers.to_object()), I32WrapI64,
-        I64Load(MemArg { offset: OBJ_PROTO_OFFSET, align: 3, memory_index: 0 }),
-    );
+    wasm!(function; LocalGet(this), Call(helpers.to_object()), Call(helpers.get_proto()));
 }
 
 /// The setter of `Object.prototype.__proto__`: `RequireObjectCoercible(this)`;
@@ -405,14 +409,10 @@ pub(super) fn emit_proto_set(
     wasm!(function;
         I32And,
         If(BlockType::Empty),
-        LocalGet(this), I32WrapI64, LocalGet(proto), Call(helpers.set_proto()), LocalTee(r),
-        If(BlockType::Empty),
+        LocalGet(this), I32WrapI64, LocalGet(proto), Call(helpers.set_proto()), LocalSet(r),
     );
-    object_static::prop_throw(
-        function,
-        |function| push_str(function, strings, ""),
-        |function| wasm!(function; LocalGet(r)),
-        helpers,
-    );
+    return_if_pending(function);
+    wasm!(function; LocalGet(r), If(BlockType::Empty));
+    object_static::throw_proto_rejection(function, r, strings, helpers);
     wasm!(function; End, End, I64Const(UNDEFINED_BITS));
 }
