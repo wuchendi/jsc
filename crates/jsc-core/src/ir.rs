@@ -211,9 +211,14 @@ pub enum ConvertOp {
     /// `String(x)` called (not constructed): [`ConvertOp::ToString`], except
     /// a symbol yields its `SymbolDescriptiveString` (`"Symbol(desc)"`).
     String,
-    /// `Number(x)` — `ToNumber`: a number passes through, anything else goes
-    /// through `__to_number` (`ToPrimitive`, then the host `StringToNumber`).
+    /// `ToNumber(x)` (unary `+`, the update desugarings): a number passes
+    /// through, anything else goes through `__to_number` (`ToPrimitive`, then
+    /// `StringToNumber`; a symbol or a `BigInt` throws).
     ToNumber,
+    /// `Number(x)` (DESIGN.md §6.10.7): a number passes through inline like
+    /// [`ConvertOp::ToNumber`], anything else goes through `__number_value`
+    /// (`ToNumeric`, then a `BigInt` converts to its Number value).
+    NumberCall,
     /// `Boolean(x)` — JS truthiness (a boolean jsval). Lowered to inline wasm.
     ToBoolean,
     /// `parseInt(s, radix)` — the guest `__parse_int` over `ToString(s)` and the
@@ -563,11 +568,13 @@ pub enum BuiltinCtor {
     WeakRef,
     /// `FinalizationRegistry`.
     FinalizationRegistry,
+    /// `BigInt` (DESIGN.md §6.10.7): callable, `new` throws.
+    BigInt,
 }
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 24] = [
+    pub(crate) const ALL: [BuiltinCtor; 25] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -592,6 +599,7 @@ impl BuiltinCtor {
         Self::WeakSet,
         Self::WeakRef,
         Self::FinalizationRegistry,
+        Self::BigInt,
     ];
 
     /// The constructor's global name (also its `name`).
@@ -614,6 +622,7 @@ impl BuiltinCtor {
             Self::WeakSet => "WeakSet",
             Self::WeakRef => "WeakRef",
             Self::FinalizationRegistry => "FinalizationRegistry",
+            Self::BigInt => "BigInt",
         }
     }
 

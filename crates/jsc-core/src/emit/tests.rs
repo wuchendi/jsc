@@ -1558,13 +1558,22 @@ fn leaf_set_matches_the_call_graph() {
             Big::CmpNum,
             Big::Hash,
             Big::ToF64,
+            Big::ToI64,
         ] {
             assert!(
                 leaves.is_leaf(helpers.bigint(helper)),
                 "{helper:?} must be a leaf"
             );
         }
-        for helper in [Big::New, Big::ToString, Big::FromString, Big::FromF64] {
+        for helper in [
+            Big::New,
+            Big::ToString,
+            Big::FromString,
+            Big::FromF64,
+            Big::NumberValue,
+            Big::AsN,
+            Big::FromI64,
+        ] {
             assert!(
                 !leaves.is_leaf(helpers.bigint(helper)),
                 "{helper:?} must be a safepoint"

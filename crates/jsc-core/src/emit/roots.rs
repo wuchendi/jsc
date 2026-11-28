@@ -223,7 +223,7 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
         | IrNode::MathCall { .. }
         | IrNode::MathSpread { .. }
         | IrNode::ConvertCall {
-            op: ConvertOp::ToNumber,
+            op: ConvertOp::ToNumber | ConvertOp::NumberCall,
             ..
         }
         | IrNode::Binary { .. }
