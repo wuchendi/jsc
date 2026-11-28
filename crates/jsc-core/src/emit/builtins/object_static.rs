@@ -463,10 +463,12 @@ fn emit_set_level(
     wasm!(function; LocalGet(r), I32Eqz, If(BlockType::Empty));
     // A refusal is a proxy's falsish trap or, in a program that can reach
     // one, a variable-length typed array (DESIGN.md §6.3).
-    let typed_array = |function: &mut FnBuilder<'_>| {
+    // `select` keeps its first operand (the proxy's) when the refused object
+    // is not a typed array.
+    let not_typed_array = |function: &mut FnBuilder<'_>| {
         wasm!(function;
             LocalGet(v), I32WrapI64, I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }),
-            I32Const(i32::from(abi::TYPE_TYPEDARRAY)), I32Eq,
+            I32Const(i32::from(abi::TYPE_TYPEDARRAY)), I32Ne,
         );
     };
     prop_throw(
@@ -475,7 +477,7 @@ fn emit_set_level(
             push_str(function, strings, "preventExtensions");
             if helpers.has_binary() {
                 push_str(function, strings, "");
-                typed_array(function);
+                not_typed_array(function);
                 wasm!(function; Select);
             }
         },
@@ -483,7 +485,7 @@ fn emit_set_level(
             wasm!(function; I32Const(PROP_THROW_PROXY_FALSISH_OP));
             if helpers.has_binary() {
                 wasm!(function; I32Const(PROP_THROW_TA_PREVENT_EXTENSIONS));
-                typed_array(function);
+                not_typed_array(function);
                 wasm!(function; Select);
             }
         },

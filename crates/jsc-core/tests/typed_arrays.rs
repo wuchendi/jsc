@@ -352,6 +352,23 @@ fn integrity_levels() {
     );
 }
 
+/// In a program with typed arrays, `Object.preventExtensions` still tells
+/// the refusals apart: a variable-length view's message, and a proxy whose
+/// trap returns falsish its own.
+#[test]
+fn prevent_extensions_refusals_keep_their_messages() {
+    assert_string(
+        &with_prelude(
+            "const p = new Proxy({}, { preventExtensions() { return false; } });
+             const rab = new ArrayBuffer(2, { maxByteLength: 4 });
+             [err(() => Object.preventExtensions(p)),
+              err(() => Object.preventExtensions(new Uint8Array(rab)))].join('\\n')",
+        ),
+        "TypeError: 'preventExtensions' on proxy: trap returned falsish\n\
+         TypeError: Cannot prevent extensions on a variable-length TypedArray",
+    );
+}
+
 /// Length-tracking and fixed views over a resizable buffer through grow,
 /// shrink (out of bounds and back), and detach: lengths, byte lengths and
 /// offsets from the buffer's current length (`0` out of bounds), element
