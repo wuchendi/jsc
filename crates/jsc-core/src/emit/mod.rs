@@ -999,6 +999,19 @@ enum ProxyGate {
     Open,
 }
 
+/// The DESIGN.md §6.10.9 reachability gate: whether the program can produce
+/// a `BigInt` — a `BigInt` literal, a `BIGINT_NAMES` name (an identifier, a
+/// member or property name, a string) or the global object. When closed, the
+/// numeric operators emit their Number-only code and reference no `BigInt`
+/// kernel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BigIntGate {
+    /// No `BigInt` can exist.
+    Closed,
+    /// A `BigInt` may exist.
+    Open,
+}
+
 #[derive(Clone, Copy)]
 struct Helpers<'a> {
     /// The call-depth limit of the call-stack guard
@@ -1198,6 +1211,9 @@ struct Helpers<'a> {
     /// Whether the program can create a proxy (DESIGN.md §6.11 reachability
     /// gate; see [`Helpers::proxies`]).
     proxy_gate: ProxyGate,
+    /// Whether the program can produce a `BigInt` (DESIGN.md §6.10.9
+    /// reachability gate; see [`Helpers::bigints`]).
+    bigint_gate: BigIntGate,
     /// Base address of the Unicode tables (see [`unicode`]).
     unicode: i32,
     /// Base address of the `__fn_info` table (see [`FnLayout`]). The static
@@ -1466,6 +1482,12 @@ impl Helpers<'_> {
     /// Whether the program can reach binary data ([`Self::binary`]).
     fn has_binary(self) -> bool {
         self.binary == BinaryData::Reachable
+    }
+
+    /// Whether the program can produce a `BigInt` (DESIGN.md §6.10.9
+    /// reachability gate, [`Self::bigint_gate`]).
+    fn bigints(self) -> bool {
+        self.bigint_gate == BigIntGate::Open
     }
 
     /// `__ab_alloc(size) -> block | 0` (see [`binary`]).
@@ -1867,6 +1889,17 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     if options.no_stack_guard {
         helpers.stack_guard = None;
     }
+    // A program that can produce no `BigInt` (DESIGN.md §6.10.9) is emitted
+    // from its Number-only IR, with the gate published to the emitters that
+    // take no `Helpers` for the rest of this module.
+    let _bigint_scope = roots::BigIntScope::enter(helpers.bigints());
+    let number_only;
+    let program = if helpers.bigints() {
+        program
+    } else {
+        number_only = lower_number_only(program);
+        &number_only
+    };
     module.section(&types);
 
     // Import section: exactly the four WASI functions (indices 0..=3).

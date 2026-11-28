@@ -22,7 +22,40 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+
+thread_local! {
+    /// Whether the program being emitted can produce a `BigInt`
+    /// ([`Helpers::bigints`], DESIGN.md §6.10.9), for the emitters that
+    /// take no [`Helpers`]: [`classify`] and [`emit_is_object`]. `true`
+    /// outside [`BigIntScope`], the sound default.
+    static BIGINTS: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Whether the program being emitted can produce a `BigInt` (see
+/// [`BIGINTS`]).
+pub(super) fn bigints_reachable() -> bool {
+    BIGINTS.get()
+}
+
+/// Publishes [`Helpers::bigints`] to [`bigints_reachable`] for the
+/// emission of one module; dropping it restores the sound default.
+pub(super) struct BigIntScope;
+
+impl BigIntScope {
+    /// Enter the emission of a module whose gate is `reachable`.
+    pub(super) fn enter(reachable: bool) -> Self {
+        BIGINTS.set(reachable);
+        Self
+    }
+}
+
+impl Drop for BigIntScope {
+    fn drop(&mut self) {
+        BIGINTS.set(true);
+    }
+}
 
 /// The non-allocating leaf helpers, as wasm function indices. WASI imports
 /// never call back; the remaining `env` imports do and are not leaves.
@@ -46,6 +79,8 @@ const WASI_IMPORT_COUNT: u32 = 4;
 
 /// Each candidate leaf helper and its declared callees.
 pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
+    use registry::Big;
+    let big = |h| helpers.bigint(h);
     let mut graph = vec![
         (helpers.str_eq, vec![]),
         (helpers.str_cmp, vec![]),
@@ -54,12 +89,12 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         (helpers.intern_find, vec![helpers.intern_slot]),
         (helpers.index_value, vec![]),
         (helpers.str_exotic_index(), vec![helpers.index_value]),
-        (helpers.same_value_zero, vec![helpers.str_eq]),
+        (helpers.same_value_zero, vec![helpers.str_eq, big(Big::Eq)]),
         (
             helpers.array_search,
             vec![helpers.same_value_zero, helpers.index_value],
         ),
-        (helpers.map_hash(), vec![helpers.str_hash]),
+        (helpers.map_hash(), vec![helpers.str_hash, big(Big::Hash)]),
         (
             helpers.map_find,
             vec![helpers.same_value_zero, helpers.map_hash()],
@@ -240,18 +275,27 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
         | IrNode::IsHole(_)
         | IrNode::IsObject(_)
         | IrNode::IsArray(_)
-        | IrNode::IncDec { .. }
         | IrNode::MathCall { .. }
         | IrNode::MathSpread { .. }
         | IrNode::ConvertCall {
-            op: ConvertOp::ToNumber,
+            op: ConvertOp::ToNumber | ConvertOp::NumberCall,
             ..
-        }
-        | IrNode::Binary { .. }
-            if !matches!(node, IrNode::Binary { op: BinOp::Add, .. }) =>
+        } => ValueClass::numeric(),
+        // `>>>`, the relational and the equality operators never yield a
+        // `BigInt`; every other arithmetic operator may (DESIGN.md §6.10.5),
+        // unless the program can produce none (§6.10.9): then only `+`
+        // (a string) may be a heap value, and `++` / `--` is a number.
+        IrNode::Binary { op, .. }
+            if !is_numeric_op(*op) || (*op != BinOp::Add && !bigints_reachable()) =>
         {
             ValueClass::numeric()
         }
+        IrNode::IncDec { .. } if !bigints_reachable() => ValueClass::numeric(),
+        // `++` / `--` of a local: numeric iff the local is.
+        IrNode::IncDec { local, .. } => ValueClass {
+            numeric: Some(vec![*local]),
+            noroot: Some((vec![*local], vec![])),
+        },
         IrNode::Str(_)
         | IrNode::BigInt { .. }
         | IrNode::TypeOf(_)
@@ -262,11 +306,18 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
             noroot: Some((vec![], vec![*local])),
         },
         IrNode::Assign { value, .. } => classify(value),
-        IrNode::Binary {
-            op: BinOp::Add,
-            lhs,
-            rhs,
-        } => match (classify(lhs).numeric, classify(rhs).numeric) {
+        // Numeric iff every operand is (a number, boolean, `null` or
+        // `undefined` operand yields a number, or throws).
+        IrNode::Negate(arg) | IrNode::BitNot(arg) | IrNode::NumericStep { arg, .. } => {
+            match classify(arg).numeric {
+                Some(deps) => ValueClass {
+                    numeric: Some(deps.clone()),
+                    noroot: Some((deps, vec![])),
+                },
+                None => ValueClass::default(),
+            }
+        }
+        IrNode::Binary { lhs, rhs, .. } => match (classify(lhs).numeric, classify(rhs).numeric) {
             (Some(mut deps), Some(rhs)) => {
                 deps.extend(rhs);
                 ValueClass {
@@ -277,6 +328,39 @@ pub(super) fn classify(node: &IrNode) -> ValueClass {
             _ => ValueClass::default(),
         },
         _ => ValueClass::default(),
+    }
+}
+
+/// Whether `op` is an arithmetic operator whose result may be a `BigInt`
+/// (or, for `+`, a string).
+fn is_numeric_op(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Mod
+            | BinOp::Exp
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
+    )
+}
+
+/// Whether `node` never evaluates to a string (it may still be a `BigInt`,
+/// whose property key is a canonical numeric string): the numeric
+/// operators other than `+`.
+pub(super) fn never_string(node: &IrNode) -> bool {
+    match node {
+        IrNode::Binary { op, .. } => *op != BinOp::Add,
+        IrNode::Negate(_)
+        | IrNode::BitNot(_)
+        | IrNode::NumericStep { .. }
+        | IrNode::IncDec { .. } => true,
+        _ => false,
     }
 }
 

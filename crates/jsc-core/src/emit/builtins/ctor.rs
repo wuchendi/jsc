@@ -197,7 +197,9 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
             [ConvertOp::String, ConvertOp::ToString],
             IrNode::Str("".into()),
         ),
-        BuiltinCtor::Number => conversion(&body, ctor, [ConvertOp::ToNumber; 2], IrNode::Num(0.0)),
+        BuiltinCtor::Number => {
+            conversion(&body, ctor, [ConvertOp::NumberCall; 2], IrNode::Num(0.0))
+        }
         BuiltinCtor::Boolean => {
             conversion(&body, ctor, [ConvertOp::ToBoolean; 2], IrNode::Bool(false))
         }
@@ -266,8 +268,8 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
             body.requires_new(ctor, after(capture, body.with_proto(ctor, promise)))
         }
         BuiltinCtor::Date => date(k),
-        // A hand-written body (`symbol::emit_ctor`).
-        BuiltinCtor::Symbol => IrNode::Undefined,
+        // Hand-written bodies (`symbol::emit_ctor`, `bigint::emit_ctor`).
+        BuiltinCtor::Symbol | BuiltinCtor::BigInt => IrNode::Undefined,
         // Abstract: only a subclass `new.target` constructs (the allocated
         // `this`, `proto` from `new.target`, is the instance).
         BuiltinCtor::Iterator => ternary(
