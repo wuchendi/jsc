@@ -2,7 +2,9 @@
 //! the program holds the global object, in every form it can take — an
 //! escaping `globalThis` (which lowers to a global-object lookup), an alias
 //! of it, a top-level `this` — so a binary-data constructor found by a
-//! computed name runs instead of reaching a stubbed body.
+//! computed name runs instead of reaching a stubbed body. The same holds for
+//! the `BigInt` gate (DESIGN.md §6.10.9): a `BigInt` found that way must not
+//! take the Number-only operator code.
 #![allow(clippy::expect_used, clippy::panic)]
 
 mod common;
@@ -124,5 +126,21 @@ fn computed_global_inside_a_function() {
     prints(
         r#"function f(k) { return new globalThis[k](3); } console.log(f("Uint8" + "Array").length)"#,
         "3",
+    );
+}
+
+#[test]
+fn computed_global_bigint() {
+    prints(
+        r#"let k = "Big" + "Int"; let x = globalThis[k](5); console.log(x * x, x > 2)"#,
+        "25n true",
+    );
+    prints(
+        r#"const g = globalThis; const B = g["Big" + "Int"]; const y = B(7); console.log(y * y, -y, y ** 2n, y > 6, y + 1n)"#,
+        "49n -7n 49n true 8n",
+    );
+    prints(
+        r#"let k = "Big" + "Int"; let x = this[k](3); console.log(x * x)"#,
+        "9n",
     );
 }
