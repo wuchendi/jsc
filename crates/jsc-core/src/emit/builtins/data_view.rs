@@ -52,7 +52,7 @@ macro_rules! op_texts {
 
 /// The receiver and out-of-bounds `TypeError`s of every prototype builtin,
 /// by property key.
-const OP_TEXTS: [(&str, CalleeErrorText<'static>, CalleeErrorText<'static>); 23] = [
+const OP_TEXTS: [(&str, CalleeErrorText<'static>, CalleeErrorText<'static>); 25] = [
     op_texts!("buffer"),
     op_texts!("byteLength"),
     op_texts!("byteOffset"),
@@ -72,6 +72,8 @@ const OP_TEXTS: [(&str, CalleeErrorText<'static>, CalleeErrorText<'static>); 23]
     op_texts!("setFloat32"),
     op_texts!("getFloat64"),
     op_texts!("setFloat64"),
+    op_texts!("getFloat16"),
+    op_texts!("setFloat16"),
     op_texts!("getBigInt64"),
     op_texts!("setBigInt64"),
     op_texts!("getBigUint64"),
