@@ -1,4 +1,4 @@
-//! Integration tests: binary16 (DESIGN.md §5.8.6): `Math.f16round`, the
+//! Integration tests: binary16 (DESIGN.md §6.2): `Math.f16round`, the
 //! `Float16Array` constructor and methods, and `DataView.prototype.getFloat16`
 //! / `setFloat16`, with the encode edge table (signed zeros, subnormals, the
 //! overflow threshold, ties to even, values a detour through `float32` would

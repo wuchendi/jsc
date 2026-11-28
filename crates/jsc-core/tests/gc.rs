@@ -228,7 +228,7 @@ fn gc_stress_run_suite() {
     same_under_stress(src, "100 v99\n");
 }
 
-/// Out of memory is a catchable `RangeError` (§5.8): the same static
+/// Out of memory is a catchable `RangeError` (design/runtime-memory.md §5.8): the same static
 /// `%OutOfMemoryError%` every time, its message and stack own and
 /// non-enumerable, and the program goes on (the reserve is taken back by the
 /// next collection) to exit normally.

@@ -19,7 +19,7 @@ pub const PRINT_PRELUDE: &str = "function print(message) { console.log(message);
 /// `$262.detachArrayBuffer`.
 pub const DETACH_INCLUDE: &str = "detachArrayBuffer.js";
 
-/// Host-defined `$262.detachArrayBuffer` (DESIGN.md §5.8.4): detaches through
+/// Host-defined `$262.detachArrayBuffer` (DESIGN.md §6.2): detaches through
 /// `ArrayBuffer.prototype.transfer`, captured with the `detached` getter
 /// before the test runs (so replacing them does not break the hook); an
 /// already detached buffer is left alone.

@@ -1,4 +1,4 @@
-//! Integration tests: `ArrayBuffer` (DESIGN.md §5.8): the constructor and
+//! Integration tests: `ArrayBuffer` (DESIGN.md §7.9): the constructor and
 //! its `options.maxByteLength`, the prototype getters, `resize`, `slice`
 //! with `SpeciesConstructor`, `transfer` / `transferToFixedLength` and the
 //! detached state they leave, `isView`, `@@species`, `@@toStringTag`,
@@ -442,7 +442,7 @@ fn transfer_errors_and_detached_operations() {
 }
 
 /// The test262 runner's `$262.detachArrayBuffer` prelude (DESIGN.md
-/// §5.8.4) works in jsc: it detaches through the captured `transfer` even
+/// §6.2) works in jsc: it detaches through the captured `transfer` even
 /// after the test replaced it, and an already detached buffer is a no-op.
 #[test]
 fn test262_detach_hook() {
@@ -463,7 +463,7 @@ fn test262_detach_hook() {
     );
 }
 
-/// The console form (DESIGN.md §5.8.8): the bytes as lowercase hex, `<>`
+/// The console form (DESIGN.md §6.9): the bytes as lowercase hex, `<>`
 /// when empty, `(detached)` once detached, nested like any value.
 #[test]
 fn rendering() {

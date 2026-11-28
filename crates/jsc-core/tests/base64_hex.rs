@@ -1,4 +1,4 @@
-//! Integration tests: `Uint8Array` base64 / hex (DESIGN.md §5.8.7): the RFC
+//! Integration tests: `Uint8Array` base64 / hex (DESIGN.md §7.9): the RFC
 //! 4648 vectors both ways, `base64url`, padding and `omitPadding`, every
 //! `lastChunkHandling` mode with its errors, ASCII whitespace, `setFrom*`
 //! with short targets (`{ read, written }` and the bytes written before a

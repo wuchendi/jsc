@@ -861,9 +861,9 @@ pub(crate) const FINREG_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 24;
 pub(crate) const FINREG_FLAG_JOB_QUEUED: u32 = 1;
 
 // Type byte `20` is [`TYPE_PROXY`] and `21` [`TYPE_BIGINT`]; `22` and `23` are
-// spare (DESIGN.md §5.8.1); the binary-data kinds start at `24`.
+// spare (DESIGN.md §5.2); the binary-data kinds start at `24`.
 
-/// TYPE BYTE of an `ArrayBuffer` (DESIGN.md §5.8.3): the object-family
+/// TYPE BYTE of an `ArrayBuffer` (DESIGN.md §5.2): the object-family
 /// prefix, then `[data:u32 @16][byte_length:u32 @20][max_byte_length:u32
 /// @24][reserved:u32]`. `data` is a raw ref to the [`TYPE_RAW`] block holding
 /// the bytes (its `len` is the capacity), `0` when detached or never needed;
@@ -871,11 +871,11 @@ pub(crate) const FINREG_FLAG_JOB_QUEUED: u32 = 1;
 /// has all three `0` and [`AB_FLAG_DETACHED`]. Maps to `typeof` "object".
 pub(crate) const TYPE_ARRAYBUFFER: u8 = 24;
 
-/// TYPE BYTE of a typed array (DESIGN.md §5.8.3); `ArrayBuffer.isView` tests
+/// TYPE BYTE of a typed array (DESIGN.md §5.2); `ArrayBuffer.isView` tests
 /// it.
 pub(crate) const TYPE_TYPEDARRAY: u8 = 25;
 
-/// TYPE BYTE of a `DataView` (DESIGN.md §5.8.3); `ArrayBuffer.isView` tests
+/// TYPE BYTE of a `DataView` (DESIGN.md §5.2); `ArrayBuffer.isView` tests
 /// it.
 pub(crate) const TYPE_DATAVIEW: u8 = 26;
 
@@ -911,7 +911,7 @@ pub(crate) const BYTE_LENGTH_MAX: u32 = 1 << 29;
 pub(crate) const TA_BUFFER_OFFSET: u32 = OBJ_PREFIX_SIZE;
 
 /// Byte offset (from a [`TYPE_TYPEDARRAY`] block base) of the u8 element kind
-/// (DESIGN.md §5.8.6).
+/// (DESIGN.md §6.2).
 pub(crate) const TA_KIND_OFFSET: u32 = OBJ_PREFIX_SIZE + 4;
 
 /// Byte offset (from a [`TYPE_TYPEDARRAY`] block base) of the u8 `log2` of
@@ -938,7 +938,7 @@ pub(crate) const TA_FLAG_LENGTH_TRACKING: u8 = 2;
 pub(crate) const TA_FLAG_RESIZABLE_BUFFER: u8 = 4;
 
 /// Byte offset (from a [`TYPE_DATAVIEW`] block base) of the u32 raw ref to
-/// the viewed [`TYPE_ARRAYBUFFER`] block (DESIGN.md §5.8.3).
+/// the viewed [`TYPE_ARRAYBUFFER`] block (DESIGN.md §5.2).
 pub(crate) const DV_BUFFER_OFFSET: u32 = OBJ_PREFIX_SIZE;
 
 /// Byte offset (from a [`TYPE_DATAVIEW`] block base) of the u32 byte offset

@@ -51,7 +51,7 @@ fn proxy_helpers_are_dropped_without_proxy() {
 }
 
 /// A program that cannot reach binary data keeps no binary-data builtin, no
-/// `Group::Binary` helper and no binary arm (DESIGN.md §5.8.5): naming a
+/// `Group::Binary` helper and no binary arm (DESIGN.md §6.4): naming a
 /// typed-array constructor grows the shaken module by the typed-array
 /// runtime.
 #[test]

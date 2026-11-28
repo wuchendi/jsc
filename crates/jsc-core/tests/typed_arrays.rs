@@ -1,6 +1,6 @@
-//! Integration tests: the typed-array core (DESIGN.md §5.8): every
+//! Integration tests: the typed-array core (DESIGN.md §6.2): every
 //! constructor overload per kind, the element conversions, the
-//! integer-indexed exotic object hooks (§5.8.5), length-tracking views over
+//! integer-indexed exotic object hooks (§6.3), length-tracking views over
 //! resizable buffers with grow / shrink / out-of-bounds and detach,
 //! `%TypedArray%` and its statics `from` / `of` / `@@species`, the
 //! prototype getters, iteration, rendering, and the allocation-heavy paths
@@ -188,7 +188,7 @@ fn element_conversions_per_kind() {
     );
 }
 
-/// The §5.8.5 key cases on reads: a canonical numeric key never reaches the
+/// The §6.3 key cases on reads: a canonical numeric key never reaches the
 /// chain (`"-0"`, `"1.5"`, `"Infinity"`, `"NaN"`, an out-of-range index, a
 /// negative or fractional number), while a non-canonical one (`"1.0"`,
 /// `"1e3"`, `"01"`, `"+1"`) and any other string or symbol is ordinary.
@@ -215,7 +215,7 @@ fn numeric_keys_read() {
     );
 }
 
-/// The §5.8.5 key cases on writes: a numeric key on the receiver is
+/// The §6.3 key cases on writes: a numeric key on the receiver is
 /// `TypedArraySetElement` (`ToNumber` first, even for an invalid index,
 /// which then stores nothing and creates nothing), a non-canonical key is
 /// an ordinary property, and an inherited setter of a numeric key never
@@ -501,7 +501,7 @@ fn iteration() {
     );
 }
 
-/// The console form (DESIGN.md §5.8.8): `<Kind>(n) [ .. ]` with the
+/// The console form (DESIGN.md §6.9): `<Kind>(n) [ .. ]` with the
 /// elements by the number rule, own named properties after them, the kind's
 /// name for a subclass, length `0` out of bounds, nested like any value.
 #[test]
