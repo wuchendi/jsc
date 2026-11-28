@@ -325,8 +325,8 @@ fn length_growth_then_fill_is_linear() {
     );
 }
 
-/// The tail a pure `length` growth adds is holes: absent own properties, read
-/// through the prototype chain.
+/// The tail a pure `length` growth adds is holes: absent own properties, an
+/// inherited index visible through `[[Get]]` and `[[HasProperty]]`.
 #[test]
 fn length_growth_tail_is_holes() {
     assert_string(
@@ -334,7 +334,18 @@ fn length_growth_tail_is_holes() {
          let a = []; a.length = 10000;
          [a[5000], 5000 in a, a.hasOwnProperty(5000), a.hasOwnProperty(4999),
           Object.keys(a).length, a.length].join()",
-        "p,false,false,false,0,10000",
+        "p,true,false,false,0,10000",
+    );
+}
+
+/// Without an inherited index the grown tail is absent everywhere.
+#[test]
+fn length_growth_tail_pure_hole_is_absent() {
+    assert_string(
+        "let a = []; a.length = 10000;
+         [a[5000] === undefined, 5000 in a, a.hasOwnProperty(5000),
+          Object.keys(a).length, a.length].join()",
+        "true,false,false,0,10000",
     );
 }
 
