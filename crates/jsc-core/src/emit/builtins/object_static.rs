@@ -128,7 +128,7 @@ fn arg_to_object(
 }
 
 /// Push element `i` (an i32 local) of the array whose i32 base is in `arr`.
-fn emit_element(function: &mut FnBuilder<'_>, arr: u32, i: u32, slot: u64) {
+pub(super) fn emit_element(function: &mut FnBuilder<'_>, arr: u32, i: u32, slot: u64) {
     wasm!(function; LocalGet(arr));
     emit_array_elems(function);
     wasm!(function;
@@ -532,7 +532,7 @@ pub(super) fn prop_throw(
 
 /// Throw `Object prototype may only be an Object or null: <v>` unless the
 /// jsval in `proto` is an object or `null`.
-fn require_proto(function: &mut FnBuilder<'_>, proto: u32, helpers: Helpers<'_>) {
+pub(super) fn require_proto(function: &mut FnBuilder<'_>, proto: u32, helpers: Helpers<'_>) {
     emit_is_object(function, proto);
     wasm!(function;
         LocalGet(proto), I64Const(NULL_BITS), I64Eq, I32Or, I32Eqz,
@@ -643,13 +643,29 @@ fn emit_get_own_property_names(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    let v = frame.i64(0);
+    arg_to_object(function, frame, 0, v, strings, helpers);
+    own_key_list(function, frame, OWN_ALL, strings, helpers);
+}
+
+/// The own keys (`__own_keys` `mode`: [`OWN_ALL`] or [`OWN_ALL_KEYS`]) of
+/// the object in i64 `frame.i64(0)` as a fresh array, returned: a `LAZY`
+/// function is materialized first, and an array's `length` follows its
+/// indices. A proxy's trap may throw (the body returns).
+pub(super) fn own_key_list(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    mode: i32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     let (v, kv) = (frame.i64(0), frame.i64(1));
     let (res, ks, n, i) = (frame.base(0), frame.base(1), frame.i32(2), frame.i32(3));
     let (key, length) = (frame.base(4), frame.x32(1));
-    arg_to_object(function, frame, 0, v, strings, helpers);
     wasm!(function; LocalGet(v), I32WrapI64, LocalSet(key));
     emit_materialize(function, key, helpers);
-    wasm!(function; LocalGet(v), I32Const(OWN_ALL), Call(helpers.own_keys), LocalSet(kv));
+    wasm!(function; LocalGet(v), I32Const(mode), Call(helpers.own_keys), LocalSet(kv));
+    return_if_trap_threw(function, helpers);
     emit_load_type_byte(function, v);
     wasm!(function;
         I32Const(TYPE_ARRAY), I32Ne, If(BlockType::Empty), LocalGet(kv), Return, End,

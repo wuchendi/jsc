@@ -213,9 +213,8 @@ pub(super) fn emit_call(
 }
 
 /// `Function.prototype.apply(thisArg, argList)`: call `this` with `thisArg`
-/// and `CreateListFromArrayLike(argList)` (no arguments for `undefined` /
-/// `null`): an array's elements (a hole read through the prototype chain), else
-/// `ToLength(argList.length)` indexed reads; a non-object throws.
+/// and `CreateListFromArrayLike(argList)` ([`create_list`]; no arguments for
+/// `undefined` / `null`).
 pub(super) fn emit_apply(
     function: &mut FnBuilder<'_>,
     frame: Frame,
@@ -240,8 +239,35 @@ pub(super) fn emit_apply(
     wasm!(function;
         If(BlockType::Empty),
         I32Const(0), Call(helpers.new_array()), LocalSet(dst),
+        I32Const(0), LocalSet(n),
         Else,
     );
+    create_list(
+        function,
+        frame,
+        [list, v],
+        [src, dst, n, i],
+        strings,
+        helpers,
+    );
+    wasm!(function; End);
+    call_with_array(function, target, this, dst, n, helpers);
+}
+
+/// `CreateListFromArrayLike(list)` (ECMA-262 7.3.20) of the jsval in i64
+/// `list` into a fresh dense array (rooted i32 base `dst`, its length into
+/// i32 `n`): a non-object throws; an array gives its elements (a hole read
+/// through the prototype chain), anything else `ToLength(list.length)`
+/// indexed `Get`s (a proxy's traps). Uses the rooted i32 base `src`, i32 `i`
+/// and i64 `v`; an exception returns from the body.
+pub(super) fn create_list(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    [list, v]: [u32; 2],
+    [src, dst, n, i]: [u32; 4],
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     emit_is_object(function, list);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, NOT_ARRAY_LIKE, strings, helpers);
@@ -280,10 +306,8 @@ pub(super) fn emit_apply(
         Br(0),
         End, End,
         End,
-        End,
         LocalGet(dst), I32Load(MemArg { offset: ARRAY_LEN_OFFSET, align: 2, memory_index: 0 }), LocalSet(n),
     );
-    call_with_array(function, target, this, dst, n, helpers);
 }
 
 /// The out-of-line generic method call of the guarded builtin call sites

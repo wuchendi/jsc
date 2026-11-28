@@ -88,6 +88,9 @@ pub(super) enum Intrinsic {
     /// `%Proxy%` (DESIGN.md §6.11): a constructor without `prototype`, its
     /// one static `revocable`.
     Proxy,
+    /// `%Reflect%` (DESIGN.md §6.11): an ordinary namespace object holding
+    /// the thirteen `Reflect` functions and `@@toStringTag` `"Reflect"`.
+    Reflect,
 }
 
 /// A builtin iterator family: the receivers of one iterator prototype's
@@ -270,7 +273,8 @@ impl Intrinsic {
             | Self::Prototype(_)
             | Self::IteratorPrototype
             | Self::AsyncIteratorPrototype
-            | Self::BigIntPrototype => Some(Self::ObjectPrototype),
+            | Self::BigIntPrototype
+            | Self::Reflect => Some(Self::ObjectPrototype),
             Self::IterPrototype(_)
             | Self::GeneratorPrototype
             | Self::WrapForValidIteratorPrototype
@@ -304,11 +308,16 @@ impl Intrinsic {
 
     /// The header `flags` of a callable intrinsic: a constructor is
     /// `CONSTRUCTOR`, and `SELF_ALLOC` when it allocates its own kind of
-    /// object from `new.target` (DESIGN.md §7.6, §7.7).
+    /// object from `new.target` (DESIGN.md §7.6, §7.7; the wrapper
+    /// constructors too, so the construct site does not read
+    /// `new.target.prototype` a second time, DESIGN.md §6.11).
     fn flags(self) -> u8 {
         match self {
             Self::Ctor(
                 BuiltinCtor::Array
+                | BuiltinCtor::String
+                | BuiltinCtor::Number
+                | BuiltinCtor::Boolean
                 | BuiltinCtor::Error(_)
                 | BuiltinCtor::Map
                 | BuiltinCtor::Set
@@ -438,6 +447,7 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
             Intrinsic::IteratorHelperPrototype,
             Intrinsic::OutOfMemoryError,
             Intrinsic::Proxy,
+            Intrinsic::Reflect,
         ])
         .chain(
             BINARY_CTORS
@@ -720,6 +730,8 @@ pub(super) enum Builtin {
     /// A `%TypedArray%` static, `%TypedArray.prototype%` getter or iterator
     /// method (DESIGN.md §5.8.7, `emit/builtins/typed_array.rs`).
     TypedArray(TypedArrayOp),
+    /// A `Reflect` function (DESIGN.md §6.11, `emit/builtins/reflect.rs`).
+    Reflect(ReflectFn),
     /// A `BigInt` static or `%BigInt.prototype%` method (DESIGN.md §6.10.7).
     BigInt(BigIntOp),
 }
@@ -1002,6 +1014,79 @@ pub(super) enum ProxyOp {
     /// The `[[Call]]` / `[[Construct]]` trampoline in a callable proxy's
     /// `func_idx` (its `env` is the proxy). Not installed on any intrinsic.
     Call,
+}
+
+/// The thirteen `Reflect` functions of DESIGN.md §6.11 (distinct from
+/// [`ReflectOp`], which names `Object` statics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReflectFn {
+    Apply,
+    Construct,
+    DefineProperty,
+    DeleteProperty,
+    Get,
+    GetOwnPropertyDescriptor,
+    GetPrototypeOf,
+    Has,
+    IsExtensible,
+    OwnKeys,
+    PreventExtensions,
+    Set,
+    SetPrototypeOf,
+}
+
+impl ReflectFn {
+    /// Every function, in [`Builtin::ALL`] and slot order.
+    pub(super) const ALL: [ReflectFn; 13] = [
+        Self::Apply,
+        Self::Construct,
+        Self::DefineProperty,
+        Self::DeleteProperty,
+        Self::Get,
+        Self::GetOwnPropertyDescriptor,
+        Self::GetPrototypeOf,
+        Self::Has,
+        Self::IsExtensible,
+        Self::OwnKeys,
+        Self::PreventExtensions,
+        Self::Set,
+        Self::SetPrototypeOf,
+    ];
+
+    /// The function's name.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Apply => "apply",
+            Self::Construct => "construct",
+            Self::DefineProperty => "defineProperty",
+            Self::DeleteProperty => "deleteProperty",
+            Self::Get => "get",
+            Self::GetOwnPropertyDescriptor => "getOwnPropertyDescriptor",
+            Self::GetPrototypeOf => "getPrototypeOf",
+            Self::Has => "has",
+            Self::IsExtensible => "isExtensible",
+            Self::OwnKeys => "ownKeys",
+            Self::PreventExtensions => "preventExtensions",
+            Self::Set => "set",
+            Self::SetPrototypeOf => "setPrototypeOf",
+        }
+    }
+
+    /// The function's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::Apply | Self::DefineProperty | Self::Set => 3,
+            Self::Construct
+            | Self::DeleteProperty
+            | Self::Get
+            | Self::GetOwnPropertyDescriptor
+            | Self::Has
+            | Self::SetPrototypeOf => 2,
+            Self::GetPrototypeOf | Self::IsExtensible | Self::OwnKeys | Self::PreventExtensions => {
+                1
+            }
+        }
+    }
 }
 
 /// The `Iterator` builtins of DESIGN.md §7.9.
@@ -2075,7 +2160,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 428] = [
+    pub(super) const ALL: [Builtin; 441] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -2594,6 +2679,19 @@ impl Builtin {
         Self::TypedArray(TypedArrayOp::ALL[8]),
         Self::TypedArray(TypedArrayOp::ALL[9]),
         Self::Species(SpeciesOp::Getter(BuiltinCtor::TypedArray)),
+        Self::Reflect(ReflectFn::ALL[0]),
+        Self::Reflect(ReflectFn::ALL[1]),
+        Self::Reflect(ReflectFn::ALL[2]),
+        Self::Reflect(ReflectFn::ALL[3]),
+        Self::Reflect(ReflectFn::ALL[4]),
+        Self::Reflect(ReflectFn::ALL[5]),
+        Self::Reflect(ReflectFn::ALL[6]),
+        Self::Reflect(ReflectFn::ALL[7]),
+        Self::Reflect(ReflectFn::ALL[8]),
+        Self::Reflect(ReflectFn::ALL[9]),
+        Self::Reflect(ReflectFn::ALL[10]),
+        Self::Reflect(ReflectFn::ALL[11]),
+        Self::Reflect(ReflectFn::ALL[12]),
         Self::Ctor(BuiltinCtor::BigInt),
         Self::BigInt(BigIntOp::AsIntN),
         Self::BigInt(BigIntOp::AsUintN),
@@ -2622,6 +2720,7 @@ impl Builtin {
             Self::ArrayBuffer(op) => op.name(),
             Self::DataView(op) => op.name(),
             Self::TypedArray(op) => op.name(),
+            Self::Reflect(op) => op.name(),
             method => method.method_name(),
         }
     }
@@ -2810,6 +2909,7 @@ impl Builtin {
             Self::ArrayBuffer(op) => op.length(),
             Self::DataView(op) => op.length(),
             Self::TypedArray(op) => op.length(),
+            Self::Reflect(op) => op.length(),
             Self::JsonStringify | Self::Ctor(BuiltinCtor::Typed(_)) => 3,
             // Every other builtin takes one argument.
             _ => 1,
@@ -3003,7 +3103,7 @@ const NUMBER_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 48] = [
+const GLOBALS: [(&str, u32, Value); 49] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -3210,6 +3310,11 @@ const GLOBALS: [(&str, u32, Value); 48] = [
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::Float64))),
     ),
     (
+        "Reflect",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Reflect),
+    ),
+    (
         "BigInt",
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::BigInt)),
@@ -3325,6 +3430,7 @@ pub(super) fn registry() -> Vec<Entry> {
     data_view_entries(&mut entries);
     proxy_entries(&mut entries);
     typed_array_entries(&mut entries);
+    reflect_entries(&mut entries);
     bigint_entries(&mut entries);
     entries.extend(GLOBALS.map(|(key, attrs, value)| entry(Intrinsic::Global, key, attrs, value)));
     entries
@@ -3455,6 +3561,23 @@ fn proxy_entries(entries: &mut Vec<Entry>) {
             Value::Method(Builtin::Proxy(ProxyOp::Revocable)),
         ),
     ]);
+}
+
+/// The own properties of `%Reflect%` (DESIGN.md §6.11): the thirteen
+/// functions, then `@@toStringTag` `"Reflect"` (configurable only).
+fn reflect_entries(entries: &mut Vec<Entry>) {
+    entries.extend(ReflectFn::ALL.map(|op| Entry {
+        intrinsic: Intrinsic::Reflect,
+        key: Key::Str(op.name()),
+        attrs: METHOD_ATTRS,
+        value: Value::Method(Builtin::Reflect(op)),
+    }));
+    entries.push(Entry {
+        intrinsic: Intrinsic::Reflect,
+        key: Key::Symbol(WellKnown::ToStringTag),
+        attrs: FN_FACT_ATTRS,
+        value: Value::Str("Reflect"),
+    });
 }
 
 /// `ArrayBuffer.isView` and the `%ArrayBuffer.prototype%` getters
@@ -4295,6 +4418,7 @@ mod tests {
                     | Intrinsic::AsyncGeneratorPrototype
                     | Intrinsic::Math
                     | Intrinsic::Json
+                    | Intrinsic::Reflect
                     | Intrinsic::BigIntPrototype
             );
             assert_eq!(

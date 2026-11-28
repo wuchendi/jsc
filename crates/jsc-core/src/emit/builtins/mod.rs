@@ -42,6 +42,7 @@ mod object;
 mod object_static;
 mod promise;
 mod proxy;
+mod reflect;
 mod string;
 mod symbol;
 mod typed_array;
@@ -338,6 +339,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(typed_array::strings())
         .chain(data_view::strings())
         .chain(proxy::strings())
+        .chain(reflect::strings())
         .chain(bigint::STRINGS)
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
@@ -461,15 +463,17 @@ fn emit_builtin_body(
         | Builtin::ObjectStatic(_)
         | Builtin::IsArray
         | Builtin::DateNow => emit_fragment(builtin, f, frame, strings, helpers),
-        // `WeakOp`, `WeakCell`, `ArrayBuffer`, `DataView`, `TypedArray`, `Proxy`.
+        // `WeakOp`, `WeakCell`, `ArrayBuffer`, `DataView`, `TypedArray`, `Proxy`,
+        // `Reflect`.
         _ => emit_handle_family(builtin, f, frame, strings, helpers),
     }
 }
 
 /// Emit the body of a weak-collection ([`weak::emit`]), `ArrayBuffer`
 /// ([`array_buffer::emit`]), `DataView` ([`data_view::emit`]), typed-array
-/// ([`typed_array::emit`]) or `Proxy` ([`proxy::emit`]) builtin into `f`:
-/// the families with a type byte of their own.
+/// ([`typed_array::emit`]) or `Proxy` ([`proxy::emit`]) builtin into `f`
+/// (the families with a type byte of their own), or a `Reflect` function
+/// ([`reflect::emit`]).
 fn emit_handle_family(
     builtin: Builtin,
     f: &mut FnBuilder<'_>,
@@ -482,6 +486,7 @@ fn emit_handle_family(
         Builtin::DataView(_) => data_view::emit(builtin, f, frame, strings, helpers),
         Builtin::TypedArray(_) => typed_array::emit(builtin, f, frame, strings, helpers),
         Builtin::Proxy(op) => proxy::emit(op, f, frame, strings, helpers),
+        Builtin::Reflect(op) => reflect::emit(op, f, frame, strings, helpers),
         _ => weak::emit(builtin, f, frame, strings, helpers),
     }
 }
