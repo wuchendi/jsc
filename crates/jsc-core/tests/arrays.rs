@@ -449,3 +449,43 @@ fn length_growth_and_regrow_gc_stress() {
         "5000 s1 7998003 4001\n",
     );
 }
+
+// --- length write order (ArraySetLength) ----------------------------------------
+
+/// `a.length = v` converts a non-number `v` twice (`ToUint32`, then
+/// `ToNumber`), and a conversion that makes `length` read-only makes the
+/// write throw the `TypeError` (and `Reflect.set` return `false`); an
+/// already read-only `length` throws before any conversion; a mismatch is
+/// the `RangeError`.
+#[test]
+fn length_write_conversion_order() {
+    assert_string(
+        "let a = [1, 2, 3];
+         let hints = [];
+         const len = { [Symbol.toPrimitive](hint) {
+           hints.push(hint);
+           Object.defineProperty(a, 'length', { writable: false });
+           return 0;
+         } };
+         let r1;
+         try { a.length = len; r1 = 'no throw'; } catch (e) { r1 = e.constructor.name; }
+         const out = [r1, hints.join('/'), a.length];
+         a = [1, 2, 3];
+         hints = [];
+         out.push(Reflect.set(a, 'length', len), hints.join('/'), a.length);
+         hints = [];
+         let r2;
+         try { a.length = len; r2 = 'no throw'; } catch (e) { r2 = e.constructor.name; }
+         out.push(r2, hints.length);
+         const b = [1, 2];
+         let n = 0;
+         const odd = { valueOf() { n += 1; return n === 1 ? 1 : 2; } };
+         let r3;
+         try { b.length = odd; r3 = 'no throw'; } catch (e) { r3 = e.constructor.name; }
+         const c = [1, 2, 3];
+         c.length = { valueOf() { return 1; } };
+         out.push(r3, n, b.length, c.length);
+         out.join()",
+        "TypeError,number/number,3,false,number/number,3,TypeError,0,RangeError,2,2,1",
+    );
+}

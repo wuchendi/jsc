@@ -258,14 +258,26 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
         }
         // Under `K = 0` the executor of a spread construct (a subclass's
         // implicit `super(...args)`, a species construct) is in the spread
-        // argument array, read after the `new.target.prototype` lookup.
+        // argument array, read after the `new.target.prototype` lookup. A
+        // non-callable executor throws before that lookup.
         BuiltinCtor::Promise => {
             let (body, capture) = Body::snapshotted(k, 1);
+            let callable = IrNode::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(IrNode::TypeOf(Box::new(body.arg(0)))),
+                rhs: Box::new(IrNode::Str("function".into())),
+            };
+            let check = ternary(
+                callable,
+                IrNode::Undefined,
+                throw_type_error("Promise resolver is not a function"),
+            );
             let promise = IrNode::PromiseCtor {
                 executor: Box::new(body.arg(0)),
                 p_local: body.temp(3),
             };
-            body.requires_new(ctor, after(capture, body.with_proto(ctor, promise)))
+            let steps = IrNode::Seq(vec![check, body.with_proto(ctor, promise)]);
+            body.requires_new(ctor, after(capture, steps))
         }
         BuiltinCtor::Date => date(k),
         // Hand-written bodies (`symbol::emit_ctor`, `bigint::emit_ctor`).
@@ -441,7 +453,8 @@ fn conversion(
 
 /// `new Date()` / `new Date(ms)` / `new Date(year, month, ..)`; called,
 /// `Date()` is the current time as `Date.prototype.toString` renders it. The
-/// arguments (up to seven) are read after `GetPrototypeFromConstructor`.
+/// arguments (up to seven) are converted before `GetPrototypeFromConstructor`
+/// (snapshotted all the same: a conversion runs user code).
 fn date(k: u32) -> IrNode {
     let (body, capture) = Body::snapshotted(k, 7);
     let body = &body;
@@ -457,7 +470,13 @@ fn date(k: u32) -> IrNode {
         ),
     );
     let now = body.temp(3);
-    let constructed = body.with_proto(BuiltinCtor::Date, alloc);
+    // The time value is computed (the arguments converted) before
+    // `GetPrototypeFromConstructor`: the Date is allocated first, then its
+    // `proto` replaced.
+    let constructed = IrNode::Seq(vec![
+        assign(now, alloc),
+        body.with_proto(BuiltinCtor::Date, IrNode::Local(now)),
+    ]);
     ternary(
         body.constructing(),
         after(capture, constructed),

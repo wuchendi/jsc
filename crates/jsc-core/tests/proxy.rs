@@ -1064,3 +1064,37 @@ fn callable_proxies_survive_gc_stress() {
         "9,01w,6,9,11w,6,9,21w,6,9,31w,6,9,41w,6,9,51w,6,9,61w,6,9,71w,6,9,81w,6,9,91w,6 true [1,{\"a\":2}]\n",
     );
 }
+
+// --- GetFunctionRealm (F7) ---------------------------------------------------------------
+
+/// A base constructor reached through a proxy `newTarget` whose `prototype`
+/// read revokes it and returns a non-object: `GetFunctionRealm` of the now
+/// revoked proxy throws before the body runs; a live proxy (or a proxy chain)
+/// falls back to `%Object.prototype%`.
+#[test]
+fn construct_revoked_new_target_throws() {
+    assert_type_errors(
+        "",
+        &[
+            "const h = Proxy.revocable(function () {}, { get() { h.revoke(); } });
+           new h.proxy()",
+            "let ran = false;
+           function F() { ran = true; }
+           const h = Proxy.revocable(function () {}, { get() { h.revoke(); } });
+           Reflect.construct(F, [], h.proxy)",
+            "const inner = Proxy.revocable(function () {}, {});
+           const outer = new Proxy(inner.proxy, { get() { inner.revoke(); return 1; } });
+           Reflect.construct(function () {}, [], outer)",
+        ],
+    );
+    assert_string(
+        "let ran = false;
+         function F() { ran = true; }
+         const h = Proxy.revocable(function () {}, { get() { h.revoke(); } });
+         try { Reflect.construct(F, [], h.proxy); } catch (e) {}
+         const p = new Proxy(function () {}, { get() { return 1; } });
+         const o = Reflect.construct(F, [], new Proxy(p, {}));
+         [ran, Object.getPrototypeOf(o) === Object.prototype].join()",
+        "false,true",
+    );
+}

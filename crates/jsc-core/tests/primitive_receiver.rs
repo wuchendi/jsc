@@ -4,7 +4,7 @@
 //! of an unknown property yield `undefined`.
 
 mod common;
-use common::{assert_eval, assert_str, assert_uncaught};
+use common::{assert_eval, assert_same_under_gc_stress, assert_str, assert_uncaught};
 
 /// Wrap `body` so the script yields `"<instanceof TypeError>|<message>"` for the
 /// error it throws (or `"none"` when it completes normally).
@@ -179,4 +179,62 @@ fn array_string_keys() {
     assert_eval("let a=[1,2]; a.foo", "undefined");
     assert_eval("let a=[1,2]; a[\"1\"]", "2");
     assert_eval("let a=[1,2]; a[\"length\"]", "2");
+}
+
+// --- PutValue on a primitive base (F7) -----------------------------------------
+
+/// A store on a primitive is `ToObject(base).[[Set]](k, v, base)`: an
+/// inherited setter runs with `this` = the primitive, a proxy on the realm
+/// prototype chain runs its `set` trap with the primitive as receiver, and
+/// only a refusal throws.
+#[test]
+fn primitive_store_consults_prototype_chain() {
+    assert_str(
+        "\"use strict\";
+         const log = [];
+         Object.defineProperty(Number.prototype, 'tag', {
+           set(v) { log.push(typeof this + ':' + this + '=' + v); }, configurable: true });
+         Object.defineProperty(String.prototype, 'tag', {
+           set(v) { log.push(typeof this + ':' + this + '=' + v); }, configurable: true });
+         (5).tag = 1;
+         'ab'.tag = 2;
+         const key = 'tag';
+         (7)[key] = 3;
+         Object.setPrototypeOf(Boolean.prototype, new Proxy({}, {
+           set(t, k, v, r) { log.push('trap:' + String(k) + ':' + typeof r + ':' + v); return true; } }));
+         true.x = 4;
+         Object.setPrototypeOf(Symbol.prototype, new Proxy({}, {
+           set(t, k, v, r) { log.push('sym:' + typeof r); return true; } }));
+         Symbol().y = 5;
+         log.join(' ')",
+        "number:5=1 string:ab=2 number:7=3 trap:x:boolean:4 sym:symbol",
+    );
+    assert_type_error(
+        "Object.defineProperty(Number.prototype, 'ro', { value: 1 }); (1).ro = 2;",
+        "Cannot create property 'ro' on number '1'",
+    );
+    assert_type_error(
+        "Object.setPrototypeOf(String.prototype, new Proxy({}, { set() { return false; } })); 'a'.z = 1;",
+        "Cannot create property 'z' on string 'a'",
+    );
+    assert_type_error(
+        "'abc'[0] = 'x';",
+        "Cannot create property '0' on string 'abc'",
+    );
+}
+
+/// The wrapper `ToObject` allocates and the boxed key stay valid across a
+/// collection at every allocation.
+#[test]
+fn primitive_store_survives_gc_stress() {
+    assert_same_under_gc_stress(
+        "const log = [];
+         Object.defineProperty(Number.prototype, 'tag', {
+           set(v) { log.push([this, v].map(String).join('=')); } });
+         for (let i = 0; i < 8; i++) { const k = 'ta' + 'g'; (i)[k] = [i].map((x) => x * 2)[0]; }
+         let r;
+         try { 'abc'['k' + 1] = 1; } catch (e) { r = e.message; }
+         console.log(log.join(), r);",
+        "0=0,1=2,2=4,3=6,4=8,5=10,6=12,7=14 Cannot create property 'k1' on string 'abc'\n",
+    );
 }
