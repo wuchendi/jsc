@@ -1386,18 +1386,19 @@ pub(super) fn emit_json_str(
 /// helper.
 ///
 /// `SameValueZero`, the key comparison of the `__map_*` linear scans: two heap
-/// STRINGS compare by byte content (via `__str_eq` at `str_eq_index`), and
-/// everything else matches on `f64` equality OR identical raw bits. Two numbers
+/// STRINGS compare by byte content (via `__str_eq`), a `BigInt` by value (via
+/// `__bigint_eq`, `0` unless both are `BigInts`), and everything else matches on `f64` equality OR identical raw bits. Two numbers
 /// hence match when `f64`-equal (`+0` and `-0`) or both NaN — the number NaN is
 /// always the canonical bits (see [`emit_box_f64`]); a non-number's `f64` view
 /// is a NaN that never compares equal, so it falls to identity (different types
 /// differ in tag, distinct heap objects/arrays are reference-unequal). The string
 /// path is guarded by an `if` so `__str_eq` never runs on a non-pointer. The two
 /// `i64` params occupy locals 0/1; no extra locals.
-pub(super) fn emit_same_value_zero(str_eq_index: u32, leaves: &LeafSet) -> Function {
+pub(super) fn emit_same_value_zero(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut function = helper_builder(leaves, &[ROOT_JS, ROOT_JS], &[]);
     let (a, b) = (0, 1);
-    // both strings ? __str_eq : (f64_eq | identity bits).
+    // both strings ? __str_eq : either BigInt ? __bigint_eq
+    //   : (f64_eq | identity bits).
     emit_is_string(&mut function, a);
     emit_is_string(&mut function, b);
     function.instruction(&Instruction::I32And);
@@ -1406,7 +1407,13 @@ pub(super) fn emit_same_value_zero(str_eq_index: u32, leaves: &LeafSet) -> Funct
     function.instruction(&Instruction::I32WrapI64);
     function.instruction(&Instruction::LocalGet(b));
     function.instruction(&Instruction::I32WrapI64);
-    function.instruction(&Instruction::Call(str_eq_index));
+    function.instruction(&Instruction::Call(helpers.str_eq));
+    function.instruction(&Instruction::Else);
+    bigint::emit_is_bigint(&mut function, a);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(a));
+    function.instruction(&Instruction::LocalGet(b));
+    function.instruction(&Instruction::Call(helpers.bigint(registry::Big::Eq)));
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::LocalGet(a));
     function.instruction(&Instruction::F64ReinterpretI64);
@@ -1417,6 +1424,7 @@ pub(super) fn emit_same_value_zero(str_eq_index: u32, leaves: &LeafSet) -> Funct
     function.instruction(&Instruction::LocalGet(b));
     function.instruction(&Instruction::I64Eq);
     function.instruction(&Instruction::I32Or);
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     finish_builder(function)
@@ -1528,9 +1536,19 @@ pub(super) fn emit_loose_eq(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
     // Fallback: an object against a non-nullish primitive compares its
     // `ToPrimitive` again; otherwise raw identity bits.
     emit_loose_eq_to_primitive(&mut function, helpers);
+    // A BigInt against a primitive (DESIGN.md §6.10.6), else identity.
+    bigint::emit_is_bigint(&mut function, a);
+    bigint::emit_is_bigint(&mut function, b);
+    function.instruction(&Instruction::I32Or);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    function.instruction(&Instruction::LocalGet(a));
+    function.instruction(&Instruction::LocalGet(b));
+    function.instruction(&Instruction::Call(helpers.bigint(registry::Big::LooseEq)));
+    function.instruction(&Instruction::Else);
     function.instruction(&Instruction::LocalGet(a));
     function.instruction(&Instruction::LocalGet(b));
     function.instruction(&Instruction::I64Eq);
+    function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
@@ -1656,9 +1674,17 @@ pub(super) fn emit_map_hash(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
         If(BlockType::Result(ValType::I32)),
         LocalGet(key), I32WrapI64, Call(helpers.str_hash),
         Else,
+    );
+    // Equal BigInts (static or heap blocks) share a bucket.
+    bigint::emit_is_bigint(&mut f, key);
+    wasm!(f;
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(key), I32WrapI64, Call(helpers.bigint(registry::Big::Hash)),
+        Else,
         LocalGet(key), F64ReinterpretI64, F64Const(0.0.into()), F64Eq,
         If(BlockType::Result(ValType::I64)), I64Const(0), Else, LocalGet(key), End,
         LocalTee(key), LocalGet(key), I64Const(32), I64ShrU, I64Xor, I32WrapI64,
+        End,
         End,
         I32Const(0x9E37_79B1_u32.cast_signed()), I32Mul, LocalTee(h),
         LocalGet(h), I32Const(15), I32ShrU, I32Xor,

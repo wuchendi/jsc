@@ -4,7 +4,7 @@
 //! split by a spread or a computed entry.
 
 mod common;
-use common::{assert_bool, assert_number, assert_rejected, assert_string};
+use common::{assert_bool, assert_number, assert_string};
 
 // ---------------------------------------------------------------------------
 // Object patterns
@@ -209,8 +209,15 @@ fn computed_key_with_yield_in_a_generator() {
 }
 
 #[test]
-fn bigint_pattern_key_is_rejected() {
-    assert_rejected("let { 1n: a } = {}; a");
+fn bigint_pattern_keys_use_the_decimal_string() {
+    // `{1n: a}` keys on `ToString(1n)`, `"1"` (DESIGN.md §6.10.7).
+    assert_string("let { 1n: a } = { 1: 'one' }; a", "one");
+    assert_string("let a; ({ 0x10n: a } = { 16: 'hex' }); a", "hex");
+    assert_string(
+        "function f({ 18446744073709551616n: v }) { return v } \
+         f({ '18446744073709551616': 'big' })",
+        "big",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -255,8 +262,16 @@ fn class_numeric_getter_and_setter_share_one_property() {
 }
 
 #[test]
-fn bigint_class_member_key_is_rejected() {
-    assert_rejected("class C { 1n() {} } 0");
+fn bigint_class_member_and_object_literal_keys() {
+    assert_string(
+        "class C { 1n() { return 'm' } static 2n = 's'; get 0x3n() { return 'g' } } \
+         let c = new C(); c[1]() + C[2] + c['3'] + '|' + C.prototype[1].name",
+        "msg|1",
+    );
+    assert_string(
+        "let o = { 1n: 'a', 0b10n: 'b' }; Object.keys(o).join() + o[1] + o['2']",
+        "1,2ab",
+    );
 }
 
 #[test]

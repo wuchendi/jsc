@@ -61,11 +61,13 @@ pub(super) enum Group {
     Gc,
     /// [`Extra`].
     Extra,
+    /// [`Big`].
+    Bigint,
 }
 
 impl Group {
     /// Every group, in function-index order.
-    const ALL: [Group; 13] = [
+    const ALL: [Group; 14] = [
         Self::Core,
         Self::Dtoa,
         Self::Tail,
@@ -79,6 +81,7 @@ impl Group {
         Self::Engine,
         Self::Gc,
         Self::Extra,
+        Self::Bigint,
     ];
 
     /// The number of functions in the group.
@@ -97,6 +100,7 @@ impl Group {
             Self::Engine => promise_engine::TYPES.len(),
             Self::Gc => gc::TYPES.len(),
             Self::Extra => EXTRA.len(),
+            Self::Bigint => BIGINT.len(),
         }
     }
 
@@ -118,6 +122,7 @@ impl Group {
             Self::Engine => promise_engine::TYPES.to_vec(),
             Self::Gc => gc::TYPES.to_vec(),
             Self::Extra => of(&EXTRA),
+            Self::Bigint => of(&BIGINT),
             Self::Settlers | Self::Builtins => return None,
         })
     }
@@ -164,6 +169,7 @@ impl Group {
             Self::Engine => sink(promise_engine::emit_helpers(strings, helpers, leaves)),
             Self::Gc => sink(gc::emit_helpers(helpers, leaves, gc)),
             Self::Extra => of(&EXTRA, cx, sink),
+            Self::Bigint => of(&BIGINT, cx, sink),
         }
     }
 
@@ -260,6 +266,11 @@ impl Helpers<'_> {
     /// The function index of `helper`.
     pub(super) fn extra(self, helper: Extra) -> u32 {
         self.group(Group::Extra) + helper as u32
+    }
+
+    /// The function index of `helper`.
+    pub(super) fn bigint(self, helper: Big) -> u32 {
+        self.group(Group::Bigint) + helper as u32
     }
 }
 
@@ -397,6 +408,25 @@ pub(super) enum Extra {
     MapReindex,
 }
 
+/// The `BigInt` runtime ([`bigint`]), after the extra helpers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Big {
+    New,
+    Trim,
+    Eq,
+    CmpMag,
+    Cmp,
+    CmpNum,
+    Hash,
+    ToString,
+    FromString,
+    ToF64,
+    FromF64,
+    ToNumeric,
+    ToBigInt,
+    LooseEq,
+}
+
 const CORE: [Row<Core>; 59] = [
     (Core::Alloc, (&[I32], &[I32]), |cx| {
         emit_alloc(cx.helpers, cx.leaves, cx.options.gc_stress, false)
@@ -524,7 +554,7 @@ const CORE: [Row<Core>; 59] = [
         )
     }),
     (Core::SameValueZero, (&[I64, I64], &[I32]), |cx| {
-        emit_same_value_zero(cx.helpers.str_eq, cx.leaves)
+        emit_same_value_zero(cx.helpers, cx.leaves)
     }),
     (Core::ArraySearch, (&[I64, I64, I32], &[I64]), |cx| {
         builtins::emit_array_search(cx.helpers, cx.leaves)
@@ -779,6 +809,51 @@ const EXTRA: [Row<Extra>; 3] = [
     }),
 ];
 
+const BIGINT: [Row<Big>; 14] = [
+    (Big::New, (&[I32, I32], &[I32]), |cx| {
+        bigint::emit_new(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Big::Trim, (&[I32], &[I64]), |cx| {
+        bigint::emit_trim(cx.leaves)
+    }),
+    (Big::Eq, (&[I64, I64], &[I32]), |cx| {
+        bigint::emit_eq(cx.leaves)
+    }),
+    (Big::CmpMag, (&[I32, I32], &[I32]), |cx| {
+        bigint::emit_cmp_mag(cx.leaves)
+    }),
+    (Big::Cmp, (&[I32, I32], &[I32]), |cx| {
+        bigint::emit_cmp(cx.helpers, cx.leaves)
+    }),
+    (Big::CmpNum, (&[I32, F64], &[I32]), |cx| {
+        bigint::emit_cmp_num(cx.leaves)
+    }),
+    (Big::Hash, (&[I32], &[I32]), |cx| {
+        bigint::emit_hash(cx.leaves)
+    }),
+    (Big::ToString, (&[I64, I32], &[I32]), |cx| {
+        bigint::emit_to_string(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Big::FromString, (&[I32], &[I64]), |cx| {
+        bigint::emit_from_string(cx.helpers, cx.leaves)
+    }),
+    (Big::ToF64, (&[I32], &[F64]), |cx| {
+        bigint::emit_to_f64(cx.leaves)
+    }),
+    (Big::FromF64, (&[F64], &[I64]), |cx| {
+        bigint::emit_from_f64(cx.helpers, cx.leaves)
+    }),
+    (Big::ToNumeric, (&[I64], &[I64]), |cx| {
+        bigint::emit_to_numeric(cx.helpers, cx.leaves)
+    }),
+    (Big::ToBigInt, (&[I64], &[I64]), |cx| {
+        bigint::emit_to_bigint(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Big::LooseEq, (&[I64, I64], &[I32]), |cx| {
+        bigint::emit_loose_eq(cx.helpers, cx.leaves)
+    }),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,5 +871,6 @@ mod tests {
         check(&CTOR, |member| member as usize);
         check(&CONV, |member| member as usize);
         check(&EXTRA, |member| member as usize);
+        check(&BIGINT, |member| member as usize);
     }
 }

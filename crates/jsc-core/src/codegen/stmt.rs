@@ -2307,17 +2307,13 @@ impl LowerCtx<'_> {
 }
 
 /// Extract the static string name of an identifier or string-literal property
-/// key. Callers convert a numeric or computed key at run time instead; a `BigInt`
-/// key is a spanned error.
+/// key, or the decimal string of a `BigInt` key (`{1n: a}` keys on `"1"`).
+/// Callers convert a numeric or computed key at run time instead.
 pub(super) fn prop_key_name(key: &PropName) -> anyhow::Result<JsStr> {
     match key {
         PropName::Ident(id) => Ok(id.sym.as_ref().into()),
         PropName::Str(s) => Ok(lit_str(s)),
-        PropName::BigInt(_) => Err(CompileError::spanned(
-            key.span(),
-            "unsupported property key: BigInt keys are not supported",
-        )
-        .into()),
+        PropName::BigInt(b) => Ok(b.value.to_string().as_str().into()),
         PropName::Num(_) | PropName::Computed(_) => Err(CompileError::spanned(
             key.span(),
             "a numeric or computed property key has no static name",

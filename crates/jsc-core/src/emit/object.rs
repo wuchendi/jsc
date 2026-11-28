@@ -3053,16 +3053,20 @@ pub(super) fn emit_prop_throw(
     function.instruction(&Instruction::I32Eq);
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     // prefix + String(key) + "' on " + kind + " '" + String(recv) + "'", where
-    // kind is number / symbol / string (the heap primitives) / boolean.
+    // kind is number / symbol / bigint / string (the heap primitives) /
+    // boolean.
     function.instruction(&Instruction::I32Const(at(PRIM_CREATE_PREFIX)));
     to_string(&mut function, key);
     concat(&mut function);
     function.instruction(&Instruction::I32Const(at(PRIM_CREATE_MID)));
     concat(&mut function);
     function.instruction(&Instruction::I32Const(at("number")));
+    function.instruction(&Instruction::I32Const(at("bigint")));
     function.instruction(&Instruction::I32Const(at("symbol")));
     function.instruction(&Instruction::I32Const(at("string")));
     emit_is_symbol(&mut function, recv);
+    function.instruction(&Instruction::Select);
+    bigint::emit_is_bigint(&mut function, recv);
     function.instruction(&Instruction::Select);
     function.instruction(&Instruction::I32Const(at("boolean")));
     emit_is_pointer(&mut function, recv);
