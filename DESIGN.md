@@ -1757,7 +1757,7 @@ function-index order:
 | number to string (§6.5) | `__umul128`, `__ryu_pow5`, `__ryu_mul_shift`, `__ryu_mp5`, `__ryu_d2d(bits)` (Ryu shortest digits), `__scratch_str(ptr, len)`, `__num_to_str(bits)` (`Number::toString`), `__prim_str(v)` (`ToString` of a primitive), `__msg_str(v)` (the text of any value in an error message), `__dec_expand(bits)` (the exact decimal expansion), `__num_format(bits, mode, f)` (`toFixed` / `toExponential` / `toPrecision`), `__num_radix(bits, radix)` |
 | string to number (§6.5) | `__num_unit`, `__str_ws`, `__dec_parse(data, start, end)`, `__dec_slow`, `__dec_round`, `__dec_left`, `__dec_right`, `__digit_span`, `__radix_pow2`, `__radix_fold`, `__string_to_number(s)`, `__to_number_prim(v)`, `__parse_float(v)`, `__parse_int(v, radix)` |
 | clock, random | `__now()`, `__random()` (§6.5) |
-| BigInt (§6.10) | `__bigint_new(len, neg)`, `__bigint_trim(p)`, `__bigint_eq(a, b)`, `__bigint_cmp_mag(a, b)`, `__bigint_cmp(a, b)`, `__bigint_cmp_num(a, x)`, `__bigint_hash(p)`, `__bigint_to_string(v, radix)`, `__string_to_bigint(s)`, `__bigint_to_f64(p)`, `__bigint_from_f64(x)`, `__to_numeric(v)`, `__to_bigint(v)`, `__bigint_loose_eq(a, b)` (the last group, after the extra helpers) |
+| BigInt (§6.10) | `__bigint_new(len, neg)`, `__bigint_trim(p)`, `__bigint_eq(a, b)`, `__bigint_cmp_mag(a, b)`, `__bigint_cmp(a, b)`, `__bigint_cmp_num(a, x)`, `__bigint_hash(p)`, `__bigint_to_string(v, radix)`, `__string_to_bigint(s)`, `__bigint_to_f64(p)`, `__bigint_from_f64(x)`, `__to_numeric(v)`, `__to_bigint(v)`, `__bigint_loose_eq(a, b)`, `__number_value(v)`, `__bigint_as_n(bits, v, signed)`, `__bigint_to_i64(p)`, `__bigint_from_i64(v, signed)` (the last group, after the extra helpers) |
 | misc | `__gen_to_array(gen)`, `__nullish_throw(recv, key, set)`, `__prop_throw(recv, key, mode)`, `__box_f64(x)`, `__to_number(v)` |
 | trampolines | `__invoke1(fn, arg)` (the promise jobs' callback trampoline), `__async_step(gen, sent)` (the `async` driver's step trampoline), the two `new Promise` settlers |
 | constructors | `new_string(len, two_byte)`, `__new_array(len)` |
@@ -2377,11 +2377,11 @@ them.
 
 ### 6.10 BigInt
 
-> **Partly implemented** (phase 5b, workstream L2-B). Stage B2a (the value,
+> **Partly implemented** (phase 5b, workstream L2-B). Stages B2a (the value,
 > literals, conversions, equality, hashing, property keys, JSON, the wrapper
-> and the empty `%BigInt.prototype%`) is implemented as described; the
-> operators (B2b), the `BigInt` builtins (B3) and the closeout (B4) are still
-> the design (table at the end). Each stage turns its part of this text into
+> and `%BigInt.prototype%`) and B3 (the `BigInt` builtins, `Number(1n)`, the
+> 64-bit boundary helpers) are implemented as described; the operators (B2b)
+> and the closeout (B4) are still the design (table at the end). Each stage turns its part of this text into
 > a description of the implementation and drops the "lands in" notes it
 > fulfils. ECMA-262 §6.1.6.2 (the BigInt
 > type), §7.1 (conversions), §13 (operators), §21.2 (the BigInt object).
@@ -2452,7 +2452,8 @@ is ToBoolean for both strings and BigInts (§6.10.2).
 `WRAPPER_VALUE_OFFSET`, proto `%BigInt.prototype%`), traced like the other
 wrapper classes (jsval `@16`), rendered `[BigInt: 1n]`, unwrapped by
 `JSON.stringify`. `%BigInt.prototype%` is `Intrinsic::BigIntPrototype`, an
-ordinary object over `%Object.prototype%`, empty until B3. No other new
+ordinary object over `%Object.prototype%` holding the builtins of §6.10.7.
+No other new
 heap kind is needed.
 
 #### 6.10.2 Type tests, `typeof`, ToBoolean, rendering
@@ -2711,28 +2712,40 @@ argument (`Math.floor(a - b)` with BigInts must throw).
   object does; a `CLASS_BIGINT` wrapper is then unwrapped like the other
   wrappers; a BigInt still left throws `TypeError: Do not know how to
   serialize a BigInt`, at any nesting depth. `__json_str` never sees one.
-- **`BigInt`** (`BuiltinCtor::BigInt` in `ir.rs`, the realm entries in
-  `emit/realm.rs` appended after the existing constructors, bodies in a new
-  `emit/builtins/bigint.rs` following `emit/builtins/number.rs`): `BigInt(v)`
-  is `ToPrimitive(v, number)`, then a number → NumberToBigInt (`RangeError`
-  for non-integers), anything else → `ToBigInt`. It is a constructor for
+- **`BigInt`** (`BuiltinCtor::BigInt` in `ir.rs`, the last constructor;
+  the realm entries in `emit/realm.rs`: the global, `Builtin::Ctor(BigInt)`
+  and `Builtin::BigInt(BigIntOp)` appended to `Builtin::ALL`, the statics and
+  the tag in `bigint_entries`; bodies in `emit/builtins/bigint.rs`, which
+  also re-exports `emit_is_bigint` for the sibling bodies): `BigInt(v)`
+  is `ToPrimitive(v, number)`, then a number → NumberToBigInt (`RangeError:
+  The number <x> cannot be converted to a BigInt because it is not an
+  integer` for `NaN`, `±Infinity` and non-integers, tested as `x - trunc(x)
+  != 0`), anything else → `ToBigInt`. It is a constructor for
   `IsConstructor` (flag `CONSTRUCTOR`, like `Symbol`), but `new BigInt(..)`
   throws `TypeError: BigInt is not a constructor` before converting.
   `length` 1, `name` `"BigInt"`. `BigInt.asIntN(bits, bigint)` /
-  `BigInt.asUintN(bits, bigint)`: `bits = ToIndex(bits)` (`RangeError` for
+  `BigInt.asUintN(bits, bigint)` (`length` 2): `bits = ToIndex(bits)`
+  (`RangeError: Invalid value: not (convertible to) a safe integer` for
   negative or `> 2^53 - 1`), `bigint = ToBigInt(bigint)`, in that order, then
-  `__bigint_as_n`.
+  `__bigint_as_n` (§6.10.4; the `w = ceil(bits / 32)`-limb result is built
+  only when `w <= len + 1` or for `asUintN` of a negative value, every other
+  wider case returns the operand).
 - **`%BigInt.prototype%`** (an ordinary object, not a BigInt): `constructor`,
   `toString(radix)` (`thisBigIntValue`: a BigInt or a `CLASS_BIGINT`
   wrapper, else `TypeError`; `radix` `undefined` → 10, else
-  `ToIntegerOrInfinity`, outside `2..=36` → `RangeError`),
-  `toLocaleString()` (= `toString()`, no locale data), `valueOf()`,
+  `ToIntegerOrInfinity`, outside `2..=36` → `RangeError` with
+  `Number.prototype.toString`'s message), `toLocaleString()` (=
+  `toString()`, no locale data), `valueOf()` (all three `length` 0),
   `[@@toStringTag]` `"BigInt"` (configurable only). `Object.prototype.toString`
   then gives `[object BigInt]`.
 - **Unchanged builtins that now see BigInts**: `Number(1n)` is `1` (the
-  `Number` call — not unary `+` — uses `ToNumeric` and converts a BigInt with
-  `__bigint_to_f64`; `ConvertOp::ToNumber` stays the unary-`+` / ToNumber
-  conversion and a new `ConvertOp::NumberCall` is the inlined `Number(v)`);
+  `Number` call and construct — not unary `+` — use `ToNumeric` and convert a
+  BigInt with `__bigint_to_f64`; `ConvertOp::ToNumber` stays the unary-`+` /
+  ToNumber conversion and `ConvertOp::NumberCall` is `Number(v)`, inlined at
+  the call site and in the `Number` constructor body: the number test inline,
+  anything else through `__number_value(v) -> i64` (`emit/bigint.rs`:
+  `__to_numeric`, then `__bigint_to_f64` of a BigInt); `NumberCall` is
+  numeric for the root classification and `yields_number`);
   `Number.isInteger(1n)` / `isSafeInteger` / `isFinite` / `isNaN` are
   `false` (no coercion); `parseInt(1n)` / `parseFloat` read `"1"`; `isNaN`,
   `isFinite`, `Math.*`, `Date` setters throw (ToNumber); `String(1n)` is

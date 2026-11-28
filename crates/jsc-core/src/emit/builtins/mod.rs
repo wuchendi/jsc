@@ -23,6 +23,7 @@ macro_rules! wasm {
 mod array;
 mod array_buffer;
 mod async_iter;
+mod bigint;
 mod ctor;
 mod data_view;
 mod date;
@@ -332,6 +333,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(iterator::STRINGS)
         .chain(array_buffer::strings())
         .chain(data_view::strings())
+        .chain(bigint::STRINGS)
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
 
@@ -445,7 +447,7 @@ fn emit_builtin_body(
         Builtin::JsonStringify => json::emit_stringify(f, frame, strings, helpers),
         Builtin::JsonParse => json::emit_parse(f, frame, strings, helpers),
         Builtin::IsNaN | Builtin::IsFinite => emit_global(builtin, f, frame, helpers),
-        Builtin::Symbol(op) => symbol::emit(op, f, frame, strings, helpers),
+        Builtin::Symbol(_) | Builtin::BigInt(_) => emit_prim(builtin, f, frame, strings, helpers),
         Builtin::Math(_)
         | Builtin::ConsoleLog
         | Builtin::Ctor(_)
@@ -486,7 +488,7 @@ fn emit_global(builtin: Builtin, f: &mut FnBuilder<'_>, frame: Frame, helpers: H
 /// Emit the IR [`fragment`] body of `builtin` into `f`; the weak
 /// constructors (`WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`)
 /// go to [`weak::emit`] instead, `ArrayBuffer` to [`array_buffer::emit`],
-/// `DataView` to [`data_view::emit`].
+/// `DataView` to [`data_view::emit`] and `BigInt` to [`bigint::emit_ctor`].
 fn emit_fragment(
     builtin: Builtin,
     f: &mut FnBuilder<'_>,
@@ -506,8 +508,29 @@ fn emit_fragment(
         data_view::emit(builtin, f, frame, strings, helpers);
         return;
     }
+    if builtin == Builtin::Ctor(BuiltinCtor::BigInt) {
+        bigint::emit_ctor(f, frame, strings, helpers);
+        return;
+    }
     let body = fragment(builtin, frame.k).unwrap_or(IrNode::Undefined);
     emit_node(&body, f, frame.scratch(), strings, helpers);
+}
+
+/// Emit the body of a `Symbol` or `BigInt` static or prototype builtin into
+/// `f` (the variants [`emit_builtin`] routes here).
+fn emit_prim(
+    builtin: Builtin,
+    f: &mut FnBuilder<'_>,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    match builtin {
+        Builtin::Symbol(op) => symbol::emit(op, f, frame, strings, helpers),
+        Builtin::BigInt(op) => bigint::emit(op, f, frame, strings, helpers),
+        // Only the variants `emit_builtin` routes here reach this match.
+        _ => {}
+    }
 }
 
 /// Emit the body of a `String` static or `%String.prototype%` method into `f`

@@ -466,7 +466,7 @@ fn yields_number(node: &IrNode) -> bool {
         | IrNode::MathCall { .. }
         | IrNode::MathSpread { .. }
         | IrNode::ConvertCall {
-            op: ConvertOp::ToNumber,
+            op: ConvertOp::ToNumber | ConvertOp::NumberCall,
             ..
         } => true,
         IrNode::Binary { op, .. } => matches!(
@@ -981,8 +981,10 @@ pub(super) fn emit_pow<S: Sink>(
 /// Emit a conversion built-in call, leaving its result jsval on the stack.
 ///
 /// `Boolean(x)` is emitted inline: JS truthiness (via [`emit_cond`]) selects
-/// between the boxed `true`/`false` jsvals, no host call. `Number(x)` is the
-/// shared `ToNumber`, `String(x)` the guest `__to_string`; `parseInt` /
+/// between the boxed `true`/`false` jsvals, no host call. `ToNumber` is the
+/// shared coercion, `Number(x)` the same number fast path with
+/// `__number_value` (`ToNumeric`, `BigInt` to Number) behind it, `String(x)`
+/// the guest `__to_string`; `parseInt` /
 /// `parseFloat` convert their argument with `__to_string` and parse it with
 /// the guest `__parse_int` / `__parse_float`.
 pub(super) fn emit_convert_call(
@@ -1009,6 +1011,26 @@ pub(super) fn emit_convert_call(
         emit_node(arg, function, scratch, strings, helpers);
         function.instruction(&Instruction::LocalSet(scratch));
         emit_coerce_number(function, scratch, helpers);
+        function.instruction(&Instruction::LocalGet(scratch));
+        return;
+    }
+    if matches!(op, ConvertOp::NumberCall) {
+        // `Number(x)`: a number passes through, anything else is converted
+        // by `__number_value` (`ToNumeric`, a `BigInt` to its Number value).
+        emit_node(arg, function, scratch, strings, helpers);
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_is_number(function, scratch);
+        function.instruction(&Instruction::I32Eqz);
+        function.instruction(&Instruction::If(BlockType::Empty));
+        enter_frame(helpers);
+        function.instruction(&Instruction::LocalGet(scratch));
+        function.instruction(&Instruction::Call(
+            helpers.bigint(registry::Big::NumberValue),
+        ));
+        function.instruction(&Instruction::LocalSet(scratch));
+        emit_propagate_if_pending(function, helpers);
+        leave_frame(helpers);
+        function.instruction(&Instruction::End);
         function.instruction(&Instruction::LocalGet(scratch));
         return;
     }

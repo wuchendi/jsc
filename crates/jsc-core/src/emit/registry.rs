@@ -431,6 +431,10 @@ pub(super) enum Big {
     ToNumeric,
     ToBigInt,
     LooseEq,
+    NumberValue,
+    AsN,
+    ToI64,
+    FromI64,
 }
 
 const CORE: [Row<Core>; 59] = [
@@ -815,7 +819,7 @@ const EXTRA: [Row<Extra>; 3] = [
     }),
 ];
 
-const BIGINT: [Row<Big>; 14] = [
+const BIGINT: [Row<Big>; 18] = [
     (Big::New, (&[I32, I32], &[I32]), |cx| {
         bigint::emit_new(cx.strings, cx.helpers, cx.leaves)
     }),
@@ -857,6 +861,18 @@ const BIGINT: [Row<Big>; 14] = [
     }),
     (Big::LooseEq, (&[I64, I64], &[I32]), |cx| {
         bigint::emit_loose_eq(cx.helpers, cx.leaves)
+    }),
+    (Big::NumberValue, (&[I64], &[I64]), |cx| {
+        bigint::emit_number_value(cx.helpers, cx.leaves)
+    }),
+    (Big::AsN, (&[F64, I64, I32], &[I64]), |cx| {
+        bigint::emit_as_n(cx.helpers, cx.leaves)
+    }),
+    (Big::ToI64, (&[I32], &[I64]), |cx| {
+        bigint::emit_to_i64(cx.leaves)
+    }),
+    (Big::FromI64, (&[I64, I32], &[I64]), |cx| {
+        bigint::emit_from_i64(cx.helpers, cx.leaves)
     }),
 ];
 

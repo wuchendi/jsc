@@ -82,8 +82,8 @@ pub(super) enum Intrinsic {
     /// `stack`; not reachable from the global object.
     OutOfMemoryError,
     /// `%BigInt.prototype%` (DESIGN.md §6.10.7): the `proto` of a `BigInt`
-    /// receiver and of its `CLASS_BIGINT` wrapper; an empty ordinary object
-    /// until the `BigInt` builtins land.
+    /// receiver and of its `CLASS_BIGINT` wrapper, an ordinary object holding
+    /// `constructor`, the [`BigIntOp`] methods and `[@@toStringTag]`.
     BigIntPrototype,
 }
 
@@ -231,6 +231,7 @@ pub(super) fn prototype_of(ctor: BuiltinCtor) -> Intrinsic {
         BuiltinCtor::Function => Intrinsic::FunctionPrototype,
         BuiltinCtor::Error(kind) => Intrinsic::ErrorPrototype(kind),
         BuiltinCtor::Iterator => Intrinsic::IteratorPrototype,
+        BuiltinCtor::BigInt => Intrinsic::BigIntPrototype,
         _ => Intrinsic::Prototype(ctor),
     }
 }
@@ -685,6 +686,8 @@ pub(super) enum Builtin {
     /// A `%DataView.prototype%` method or getter (DESIGN.md §5.8.7,
     /// `emit/builtins/data_view.rs`).
     DataView(DataViewOp),
+    /// A `BigInt` static or `%BigInt.prototype%` method (DESIGN.md §6.10.7).
+    BigInt(BigIntOp),
 }
 
 /// The `DataView` builtins of DESIGN.md §5.8.7 other than the constructor.
@@ -1530,6 +1533,42 @@ impl SymbolOp {
     }
 }
 
+/// A `BigInt` static or `%BigInt.prototype%` method (DESIGN.md §6.10.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BigIntOp {
+    /// `BigInt.asIntN`.
+    AsIntN,
+    /// `BigInt.asUintN`.
+    AsUintN,
+    /// `BigInt.prototype.toString`.
+    ToString,
+    /// `BigInt.prototype.toLocaleString`.
+    ToLocaleString,
+    /// `BigInt.prototype.valueOf`.
+    ValueOf,
+}
+
+impl BigIntOp {
+    /// The builtin's `name`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::AsIntN => "asIntN",
+            Self::AsUintN => "asUintN",
+            Self::ToString => "toString",
+            Self::ToLocaleString => "toLocaleString",
+            Self::ValueOf => "valueOf",
+        }
+    }
+
+    /// The builtin's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::AsIntN | Self::AsUintN => 2,
+            Self::ToString | Self::ToLocaleString | Self::ValueOf => 0,
+        }
+    }
+}
+
 /// An async generator request (`%AsyncGeneratorPrototype%` method).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AsyncGenRequest {
@@ -1887,7 +1926,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 397] = [
+    pub(super) const ALL: [Builtin; 403] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -2381,6 +2420,12 @@ impl Builtin {
         Self::DataView(DataViewOp::Set(8)),
         Self::DataView(DataViewOp::Get(9)),
         Self::DataView(DataViewOp::Set(9)),
+        Self::Ctor(BuiltinCtor::BigInt),
+        Self::BigInt(BigIntOp::AsIntN),
+        Self::BigInt(BigIntOp::AsUintN),
+        Self::BigInt(BigIntOp::ToString),
+        Self::BigInt(BigIntOp::ToLocaleString),
+        Self::BigInt(BigIntOp::ValueOf),
     ];
 
     /// The function's `name`.
@@ -2427,6 +2472,7 @@ impl Builtin {
                 "valueOf"
             }
             Self::Symbol(op) => op.name(),
+            Self::BigInt(op) => op.name(),
             Self::DateMethod(op) => op.name(),
             Self::DateBody(op) => op.name(),
             Self::CollectionOp { op, .. } | Self::WeakOp { op, .. } => op.name(),
@@ -2577,6 +2623,7 @@ impl Builtin {
             Self::StringMethod(op) => op.length(),
             Self::ObjectReflect(op) => op.length(),
             Self::Symbol(op) => op.length(),
+            Self::BigInt(op) => op.length(),
             Self::Species(op) => op.length(),
             Self::Iterator(op) => op.length(),
             Self::ArrayBuffer(op) => op.length(),
@@ -2646,6 +2693,9 @@ impl Builtin {
             Self::Iterator(op) => return op.prototype(),
             Self::ArrayBuffer(op) => return op.prototype(),
             Self::DataView(op) => return op.prototype(),
+            Self::BigInt(BigIntOp::ToString | BigIntOp::ToLocaleString | BigIntOp::ValueOf) => {
+                return Some(Intrinsic::BigIntPrototype);
+            }
             _ => None,
         };
         ctor.map(Intrinsic::Prototype)
@@ -2770,7 +2820,7 @@ const NUMBER_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 37] = [
+const GLOBALS: [(&str, u32, Value); 38] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -2928,6 +2978,11 @@ const GLOBALS: [(&str, u32, Value); 37] = [
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::DataView)),
     ),
+    (
+        "BigInt",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::BigInt)),
+    ),
 ];
 
 /// The `%Object.prototype%` methods, in slot order.
@@ -3037,6 +3092,7 @@ pub(super) fn registry() -> Vec<Entry> {
     constructor_entries(&mut entries);
     array_buffer_entries(&mut entries);
     data_view_entries(&mut entries);
+    bigint_entries(&mut entries);
     entries.extend(GLOBALS.map(|(key, attrs, value)| entry(Intrinsic::Global, key, attrs, value)));
     entries
 }
@@ -3414,6 +3470,25 @@ fn symbol_prototype_entries(entries: &mut Vec<Entry>) {
             value: Value::Str("Symbol"),
         },
     ]);
+}
+
+/// The `BigInt` statics `asIntN` / `asUintN` and `%BigInt.prototype%`'s
+/// `[@@toStringTag]` `"BigInt"` (configurable only), past the entries
+/// [`constructor_entries`] gives every constructor (DESIGN.md §6.10.7).
+fn bigint_entries(entries: &mut Vec<Entry>) {
+    let ctor = Intrinsic::Ctor(BuiltinCtor::BigInt);
+    entries.extend([BigIntOp::AsIntN, BigIntOp::AsUintN].map(|op| Entry {
+        intrinsic: ctor,
+        key: Key::Str(op.name()),
+        attrs: METHOD_ATTRS,
+        value: Value::Method(Builtin::BigInt(op)),
+    }));
+    entries.push(Entry {
+        intrinsic: Intrinsic::BigIntPrototype,
+        key: Key::Symbol(WellKnown::ToStringTag),
+        attrs: FN_FACT_ATTRS,
+        value: Value::Str("BigInt"),
+    });
 }
 
 /// The statics of `Object`, in slot order.
@@ -3903,6 +3978,7 @@ mod tests {
                     | Intrinsic::AsyncGeneratorPrototype
                     | Intrinsic::Math
                     | Intrinsic::Json
+                    | Intrinsic::BigIntPrototype
             );
             assert_eq!(
                 tflags & abi::PROPS_HAS_SYMBOL_KEYS != 0,

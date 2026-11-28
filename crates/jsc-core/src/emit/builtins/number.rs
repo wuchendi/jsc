@@ -24,7 +24,7 @@ const NOT_BOOLEAN_VALUE_OF: CalleeErrorText<'static> = [
 
 /// The `RangeError` of `Number.prototype.toString` with a radix outside
 /// `2..=36`.
-const BAD_RADIX: [&str; 2] = [
+pub(super) const BAD_RADIX: [&str; 2] = [
     "toString() radix must be between 2 and 36",
     "RangeError: toString() radix must be between 2 and 36",
 ];
