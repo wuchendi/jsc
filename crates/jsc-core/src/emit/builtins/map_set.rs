@@ -376,7 +376,7 @@ pub(super) fn emit_for_each(
     this_collection(function, frame, this, builtin, set, strings, helpers);
     frame.arg(function, 0);
     wasm!(function; LocalSet(callback));
-    emit_is_function(function, callback);
+    emit_is_function(function, callback, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(
         function,
@@ -500,7 +500,7 @@ pub(super) fn emit_add_from_iterable(
         LocalSet(adder),
     );
     return_if_pending(function);
-    emit_is_function(function, adder);
+    emit_is_function(function, adder, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     emit_drop(
         function,

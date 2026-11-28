@@ -788,7 +788,7 @@ fn emit_dispatch(
     return_if_pending(function);
     emit_is_nullish(function, m);
     wasm!(function; I32Eqz, If(BlockType::Empty));
-    emit_is_function(function, m);
+    emit_is_function(function, m, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, not_callable_text(symbol), strings, helpers);
     wasm!(function; End);
@@ -1843,7 +1843,7 @@ fn emit_replace(
     to_string(function, search, helpers);
     frame.arg(function, 1);
     wasm!(function; LocalSet(replacer));
-    emit_is_function(function, replacer);
+    emit_is_function(function, replacer, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     to_string(function, replacer, helpers);
     wasm!(function; End);
@@ -1867,7 +1867,7 @@ fn emit_replace(
         tmp,
     );
     wasm!(function; LocalGet(pos), LocalGet(t.n), I32Add, LocalSet(end));
-    emit_is_function(function, replacer);
+    emit_is_function(function, replacer, helpers);
     wasm!(function; If(BlockType::Empty));
     // The replacer over `(match, position, string)` with `this = undefined`;
     // its `ToString` result is appended.

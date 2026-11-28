@@ -109,6 +109,81 @@ fn unwrap_primitive(function: &mut FnBuilder<'_>, local: u32) {
     );
 }
 
+/// Push i32 `IsArray(v)` for the jsval in `v`: a proxy answers for its target
+/// (when the program can hold proxies), returning when a revoked one throws.
+fn is_array_value(function: &mut FnBuilder<'_>, v: u32, helpers: Helpers<'_>) {
+    if helpers.proxies() {
+        wasm!(function; LocalGet(v), Call(helpers.is_array()));
+        return_if_pending(function);
+    } else {
+        emit_is_pointer(function, v);
+        wasm!(function; If(BlockType::Result(ValType::I32)));
+        emit_load_type_byte(function, v);
+        wasm!(function; I32Const(TYPE_ARRAY), I32Eq, Else, I32Const(0), End);
+    }
+}
+
+/// The length of the array (i32 base `arr`, jsval `v`) into i32 `n`: its
+/// `length` field, or for a proxy (when the program can hold proxies)
+/// `ToLength(Get(v, "length"))` through its traps, returning when that throws.
+fn array_like_len(
+    function: &mut FnBuilder<'_>,
+    arr: u32,
+    v: u32,
+    n: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    if helpers.proxies() {
+        wasm!(function;
+            LocalGet(arr), I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }),
+            I32Const(TYPE_PROXY), I32Eq,
+            If(BlockType::Empty),
+            LocalGet(v), I32Const(static_key(strings, INDEX_LENGTH_KEY)), Call(helpers.get),
+        );
+        return_if_pending(function);
+        wasm!(function; Call(helpers.to_number));
+        return_if_pending(function);
+        wasm!(function;
+            F64ReinterpretI64, I32TruncSatF64U, LocalSet(n),
+            Else,
+            LocalGet(arr), I32Load(ARR_LEN), LocalSet(n),
+            End,
+        );
+    } else {
+        wasm!(function; LocalGet(arr), I32Load(ARR_LEN), LocalSet(n));
+    }
+}
+
+/// Push element `i` (i32) of the array (i32 base `arr`, jsval `v`) like
+/// [`elem_or_undefined`], or for a proxy (when the program can hold proxies)
+/// `Get(v, i)` through its traps, returning when that throws. `out` is a
+/// jsval scratch.
+fn array_like_elem(
+    function: &mut FnBuilder<'_>,
+    arr: u32,
+    v: u32,
+    i: u32,
+    out: u32,
+    helpers: Helpers<'_>,
+) {
+    if !helpers.proxies() {
+        elem_or_undefined(function, arr, i, out, helpers);
+        return;
+    }
+    wasm!(function;
+        LocalGet(arr), I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }),
+        I32Const(TYPE_PROXY), I32Eq,
+        If(BlockType::Result(ValType::I64)),
+        LocalGet(v), LocalGet(i), F64ConvertI32U, I64ReinterpretF64, I32Const(1), Call(helpers.to_key),
+        Call(helpers.get), LocalSet(out),
+    );
+    return_if_pending(function);
+    wasm!(function; LocalGet(out), Else);
+    elem_or_undefined(function, arr, i, out, helpers);
+    wasm!(function; End);
+}
+
 /// Push array element `i` (i32 local) of the array handle in i32 local `arr`
 /// as `Get` reads it: an element at or past the current length or a hole
 /// reads through the prototype chain (`undefined` when absent; a throwing
@@ -171,25 +246,22 @@ pub(super) fn emit_stringify(
     // its strings, numbers and String/Number wrappers as keys, in order,
     // without duplicates.
     wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(list));
-    emit_is_function(function, rep);
+    emit_is_function(function, rep, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
-    emit_is_pointer(function, rep);
-    wasm!(function; If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, rep);
+    is_array_value(function, rep, helpers);
     wasm!(function;
-        I32Const(TYPE_ARRAY), I32Eq, Else, I32Const(0), End,
         If(BlockType::Empty),
         I32Const(0), Call(helpers.new_array()),
     );
     box_heap(function);
+    wasm!(function; LocalSet(list), LocalGet(rep), I32WrapI64, LocalSet(arr));
+    array_like_len(function, arr, rep, n, strings, helpers);
     wasm!(function;
-        LocalSet(list),
-        LocalGet(rep), I32WrapI64, LocalTee(arr), I32Load(ARR_LEN), LocalSet(n),
         I32Const(0), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(n), I32GeU, BrIf(1),
     );
-    elem_or_undefined(function, arr, i, elem, helpers);
+    array_like_elem(function, arr, rep, i, elem, helpers);
     wasm!(function; LocalSet(elem));
     emit_is_string(function, elem);
     wasm!(function; I32Eqz, If(BlockType::Empty));
@@ -349,7 +421,7 @@ pub(super) fn emit_parse(
     emit_node(&node, function, frame.scratch(), strings, helpers);
     wasm!(function; LocalSet(value));
     return_if_pending(function);
-    emit_is_function(function, reviver);
+    emit_is_function(function, reviver, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty), LocalGet(value), Return, End);
     emit_node(
         &root_holder(value),
@@ -429,7 +501,7 @@ pub(in crate::emit) fn emit_json_rep(
         LocalGet(value), I32Const(tok("toJSON")), Call(helpers.get), LocalSet(to_json),
     );
     return_if_pending(&mut f);
-    emit_is_function(&mut f, to_json);
+    emit_is_function(&mut f, to_json, helpers);
     wasm!(f; If(BlockType::Empty));
     key_string(&mut f);
     call_with(&mut f, to_json, value, &[key], spread, helpers);
@@ -455,7 +527,7 @@ pub(in crate::emit) fn emit_json_rep(
     );
     wasm!(f; End);
     wasm!(f; LocalGet(value), I64Const(UNDEFINED_BITS), I64Eq);
-    emit_is_function(&mut f, value);
+    emit_is_function(&mut f, value, helpers);
     wasm!(f; I32Or);
     emit_is_symbol(&mut f, value);
     wasm!(f; I32Or, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End);
@@ -475,11 +547,23 @@ pub(in crate::emit) fn emit_json_rep(
         End,
         LocalGet(stack), LocalGet(value), Call(helpers.array_push), Drop,
         LocalGet(value), I32WrapI64, LocalTee(ptr),
-        I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }), I32Const(TYPE_ARRAY), I32Eq,
+    );
+    if helpers.proxies() {
+        // `IsArray(value)`: a proxy answers for its target.
+        wasm!(f; Drop, LocalGet(value), Call(helpers.is_array()));
+        return_if_pending(&mut f);
+    } else {
+        wasm!(f;
+            I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }), I32Const(TYPE_ARRAY), I32Eq,
+        );
+    }
+    wasm!(f;
         If(BlockType::Empty),
         // "[" + each element (`null` when not serializable) joined by "," + "]".
         I32Const(tok("[")), LocalSet(acc),
-        LocalGet(ptr), I32Load(ARR_LEN), LocalSet(n),
+    );
+    array_like_len(&mut f, ptr, value, n, strings, helpers);
+    wasm!(f;
         I32Const(0), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(n), I32GeU, BrIf(1),
@@ -487,7 +571,7 @@ pub(in crate::emit) fn emit_json_rep(
     );
     concat(&mut f);
     wasm!(f; End);
-    elem_or_undefined(&mut f, ptr, i, elem, helpers);
+    array_like_elem(&mut f, ptr, value, i, elem, helpers);
     wasm!(f; LocalSet(elem), LocalGet(i), F64ConvertI32U, I64ReinterpretF64, LocalSet(k));
     recurse(&mut f);
     wasm!(f;
@@ -706,7 +790,11 @@ pub(in crate::emit) fn emit_json_indent(helpers: Helpers<'_>, leaves: &LeafSet) 
 /// non-configurable property rejects both silently), then passed to the
 /// reviver as `(key, value)` with `this = holder`. A throw returns with it
 /// pending.
-pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+pub(in crate::emit) fn emit_json_revive(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
     use LocalClass::{Base, Jsval, Raw};
     let int = Raw(ValType::I32);
     let mut f = FnBuilder::new(leaves);
@@ -723,21 +811,46 @@ pub(in crate::emit) fn emit_json_revive(helpers: Helpers<'_>, leaves: &LeafSet) 
     return_if_pending(&mut f);
     emit_is_pointer(&mut f, val);
     wasm!(f; If(BlockType::Empty));
-    emit_load_type_byte(&mut f, val);
+    if helpers.proxies() {
+        // `IsArray(val)` (a proxy answers for its target, a revoked one
+        // throws); a proxy is walked through its traps like an object.
+        wasm!(f; LocalGet(val), Call(helpers.is_array()), LocalSet(array));
+        return_if_pending(&mut f);
+        emit_load_type_byte(&mut f, val);
+        wasm!(f;
+            LocalTee(n), I32Const(TYPE_OBJECT), I32Eq,
+            LocalGet(n), I32Const(TYPE_PROXY), I32Eq, I32Or, LocalGet(array), I32Or,
+            If(BlockType::Empty),
+            LocalGet(array),
+            If(BlockType::Empty),
+            LocalGet(val), I32WrapI64, LocalSet(ptr),
+        );
+        array_like_len(&mut f, ptr, val, n, strings, helpers);
+        wasm!(f;
+            Else,
+            LocalGet(val), I32Const(OWN_KEYS), Call(helpers.own_keys), I32WrapI64, LocalSet(ptr),
+        );
+        return_if_pending(&mut f);
+        wasm!(f; LocalGet(ptr), I32Load(ARR_LEN), LocalSet(n), End);
+    } else {
+        emit_load_type_byte(&mut f, val);
+        wasm!(f;
+            LocalTee(n), I32Const(TYPE_ARRAY), I32Eq, LocalTee(array),
+            LocalGet(n), I32Const(TYPE_OBJECT), I32Eq, I32Or,
+            If(BlockType::Empty),
+            // The keys: the indices below the length of an array, else the own
+            // enumerable keys (`ptr` the key array).
+            LocalGet(array),
+            If(BlockType::Result(ValType::I32)),
+            LocalGet(val), I32WrapI64, I32Load(ARR_LEN),
+            Else,
+            LocalGet(val), I32Const(OWN_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ptr),
+            I32Load(ARR_LEN),
+            End,
+            LocalSet(n),
+        );
+    }
     wasm!(f;
-        LocalTee(n), I32Const(TYPE_ARRAY), I32Eq, LocalTee(array),
-        LocalGet(n), I32Const(TYPE_OBJECT), I32Eq, I32Or,
-        If(BlockType::Empty),
-        // The keys: the indices below the length of an array, else the own
-        // enumerable keys (`ptr` the key array).
-        LocalGet(array),
-        If(BlockType::Result(ValType::I32)),
-        LocalGet(val), I32WrapI64, I32Load(ARR_LEN),
-        Else,
-        LocalGet(val), I32Const(OWN_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ptr),
-        I32Load(ARR_LEN),
-        End,
-        LocalSet(n),
         I32Const(0), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(i), LocalGet(n), I32GeU, BrIf(1),

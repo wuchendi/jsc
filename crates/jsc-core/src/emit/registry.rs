@@ -428,6 +428,7 @@ pub(super) enum Extra {
     ProxySet,
     ProxyDelete,
     ProxyOwnKeys,
+    IsArray,
 }
 
 /// The `BigInt` runtime ([`bigint`]), after the extra helpers.
@@ -760,7 +761,7 @@ const CONV: [Row<Conv>; 26] = [
         builtins::emit_json_indent(cx.helpers, cx.leaves)
     }),
     (Conv::JsonRevive, (&[I64, I32, I64], &[I64]), |cx| {
-        builtins::emit_json_revive(cx.helpers, cx.leaves)
+        builtins::emit_json_revive(cx.strings, cx.helpers, cx.leaves)
     }),
     (
         Conv::DefineOwn,
@@ -819,7 +820,7 @@ const CONV: [Row<Conv>; 26] = [
     }),
 ];
 
-const EXTRA: [Row<Extra>; 19] = [
+const EXTRA: [Row<Extra>; 20] = [
     (Extra::StackOverflow, (&[], &[]), |cx| {
         emit_stack_overflow(cx.strings, cx.helpers, cx.leaves)
     }),
@@ -878,6 +879,9 @@ const EXTRA: [Row<Extra>; 19] = [
     }),
     (Extra::ProxyOwnKeys, (&[I32, I32], &[I64]), |cx| {
         emit_proxy_own_keys(cx.strings, cx.helpers, cx.leaves)
+    }),
+    (Extra::IsArray, (&[I64], &[I32]), |cx| {
+        emit_is_array(cx.strings, cx.helpers, cx.leaves)
     }),
 ];
 

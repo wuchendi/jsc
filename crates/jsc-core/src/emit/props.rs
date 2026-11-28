@@ -1297,7 +1297,7 @@ fn emit_get_from(
             LocalGet(e), I64Load(m64(E_VALUE)), I32WrapI64, I64Load(m64(ACCESSOR_GET_OFFSET)),
             LocalSet(p),
         );
-        emit_is_function(&mut f, p);
+        emit_is_function(&mut f, p, helpers);
         wasm!(f; I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End);
         emit_accessor_call(&mut f, p, this, None, base, helpers);
         wasm!(f; Return, End);
@@ -1384,7 +1384,7 @@ pub(super) fn emit_symbol_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
         LocalGet(e), I64Load(m64(E_VALUE)), I32WrapI64, I64Load(m64(ACCESSOR_GET_OFFSET)),
         LocalSet(g),
     );
-    emit_is_function(&mut f, g);
+    emit_is_function(&mut f, g, helpers);
     wasm!(f; I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End);
     emit_accessor_call(&mut f, g, v, None, base, helpers);
     wasm!(f;
@@ -1541,7 +1541,7 @@ fn emit_set_accessor(
         LocalGet(e), I64Load(m64(E_VALUE)), I32WrapI64, I64Load(m64(ACCESSOR_SET_OFFSET)),
         LocalSet(s),
     );
-    emit_is_function(f, s);
+    emit_is_function(f, s, helpers);
     wasm!(f; If(BlockType::Empty));
     emit_accessor_call(f, s, this, Some(v), q, helpers);
     wasm!(f; Drop);
@@ -2209,7 +2209,7 @@ pub(super) fn emit_sparse_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
             LocalGet(e), I64Load(m64(E_VALUE)), I32WrapI64, I64Load(m64(ACCESSOR_GET_OFFSET)),
             LocalSet(g),
         );
-        emit_is_function(&mut f, g);
+        emit_is_function(&mut f, g, helpers);
         wasm!(f; I32Eqz, If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End, LocalGet(o));
         emit_box_heap(&mut f);
         wasm!(f; LocalSet(this));
@@ -2461,7 +2461,7 @@ pub(super) fn emit_proto_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
             LocalGet(e), I64Load(m64(E_VALUE)), I32WrapI64, I64Load(m64(ACCESSOR_SET_OFFSET)),
             LocalSet(p),
         );
-        emit_is_function(&mut f, p);
+        emit_is_function(&mut f, p, helpers);
         wasm!(f; If(BlockType::Empty));
         emit_accessor_call(&mut f, p, recv, Some(v), q, helpers);
         wasm!(f; Drop, I32Const(1), Return, End, I32Const(1));

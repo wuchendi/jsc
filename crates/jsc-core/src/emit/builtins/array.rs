@@ -980,7 +980,7 @@ pub(super) fn emit_to_locale_string(
             LocalSet(f),
         );
         return_if_pending(function);
-        emit_is_function(function, f);
+        emit_is_function(function, f, helpers);
         wasm!(function; I32Eqz, If(BlockType::Empty));
         throw_type_error(
             function,
@@ -1104,7 +1104,7 @@ pub(super) fn emit_to_string(
     object::require_object_coercible(function, frame, this, strings, helpers);
     wasm!(function; LocalGet(this), I32Const(static_key(strings, JOIN)), Call(helpers.get), LocalSet(join));
     return_if_pending(function);
-    emit_is_function(function, join);
+    emit_is_function(function, join, helpers);
     wasm!(function; If(BlockType::Result(ValType::I64)));
     emit_accessor_call(function, join, this, None, base, helpers);
     wasm!(function; Else);
@@ -1338,7 +1338,7 @@ fn require_callable(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    emit_is_function(function, local);
+    emit_is_function(function, local, helpers);
     wasm!(function; I32Eqz, If(BlockType::Empty));
     throw_type_error(function, frame, text, strings, helpers);
     wasm!(function; End);
@@ -1376,7 +1376,7 @@ fn construct_or_create(
 ) {
     let array = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Array), helpers);
     wasm!(function; LocalGet(c), I64Const(array), I64Ne);
-    emit_is_constructor(function, c);
+    emit_is_constructor(function, c, helpers);
     wasm!(function; I32Const(0), I32Ne, I32And, If(BlockType::Empty));
     let node = construct(frame, c, len, THIS_NOT_CTOR);
     emit_node(&node, function, frame.scratch(), strings, helpers);
@@ -1411,12 +1411,20 @@ fn species_ctor(
 ) {
     let array = intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Array), helpers);
     wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(c));
-    emit_is_pointer(function, o);
-    wasm!(function; If(BlockType::Result(ValType::I32)));
-    emit_load_type_byte(function, o);
+    if helpers.proxies() {
+        // `IsArray(o)`: a proxy answers for its target; a revoked one throws.
+        wasm!(function; LocalGet(o), Call(helpers.is_array()));
+        return_if_pending(function);
+    } else {
+        emit_is_pointer(function, o);
+        wasm!(function; If(BlockType::Result(ValType::I32)));
+        emit_load_type_byte(function, o);
+        wasm!(function;
+            I32Const(TYPE_ARRAY), I32Eq,
+            Else, I32Const(0), End,
+        );
+    }
     wasm!(function;
-        I32Const(TYPE_ARRAY), I32Eq,
-        Else, I32Const(0), End,
         If(BlockType::Empty),
         LocalGet(o), I32Const(static_key(strings, CONSTRUCTOR)), Call(helpers.get), LocalSet(c),
     );
@@ -2263,7 +2271,7 @@ impl<'a> Run<'a> {
     fn start_iterator(self, function: &mut FnBuilder<'_>) {
         let (frame, strings, helpers) = (self.frame, self.strings, self.helpers);
         let (method, result, next) = (self.method, self.result, self.next);
-        emit_is_function(function, method);
+        emit_is_function(function, method, helpers);
         wasm!(function; I32Eqz, If(BlockType::Empty));
         let error = iter::not_a_function(method, result);
         iter::throw_and_return(function, frame, &error, strings, helpers);
@@ -2690,8 +2698,14 @@ pub(super) fn emit_concat(
     );
     return_if_pending(function);
     wasm!(function; LocalGet(v), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty));
-    emit_load_type_byte(function, item);
-    wasm!(function; I32Const(TYPE_ARRAY), I32Eq, LocalSet(len), Else);
+    if helpers.proxies() {
+        wasm!(function; LocalGet(item), Call(helpers.is_array()), LocalSet(len));
+        return_if_pending(function);
+    } else {
+        emit_load_type_byte(function, item);
+        wasm!(function; I32Const(TYPE_ARRAY), I32Eq, LocalSet(len));
+    }
+    wasm!(function; Else);
     emit_cond(
         &IrNode::Local(v),
         function,
@@ -2822,10 +2836,22 @@ pub(super) fn emit_flat(
         call_fn(function, frame, mapper, this_arg, &args, el, helpers);
         wasm!(function; End);
     }
-    wasm!(function; LocalGet(depth), F64Const(Ieee64::from(0.0)), F64Gt);
-    is_array(function, el);
+    if helpers.proxies() {
+        // `depth > 0` and `IsArray(element)` (only then: a revoked proxy
+        // element throws).
+        wasm!(function;
+            LocalGet(depth), F64Const(Ieee64::from(0.0)), F64Gt,
+            If(BlockType::Result(ValType::I32)),
+            LocalGet(el), Call(helpers.is_array()),
+            Else, I32Const(0), End,
+        );
+        return_if_pending(function);
+    } else {
+        wasm!(function; LocalGet(depth), F64Const(Ieee64::from(0.0)), F64Gt);
+        is_array(function, el);
+        wasm!(function; I32And);
+    }
     wasm!(function;
-        I32And,
         If(BlockType::Empty),
         LocalGet(stack), LocalGet(cur), Call(helpers.array_push), Drop,
         LocalGet(stack),
