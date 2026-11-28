@@ -107,6 +107,11 @@ pub(super) fn build_type_and_function_sections<'a>(
         gathers_arguments: program_any(program, |n| matches!(n, IrNode::SpreadArgsGlobal)),
         has_accessors: program_has_accessors(program),
         dirty_tracking: program_tests_dirty_bits(program),
+        binary: if program_has_binary(program) {
+            BinaryData::Reachable
+        } else {
+            BinaryData::Unreachable
+        },
         unicode: layout.unicode,
         fn_info: layout.info,
     };
@@ -1301,7 +1306,8 @@ fn collect_entries<'a>(entries: &'a [(PropKey, IrNode)], strs: &mut Strs<'a>) {
 /// `Object.prototype.__proto__` pair, the `constructor` / `@@toStringTag`
 /// pairs of `%Iterator.prototype%`, which a program reaches only through
 /// `Iterator`, a prototype read or write, or `constructor`, the
-/// `Symbol.prototype.description` getter): it names them,
+/// `Symbol.prototype.description` getter, the `%ArrayBuffer.prototype%`
+/// getters, which a program reaches only through `ArrayBuffer`): it names them,
 /// or reads or writes a member under a key computed at run time. Then `__get` / `__set` must
 /// dispatch to getters and setters. (The builtins only read fixed keys:
 /// `length`, indices, `prototype`, `name`, `message`; `Object.assign` writes
@@ -1314,9 +1320,11 @@ fn program_has_accessors(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
         IrNode::MakeAccessor { .. }
         | IrNode::SizeRead { .. }
-        | IrNode::Intrinsic(GlobalIntrinsic::Ctor(BuiltinCtor::Iterator)) => true,
+        | IrNode::Intrinsic(GlobalIntrinsic::Ctor(
+            BuiltinCtor::Iterator | BuiltinCtor::ArrayBuffer,
+        )) => true,
         IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
-            global.name == "Iterator"
+            global.name == "Iterator" || BINARY_NAMES.contains(&global.name.as_str())
         }
         IrNode::Str(s) => [
             "caller",
@@ -1336,6 +1344,7 @@ fn program_has_accessors(program: &IrProgram) -> bool {
             "description",
         ]
         .iter()
+        .chain(&BINARY_NAMES)
         .any(|name| s == name),
         IrNode::Index { index: key, .. }
         | IrNode::IndexSet { index: key, .. }
@@ -1343,6 +1352,27 @@ fn program_has_accessors(program: &IrProgram) -> bool {
         | IrNode::SuperGet { key, .. }
         | IrNode::SuperSet { key, .. }
         | IrNode::MethodCallUser { key, .. } => computed(key),
+        _ => false,
+    })
+}
+
+/// The globals of the binary-data constructors (DESIGN.md §5.8.5).
+const BINARY_NAMES: [&str; 1] = ["ArrayBuffer"];
+
+/// Whether `program` can reach binary data (DESIGN.md §5.8.5): it names a
+/// binary-data constructor (the intrinsic, a global reference, or a string
+/// such as a static `globalThis.ArrayBuffer` key), or uses the global object
+/// as a value, which could reach one by a computed name. Then the collector
+/// and the renderer carry their binary-data arms.
+fn program_has_binary(program: &IrProgram) -> bool {
+    program_any(program, |n| match n {
+        IrNode::Intrinsic(
+            GlobalIntrinsic::Global | GlobalIntrinsic::Ctor(BuiltinCtor::ArrayBuffer),
+        ) => true,
+        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
+            BINARY_NAMES.contains(&global.name.as_str())
+        }
+        IrNode::Str(s) => BINARY_NAMES.iter().any(|name| s == name),
         _ => false,
     })
 }
