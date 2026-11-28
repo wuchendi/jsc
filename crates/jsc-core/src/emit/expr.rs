@@ -254,9 +254,25 @@ fn emit_node_inner(
             emit_load_type_byte(function, scratch + 22);
             function.instruction(&Instruction::I32Const(TYPE_ARRAY));
             function.instruction(&Instruction::I32Eq);
+            if helpers.proxies() {
+                // A proxy answers for its target; a revoked one throws.
+                emit_load_type_byte(function, scratch + 22);
+                function.instruction(&Instruction::I32Const(TYPE_PROXY));
+                function.instruction(&Instruction::I32Eq);
+                function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+                function.instruction(&Instruction::LocalGet(scratch + 22));
+                function.instruction(&Instruction::Call(helpers.is_array()));
+                function.instruction(&Instruction::Else);
+                function.instruction(&Instruction::I32Const(0));
+                function.instruction(&Instruction::End);
+                function.instruction(&Instruction::I32Or);
+            }
             function.instruction(&Instruction::Else);
             function.instruction(&Instruction::I32Const(0));
             function.instruction(&Instruction::End);
+            if helpers.proxies() {
+                emit_propagate_if_pending(function, helpers);
+            }
             emit_box_bool(function, scratch);
         }
         IrNode::PrivateName(desc) => emit_private_name(desc, function, scratch, strings, helpers),
@@ -1788,7 +1804,7 @@ pub(super) fn emit_construct<S: Sink>(
         }
         None => emit_call_args(args, function, scratch, strings, helpers),
     }
-    emit_is_constructor(function, f);
+    emit_is_constructor(function, f, helpers);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
@@ -1897,7 +1913,7 @@ fn emit_class_heritage(
     function.instruction(&Instruction::I64Ne);
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
-    emit_is_constructor(function, parent);
+    emit_is_constructor(function, parent, helpers);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
     enter_frame(helpers);
@@ -2018,10 +2034,27 @@ fn penv_slot(slot: u32) -> MemArg {
     }
 }
 
-/// Push nonzero if the jsval in `local` is a constructor: a function value
-/// whose header carries `FUNC_FLAG_CONSTRUCTOR`, else `0`.
-pub(super) fn emit_is_constructor(function: &mut impl Sink, local: u32) {
-    emit_is_function(function, local);
+/// Push nonzero if the jsval in `local` is a constructor (`IsConstructor`):
+/// a function value whose header carries `FUNC_FLAG_CONSTRUCTOR`, or (when
+/// the program can hold proxies, DESIGN.md §6.11) a proxy with the same flag
+/// bit, else `0`.
+pub(super) fn emit_is_constructor(function: &mut impl Sink, local: u32, helpers: Helpers<'_>) {
+    if helpers.proxies() {
+        emit_is_pointer(function, local);
+        function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+        emit_load_type_byte(function, local);
+        function.instruction(&Instruction::I32Const(TYPE_FUNCTION));
+        function.instruction(&Instruction::I32Eq);
+        emit_load_type_byte(function, local);
+        function.instruction(&Instruction::I32Const(TYPE_PROXY));
+        function.instruction(&Instruction::I32Eq);
+        function.instruction(&Instruction::I32Or);
+        function.instruction(&Instruction::Else);
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::End);
+    } else {
+        emit_is_function_block(function, local);
+    }
     function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
     function.instruction(&Instruction::LocalGet(local));
     function.instruction(&Instruction::I32WrapI64);
@@ -2897,7 +2930,7 @@ pub(super) fn emit_callable_guard(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    emit_is_function(function, local);
+    emit_is_function(function, local, helpers);
     function.instruction(&Instruction::I32Eqz);
     function.instruction(&Instruction::If(BlockType::Empty));
     // The `if` opens a control frame around the throw transfer; count it so the

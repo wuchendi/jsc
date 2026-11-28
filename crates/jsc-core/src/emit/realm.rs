@@ -873,6 +873,9 @@ pub(super) enum ProxyOp {
     /// The revoke function `Proxy.revocable` makes (`env` is the proxy). Not
     /// installed on any intrinsic.
     Revoke,
+    /// The `[[Call]]` / `[[Construct]]` trampoline in a callable proxy's
+    /// `func_idx` (its `env` is the proxy). Not installed on any intrinsic.
+    Call,
 }
 
 /// The `Iterator` builtins of DESIGN.md §7.9.
@@ -1946,7 +1949,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 406] = [
+    pub(super) const ALL: [Builtin; 407] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -2443,6 +2446,7 @@ impl Builtin {
         Self::Proxy(ProxyOp::Ctor),
         Self::Proxy(ProxyOp::Revocable),
         Self::Proxy(ProxyOp::Revoke),
+        Self::Proxy(ProxyOp::Call),
         Self::Ctor(BuiltinCtor::BigInt),
         Self::BigInt(BigIntOp::AsIntN),
         Self::BigInt(BigIntOp::AsUintN),
@@ -2462,7 +2466,7 @@ impl Builtin {
             | Self::AsyncGeneratorDrain
             | Self::AsyncGeneratorStep
             | Self::AsyncGeneratorReaction(_)
-            | Self::Proxy(ProxyOp::Revoke) => "",
+            | Self::Proxy(ProxyOp::Revoke | ProxyOp::Call) => "",
             Self::ProtoGet => "get __proto__",
             Self::ProtoSet => "set __proto__",
             Self::CollectionSize { .. } => "get size",
@@ -2585,7 +2589,7 @@ impl Builtin {
             | Self::Protocol(_)
             | Self::AsyncGeneratorDrain
             | Self::AsyncGeneratorStep
-            | Self::Proxy(ProxyOp::Revoke)
+            | Self::Proxy(ProxyOp::Revoke | ProxyOp::Call)
             | Self::FunctionToString
             | Self::StringToString
             | Self::StringValueOf
