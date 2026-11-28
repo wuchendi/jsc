@@ -646,9 +646,9 @@ on a detached or out-of-bounds TypedArray') + ' ' + out.length"
 }
 
 /// The exact test262 setup of the `coerced-values-*-detached*` cases: a
-/// 10000-element source array made by `length` growth then `fill` (a
-/// `SPARSE` array, DESIGN.md §5.4), and the detach in `end`'s `valueOf`.
-/// Must terminate with the `TypeError`.
+/// 10000-element source array made by `length` growth then `fill` (the fill
+/// re-densifies the grown store, DESIGN.md §5.4, so the setup is linear), and
+/// the detach in `end`'s `valueOf`. Must terminate with the `TypeError`.
 #[test]
 fn copy_within_detach_during_coercion_large_source() {
     assert_string(
