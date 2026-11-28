@@ -1518,6 +1518,24 @@ fn data_view_bodies_validate() {
 }
 
 #[test]
+fn bigint_typed_array_bodies_validate() {
+    // The `BigInt` kinds (DESIGN.md §5.8.6, stage T5b): the element arms of
+    // `__raw_load` / `__raw_store` and `TypedArraySetElement`'s `ToBigInt`,
+    // the content-type checks, the methods' `BigInt` comparisons and the
+    // `DataView` `BigInt` accessors; every body must stay valid wasm.
+    validate(&compile(
+        "const t = new BigInt64Array([1n, -2n]), u = BigUint64Array.of(3n), k = 1;
+        t[k] = 5n; t[0] = t[k] + 1n; u.fill(2n ** 64n + 1n);
+        const v = new DataView(new ArrayBuffer(16));
+        v.setBigInt64(0, -1n); v.setBigUint64(8, 2n, true);
+        console.log(t, u, t.includes(5n), t.indexOf(5n), t.lastIndexOf(6n), t.sort(), t.toSorted(),
+            t.with(0, 7n), t.map((x) => x * 2n), t.filter((x) => x > 0n), t.slice(1), t.join(),
+            new BigInt64Array(u), BigInt64Array.from([1n]), v.getBigInt64(0), v.getBigUint64(8, true));
+        try { new BigInt64Array(new Int8Array(1)); } catch (e) { console.log(e.message); }",
+    ));
+}
+
+#[test]
 fn computed_and_numeric_pattern_keys_validate() {
     // Pattern keys converted into locals, in statement and expression
     // position, a generator, a rest exclusion list, and numeric class keys.
@@ -2097,8 +2115,7 @@ fn bigint_gate_shakes_out_the_operator_kernels() {
 }
 
 /// Each `BigInt` source opens the gate (DESIGN.md §6.10.9); Number-only
-/// programs, binary data without the `BigInt` accessors and look-alike
-/// names do not.
+/// programs, the Number typed arrays and look-alike names do not.
 #[test]
 fn bigint_gate_triggers() {
     let gate = |src: &str| super::sections::program_has_bigint(&lower_js(src));
@@ -2117,6 +2134,9 @@ fn bigint_gate_triggers() {
         "function f(v) { return v.getBigUint64(0); }",
         "function f(v) { v.setBigInt64(0, 0); }",
         "function f(v) { v.setBigUint64(0, 0); }",
+        // A `DataView` reached by reflection reaches `getBigInt64` unnamed.
+        "new DataView(new ArrayBuffer(8)).getFloat64(0)",
+        "new BigInt64Array(1)",
     ] {
         assert!(gate(src), "`{src}` must open the BigInt gate");
     }
@@ -2124,7 +2144,7 @@ fn bigint_gate_triggers() {
         "1 + 2",
         "let a = 1; a++; (-a) ** 2",
         "Number('1')",
-        "new DataView(new ArrayBuffer(8)).getFloat64(0)",
+        "new Float64Array(2)[0]",
         "const o = { Big: 1 }; o.Big",
         "const k = 'bigint'",
     ] {

@@ -27,6 +27,7 @@ use super::typed_array::{
 };
 use crate::emit::binary::RAW_DATA;
 use crate::emit::realm::TypedArrayOp;
+use crate::emit::registry::Big;
 
 /// `[message, stack]` of a `TypeError` with `message`.
 macro_rules! type_error {
@@ -407,6 +408,33 @@ fn content_types_differ(function: &mut FnBuilder<'_>, a: u32, b: u32) {
     wasm!(function; I32Const(FIRST_BIGINT_KIND), I32GeU, I32Ne);
 }
 
+/// The value conversion of `TypedArraySetElement` for the typed array in
+/// i64 `ta` of the jsval in i64 `v` into i64 `out`: `ToBigInt` for a `BigInt`
+/// kind (DESIGN.md §5.8.6; only with the program's `BigInt` gate open, as no
+/// `BigInt` typed array exists otherwise), else `ToNumber`; a throw returns.
+fn to_element(function: &mut FnBuilder<'_>, ta: u32, v: u32, out: u32, helpers: Helpers<'_>) {
+    if helpers.bigints() {
+        is_bigint_kind(function, ta);
+        wasm!(function;
+            If(BlockType::Result(ValType::I64)),
+            LocalGet(v), Call(helpers.bigint(Big::ToBigInt)),
+            Else,
+        );
+    }
+    wasm!(function; LocalGet(v), Call(helpers.to_number));
+    if helpers.bigints() {
+        wasm!(function; End);
+    }
+    wasm!(function; LocalSet(out));
+    return_if_pending(function);
+}
+
+/// Push `1` when the typed array in i64 `ta` has the `BigInt` content type.
+fn is_bigint_kind(function: &mut FnBuilder<'_>, ta: u32) {
+    kind(function, ta);
+    wasm!(function; I32Const(FIRST_BIGINT_KIND), I32GeU);
+}
+
 /// Emit the body of the T3b method `op` into `f`.
 pub(super) fn emit(
     op: TypedArrayOp,
@@ -587,16 +615,16 @@ fn emit_find(function: &mut FnBuilder<'_>, l: L, strings: &StrOffsets, helpers: 
     }
 }
 
-/// `fill(value, start, end)`: `ToNumber(value)`, the relative `start` /
-/// `end`, then the receiver is re-validated and `end` clamped to the
-/// current length; every element of `[start, end)` gets the number.
+/// `fill(value, start, end)`: `ToNumber(value)` (`ToBigInt` for a `BigInt`
+/// kind), the relative `start` / `end`, then the receiver is re-validated
+/// and `end` clamped to the current length; every element of `[start, end)`
+/// gets the value.
 fn emit_fill(function: &mut FnBuilder<'_>, l: L, strings: &StrOffsets, helpers: Helpers<'_>) {
     let [start, fin, len, _] = l.f;
     l.args(function, 3);
     l.validate(function, strings, helpers);
     l.len_f64(function, len);
-    wasm!(function; LocalGet(l.a[0]), Call(helpers.to_number), LocalSet(l.v));
-    return_if_pending(function);
+    to_element(function, l.o, l.a[0], l.v, helpers);
     relative(function, l.a[1], len, start, helpers);
     relative_end(function, l.a[2], len, fin, helpers);
     l.revalidate(function, strings, helpers);
@@ -686,7 +714,8 @@ fn search_start(function: &mut FnBuilder<'_>, l: L, miss: i64, helpers: Helpers<
 
 /// `includes(searchElement, fromIndex)`: `SameValueZero` against `Get(O,
 /// k)` from the start index, so after a detaching `fromIndex` conversion
-/// `undefined` is found.
+/// `undefined` is found; a non-number compares by `__same_value_zero` when
+/// the program can hold a `BigInt` (by value), else by identity.
 fn emit_includes(function: &mut FnBuilder<'_>, l: L, strings: &StrOffsets, helpers: Helpers<'_>) {
     let search = l.a[0];
     let [_, _, s, _] = l.f;
@@ -708,7 +737,14 @@ fn emit_includes(function: &mut FnBuilder<'_>, l: L, strings: &StrOffsets, helpe
             I32Or,
             Else, I32Const(0), End,
             Else,
-            LocalGet(l.v), LocalGet(search), I64Eq,
+            LocalGet(l.v), LocalGet(search),
+        );
+        if helpers.bigints() {
+            wasm!(function; Call(helpers.same_value_zero));
+        } else {
+            wasm!(function; I64Eq);
+        }
+        wasm!(function;
             End,
             If(BlockType::Empty), I64Const(TRUE_BITS), Return, End,
         );
@@ -716,31 +752,54 @@ fn emit_includes(function: &mut FnBuilder<'_>, l: L, strings: &StrOffsets, helpe
     wasm!(function; I64Const(FALSE_BITS));
 }
 
-/// Push `1` when the element in `v` (a number or `undefined`) is strictly
-/// equal to the number in i64 `search`.
-fn strictly_equal(function: &mut FnBuilder<'_>, v: u32, search: u32) {
+/// Push `1` when the element in `v` (a number, a `BigInt` or `undefined`)
+/// is strictly equal to the number or `BigInt` in i64 `search`
+/// ([`search_or_miss`] let only those through): numbers by `f64.eq`, a
+/// `BigInt` by value (`__bigint_eq`, `0` unless both are `BigInts`).
+fn strictly_equal(function: &mut FnBuilder<'_>, v: u32, search: u32, helpers: Helpers<'_>) {
+    if helpers.bigints() {
+        emit_is_number(function, search);
+        wasm!(function; If(BlockType::Result(ValType::I32)));
+    }
     emit_is_number(function, v);
     wasm!(function;
         If(BlockType::Result(ValType::I32)),
         LocalGet(v), F64ReinterpretI64, LocalGet(search), F64ReinterpretI64, F64Eq,
         Else, I32Const(0), End,
     );
+    if helpers.bigints() {
+        wasm!(function;
+            Else, LocalGet(v), LocalGet(search), Call(helpers.bigint(Big::Eq)), End,
+        );
+    }
+}
+
+/// Return `miss` unless the jsval in i64 `search` is a number, or a `BigInt`
+/// in a program that can hold one: nothing else is strictly equal to an
+/// element.
+fn search_or_miss(function: &mut FnBuilder<'_>, search: u32, miss: i64, helpers: Helpers<'_>) {
+    emit_is_number(function, search);
+    if helpers.bigints() {
+        crate::emit::bigint::emit_is_bigint(function, search);
+        wasm!(function; I32Or);
+    }
+    wasm!(function; I32Eqz, If(BlockType::Empty), I64Const(miss), Return, End);
 }
 
 /// `indexOf(searchElement, fromIndex)`: `IsStrictlyEqual` against each
 /// present element from the start index (a detached or shrunk buffer has no
-/// elements there); a non-number never matches.
+/// elements there); a value that is neither a number nor a `BigInt` never
+/// matches.
 fn emit_index_of(function: &mut FnBuilder<'_>, l: L, strings: &StrOffsets, helpers: Helpers<'_>) {
     let search = l.a[0];
     let miss = (-1.0f64).to_bits().cast_signed();
     l.args(function, 2);
     l.validate(function, strings, helpers);
     search_start(function, l, miss, helpers);
-    emit_is_number(function, search);
-    wasm!(function; I32Eqz, If(BlockType::Empty), I64Const(miss), Return, End);
+    search_or_miss(function, search, miss, helpers);
     count_loop(function, l.k, l.len, |function| {
         get(function, l.o, l.k, l.v, helpers);
-        strictly_equal(function, l.v, search);
+        strictly_equal(function, l.v, search, helpers);
         wasm!(function;
             If(BlockType::Empty), LocalGet(l.k), F64ConvertI32U, I64ReinterpretF64, Return, End,
         );
@@ -782,14 +841,11 @@ fn emit_last_index_of(
         LocalTee(n), F64Const(Ieee64::from(0.0)), F64Lt,
         If(BlockType::Empty), I64Const(miss), Return, End,
     );
-    emit_is_number(function, search);
-    wasm!(function;
-        I32Eqz, If(BlockType::Empty), I64Const(miss), Return, End,
-        LocalGet(n), I32TruncF64U, I32Const(1), I32Add, LocalSet(l.k),
-    );
+    search_or_miss(function, search, miss, helpers);
+    wasm!(function; LocalGet(n), I32TruncF64U, I32Const(1), I32Add, LocalSet(l.k));
     down_loop(function, l.k, |function| {
         get(function, l.o, l.k, l.v, helpers);
-        strictly_equal(function, l.v, search);
+        strictly_equal(function, l.v, search, helpers);
         wasm!(function;
             If(BlockType::Empty), LocalGet(l.k), F64ConvertI32U, I64ReinterpretF64, Return, End,
         );
@@ -1165,7 +1221,8 @@ fn emit_slice(function: &mut FnBuilder<'_>, l: L, strings: &StrOffsets, helpers:
 /// creates `A = TypedArrayCreateSameType(O, [len])`; the `len` elements are
 /// read into a private list of `(value, value)` pairs, sorted by the stable
 /// merge sort of `Array.prototype.sort` — by `ToNumber(comparefn(x, y)) <
-/// 0`, or numerically with `-0` before `+0` and `NaN` last — and written
+/// 0`, or numerically with `-0` before `+0` and `NaN` last (a `BigInt`
+/// kind by value, `__bigint_cmp`) — and written
 /// back (to `O`, or `A`) through `__ta_set`, which ignores an index a
 /// comparator detached or shrank away.
 fn emit_sort(
@@ -1232,18 +1289,9 @@ fn emit_sort(
             I64Load(elem_slot(0)), LocalSet(rhs),
             LocalGet(cmp), I64Const(UNDEFINED_BITS), I64Eq,
             If(BlockType::Result(ValType::I32)),
-            // x < y, or y is NaN and x is not, or x is -0 and y is +0.
-            LocalGet(lhs), F64ReinterpretI64, LocalGet(rhs), F64ReinterpretI64, F64Lt,
-            LocalGet(rhs), F64ReinterpretI64, LocalGet(rhs), F64ReinterpretI64, F64Ne,
-            LocalGet(lhs), F64ReinterpretI64, LocalGet(lhs), F64ReinterpretI64, F64Eq, I32And,
-            I32Or,
-            LocalGet(lhs), I64Const(0), I64LtS,
-            LocalGet(rhs), I64Const(0), I64GeS, I32And,
-            LocalGet(lhs), F64ReinterpretI64, F64Const(Ieee64::from(0.0)), F64Eq, I32And,
-            LocalGet(rhs), F64ReinterpretI64, F64Const(Ieee64::from(0.0)), F64Eq, I32And,
-            I32Or,
-            Else,
         );
+        default_less(function, l.o, (lhs, rhs), helpers);
+        wasm!(function; Else);
         let args = [CallArg::Val(lhs), CallArg::Val(rhs)];
         push_call(function, frame, cmp, undefined, &args, helpers);
         wasm!(function; LocalSet(l.r));
@@ -1264,6 +1312,44 @@ fn emit_sort(
         set(function, target, l.k, l.v, helpers);
     });
     wasm!(function; LocalGet(target));
+}
+
+/// Push i32 `1` when the element in i64 `lhs` sorts strictly before the one
+/// in `rhs` in the default order of the typed array in i64 `o`: numerically
+/// with `-0` before `+0` and `NaN` last, or by `BigInt` value for a `BigInt`
+/// kind.
+fn default_less(
+    function: &mut FnBuilder<'_>,
+    o: u32,
+    (lhs, rhs): (u32, u32),
+    helpers: Helpers<'_>,
+) {
+    if helpers.bigints() {
+        // A `BigInt` kind: every pair holds a `BigInt` (no user code ran
+        // while collecting), compared by value.
+        is_bigint_kind(function, o);
+        wasm!(function;
+            If(BlockType::Result(ValType::I32)),
+            LocalGet(lhs), I32WrapI64, LocalGet(rhs), I32WrapI64,
+            Call(helpers.bigint(Big::Cmp)), I32Const(0), I32LtS,
+            Else,
+        );
+    }
+    wasm!(function;
+        // x < y, or y is NaN and x is not, or x is -0 and y is +0.
+        LocalGet(lhs), F64ReinterpretI64, LocalGet(rhs), F64ReinterpretI64, F64Lt,
+        LocalGet(rhs), F64ReinterpretI64, LocalGet(rhs), F64ReinterpretI64, F64Ne,
+        LocalGet(lhs), F64ReinterpretI64, LocalGet(lhs), F64ReinterpretI64, F64Eq, I32And,
+        I32Or,
+        LocalGet(lhs), I64Const(0), I64LtS,
+        LocalGet(rhs), I64Const(0), I64GeS, I32And,
+        LocalGet(lhs), F64ReinterpretI64, F64Const(Ieee64::from(0.0)), F64Eq, I32And,
+        LocalGet(rhs), F64ReinterpretI64, F64Const(Ieee64::from(0.0)), F64Eq, I32And,
+        I32Or,
+    );
+    if helpers.bigints() {
+        wasm!(function; End);
+    }
 }
 
 /// `subarray(start, end)`: the receiver must be a typed array (never
@@ -1379,7 +1465,8 @@ fn emit_to_reversed(
     wasm!(function; LocalGet(l.out));
 }
 
-/// `with(index, value)`: the relative index (not clamped), `ToNumber(value)`,
+/// `with(index, value)`: the relative index (not clamped), `ToNumber(value)`
+/// (`ToBigInt` for a `BigInt` kind),
 /// then an index that is not a valid integer index of the live view is a
 /// `RangeError`; `A = TypedArrayCreateSameType(O, [len])` gets the number at
 /// the index and `Get(O, k)` elsewhere (`undefined`, stored as `NaN`, past
@@ -1394,9 +1481,8 @@ fn emit_with(function: &mut FnBuilder<'_>, l: L, strings: &StrOffsets, helpers: 
     wasm!(function;
         LocalGet(r), F64Const(Ieee64::from(0.0)), F64Lt,
         If(BlockType::Empty), LocalGet(len), LocalGet(r), F64Add, LocalSet(r), End,
-        LocalGet(l.a[1]), Call(helpers.to_number), LocalSet(value),
     );
-    return_if_pending(function);
+    to_element(function, l.o, l.a[1], value, helpers);
     wasm!(function;
         LocalGet(r), F64Const(Ieee64::from(0.0)), F64Lt,
         LocalGet(r), LocalGet(l.o), I32WrapI64, Call(helpers.ta_length()), F64ConvertI32U, F64Ge,
