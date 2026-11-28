@@ -972,32 +972,50 @@ pub(super) fn emit_to_locale_string(
             End,
         );
         get_index(function, o, k, key, v, helpers);
-        emit_is_nullish(function, v);
-        wasm!(function;
-            I32Eqz,
-            If(BlockType::Empty),
-            LocalGet(v), I32Const(static_key(strings, TO_LOCALE_STRING_KEY)), Call(helpers.get),
-            LocalSet(f),
-        );
-        return_if_pending(function);
-        emit_is_function(function, f, helpers);
-        wasm!(function; I32Eqz, If(BlockType::Empty));
-        throw_type_error(
+        locale_element(
             function,
             frame,
+            (v, f, acc, base),
             TO_LOCALE_STRING.not_callable,
             strings,
             helpers,
         );
-        wasm!(function; End);
-        emit_accessor_call(function, f, v, None, base, helpers);
-        wasm!(function; LocalSet(v));
-        return_if_pending(function);
-        wasm!(function; LocalGet(acc), LocalGet(v), Call(helpers.to_str()), Call(helpers.concat), LocalSet(acc));
-        return_if_pending(function);
-        wasm!(function; End);
     });
     wasm!(function; LocalGet(acc), I64ExtendI32U, I64Const(HEAP_BITS), I64Or);
+}
+
+/// The element step of `Array.prototype.toLocaleString` (also
+/// `%TypedArray%.prototype.toLocaleString`'s): unless the element in i64 `v`
+/// is `undefined` / `null`, append `ToString(Invoke(v, "toLocaleString"))`
+/// to the string in rooted i32 `acc` (`f` an i64 temp, `base` a rooted i32
+/// temp); a non-callable `toLocaleString` throws `not_callable`, and any
+/// throw returns.
+pub(super) fn locale_element(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    (v, f, acc, base): (u32, u32, u32, u32),
+    not_callable: CalleeErrorText<'static>,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    emit_is_nullish(function, v);
+    wasm!(function;
+        I32Eqz,
+        If(BlockType::Empty),
+        LocalGet(v), I32Const(static_key(strings, TO_LOCALE_STRING_KEY)), Call(helpers.get),
+        LocalSet(f),
+    );
+    return_if_pending(function);
+    emit_is_function(function, f, helpers);
+    wasm!(function; I32Eqz, If(BlockType::Empty));
+    throw_type_error(function, frame, not_callable, strings, helpers);
+    wasm!(function; End);
+    emit_accessor_call(function, f, v, None, base, helpers);
+    wasm!(function; LocalSet(v));
+    return_if_pending(function);
+    wasm!(function; LocalGet(acc), LocalGet(v), Call(helpers.to_str()), Call(helpers.concat), LocalSet(acc));
+    return_if_pending(function);
+    wasm!(function; End);
 }
 
 /// `Array.prototype.slice(start, end)`: `k` and `final` from the relative
@@ -3498,7 +3516,7 @@ pub(super) fn emit_copy_within(
 /// Push the address of pair `p` (an i32 local) of the sort buffer whose array
 /// handle base is in i32 `buf`: its sort key at [`elem_slot`] 0, its value at
 /// slot 1.
-fn pair_at(function: &mut FnBuilder<'_>, buf: u32, p: u32) {
+pub(super) fn pair_at(function: &mut FnBuilder<'_>, buf: u32, p: u32) {
     wasm!(function; LocalGet(buf));
     emit_array_elems(function);
     wasm!(function; LocalGet(p), I32Const(4), I32Shl, I32Add);
@@ -3627,6 +3645,96 @@ pub(super) fn emit_sort(
             End,
         );
     };
+    let merge = MergeLocals {
+        src,
+        dst,
+        pairs,
+        width,
+        lo,
+        mid,
+        hi,
+        left,
+        right,
+        out,
+    };
+    merge_pairs(function, merge, less);
+    // Write back the values, the `undefined`s, then delete up to `len`.
+    let put = |function: &mut FnBuilder<'_>| {
+        if copy {
+            put_at(function, frame, (target, k, v, kv), strings, helpers);
+        } else {
+            set_at(function, frame, (o, k, v, kv), strings, helpers);
+        }
+    };
+    wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(k), I32Const(0), LocalSet(left));
+    count_loop(function, left, pairs, |function| {
+        pair_at(function, src, left);
+        wasm!(function; I64Load(elem_slot(1)), LocalSet(v));
+        put(function);
+        bump(function, k, 1.0);
+    });
+    wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(v));
+    while_loop(
+        function,
+        |function| wasm!(function; LocalGet(undefs), F64Const(Ieee64::from(0.0)), F64Gt),
+        |function| {
+            put(function);
+            bump(function, k, 1.0);
+            bump(function, undefs, -1.0);
+        },
+    );
+    if !copy {
+        while_loop(
+            function,
+            |function| wasm!(function; LocalGet(k), LocalGet(len), F64Lt),
+            |function| {
+                delete_at(function, frame, (o, k, kv), strings, helpers);
+                bump(function, k, 1.0);
+            },
+        );
+    }
+    wasm!(function; LocalGet(target));
+}
+
+/// The locals of [`merge_pairs`]: the rooted i32 array bases `src` / `dst`
+/// (swapped after each pass, so the sorted pairs end in `src`), the i32 pair
+/// count `pairs` and the raw i32 temps of the passes.
+#[derive(Clone, Copy)]
+pub(super) struct MergeLocals {
+    pub(super) src: u32,
+    pub(super) dst: u32,
+    pub(super) pairs: u32,
+    pub(super) width: u32,
+    pub(super) lo: u32,
+    pub(super) mid: u32,
+    pub(super) hi: u32,
+    pub(super) left: u32,
+    pub(super) right: u32,
+    pub(super) out: u32,
+}
+
+/// The stable bottom-up merge sort of `Array.prototype.sort` over the
+/// `(key, value)` pairs ([`pair_at`]) of the array in `src`, through the
+/// equally long array in `dst`: `less` pushes i32 `1` when pair `right` of
+/// `src` sorts strictly before pair `left` (it may call user code and
+/// return on a throw). The sorted pairs end in `src`.
+pub(super) fn merge_pairs(
+    function: &mut FnBuilder<'_>,
+    merge: MergeLocals,
+    less: impl Fn(&mut FnBuilder<'_>),
+) {
+    let MergeLocals {
+        src,
+        dst,
+        pairs,
+        width,
+        lo,
+        mid,
+        hi,
+        left,
+        right,
+        out,
+    } = merge;
     // dst[out] = src[pair], then pair += 1 and out += 1.
     let take = |function: &mut FnBuilder<'_>, pair: u32| {
         for slot in 0..2 {
@@ -3691,42 +3799,6 @@ pub(super) fn emit_sort(
             );
         },
     );
-    // Write back the values, the `undefined`s, then delete up to `len`.
-    let put = |function: &mut FnBuilder<'_>| {
-        if copy {
-            put_at(function, frame, (target, k, v, kv), strings, helpers);
-        } else {
-            set_at(function, frame, (o, k, v, kv), strings, helpers);
-        }
-    };
-    wasm!(function; F64Const(Ieee64::from(0.0)), LocalSet(k), I32Const(0), LocalSet(left));
-    count_loop(function, left, pairs, |function| {
-        pair_at(function, src, left);
-        wasm!(function; I64Load(elem_slot(1)), LocalSet(v));
-        put(function);
-        bump(function, k, 1.0);
-    });
-    wasm!(function; I64Const(UNDEFINED_BITS), LocalSet(v));
-    while_loop(
-        function,
-        |function| wasm!(function; LocalGet(undefs), F64Const(Ieee64::from(0.0)), F64Gt),
-        |function| {
-            put(function);
-            bump(function, k, 1.0);
-            bump(function, undefs, -1.0);
-        },
-    );
-    if !copy {
-        while_loop(
-            function,
-            |function| wasm!(function; LocalGet(k), LocalGet(len), F64Lt),
-            |function| {
-                delete_at(function, frame, (o, k, kv), strings, helpers);
-                bump(function, k, 1.0);
-            },
-        );
-    }
-    wasm!(function; LocalGet(target));
 }
 
 // --- with / toReversed / toSpliced ----------------------------------------------------

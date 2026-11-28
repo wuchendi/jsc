@@ -86,7 +86,7 @@ const FROM_NOT_CALLABLE: CalleeErrorText<'static> =
     type_error!("%TypedArray%.from: when provided, the second argument must be a function");
 
 /// `from` over `null` / `undefined`.
-const FROM_NULLISH: CalleeErrorText<'static> =
+pub(super) const FROM_NULLISH: CalleeErrorText<'static> =
     type_error!("Cannot convert undefined or null to object");
 
 /// `TypedArrayCreateFromConstructor`: the constructor's result is not a
@@ -144,16 +144,17 @@ const RECEIVER_NAMES: [(TypedArrayOp, &str); 7] = [
 pub(super) const ITERATOR_NEXT: &str = "%ArrayIteratorPrototype%.next";
 
 /// `2^53 - 1`, the largest `ToIndex` / `ToLength` result.
-const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+pub(super) const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
 /// The static strings of this family.
 pub(super) fn strings() -> impl Iterator<Item = &'static str> {
     TEXTS
         .into_iter()
         .chain(ALIGNMENT.into_iter().flatten())
+        .chain(SPECIES_TEXTS)
         .flatten()
         .chain(RECEIVER_NAMES.map(|(_, name)| name))
-        .chain([ITERATOR_NEXT, "prototype", "length", ""])
+        .chain([ITERATOR_NEXT, "prototype", "length", "constructor", ""])
         .chain(ElementKind::ALL.map(ElementKind::name))
 }
 
@@ -161,7 +162,15 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
 /// scan.
 pub(super) fn fragments(k: u32) -> Vec<IrNode> {
     let frame = Frame::new(k);
-    vec![construct(frame.i64(0), frame.i64(1), frame)]
+    vec![
+        construct(frame.i64(0), &[frame.i64(1)], frame),
+        construct(frame.i64(0), &[frame.i64(1), frame.i64(2)], frame),
+        construct(
+            frame.i64(0),
+            &[frame.i64(1), frame.i64(2), frame.i64(3)],
+            frame,
+        ),
+    ]
 }
 
 /// The receiver name of `op` (the first one when absent).
@@ -173,7 +182,7 @@ fn receiver_name(op: TypedArrayOp) -> &'static str {
 }
 
 /// A byte [`MemArg`] at `offset`.
-fn m8(offset: u32) -> MemArg {
+pub(super) fn m8(offset: u32) -> MemArg {
     MemArg {
         offset: u64::from(offset),
         align: 0,
@@ -191,7 +200,7 @@ fn m16(offset: u32) -> MemArg {
 }
 
 /// A `u32` [`MemArg`] at `offset`.
-fn m32(offset: u32) -> MemArg {
+pub(super) fn m32(offset: u32) -> MemArg {
     MemArg {
         offset: u64::from(offset),
         align: 2,
@@ -210,12 +219,12 @@ fn m64(offset: u32) -> MemArg {
 
 /// Push the `u32` field at `offset` of the block whose jsval is in i64
 /// `local`.
-fn field(function: &mut FnBuilder<'_>, local: u32, offset: u32) {
+pub(super) fn field(function: &mut FnBuilder<'_>, local: u32, offset: u32) {
     wasm!(function; LocalGet(local), I32WrapI64, I32Load(m32(offset)));
 }
 
 /// Push `1` when the jsval in `local` is a block of type byte `kind`.
-fn is_kind(function: &mut FnBuilder<'_>, local: u32, kind: u8) {
+pub(super) fn is_kind(function: &mut FnBuilder<'_>, local: u32, kind: u8) {
     emit_is_pointer(function, local);
     wasm!(function; If(BlockType::Result(ValType::I32)));
     emit_load_type_byte(function, local);
@@ -223,7 +232,7 @@ fn is_kind(function: &mut FnBuilder<'_>, local: u32, kind: u8) {
 }
 
 /// Throw a `RangeError` with `text` and return.
-fn throw_range_error(
+pub(super) fn throw_range_error(
     function: &mut FnBuilder<'_>,
     frame: Frame,
     [message, stack]: CalleeErrorText<'_>,
@@ -239,7 +248,7 @@ fn throw_range_error(
 }
 
 /// Throw the `RangeError` `text` when the i32 condition on the stack holds.
-fn range_error_if(
+pub(super) fn range_error_if(
     function: &mut FnBuilder<'_>,
     frame: Frame,
     text: CalleeErrorText<'static>,
@@ -252,7 +261,7 @@ fn range_error_if(
 }
 
 /// Throw the `TypeError` `text` when the i32 condition on the stack holds.
-fn type_error_if(
+pub(super) fn type_error_if(
     function: &mut FnBuilder<'_>,
     frame: Frame,
     text: CalleeErrorText<'static>,
@@ -266,7 +275,7 @@ fn type_error_if(
 
 /// `ToIntegerOrInfinity` of the jsval in i64 `v` into f64 `out` (NaN is
 /// `0`; a throwing `valueOf` returns).
-fn to_integer(function: &mut FnBuilder<'_>, v: u32, out: u32, helpers: Helpers<'_>) {
+pub(super) fn to_integer(function: &mut FnBuilder<'_>, v: u32, out: u32, helpers: Helpers<'_>) {
     wasm!(function; LocalGet(v), Call(helpers.to_number));
     return_if_pending(function);
     wasm!(function;
@@ -775,7 +784,7 @@ fn drain(
 
 /// Push element `k` (i32 local) of the array whose rooted base is in i32
 /// `list`.
-fn list_element(function: &mut FnBuilder<'_>, list: u32, k: u32) {
+pub(super) fn list_element(function: &mut FnBuilder<'_>, list: u32, k: u32) {
     wasm!(function; LocalGet(list));
     emit_array_elems(function);
     wasm!(function; LocalGet(k), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)));
@@ -783,7 +792,7 @@ fn list_element(function: &mut FnBuilder<'_>, list: u32, k: u32) {
 
 /// `ToLength(Get(obj, "length"))` of the object in i64 `obj` into f64
 /// `out` (`v` is i64 scratch; a throw returns).
-fn length_of_array_like(
+pub(super) fn length_of_array_like(
     function: &mut FnBuilder<'_>,
     (obj, v, out): (u32, u32, u32),
     strings: &StrOffsets,
@@ -801,7 +810,7 @@ fn length_of_array_like(
 }
 
 /// Push `Get(obj, k)` for the object in i64 `obj` and the i32 index `k`.
-fn get_index(function: &mut FnBuilder<'_>, obj: u32, k: u32, helpers: Helpers<'_>) {
+pub(super) fn get_index(function: &mut FnBuilder<'_>, obj: u32, k: u32, helpers: Helpers<'_>) {
     wasm!(function; LocalGet(obj));
     let mark = function.temp_mark();
     function.root_temp(TempClass::Jsval);
@@ -862,16 +871,16 @@ fn from_object(function: &mut FnBuilder<'_>, c: Ctor, strings: &StrOffsets, help
     wasm!(function; LocalGet(c.out), Return);
 }
 
-/// `Construct(c, [len])` for the constructor in i64 `c` and the length
-/// number in i64 `len`; with no positional slot (`K = 0`) the length goes in
-/// a spread argument array.
-fn construct(c: u32, len: u32, frame: Frame) -> IrNode {
-    let len = IrNode::Local(len);
-    let (args, spread) = if frame.k == 0 {
-        let spread = IrNode::ArraySpread(vec![SpreadElem::Item(len)]);
+/// `Construct(c, args)` for the constructor in i64 `c` and the jsvals in
+/// the i64 locals `args`; with fewer positional slots than arguments (`K <
+/// args.len()`) they all go in a spread argument array.
+fn construct(c: u32, args: &[u32], frame: Frame) -> IrNode {
+    let args: Vec<IrNode> = args.iter().map(|&a| IrNode::Local(a)).collect();
+    let (args, spread) = if (frame.k as usize) < args.len() {
+        let spread = IrNode::ArraySpread(args.into_iter().map(SpreadElem::Item).collect());
         (Vec::new(), Some(Box::new(spread)))
     } else {
-        (vec![len], None)
+        (args, None)
     };
     IrNode::Construct {
         callee: Box::new(IrNode::Local(c)),
@@ -896,8 +905,23 @@ fn create_from_ctor(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    create_with(function, frame, (c, &[len], out), strings, helpers);
+}
+
+/// `TypedArrayCreateFromConstructor(c, args)` for the constructor in i64
+/// `c` and the argument jsvals in the i64 locals `args` into i64 `out`: the
+/// result must be a typed array that is not out of bounds or detached and,
+/// when `args` is a single number, holds at least that many elements; else
+/// a `TypeError` (a throw returns). `frame.z64(2)` / `z64(3)` are clobbered.
+pub(super) fn create_with(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    (c, args, out): (u32, &[u32], u32),
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     emit_node(
-        &construct(c, len, frame),
+        &construct(c, args, frame),
         function,
         frame.scratch(),
         strings,
@@ -910,11 +934,124 @@ fn create_from_ctor(
     type_error_if(function, frame, CREATE_NOT_TYPED_ARRAY, strings, helpers);
     wasm!(function; LocalGet(out), I32WrapI64, Call(helpers.ta_oob()));
     type_error_if(function, frame, CREATE_OUT_OF_BOUNDS, strings, helpers);
+    if let [len] = args {
+        wasm!(function;
+            LocalGet(out), I32WrapI64, Call(helpers.ta_length()), F64ConvertI32U,
+            LocalGet(*len), F64ReinterpretI64, F64Lt,
+        );
+        type_error_if(function, frame, CREATE_TOO_SHORT, strings, helpers);
+    }
+}
+
+/// Push the intrinsic constructor of the kind of the typed array in i64
+/// `o` (`%<Kind>Array%`, the default of `TypedArraySpeciesCreate` and the
+/// constructor of `TypedArrayCreateSameType`) as a jsval; `kind` is an i32
+/// temp.
+pub(super) fn push_kind_ctor(
+    function: &mut FnBuilder<'_>,
+    o: u32,
+    kind: u32,
+    helpers: Helpers<'_>,
+) {
+    wasm!(function; LocalGet(o), I32WrapI64, I32Load8U(m8(abi::TA_KIND_OFFSET)), LocalSet(kind));
+    let ctor = |k: ElementKind| intrinsic_bits(Intrinsic::Ctor(BuiltinCtor::Typed(k)), helpers);
+    let [head, rest @ ..] = ElementKind::ALL;
+    wasm!(function; I64Const(ctor(head)));
+    for k in rest {
+        wasm!(function;
+            I64Const(ctor(k)),
+            LocalGet(kind), I32Const(i32::from(k.kind())), I32Ne,
+            Select,
+        );
+    }
+}
+
+/// `TypedArrayCreateSameType(o, [len])` for the typed array in i64 `o` and
+/// the length number in i64 `len` into i64 `out`: the realm constructor of
+/// `o`'s kind (no user code runs) through [`create_from_ctor`]; `c` is an
+/// i64 temp, `kind` an i32 temp.
+pub(super) fn create_same_type(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    (o, len, c, kind, out): (u32, u32, u32, u32, u32),
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    push_kind_ctor(function, o, kind, helpers);
+    wasm!(function; LocalSet(c));
+    create_from_ctor(function, frame, (c, len, out), strings, helpers);
+}
+
+/// `SpeciesConstructor` over a non-object `constructor`.
+const SPECIES_CTOR_NOT_OBJECT: CalleeErrorText<'static> =
+    type_error!("object.constructor is not an object");
+
+/// `SpeciesConstructor` over a `@@species` that is not a constructor.
+const SPECIES_NOT_CTOR: CalleeErrorText<'static> =
+    type_error!("object.constructor[Symbol.species] is not a constructor");
+
+/// `TypedArraySpeciesCreate`: the result's content type differs.
+const SPECIES_CONTENT_TYPE: CalleeErrorText<'static> =
+    type_error!("The TypedArray species constructor returned a TypedArray of another content type");
+
+/// The `TypeError`s of `TypedArraySpeciesCreate`.
+const SPECIES_TEXTS: [CalleeErrorText<'static>; 3] = [
+    SPECIES_CTOR_NOT_OBJECT,
+    SPECIES_NOT_CTOR,
+    SPECIES_CONTENT_TYPE,
+];
+
+/// The first `BigInt` element kind (DESIGN.md §5.8.6): a kind at or past it
+/// has the `BigInt` content type.
+const FIRST_BIGINT_KIND: i32 = 10;
+
+/// `TypedArraySpeciesCreate(o, args)` for the typed array in i64 `o` and the
+/// argument jsvals in the i64 locals `args` into i64 `out`:
+/// `SpeciesConstructor(o, %<Kind>Array%)` into i64 `c` (`C = Get(o,
+/// "constructor")`: `undefined` is the default, a non-object throws; `S =
+/// Get(C, @@species)`: `null` / `undefined` is the default, a constructor is
+/// the result, anything else throws), then [`create_with`], then the
+/// content types of `o` and the result must match. `kind` is an i32 temp; a
+/// throw returns.
+pub(super) fn species_create(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    (o, args, c, kind, out): (u32, &[u32], u32, u32, u32),
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     wasm!(function;
-        LocalGet(out), I32WrapI64, Call(helpers.ta_length()), F64ConvertI32U,
-        LocalGet(len), F64ReinterpretI64, F64Lt,
+        LocalGet(o), I32Const(static_key(strings, "constructor")), Call(helpers.get), LocalSet(c),
     );
-    type_error_if(function, frame, CREATE_TOO_SHORT, strings, helpers);
+    return_if_pending(function);
+    wasm!(function; LocalGet(c), I64Const(UNDEFINED_BITS), I64Eq, If(BlockType::Empty));
+    push_kind_ctor(function, o, kind, helpers);
+    wasm!(function; LocalSet(c), Else);
+    emit_is_object(function, c);
+    wasm!(function; I32Eqz);
+    type_error_if(function, frame, SPECIES_CTOR_NOT_OBJECT, strings, helpers);
+    wasm!(function;
+        LocalGet(c), I32Const(realm::symbol_addr(WellKnown::Species, helpers)),
+        Call(helpers.symbol_get()), LocalSet(c),
+    );
+    return_if_pending(function);
+    emit_is_nullish(function, c);
+    wasm!(function; If(BlockType::Empty));
+    push_kind_ctor(function, o, kind, helpers);
+    wasm!(function; LocalSet(c), Else);
+    emit_is_constructor(function, c, helpers);
+    wasm!(function; I32Eqz);
+    type_error_if(function, frame, SPECIES_NOT_CTOR, strings, helpers);
+    wasm!(function; End, End);
+    create_with(function, frame, (c, args, out), strings, helpers);
+    wasm!(function;
+        LocalGet(o), I32WrapI64, I32Load8U(m8(abi::TA_KIND_OFFSET)),
+        I32Const(FIRST_BIGINT_KIND), I32GeU,
+        LocalGet(out), I32WrapI64, I32Load8U(m8(abi::TA_KIND_OFFSET)),
+        I32Const(FIRST_BIGINT_KIND), I32GeU,
+        I32Ne,
+    );
+    type_error_if(function, frame, SPECIES_CONTENT_TYPE, strings, helpers);
 }
 
 /// `%TypedArray%.of(...items)`: `this` must be a constructor; then
