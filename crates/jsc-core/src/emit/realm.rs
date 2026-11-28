@@ -3043,6 +3043,60 @@ pub(super) struct Entry {
     pub(super) value: Value,
 }
 
+impl Entry {
+    /// Whether the entry belongs to binary data (DESIGN.md §5.8.5): it is an
+    /// own property of a binary-data constructor or prototype, or its value
+    /// is one, or a builtin of a binary-data family. Runtime shaking ignores
+    /// such an entry in a program that cannot reach binary data.
+    pub(super) fn is_binary(&self) -> bool {
+        self.intrinsic.is_binary()
+            || match self.value {
+                Value::Method(builtin) => builtin.is_binary(),
+                Value::Intrinsic(intrinsic) => intrinsic.is_binary(),
+                Value::Accessor { get, set } => {
+                    get.is_binary() || set.is_some_and(Builtin::is_binary)
+                }
+                Value::Str(_)
+                | Value::Num(_)
+                | Value::Undefined
+                | Value::Bool(_)
+                | Value::Symbol(_) => false,
+            }
+    }
+}
+
+/// Whether `ctor` is a binary-data constructor: `ArrayBuffer`, `DataView`,
+/// `%TypedArray%` or a typed-array constructor of any element kind.
+fn is_binary_ctor(ctor: BuiltinCtor) -> bool {
+    matches!(
+        ctor,
+        BuiltinCtor::ArrayBuffer
+            | BuiltinCtor::DataView
+            | BuiltinCtor::TypedArray
+            | BuiltinCtor::Typed(_)
+    )
+}
+
+impl Intrinsic {
+    /// Whether this is a binary-data constructor or its prototype.
+    pub(super) fn is_binary(self) -> bool {
+        matches!(self, Self::Ctor(ctor) | Self::Prototype(ctor) if is_binary_ctor(ctor))
+    }
+}
+
+impl Builtin {
+    /// Whether this belongs to a binary-data family: an `ArrayBuffer`,
+    /// `DataView` or typed-array builtin, a binary-data constructor, or the
+    /// `get [@@species]` of one.
+    pub(super) fn is_binary(self) -> bool {
+        match self {
+            Self::ArrayBuffer(_) | Self::DataView(_) | Self::TypedArray(_) => true,
+            Self::Ctor(ctor) | Self::Species(SpeciesOp::Getter(ctor)) => is_binary_ctor(ctor),
+            _ => false,
+        }
+    }
+}
+
 /// Builtin methods and error `name`/`message`: writable, configurable, not
 /// enumerable.
 const METHOD_ATTRS: u32 = abi::ATTR_WRITABLE | abi::ATTR_CONFIGURABLE;
