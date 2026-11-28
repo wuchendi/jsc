@@ -1132,7 +1132,7 @@ function-index order:
 | number to string (§6.5) | `__umul128`, `__ryu_pow5`, `__ryu_mul_shift`, `__ryu_mp5`, `__ryu_d2d(bits)` (Ryu shortest digits), `__scratch_str(ptr, len)`, `__num_to_str(bits)` (`Number::toString`), `__prim_str(v)` (`ToString` of a primitive), `__msg_str(v)` (the text of any value in an error message), `__dec_expand(bits)` (the exact decimal expansion), `__num_format(bits, mode, f)` (`toFixed` / `toExponential` / `toPrecision`), `__num_radix(bits, radix)` |
 | string to number (§6.5) | `__num_unit`, `__str_ws`, `__dec_parse(data, start, end)`, `__dec_slow`, `__dec_round`, `__dec_left`, `__dec_right`, `__digit_span`, `__radix_pow2`, `__radix_fold`, `__string_to_number(s)`, `__to_number_prim(v)`, `__parse_float(v)`, `__parse_int(v, radix)` |
 | clock, random | `__now()`, `__random()` (§6.5) |
-| BigInt (§6.10) | `__bigint_new(len, neg)`, `__bigint_trim(p)`, `__bigint_eq(a, b)`, `__bigint_cmp_mag(a, b)`, `__bigint_cmp(a, b)`, `__bigint_cmp_num(a, x)`, `__bigint_hash(p)`, `__bigint_to_string(v, radix)`, `__string_to_bigint(s)`, `__bigint_to_f64(p)`, `__bigint_from_f64(x)`, `__to_numeric(v)`, `__to_bigint(v)`, `__bigint_loose_eq(a, b)` (the last group, after the extra helpers) |
+| BigInt (§6.10) | `__bigint_new(len, neg)`, `__bigint_trim(p)`, `__bigint_eq(a, b)`, `__bigint_cmp_mag(a, b)`, `__bigint_cmp(a, b)`, `__bigint_cmp_num(a, x)`, `__bigint_hash(p)`, `__bigint_to_string(v, radix)`, `__string_to_bigint(s)`, `__bigint_to_f64(p)`, `__bigint_from_f64(x)`, `__to_numeric(v)`, `__to_bigint(v)`, `__bigint_loose_eq(a, b)`, `__bigint_add(a, b)`, `__bigint_sub(a, b)`, `__bigint_mul(a, b)`, `__bigint_divmod(a, b, want_rem)`, `__bigint_pow(a, b)`, `__bigint_neg(a)`, `__bigint_mag_step(p, inc, neg)`, `__bigint_add_small(v, d)`, `__bigint_not(a)`, `__bigint_bitop(a, b, op)`, `__bigint_shift(a, n, right)`, `__numeric_op(a, b, op)`, `__numeric_unary(v, op)` (the last group, after the extra helpers) |
 | misc | `__gen_to_array(gen)`, `__nullish_throw(recv, key, set)`, `__prop_throw(recv, key, mode)`, `__box_f64(x)`, `__to_number(v)` |
 | trampolines | `__invoke1(fn, arg)` (the promise jobs' callback trampoline), `__async_step(gen, sent)` (the `async` driver's step trampoline), the two `new Promise` settlers |
 | constructors | `new_string(len, two_byte)`, `__new_array(len)` |
@@ -1739,11 +1739,11 @@ them.
 
 ### 6.10 BigInt
 
-> **Partly implemented** (phase 5b, workstream L2-B). Stage B2a (the value,
+> **Partly implemented** (phase 5b, workstream L2-B). Stages B2a (the value,
 > literals, conversions, equality, hashing, property keys, JSON, the wrapper
-> and the empty `%BigInt.prototype%`) is implemented as described; the
-> operators (B2b), the `BigInt` builtins (B3) and the closeout (B4) are still
-> the design (table at the end). Each stage turns its part of this text into
+> and the empty `%BigInt.prototype%`) and B2b (the operators, §6.10.4–6.10.6)
+> are implemented as described; the `BigInt` builtins (B3) and the closeout
+> (B4) are still the design (table at the end). Each stage turns its part of this text into
 > a description of the implementation and drops the "lands in" notes it
 > fulfils. ECMA-262 §6.1.6.2 (the BigInt
 > type), §7.1 (conversions), §13 (operators), §21.2 (the BigInt object).
@@ -1856,11 +1856,12 @@ heap kind is needed.
 
 All conversion helpers live in `emit/bigint.rs` (the `Big` group of
 `emit/registry.rs`, the last helper group, tree-shaken by `emit/shake.rs`
-like every helper: a
-program with no BigInt literal, no `BigInt` reference and no
-`TYPE_BIGINT`-producing builtin emits none of them; the shared conversion
-helpers (`__to_string`, `__loose_eq`, ..) call them only behind a type-byte
-test, so a program without BigInts keeps them out of its module).
+like every helper). The shaker follows static calls: the cold arm of every
+numeric operator calls `__numeric_op` / `__numeric_unary` /
+`__bigint_add_small` (§6.10.5), so a program with any of `- * / % ** & | ^
+<< >> >>>`, unary `-` / `~` or `++` / `--` keeps the operator kernels and
+the conversions they reach; a program with none of them, no BigInt literal
+and no `BigInt` reference emits none of them.
 
 | operation | helper / site | rule |
 |---|---|---|
@@ -1910,15 +1911,16 @@ compare.
 | helper | algorithm |
 |---|---|
 | `__bigint_cmp_mag(a, b) -> i32` | length, then limbs from the top; leaf |
-| `__bigint_add(a, b)`, `__bigint_sub(a, b)` | sign dispatch to magnitude add (carry) or subtract-larger-minus-smaller; result `max(len) + 1` limbs |
-| `__bigint_mul(a, b)` | schoolbook O(n·m), `len_a + len_b` limbs; a zero operand returns `BIGINT_ZERO`; bound checked first |
-| `__bigint_divmod(a, b, want_rem)` | `b = 0n` → `RangeError: Division by zero`; `|a| < |b|` → `0n` / `a`; one-limb divisor → short division; otherwise Knuth's Algorithm D (normalize so the divisor's top bit is set, estimate each quotient limb from the top two limbs with the `q̂` correction, multiply-subtract, add back on borrow, denormalize the remainder). Chosen over shift-subtract, which costs a full-width subtract per *bit* (32× more passes). Quotient truncates toward zero with sign `sa ^ sb`; the remainder takes the dividend's sign |
+| `__bigint_add(a, b)`, `__bigint_sub(a, b)` | sign dispatch to magnitude add (carry, `max(len) + 1` limbs) or subtract-larger-minus-smaller (`__bigint_cmp_mag` picks the larger, which gives the sign; equal magnitudes are `0n`); one body emitted twice (`emit_add_sub(sub)`) |
+| `__bigint_mul(a, b)` | schoolbook O(n·m), `len_a + len_b` limbs (every `r + a_i·b_j + carry` fits a `u64`); a zero operand returns `BIGINT_ZERO`; the bound is `__bigint_new`'s |
+| `__bigint_divmod(a, b, want_rem)` | `b = 0n` → `RangeError: Division by zero`; `|a| < |b|` → `0n` / `a`; one-limb divisor → short division; otherwise Knuth's Algorithm D (normalize copies of both operands — two unpublished `__bigint_new` blocks — so the divisor's top bit is set, estimate each quotient limb from the top two limbs with the `q̂` correction, multiply-subtract, add back on borrow, denormalize the remainder; `q̂ <= B + 1`, so `q̂·v[n-2]` and `r̂:u[j+n-2]` fit a `u64`). Chosen over shift-subtract, which costs a full-width subtract per *bit* (32× more passes). Quotient truncates toward zero with sign `sa ^ sb`; the remainder takes the dividend's sign |
 | `__bigint_pow(a, b)` | `b < 0n` → `RangeError: Exponent must be non-negative`; `b = 0n` → `1n` (also `0n ** 0n`); base `0n` / `1n` → itself, `-1n` → `±1n` by parity; otherwise `b` must fit `u32` and `bitlen(a)·b <= 2^24`, else `RangeError: Maximum BigInt size exceeded`; then square-and-multiply |
 | `__bigint_neg(a)` | copy with the sign flipped (`0n` stays `0n`) |
-| `__bigint_add_small(a, d: i32)` | `a + d` for `d = ±1` (`++` / `--`) |
+| `__bigint_mag_step(p, inc, neg)` | the value with magnitude `|p| + 1` (`inc`) or `|p| - 1` and sign `neg` (carry / borrow pass) |
+| `__bigint_add_small(v: i64, d: i32)` | `v + d` for `d = ±1` (`++` / `--`): `__bigint_mag_step` growing the magnitude when `d` has the value's sign (or the value is `0n`), else shrinking it |
 | `__bigint_bitop(a, b, op)` | `&` `|` `^` on infinite two's complement: width `w = max(len) + 1` limbs; a negative operand is converted limb by limb to `~(|x| - 1)` (sign-extended with `0xFFFF_FFFF`), the op runs limb-wise, the result is negative iff its top limb's bit 31 is set (AND: both negative; OR: either; XOR: exactly one) and is converted back with `|r| = ~r + 1` |
-| `__bigint_not(a)` | `~a = -a - 1n` |
-| `__bigint_shl(a, n)` / `__bigint_sar(a, n)` | the count is a BigInt: a negative count shifts the other way. `a = 0n` → `0n`. Left: a count above `2^24` → `RangeError: Maximum BigInt size exceeded`; else limb move + bit shift. Right (floor semantics): a count `>= bitlen(a)` gives `0n` (non-negative) or `-1n` (negative); else `q = |a| >> n` and, for a negative `a`, `q + 1` when any shifted-out bit was set, result `-q` |
+| `__bigint_not(a)` | `~a = -a - 1n`: `__bigint_mag_step` with `-(|a| + 1)` for a non-negative `a`, `|a| - 1` for a negative one |
+| `__bigint_shift(a, n, right)` | `<<` (`right` 0) and `>>` (`right` 1) in one helper; the count is a BigInt: a negative count shifts the other way (a count of more than one limb is huge either way). `a = 0n` → `0n`. Left: a count above `2^24` → `RangeError: Maximum BigInt size exceeded`; else limb move + bit shift. Right (floor semantics): a count `>= bitlen(a)` gives `0n` (non-negative) or `-1n` (negative); else `q = |a| >> n` and, for a negative `a`, `q + 1` when any shifted-out bit was set (one spare limb for the carry), result `-q` |
 | `__bigint_as_n(bits: f64, a, signed: i32)` | `asUintN`: `a mod 2^bits` — non-negative `a` keeps its low `bits` bits; negative `a` with nonzero low part `r` gives `2^bits - r` (size checked: `bits` above `2^24` with such an `a` is the size `RangeError`); `asIntN`: that value minus `2^bits` when `bits > 0` and bit `bits - 1` is set; `bits = 0` → `0n` |
 | `__bigint_eq(a, b) -> i32` | both `TYPE_BIGINT` and identical header sign, `len` and limbs (canonical form); `0` when either is not a BigInt; leaf |
 | `__bigint_cmp(a, b) -> i32` | signed compare (`-1/0/1`); leaf |
@@ -1936,17 +1938,17 @@ path where an operand is already known not to be a number.
 - `IrNode::BigInt { neg: bool, limbs: Box<[u32]> }`: a literal, from swc's
   `Lit::BigInt` (`value.to_u32_digits()`; no new dependency). Unary minus
   folds into a literal operand (`-1n`; `-0n` is `0n`).
-- `BinOp::Exp`: `a ** b` and `**=` (the five `MathOp::Pow` construction
-  sites for `**` in `codegen/expr.rs`: the binary at ~150 and the `**=`
-  forms at ~1726, ~1915, ~2024). `Math.pow` keeps `MathCall Pow` (ToNumber
-  semantics: `Math.pow(2n, 1n)` throws). `BinOp::Exp` emits the existing
-  `emit_pow` body after the numeric-operand prologue below, so a
-  Number `**` computes exactly what it does today.
+- `BinOp::Exp`: `a ** b` and `**=` (the binary, and the `**=` forms of
+  identifiers, members, private names and `super`). `Math.pow` keeps
+  `MathCall Pow` (ToNumber semantics: `Math.pow(2n, 1n)` throws).
+  `BinOp::Exp` emits the `emit_pow` body (`emit_pow_body`) after the
+  numeric-operand prologue below, so a Number `**` computes exactly what it
+  did before.
 - `IrNode::Negate(Box<IrNode>)` and `IrNode::BitNot(Box<IrNode>)`: unary `-`
-  and `~` (today `-0 - x` and `x ^ -1`, which are wrong for BigInt:
-  `-0 - 1n` and `1n ^ -1` throw). They emit the same Number code as today
-  (`emit_arith` with lhs `-0`, `emit_bitwise` with rhs `-1`), differing only
-  in the cold arm's opcode.
+  and `~` (formerly `-0 - x` and `x ^ -1`, which are wrong for BigInt:
+  `-0 - 1n` and `1n ^ -1` throw). `emit_numeric_unary` computes a number
+  operand inline (`-0 - x`, `ToInt32(x) ^ -1`: the same values) and sends
+  any other operand to `__numeric_unary`.
 - `ConvertOp::ToNumeric` and `IrNode::NumericStep { arg, inc }` (`arg ± 1`
   of `arg`'s own type; `arg` is already numeric): the update forms that are
   not a plain local — cells, globals, generator slots (`codegen/generator.rs`
@@ -1956,10 +1958,11 @@ path where an operand is already known not to be a number.
   delta`, and postfix's old value to `NumericStep(store, !inc)` instead of
   `store - delta` (exact for BigInt; for numbers the same value as today).
 
-**Numeric-operand prologue** (`emit/numeric.rs`). `emit_arith`, `emit_mod`,
-`emit_bitwise` and `Exp` stop calling `emit_coerce_operands` (which stays,
-with ToNumber semantics, for `Math.atan2` / `Math.imul` and the other
-`Math` paths) and use a new `emit_numeric_operands(op)`:
+**Numeric-operand prologue** (`emit/numeric.rs`). The binary numeric
+operators no longer call `emit_coerce_operands` (which stays, with ToNumber
+semantics, for `Math.pow` / `Math.atan2` / `Math.imul`); one emitter,
+`emit_numeric_binary(op)`, replaces `emit_arith`, `emit_mod` and
+`emit_bitwise`:
 
 ```text
 block (result i64)                         ;; new; 0 fuel
@@ -1974,27 +1977,32 @@ block (result i64)                         ;; new; 0 fuel
 end
 ```
 
+The prologue is `emit_numeric_binary`; the inline Number computation is
+`emit_number_op(op, s0, s1, pow_scratch)` (the `emit_pow` body is
+`emit_pow_body`, shared with `Math.pow`, whose prologue keeps
+`emit_coerce_operands`).
+
 `__numeric_op(a, b, op: i32) -> i64` (`emit/bigint.rs`): `a =
 __to_numeric(a)`, then `b = __to_numeric(b)` (left first, each may throw);
-both numbers → the Number result (the same f64 / `ToInt32` code as the
-inline path, emitted from the shared `emit/numeric.rs` routines, `emit_pow`
-included); one BigInt and one number → `TypeError: Cannot mix BigInt and
+both numbers → the Number result (`emit_number_op`, the inline code);
+one BigInt and one number → `TypeError: Cannot mix BigInt and
 other types, use explicit conversions`; two BigInts → the kernel. Op codes
-(`NUMOP_*` in `emit/bigint.rs`): `SUB MUL DIV MOD EXP AND OR XOR SHL SHR
-USHR`. `>>>` on two BigInts throws `TypeError: BigInts have no unsigned right
+(`NUMOP_*` in `emit/bigint.rs`): `ADD SUB MUL DIV MOD EXP AND OR XOR SHL SHR
+USHR` (`ADD` is `__add`'s, below). `>>>` on two BigInts throws `TypeError: BigInts have no unsigned right
 shift, use >> instead`. `__numeric_unary(v, op)` does the same for
-`Negate` / `BitNot` (`ToNumeric` once; number → `-x` / `~ToInt32(x)`,
-BigInt → `__bigint_neg` / `__bigint_not`). Unary `+` stays `ToNumber` and
-so throws for a BigInt.
+`Negate` / `BitNot` (`NUMOP_NEG` / `NUMOP_NOT`; `ToNumeric` once; number →
+`-0 - x` / `~ToInt32(x)`, BigInt → `__bigint_neg` / `__bigint_not`); the
+inline site computes a number operand itself and calls it only for any other
+operand. Unary `+` stays `ToNumber` and so throws for a BigInt.
 
 | operator | two BigInts | BigInt with number | notes |
 |---|---|---|---|
-| `+` | `__bigint_add` | `TypeError` | in `__add` (`emit/convert.rs`): after both `ToPrimitive`s, a string operand concatenates (BigInt → decimal), else `ToNumeric` both and dispatch. The inline `+` already sends any heap operand to `__add`, so `emit_add` is unchanged |
+| `+` | `__bigint_add` | `TypeError` | in `__add` (`emit/convert.rs`): after both `ToPrimitive`s, a string operand concatenates (BigInt → decimal), else a BigInt operand hands both to `__numeric_op(a, b, NUMOP_ADD)` (the other is a primitive, so its `ToNumeric` is `ToNumber`; a symbol throws), else the `ToNumber`s add as before. The inline `+` already sends any heap operand to `__add`, so `emit_add` is unchanged |
 | `-` `*` | `__bigint_sub` / `__bigint_mul` | `TypeError` | |
 | `/` `%` | `__bigint_divmod` | `TypeError` | divisor `0n` → `RangeError` |
 | `**` | `__bigint_pow` | `TypeError` | negative exponent → `RangeError` |
 | `&` `|` `^` | `__bigint_bitop` | `TypeError` | two's complement |
-| `<<` `>>` | `__bigint_shl` / `__bigint_sar` | `TypeError` | negative count reverses |
+| `<<` `>>` | `__bigint_shift` | `TypeError` | negative count reverses |
 | `>>>` | `TypeError` | `TypeError` | |
 | unary `-` `~` | `__bigint_neg` / `__bigint_not` | — | via `__numeric_unary` |
 | `++` `--` | `__bigint_add_small(v, ±1)` | — | below |
@@ -2003,8 +2011,16 @@ so throws for a BigInt.
 existing `emit_coerce_number(local)` becomes `local = __to_numeric(local)`
 followed, still inside the arm, by a BigInt branch that computes
 `__bigint_add_small(local, ±1)`, leaves the prefix / postfix result and
-`br`s out of a new enclosing block; the Number path is unchanged.
-`NumericStep` emits `is_number ? f64 add ±1 : __numeric_step(v, inc)`.
+`br`s out of a new enclosing block; the Number path is unchanged. The three
+writes of the local are announced as `IncDec { local }` definitions (the
+old `note_numeric_def` is gone), so the fixpoint keeps a numeric loop
+counter unrooted. `NumericStep` emits `is_number ? f64 add ±1 :
+__bigint_add_small(v, ±1)`: its operand is already numeric, so a separate
+`__numeric_step` helper is not needed. A member update (`IndexOpSet` with
+`OpSetKind::{Prefix,Postfix}Update`, `emit/object.rs`) reads with
+`ToNumeric` and stores `NumericStep` of the old value; the cell, global,
+generator-slot, private and `super` updates are lowered to the same nodes in
+codegen.
 
 **Root classification** (`emit/roots.rs::classify`, and `yields_number` in
 `emit/numeric.rs`). An arithmetic result is no longer always a number: it may
@@ -2018,7 +2034,11 @@ the relational and equality operators, `MathCall`, `MathSpread` and
 `static_block()`. `yields_number` keeps `Num`, `MathCall`, `MathSpread`,
 `ToNumber` and `UShr` only; the `Math.*` argument paths that skip the
 coercion of a `yields_number` operand therefore coerce an arithmetic
-argument (`Math.floor(a - b)` with BigInts must throw).
+argument (`Math.floor(a - b)` with BigInts must throw). The shaker's
+dynamic-key test (`shake::note_key`) treats the numeric operators other than
+`+` as never yielding a string (`roots::never_string`): a BigInt key is a
+canonical numeric string, which names no builtin, so `a[i - 1]` still
+shakes.
 
 #### 6.10.6 Equality, comparison, hashing
 
@@ -2048,10 +2068,13 @@ argument (`Math.floor(a - b)` with BigInts must throw).
   and retry (the BigInt counts as a primitive); BigInt against `null` /
   `undefined` / symbol → `false`.
 - **Relational** (`__compare`, reached when the operands are not two strings
-  or two numbers): after `ToPrimitive` (hint number), BigInt / BigInt →
+  or two numbers): after `ToPrimitive` (hint number) and the two-strings
+  test, a BigInt operand selects the BigInt arm: BigInt / BigInt →
   `__bigint_cmp`; BigInt / string → `StringToBigInt` of the string
-  (failure → *undefined*); otherwise `ToNumeric` both (a symbol throws) and
-  BigInt / number → `__bigint_cmp_num`. An *undefined* or unordered (`2`)
+  (failure, or the size `RangeError` of a huge string, cleared → *undefined*);
+  otherwise `ToNumber` of the other operand (a symbol throws) and
+  `__bigint_cmp_num`, the order negated when the BigInt is the right
+  operand. An *undefined* or unordered (`2`)
   outcome is `false` for all four operators, including `<=` / `>=`.
 - **`Array.prototype.sort`** without a comparator compares `ToString`s, so
   BigInts sort by their decimal text through `__prim_str`.
@@ -2110,7 +2133,10 @@ moved row gets a reason cell in the stage that moves it:
 1. B2b: the cold arms of every `- * / % ** & | ^ << >> >>>`, unary `-` /
    `~` and `++` / `--` site grow (a `__numeric_op` call and a `br` instead
    of a `__to_number` call): `user_ops` of every row with such a site;
-   `fuel` only where a non-number operand is actually converted.
+   `fuel` only where a non-number operand is actually converted, except
+   that unary `-` / `~` on a number now run their own short inline code
+   (one `is_number` test, no constant-operand stash), and `++` / `--` on a
+   local open one more `block`.
 2. B2b: the root classification (§6.10.5): a local defined from
    arithmetic over a non-numeric operand (a parameter, property read or call
    result) is now rooted, adding shadow-stack stores (`user_ops` and `fuel`);
@@ -2131,8 +2157,7 @@ moved row gets a reason cell in the stage that moves it:
 **Diagnostics** (§8). Nothing BigInt-specific is a compile error (the
 literal and literal-key diagnostics are gone; their `tests/pattern_keys.rs`
 cases are positive tests); every BigInt error is a run-time `TypeError` /
-`RangeError` / `SyntaxError` as listed above. Until B2b an operator on a
-BigInt throws the `ToNumber` `TypeError` rather than computing.
+`RangeError` / `SyntaxError` as listed above.
 
 **Conformance.** `BigInt` leaves `tests/test262/unsupported-features.txt`
 in B4. Of the ≈ 1 500 tests tagged `BigInt`, about 325 become eligible on
@@ -2152,7 +2177,7 @@ very large exponent / shift tests that hit the 2^24-bit cap where V8 allows
 | stage | scope | files | tests (written per the no-local-run rule; CI runs them) |
 |---|---|---|---|
 | **B2a** value | `abi.rs` (`TYPE_BIGINT`, `BIGINT_*`, `CLASS_BIGINT`, `TYPEOF_STRINGS[7]`, `BIGINT_ZERO`); literals (`IrNode::BigInt`, static blocks, `-` folding); `__bigint_new` / `trim` / `eq` / `cmp` / `hash` / `to_string` / `string_to_bigint` / `to_f64` / `from_f64`; ToBoolean, `typeof`, ToNumber `TypeError`, ToString, ToPrimitive, `__to_numeric`, `__to_bigint`; the `TYPE_SYMBOL`-site audit (primitive vs object), primitive receivers, `CLASS_BIGINT` wrapper + empty `%BigInt.prototype%` skeleton, `__to_object`; renderer, `__msg_str`; strict equality, SameValue(Zero), `__array_search`, Map hash, loose equality; property keys (literal and `__to_key`); JSON `TypeError`; §4.1 / §5.2 / §5.7 / §6.9 / §7.2 / §8 text | `abi.rs`, `ir.rs`, `codegen/{expr,stmt}.rs`, `emit/{bigint,sections,registry,shake,roots,value,expr,stmt,render,dtoa,strtod,convert,runtime,props,realm,gc}.rs`, `emit/props/descriptor.rs`, `emit/builtins/{json,mod,map_set,array}.rs` | new `tests/bigint.rs` (literals, `typeof`, truthiness, rendering incl. nested and wrapper, ToString of multi-limb values in radix 10, equality / SameValueZero / Map keys, loose equality vs number / string incl. `NaN`, `±Infinity`, values above `2^64`, property keys, JSON `TypeError`, ToNumber `TypeError` through `+x` / `Math.abs`); `pattern_keys.rs` rewrites; `abi_drift_tests.rs` `TYPEOF_STRINGS[7]` |
-| **B2b** operators | `BinOp::Exp`, `Negate`, `BitNot`, `ToNumeric`, `NumericStep`; `emit_numeric_operands`, `__numeric_op`, `__numeric_unary`, `__numeric_step`; every kernel of §6.10.4 except `as_n`; `__add` BigInt path; relational `__compare`; `emit_inc_dec`; root classification and `yields_number`; opcount reasons | `ir.rs`, `codegen/{expr,generator}.rs`, `emit/{numeric,bigint,convert,expr,roots}.rs`, `tests/opcount/snapshot.tsv` | new `tests/bigint_ops.rs` (every operator and compound form, relational operators vs number / string incl. `NaN`, `±Infinity`, non-integral numbers and unparsable strings, mixed-type `TypeError`s, `>>>` / unary `+` `TypeError`, division / remainder signs and `RangeError`, `**` negative exponent, bitwise and shifts on negatives across limb boundaries, huge shift counts, `++`/`--` on locals, cells, globals, members, generator slots, multi-limb `*` and `/` cross-checked against known products); a `gc_stress` variant module in the same file (`CompileOptions::gc_stress = 1`) over multi-limb loops (factorial of 200, a Fibonacci accumulator, divmod round trips) so every allocation collects while operands are live |
+| **B2b** operators (implemented) | `BinOp::Exp`, `Negate`, `BitNot`, `ToNumeric`, `NumericStep`; `emit_numeric_binary`, `__numeric_op`, `__numeric_unary`; every kernel of §6.10.4 except `as_n`; `__add` BigInt path; relational `__compare`; `emit_inc_dec`; root classification and `yields_number`; opcount reasons | `ir.rs`, `codegen/{expr,generator}.rs`, `emit/{numeric,bigint,convert,expr,roots}.rs`, `tests/opcount/snapshot.tsv` | new `tests/bigint_ops.rs` (every operator and compound form, relational operators vs number / string incl. `NaN`, `±Infinity`, non-integral numbers and unparsable strings, mixed-type `TypeError`s, `>>>` / unary `+` `TypeError`, division / remainder signs and `RangeError`, `**` negative exponent, bitwise and shifts on negatives across limb boundaries, huge shift counts, `++`/`--` on locals, cells, globals, members, generator slots, multi-limb `*` and `/` cross-checked against known products); a `gc_stress` variant module in the same file (`CompileOptions::gc_stress = 1`) over multi-limb loops (factorial of 200, a Fibonacci accumulator, divmod round trips) so every allocation collects while operands are live |
 | **B3** built-ins | `BigInt` ctor, `asIntN` / `asUintN` (`__bigint_as_n`), `%BigInt.prototype%` methods and `@@toStringTag`, `toString(radix)`, `Number(1n)` (`ConvertOp::NumberCall`), `__bigint_to_i64` / `__bigint_from_i64` | `ir.rs`, `codegen/*` (the `Number(..)` inline call), `emit/realm.rs`, new `emit/builtins/bigint.rs`, `emit/builtins/{mod,number}.rs`, `emit/bigint.rs` | new `tests/bigint_builtins.rs` (constructor coercions incl. strings in every radix, whitespace, syntax errors, `new BigInt` `TypeError`, `RangeError` for non-integers, `asIntN` / `asUintN` edge widths 0 / 1 / 64 / 65 and negative inputs, `toString` radices 2..36 on multi-limb values, `thisBigIntValue` errors, `Number(2n**1024n)` = `Infinity`, round-half-even at `2^53 + 1`), with a `gc_stress` variant for the radix conversions |
 | **B4** closeout | remove `BigInt` from `unsupported-features.txt`; delete the §13 BigInt lines (the `RegExp, BigInt, ..` "not available" line, the limitation-table row, the BigInt property-key line, the §14 roadmap mention); test262 baseline / history from CI; fold this section's design notes into present-tense text | `tests/test262/*`, `DESIGN.md` | test262 delta recorded (target ≈ +300 of the 325 newly eligible) |
 
@@ -2210,15 +2235,12 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   **ToNumber** (with `ToPrimitive` for objects). Binary `+` follows §6.5.
   `**` and `Math.pow` share one inline implementation.
 - **Bitwise and shift** `& | ^ ~ << >> >>>` and their compound forms, with
-  ToInt32 / ToUint32 on the operands.
-- **BigInt** (§6.10.5–6.10.6): equality, SameValue(Zero) and `+` with a
-  string are implemented (B2a); every other operator still applies
-  ToNumber, which throws a `TypeError` for a BigInt. Design (lands in B2b):
-  every operator above applies ToNumeric instead of ToNumber on its
-  non-number path; two BigInts use the BigInt kernels, a BigInt mixed with a
-  number throws `TypeError` (except `+` with a string, and the comparisons,
-  which are exact), unary `+` and `>>>` throw for a BigInt, and `**` leaves
-  the `Math.pow` lowering for its own `BinOp::Exp`.
+  ToInt32 / ToUint32 on the operands (ToNumeric first: see BigInt below).
+- **BigInt** (§6.10.5–6.10.6): every operator above applies ToNumeric
+  instead of ToNumber on its non-number path; two BigInts use the BigInt
+  kernels, a BigInt mixed with a number throws `TypeError` (except `+` with
+  a string, and the comparisons, which are exact), unary `+` and `>>>` throw
+  for a BigInt, and `**` is its own `BinOp::Exp` (`Math.pow` keeps ToNumber).
 - **Relational** `< > <= >=` (§6.5).
 - **Strict equality** `===` / `!==`: numbers numerically (`NaN !== NaN`,
   `+0 === -0`), strings by byte content, BigInts by value, everything else

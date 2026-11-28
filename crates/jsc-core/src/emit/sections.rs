@@ -473,6 +473,7 @@ pub(super) fn collect_strings(program: &IrProgram) -> (StrOffsets, i32) {
         .chain(builtins::strings())
         .chain(convert::strings())
         .chain(bigint::strings())
+        .chain(bigint::op_strings())
         .chain(dtoa::STRINGS)
         .chain(render::STRINGS)
         .chain([STACK_KEY, STACK_OVERFLOW_MSG, STACK_OVERFLOW_STACK])
@@ -788,6 +789,9 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
         }
         IrNode::StrLen(operand)
         | IrNode::Not(operand)
+        | IrNode::Negate(operand)
+        | IrNode::BitNot(operand)
+        | IrNode::NumericStep { arg: operand, .. }
         | IrNode::IsHole(operand)
         | IrNode::IsObject(operand)
         | IrNode::IsArray(operand)

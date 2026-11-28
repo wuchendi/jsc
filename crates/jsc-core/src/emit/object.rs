@@ -2776,15 +2776,23 @@ pub(super) fn emit_index_op_set_node(
         );
     });
     function.instruction(&Instruction::LocalSet(new_local));
-    let new_value = IrNode::Binary {
-        op,
-        lhs: Box::new(IrNode::Local(new_local)),
-        rhs: rhs.clone(),
+    // A member `++`/`--` (`rhs` is the step `±1`) converts the current value
+    // with ToNumeric first and steps it in its own type.
+    let new_value = if *kind == OpSetKind::Compound {
+        IrNode::Binary {
+            op,
+            lhs: Box::new(IrNode::Local(new_local)),
+            rhs: rhs.clone(),
+        }
+    } else {
+        IrNode::NumericStep {
+            arg: Box::new(IrNode::Local(new_local)),
+            inc: matches!(**rhs, IrNode::Num(delta) if delta > 0.0),
+        }
     };
-    // A member `++`/`--` converts the current value with ToNumber first.
     if *kind != OpSetKind::Compound {
         let old_num = IrNode::ConvertCall {
-            op: ConvertOp::ToNumber,
+            op: ConvertOp::ToNumeric,
             arg: Box::new(IrNode::Local(new_local)),
             radix: None,
         };

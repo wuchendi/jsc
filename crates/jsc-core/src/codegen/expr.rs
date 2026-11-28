@@ -148,9 +148,10 @@ impl LowerCtx<'_> {
             // Exponentiation `a ** b` lowers to the same power op as `Math.pow(a, b)`
             // (swc parses `**` right-associative, so `2 ** 3 ** 2` is already
             // `2 ** (3 ** 2)`; the AST is lowered as given).
-            Expr::Bin(b) if matches!(b.op, BinaryOp::Exp) => Ok(IrNode::MathCall {
-                op: MathOp::Pow,
-                args: vec![self.lower_expr(&b.left)?, self.lower_expr(&b.right)?],
+            Expr::Bin(b) if matches!(b.op, BinaryOp::Exp) => Ok(IrNode::Binary {
+                op: BinOp::Exp,
+                lhs: Box::new(self.lower_expr(&b.left)?),
+                rhs: Box::new(self.lower_expr(&b.right)?),
             }),
             // `key in obj`: an own-key membership test, lowered to a runtime
             // key-table scan. `left` is the property key, `right` the object.
@@ -184,10 +185,9 @@ impl LowerCtx<'_> {
             Expr::Unary(u) => match u.op {
                 // Unary minus is constant-folded when the operand lowers to a
                 // literal (`-5` becomes `Num(-5.0)`, `-1n` a negative BigInt
-                // literal, `-0n` is `0n`); otherwise it is
-                // represented as `-0 - operand`, which flips the sign of zero
-                // (`-0 - +0` is `-0`, `-0 - -0` is `+0`) and negates any other
-                // number.
+                // literal, `-0n` is `0n`); otherwise it is an
+                // [`IrNode::Negate`] (`ToNumeric`, then `-0 - x` for a number,
+                // the negated value for a `BigInt`).
                 UnaryOp::Minus => {
                     let operand = self.lower_expr(&u.arg)?;
                     match operand {
@@ -196,11 +196,7 @@ impl LowerCtx<'_> {
                             neg: !neg && !limbs.is_empty(),
                             limbs,
                         }),
-                        other => Ok(IrNode::Binary {
-                            op: BinOp::Sub,
-                            lhs: Box::new(IrNode::Num(-0.0)),
-                            rhs: Box::new(other),
-                        }),
+                        other => Ok(IrNode::Negate(Box::new(other))),
                     }
                 }
                 // Unary plus is ToNumber (the same conversion as `Number(x)`),
@@ -225,13 +221,9 @@ impl LowerCtx<'_> {
                     }
                     operand => operand,
                 }))),
-                // `~operand` is `ToInt32(operand) ^ -1`, so it reuses the
-                // `BinOp::BitXor` lowering (ToNumber, then ToInt32).
-                UnaryOp::Tilde => Ok(IrNode::Binary {
-                    op: BinOp::BitXor,
-                    lhs: Box::new(self.lower_expr(&u.arg)?),
-                    rhs: Box::new(IrNode::Num(-1.0)),
-                }),
+                // `~operand`: `ToNumeric`, then `ToInt32(x) ^ -1` for a number,
+                // `-x - 1n` for a `BigInt` ([`IrNode::BitNot`]).
+                UnaryOp::Tilde => Ok(IrNode::BitNot(Box::new(self.lower_expr(&u.arg)?))),
                 // `!operand` is logical NOT: boolean inverse of truthiness.
                 UnaryOp::Bang => Ok(IrNode::Not(Box::new(self.lower_expr(&u.arg)?))),
                 // `delete obj.k` / `delete obj[k]` removes an own property and
@@ -926,17 +918,16 @@ impl LowerCtx<'_> {
                 stmts.push(IrStmt::Decl {
                     local: old_local,
                     init: IrNode::ConvertCall {
-                        op: ConvertOp::ToNumber,
+                        op: ConvertOp::ToNumeric,
                         arg: Box::new(read),
                         radix: None,
                     },
                 });
                 let store = super_set(
                     &target,
-                    IrNode::Binary {
-                        op: BinOp::Add,
-                        lhs: Box::new(IrNode::Local(old_local)),
-                        rhs: Box::new(IrNode::Num(if inc { 1.0 } else { -1.0 })),
+                    IrNode::NumericStep {
+                        arg: Box::new(IrNode::Local(old_local)),
+                        inc,
                     },
                 );
                 if prefix {
@@ -961,9 +952,10 @@ impl LowerCtx<'_> {
             ),
             SuperWrite::Assign(AssignKind::Pow | AssignKind::Plain, right) => super_set(
                 &target,
-                IrNode::MathCall {
-                    op: MathOp::Pow,
-                    args: vec![read, self.lower_expr(right)?],
+                IrNode::Binary {
+                    op: BinOp::Exp,
+                    lhs: Box::new(read),
+                    rhs: Box::new(self.lower_expr(right)?),
                 },
             ),
         };
@@ -1730,9 +1722,10 @@ impl LowerCtx<'_> {
                 rhs: Box::new(set(rhs)),
             }
         } else if assign.op == AssignOp::ExpAssign {
-            set(IrNode::MathCall {
-                op: MathOp::Pow,
-                args: vec![get, rhs],
+            set(IrNode::Binary {
+                op: BinOp::Exp,
+                lhs: Box::new(get),
+                rhs: Box::new(rhs),
             })
         } else {
             let op = map_assign_op(assign.op, assign.span())?
@@ -1753,7 +1746,8 @@ impl LowerCtx<'_> {
     }
 
     /// `obj.#x++` / `--obj.#x` on the already lowered receiver `obj`: read,
-    /// `ToNumber`, store the sum; a postfix update yields the old number.
+    /// `ToNumeric`, store the step; a postfix update yields the old numeric
+    /// value.
     fn lower_private_update(
         &mut self,
         update: &UpdateExpr,
@@ -1762,22 +1756,16 @@ impl LowerCtx<'_> {
     ) -> anyhow::Result<IrNode> {
         let target = self.private_ref(prop)?;
         let (tmp, old) = (self.fresh(), self.fresh());
-        let delta = if matches!(update.op, UpdateOp::PlusPlus) {
-            1.0
-        } else {
-            -1.0
-        };
         let read = IrNode::ConvertCall {
-            op: ConvertOp::ToNumber,
+            op: ConvertOp::ToNumeric,
             arg: Box::new(target.read(IrNode::Local(tmp))),
             radix: None,
         };
         let store = target.write(
             IrNode::Local(tmp),
-            IrNode::Binary {
-                op: BinOp::Add,
-                lhs: Box::new(IrNode::Local(old)),
-                rhs: Box::new(IrNode::Num(delta)),
+            IrNode::NumericStep {
+                arg: Box::new(IrNode::Local(old)),
+                inc: matches!(update.op, UpdateOp::PlusPlus),
             },
         );
         let mut seq = vec![
@@ -1917,9 +1905,10 @@ impl LowerCtx<'_> {
             ),
             AssignKind::Pow => Self::write_of(
                 resolved.kind,
-                IrNode::MathCall {
-                    op: MathOp::Pow,
-                    args: vec![read, rhs],
+                IrNode::Binary {
+                    op: BinOp::Exp,
+                    lhs: Box::new(read),
+                    rhs: Box::new(rhs),
                 },
             ),
             AssignKind::Logical(op) => IrNode::Logical {
@@ -2026,9 +2015,10 @@ impl LowerCtx<'_> {
                 lhs: Box::new(read),
                 rhs: Box::new(store(rhs)),
             },
-            _ => store(IrNode::MathCall {
-                op: MathOp::Pow,
-                args: vec![read, rhs],
+            _ => store(IrNode::Binary {
+                op: BinOp::Exp,
+                lhs: Box::new(read),
+                rhs: Box::new(rhs),
             }),
         };
         Ok(IrNode::Block {
@@ -2080,27 +2070,25 @@ impl LowerCtx<'_> {
                 inc,
                 prefix: update.prefix,
             }),
-            // A captured cell or a global: `x = ToNumber(x) + delta` (prefix
-            // yields new); postfix yields the old value as `new - delta`.
+            // A captured cell or a global: `x = NumericStep(ToNumeric(x))`
+            // (prefix yields new); postfix yields the old value as the
+            // reverse step of the new one (exact for numbers and `BigInts`).
             kind @ (AccessKind::Cell(_) | AccessKind::Global(_)) => {
-                let delta = if inc { 1.0 } else { -1.0 };
-                let new_value = IrNode::Binary {
-                    op: BinOp::Add,
-                    lhs: Box::new(IrNode::ConvertCall {
-                        op: ConvertOp::ToNumber,
+                let new_value = IrNode::NumericStep {
+                    arg: Box::new(IrNode::ConvertCall {
+                        op: ConvertOp::ToNumeric,
                         arg: Box::new(Self::read_of(kind.clone())),
                         radix: None,
                     }),
-                    rhs: Box::new(IrNode::Num(delta)),
+                    inc,
                 };
                 let store = Self::write_of(kind, new_value);
                 if update.prefix {
                     Ok(store)
                 } else {
-                    Ok(IrNode::Binary {
-                        op: BinOp::Sub,
-                        lhs: Box::new(store),
-                        rhs: Box::new(IrNode::Num(delta)),
+                    Ok(IrNode::NumericStep {
+                        arg: Box::new(store),
+                        inc: !inc,
                     })
                 }
             }
@@ -2108,8 +2096,8 @@ impl LowerCtx<'_> {
     }
 
     /// Lower a member update `o.p++` / `--o[k]` to an [`IrNode::IndexOpSet`] that
-    /// adds `1` / `-1` to the current value converted with `ToNumber` (so a string
-    /// member `"4"` becomes `5`, never `"41"`). The base and key are evaluated
+    /// steps the current value converted with `ToNumeric` by `1` / `-1` (so a
+    /// string member `"4"` becomes `5`, never `"41"`, and a `BigInt` stays one). The base and key are evaluated
     /// once; a postfix update yields the old numeric value. A nullish base throws
     /// the member READ `TypeError`, as in V8.
     fn lower_member_update(

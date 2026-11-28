@@ -701,6 +701,11 @@ fn emit_node_inner(
         IrNode::IncDec { local, inc, prefix } => {
             emit_inc_dec(*local, *inc, *prefix, function, helpers);
         }
+        IrNode::Negate(arg) => emit_numeric_unary(true, arg, function, scratch, strings, helpers),
+        IrNode::BitNot(arg) => emit_numeric_unary(false, arg, function, scratch, strings, helpers),
+        IrNode::NumericStep { arg, inc } => {
+            emit_numeric_step(arg, *inc, function, scratch, strings, helpers);
+        }
         // The promise primitives call the guest promise engine.
         IrNode::PromiseResolve(value) => {
             emit_promise_resolve(value, function, scratch, strings, helpers);

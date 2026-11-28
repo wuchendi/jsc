@@ -12,19 +12,21 @@
 pub enum OpSetKind {
     /// `obj[index] op= rhs`: combine the current value as-is; yield the new value.
     Compound,
-    /// `++obj[index]` / `--obj[index]`: convert the current value with `ToNumber`
-    /// before combining; yield the new value.
+    /// `++obj[index]` / `--obj[index]`: convert the current value with
+    /// `ToNumeric` and step it by `rhs` (`±1`) in its own type
+    /// ([`IrNode::NumericStep`]); yield the new value.
     PrefixUpdate,
     /// `obj[index]++` / `obj[index]--`: like [`Self::PrefixUpdate`], but yield the
-    /// OLD value converted to a number.
+    /// OLD value converted with `ToNumeric`.
     PostfixUpdate,
 }
 
 /// A binary operator over jsval operands.
 ///
-/// Arithmetic operators (`Add`..`Mod`) unbox their operands to `f64` and produce
-/// a number jsval; bitwise and shift operators (`BitAnd`..`UShr`) apply
-/// `ToNumber` then `ToInt32`/`ToUint32` and produce a number jsval; comparison operators (`Lt`..`LooseNe`) produce a boolean jsval
+/// Arithmetic operators (`Add`..`Mod`, `Exp`) and bitwise and shift operators
+/// (`BitAnd`..`UShr`) compute inline on two numbers (`ToInt32`/`ToUint32` for
+/// the bitwise ones) and otherwise apply `ToNumeric` (DESIGN.md §6.10.5): two
+/// `BigInts` give a `BigInt`, a mix throws; comparison operators (`Lt`..`LooseNe`) produce a boolean jsval
 /// (`true`/`false`). Relational operators (`Lt`..`Ge`) compare numerically;
 /// `Eq`/`Ne` are strict `===`/`!==` (type-then-value across all jsval types);
 /// `LooseEq`/`LooseNe` are loose `==`/`!=` (Abstract Equality with coercion).
@@ -45,8 +47,7 @@ pub enum BinOp {
     BitAnd,
     /// Bitwise OR (`|`) over the operands' `ToInt32`.
     BitOr,
-    /// Bitwise XOR (`^`) over the operands' `ToInt32`. Unary `~x` lowers to
-    /// `x ^ -1`.
+    /// Bitwise XOR (`^`) over the operands' `ToInt32`.
     BitXor,
     /// Left shift (`<<`): `ToInt32(lhs)` shifted by `ToUint32(rhs) & 31`.
     Shl,
@@ -56,6 +57,10 @@ pub enum BinOp {
     /// Zero-fill right shift (`>>>`): `ToUint32(lhs)` shifted logically by
     /// `ToUint32(rhs) & 31`; the result is an unsigned 32-bit number.
     UShr,
+    /// Exponentiation (`**`, `**=`): `ToNumeric` both operands; two numbers
+    /// compute `Number::exponentiate` (the `Math.pow` code), two `BigInts`
+    /// `BigInt::exponentiate`, a mix throws (DESIGN.md §6.10.5).
+    Exp,
     /// Less-than (`<`).
     Lt,
     /// Greater-than (`>`).
@@ -222,6 +227,10 @@ pub enum ConvertOp {
     /// `parseFloat(s)` — the leading decimal float of `ToString(s)`, parsed on
     /// the host, or NaN when none.
     ParseFloat,
+    /// `ToNumeric(x)` (DESIGN.md §6.10.5): a number passes through, anything
+    /// else goes through `__to_numeric` (a `BigInt` is kept). The read of a
+    /// non-local `++` / `--`.
+    ToNumeric,
 }
 
 /// The inline fast path of an `Array.prototype` search/join method on an
@@ -1776,6 +1785,21 @@ pub enum IrNode {
         /// (yields the old value).
         prefix: bool,
     },
+    /// Unary minus `-operand` (DESIGN.md §6.10.5): `ToNumeric`, then a number
+    /// is negated (`-0 - x`) and a `BigInt` goes through `__bigint_neg`.
+    Negate(Box<IrNode>),
+    /// Bitwise NOT `~operand`: `ToNumeric`, then a number is `ToInt32(x) ^ -1`
+    /// and a `BigInt` is `-x - 1n`.
+    BitNot(Box<IrNode>),
+    /// `arg ± 1` of `arg`'s own numeric type (`arg` is already a number or a
+    /// `BigInt`, the result of a [`ConvertOp::ToNumeric`]): the update step of
+    /// a non-local `++` / `--`, and the old value of a postfix one.
+    NumericStep {
+        /// The numeric operand.
+        arg: Box<IrNode>,
+        /// `true` for `+ 1`, `false` for `- 1`.
+        inc: bool,
+    },
     /// A `console.log(a0, a1, ..)` call. It is NOT a user-function call:
     /// it lowers to a sequence of calls to the host `print` import, one per
     /// argument, then yields the `undefined` jsval (its expression value). The
@@ -2676,6 +2700,9 @@ impl IrNode {
             | IrNode::NullishCheck { value: inner, .. }
             | IrNode::ArrayPush { value: inner, .. }
             | IrNode::Not(inner)
+            | IrNode::Negate(inner)
+            | IrNode::BitNot(inner)
+            | IrNode::NumericStep { arg: inner, .. }
             | IrNode::Throw(inner)
             | IrNode::ObjectBuiltin { arg: inner, .. }
             | IrNode::JsonStringify { arg: inner }
@@ -2917,6 +2944,9 @@ impl IrNode {
             | IrNode::NullishCheck { value: inner, .. }
             | IrNode::ArrayPush { value: inner, .. }
             | IrNode::Not(inner)
+            | IrNode::Negate(inner)
+            | IrNode::BitNot(inner)
+            | IrNode::NumericStep { arg: inner, .. }
             | IrNode::Throw(inner)
             | IrNode::ObjectBuiltin { arg: inner, .. }
             | IrNode::JsonStringify { arg: inner }
