@@ -1416,7 +1416,7 @@ fn collect_entries<'a>(entries: &'a [(PropKey, IrNode)], strs: &mut Strs<'a>) {
 /// no other path to the global object and no read of a global by a run-time
 /// name. Every compile-time gate that stubs a family whose constructor is a
 /// global must open on it.
-fn holds_global(node: &IrNode) -> bool {
+pub(super) fn holds_global(node: &IrNode) -> bool {
     match node {
         IrNode::Intrinsic(GlobalIntrinsic::Global) => true,
         IrNode::GlobalGet { global, .. } => global.name == "globalThis",
@@ -1534,19 +1534,17 @@ const BINARY_NAMES: [&str; 14] = [
     "BigUint64Array",
 ];
 
-/// Whether `program` can reach binary data (DESIGN.md §5.8.5): it names a
+/// Whether `program` can reach binary data (DESIGN.md §6.4): it names a
 /// binary-data constructor (the intrinsic, a global reference, or a string
-/// such as a static `globalThis.ArrayBuffer` key), or uses the global object
-/// as a value, which could reach one by a computed name. Then the collector
-/// and the renderer carry their binary-data arms.
-fn program_has_binary(program: &IrProgram) -> bool {
+/// such as a static `globalThis.ArrayBuffer` key), or holds the global
+/// object ([`holds_global`]), which could reach one by a computed
+/// name. Then the collector and the renderer carry their binary-data arms.
+pub(super) fn program_has_binary(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
-        IrNode::Intrinsic(
-            GlobalIntrinsic::Global
-            | GlobalIntrinsic::Ctor(
-                BuiltinCtor::ArrayBuffer | BuiltinCtor::DataView | BuiltinCtor::Typed(_),
-            ),
-        ) => true,
+        _ if holds_global(n) => true,
+        IrNode::Intrinsic(GlobalIntrinsic::Ctor(
+            BuiltinCtor::ArrayBuffer | BuiltinCtor::DataView | BuiltinCtor::Typed(_),
+        )) => true,
         IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
             BINARY_NAMES.contains(&global.name.as_str())
         }

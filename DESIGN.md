@@ -1687,9 +1687,9 @@ unchanged). A whole-program scan, `sections.rs::program_has_binary`, sets
 binary global — `IrNode::Intrinsic(GlobalIntrinsic::Ctor(c))` / `GlobalGet`
 / `GlobalSet` of `ArrayBuffer`, `DataView` or a typed-array constructor
 (`BINARY_NAMES`), or an `IrNode::Str` equal to one of those names (a static
-`globalThis.Uint8Array` or `o["DataView"]`) — or uses the global object as a
-value (`GlobalIntrinsic::Global`, which could reach a constructor by a
-computed name). `Math.f16round` is not a binary name: its body calls the
+`globalThis.Uint8Array` or `o["DataView"]`) — or holds the global object
+(`sections.rs::holds_global`: the `Global` intrinsic or a `GlobalGet` of
+`globalThis`, which could reach a constructor by a computed name). `Math.f16round` is not a binary name: its body calls the
 `Group::Binary` leaves `__f16_encode` / `__f16_decode` directly, which need
 no gated arm. Every typed-array arm of §6.3, the inline `ta[k]` arms, the
 collector arms (§5.7), the renderer arm (§6.9) and the typed-array arm of
