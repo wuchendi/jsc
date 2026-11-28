@@ -304,7 +304,8 @@ impl Intrinsic {
                 | BuiltinCtor::WeakMap
                 | BuiltinCtor::WeakSet
                 | BuiltinCtor::WeakRef
-                | BuiltinCtor::FinalizationRegistry,
+                | BuiltinCtor::FinalizationRegistry
+                | BuiltinCtor::ArrayBuffer,
             ) => abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_SELF_ALLOC,
             Self::Ctor(_) => abi::FUNC_FLAG_CONSTRUCTOR,
             _ => 0,
@@ -400,7 +401,12 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
             Intrinsic::Json,
             Intrinsic::Console,
         ])
-        .chain(BuiltinCtor::ALL.map(Intrinsic::Ctor))
+        .chain(
+            BuiltinCtor::ALL
+                .into_iter()
+                .filter(|ctor| !BINARY_CTORS.contains(ctor))
+                .map(Intrinsic::Ctor),
+        )
         .chain(PLAIN_PROTOTYPES.map(Intrinsic::Prototype))
         .chain([Intrinsic::IteratorPrototype])
         .chain(IterFamily::ALL.map(Intrinsic::IterPrototype))
@@ -414,9 +420,19 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
             Intrinsic::WrapForValidIteratorPrototype,
             Intrinsic::IteratorHelperPrototype,
             Intrinsic::OutOfMemoryError,
-            Intrinsic::BigIntPrototype,
         ])
+        .chain(
+            BINARY_CTORS
+                .into_iter()
+                .flat_map(|ctor| [Intrinsic::Ctor(ctor), Intrinsic::Prototype(ctor)]),
+        )
+        .chain([Intrinsic::BigIntPrototype])
 }
+
+/// The binary-data constructors (DESIGN.md §5.8.7), whose constructor and
+/// prototype intrinsics follow every other intrinsic in the image but
+/// `%BigInt.prototype%`.
+const BINARY_CTORS: [BuiltinCtor; 1] = [BuiltinCtor::ArrayBuffer];
 
 /// A builtin function body with the uniform ABI (see [`super::builtins`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -662,6 +678,100 @@ pub(super) enum Builtin {
     /// An `Iterator` static, `%WrapForValidIteratorPrototype%` method or
     /// `%IteratorPrototype%` accessor half (DESIGN.md §7.9).
     Iterator(IteratorOp),
+    /// An `ArrayBuffer` static, `%ArrayBuffer.prototype%` method or getter
+    /// (DESIGN.md §5.8.7, `emit/builtins/array_buffer.rs`).
+    ArrayBuffer(ArrayBufferOp),
+}
+
+/// The `ArrayBuffer` builtins of DESIGN.md §5.8.7 other than the
+/// constructor and `get [@@species]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArrayBufferOp {
+    /// `ArrayBuffer.isView(arg)`.
+    IsView,
+    /// The getter of `ArrayBuffer.prototype.byteLength`.
+    ByteLength,
+    /// The getter of `ArrayBuffer.prototype.maxByteLength`.
+    MaxByteLength,
+    /// The getter of `ArrayBuffer.prototype.resizable`.
+    Resizable,
+    /// The getter of `ArrayBuffer.prototype.detached`.
+    Detached,
+    /// `ArrayBuffer.prototype.resize(newLength)`.
+    Resize,
+    /// `ArrayBuffer.prototype.slice(start, end)`.
+    Slice,
+    /// `ArrayBuffer.prototype.transfer(newLength)`.
+    Transfer,
+    /// `ArrayBuffer.prototype.transferToFixedLength(newLength)`.
+    TransferToFixedLength,
+}
+
+impl ArrayBufferOp {
+    /// Every op, in [`Builtin::ALL`] order.
+    pub(super) const ALL: [ArrayBufferOp; 9] = [
+        Self::IsView,
+        Self::ByteLength,
+        Self::MaxByteLength,
+        Self::Resizable,
+        Self::Detached,
+        Self::Resize,
+        Self::Slice,
+        Self::Transfer,
+        Self::TransferToFixedLength,
+    ];
+
+    /// The getters, with their property keys, in installation order.
+    pub(super) const GETTERS: [(ArrayBufferOp, &'static str); 4] = [
+        (Self::ByteLength, "byteLength"),
+        (Self::MaxByteLength, "maxByteLength"),
+        (Self::Resizable, "resizable"),
+        (Self::Detached, "detached"),
+    ];
+
+    /// The builtin's `name`.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::IsView => "isView",
+            Self::ByteLength => "get byteLength",
+            Self::MaxByteLength => "get maxByteLength",
+            Self::Resizable => "get resizable",
+            Self::Detached => "get detached",
+            Self::Resize => "resize",
+            Self::Slice => "slice",
+            Self::Transfer => "transfer",
+            Self::TransferToFixedLength => "transferToFixedLength",
+        }
+    }
+
+    /// The builtin's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::IsView | Self::Resize => 1,
+            Self::Slice => 2,
+            Self::ByteLength
+            | Self::MaxByteLength
+            | Self::Resizable
+            | Self::Detached
+            | Self::Transfer
+            | Self::TransferToFixedLength => 0,
+        }
+    }
+
+    /// The prototype holding this builtin as a method, if any (the getters
+    /// are accessor entries, `isView` a static).
+    fn prototype(self) -> Option<Intrinsic> {
+        match self {
+            Self::Resize | Self::Slice | Self::Transfer | Self::TransferToFixedLength => {
+                Some(Intrinsic::Prototype(BuiltinCtor::ArrayBuffer))
+            }
+            Self::IsView
+            | Self::ByteLength
+            | Self::MaxByteLength
+            | Self::Resizable
+            | Self::Detached => None,
+        }
+    }
 }
 
 /// The `Iterator` builtins of DESIGN.md §7.9.
@@ -1699,7 +1809,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 366] = [
+    pub(super) const ALL: [Builtin; 377] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -2162,6 +2272,17 @@ impl Builtin {
         Self::Species(SpeciesOp::ALL[13]),
         Self::Species(SpeciesOp::ALL[14]),
         Self::MathSumPrecise,
+        Self::Ctor(BuiltinCtor::ArrayBuffer),
+        Self::ArrayBuffer(ArrayBufferOp::ALL[0]),
+        Self::ArrayBuffer(ArrayBufferOp::ALL[1]),
+        Self::ArrayBuffer(ArrayBufferOp::ALL[2]),
+        Self::ArrayBuffer(ArrayBufferOp::ALL[3]),
+        Self::ArrayBuffer(ArrayBufferOp::ALL[4]),
+        Self::ArrayBuffer(ArrayBufferOp::ALL[5]),
+        Self::ArrayBuffer(ArrayBufferOp::ALL[6]),
+        Self::ArrayBuffer(ArrayBufferOp::ALL[7]),
+        Self::ArrayBuffer(ArrayBufferOp::ALL[8]),
+        Self::Species(SpeciesOp::Getter(BuiltinCtor::ArrayBuffer)),
     ];
 
     /// The function's `name`.
@@ -2180,6 +2301,7 @@ impl Builtin {
             Self::CollectionSize { .. } => "get size",
             Self::Species(op) => op.name(),
             Self::Iterator(op) => op.name(),
+            Self::ArrayBuffer(op) => op.name(),
             method => method.method_name(),
         }
     }
@@ -2358,6 +2480,7 @@ impl Builtin {
             Self::Symbol(op) => op.length(),
             Self::Species(op) => op.length(),
             Self::Iterator(op) => op.length(),
+            Self::ArrayBuffer(op) => op.length(),
             Self::JsonStringify => 3,
             // Every other builtin takes one argument.
             _ => 1,
@@ -2421,6 +2544,7 @@ impl Builtin {
             Self::AsyncGeneratorMethod(_) => return Some(Intrinsic::AsyncGeneratorPrototype),
             Self::Iter(op) => return op.prototype(),
             Self::Iterator(op) => return op.prototype(),
+            Self::ArrayBuffer(op) => return op.prototype(),
             _ => None,
         };
         ctor.map(Intrinsic::Prototype)
@@ -2545,7 +2669,7 @@ const NUMBER_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 35] = [
+const GLOBALS: [(&str, u32, Value); 36] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -2693,6 +2817,11 @@ const GLOBALS: [(&str, u32, Value); 35] = [
         Value::Method(Builtin::ParseFloat),
     ),
     ("parseInt", METHOD_ATTRS, Value::Method(Builtin::ParseInt)),
+    (
+        "ArrayBuffer",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::ArrayBuffer)),
+    ),
 ];
 
 /// The `%Object.prototype%` methods, in slot order.
@@ -2800,6 +2929,7 @@ pub(super) fn registry() -> Vec<Entry> {
         entries.push(entry(namespace, builtin.name(), METHOD_ATTRS, method));
     }
     constructor_entries(&mut entries);
+    array_buffer_entries(&mut entries);
     entries.extend(GLOBALS.map(|(key, attrs, value)| entry(Intrinsic::Global, key, attrs, value)));
     entries
 }
@@ -2912,6 +3042,27 @@ fn constructor_entries(entries: &mut Vec<Entry>) {
     species_entries(entries);
 }
 
+/// `ArrayBuffer.isView` and the `%ArrayBuffer.prototype%` getters
+/// (configurable, non-enumerable accessors without a setter).
+fn array_buffer_entries(entries: &mut Vec<Entry>) {
+    let is_view = Builtin::ArrayBuffer(ArrayBufferOp::IsView);
+    entries.push(Entry {
+        intrinsic: Intrinsic::Ctor(BuiltinCtor::ArrayBuffer),
+        key: Key::Str(is_view.name()),
+        attrs: METHOD_ATTRS,
+        value: Value::Method(is_view),
+    });
+    entries.extend(ArrayBufferOp::GETTERS.map(|(op, key)| Entry {
+        intrinsic: Intrinsic::Prototype(BuiltinCtor::ArrayBuffer),
+        key: Key::Str(key),
+        attrs: ACCESSOR_ATTRS,
+        value: Value::Accessor {
+            get: Builtin::ArrayBuffer(op),
+            set: None,
+        },
+    }));
+}
+
 /// The method names `Array.prototype[@@unscopables]` lists.
 const UNSCOPABLES: [&str; 16] = [
     "at",
@@ -2933,7 +3084,7 @@ const UNSCOPABLES: [&str; 16] = [
 ];
 
 /// The `get [@@species]` accessors (configurable only) of `%Array%`,
-/// `%Map%`, `%Set%` and `%Promise%`, and `Array.prototype[@@unscopables]`
+/// `%Map%`, `%Set%`, `%Promise%` and `%ArrayBuffer%`, and `Array.prototype[@@unscopables]`
 /// (configurable only) with its `null`-prototype list object (each entry a
 /// writable, enumerable, configurable `true`).
 fn species_entries(entries: &mut Vec<Entry>) {
@@ -2942,6 +3093,7 @@ fn species_entries(entries: &mut Vec<Entry>) {
         BuiltinCtor::Map,
         BuiltinCtor::Set,
         BuiltinCtor::Promise,
+        BuiltinCtor::ArrayBuffer,
     ];
     entries.extend(ctors.map(|ctor| Entry {
         intrinsic: Intrinsic::Ctor(ctor),
@@ -3010,6 +3162,10 @@ fn well_known_entries(entries: &mut Vec<Entry>) {
         (Intrinsic::IterPrototype(IterFamily::Map), "Map Iterator"),
         (Intrinsic::IterPrototype(IterFamily::Set), "Set Iterator"),
         (Intrinsic::IteratorHelperPrototype, "Iterator Helper"),
+        (
+            Intrinsic::Prototype(BuiltinCtor::ArrayBuffer),
+            "ArrayBuffer",
+        ),
     ];
     entries.extend(tags.map(|(intrinsic, tag)| Entry {
         intrinsic,
@@ -3608,8 +3764,13 @@ mod tests {
                         | BuiltinCtor::FinalizationRegistry
                         | BuiltinCtor::Promise
                         | BuiltinCtor::Date
+                        | BuiltinCtor::ArrayBuffer
                 ) | Intrinsic::Ctor(
-                    BuiltinCtor::Array | BuiltinCtor::Map | BuiltinCtor::Set | BuiltinCtor::Promise
+                    BuiltinCtor::Array
+                        | BuiltinCtor::Map
+                        | BuiltinCtor::Set
+                        | BuiltinCtor::Promise
+                        | BuiltinCtor::ArrayBuffer
                 ) | Intrinsic::FunctionPrototype
                     | Intrinsic::IteratorPrototype
                     | Intrinsic::AsyncIteratorPrototype
@@ -3750,6 +3911,83 @@ mod tests {
                 kind: IterKind::Entries,
             })))
         );
+    }
+
+    #[test]
+    fn array_buffer_intrinsics_follow_every_other() {
+        // DESIGN.md §5.8.7: `%ArrayBuffer%` and its prototype are appended
+        // to the image; the constructor is `SELF_ALLOC`, `length` 1.
+        let all: Vec<Intrinsic> = intrinsics().collect();
+        let ctor = Intrinsic::Ctor(BuiltinCtor::ArrayBuffer);
+        let proto = Intrinsic::Prototype(BuiltinCtor::ArrayBuffer);
+        assert_eq!(all[all.len() - 2..], [ctor, proto]);
+        assert_eq!(all.iter().filter(|i| **i == ctor).count(), 1);
+        assert_eq!(
+            ctor.flags(),
+            abi::FUNC_FLAG_CONSTRUCTOR | abi::FUNC_FLAG_SELF_ALLOC
+        );
+        assert_eq!(Builtin::Ctor(BuiltinCtor::ArrayBuffer).length(), 1);
+        assert_eq!(proto.proto(), Some(Intrinsic::ObjectPrototype));
+        assert_eq!(ctor.proto(), Some(Intrinsic::FunctionPrototype));
+        let registry = registry();
+        let own = |intrinsic, key| {
+            registry
+                .iter()
+                .filter(|e| e.intrinsic == intrinsic && e.key == key)
+                .map(|e| (e.attrs, e.value))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            own(ctor, Key::Str("isView")),
+            [(
+                METHOD_ATTRS,
+                Value::Method(Builtin::ArrayBuffer(ArrayBufferOp::IsView))
+            )]
+        );
+        assert_eq!(
+            own(ctor, Key::Symbol(WellKnown::Species)),
+            [(
+                ACCESSOR_ATTRS,
+                Value::Accessor {
+                    get: Builtin::Species(SpeciesOp::Getter(BuiltinCtor::ArrayBuffer)),
+                    set: None,
+                }
+            )]
+        );
+        for (op, key) in ArrayBufferOp::GETTERS {
+            assert_eq!(
+                own(proto, Key::Str(key)),
+                [(
+                    ACCESSOR_ATTRS,
+                    Value::Accessor {
+                        get: Builtin::ArrayBuffer(op),
+                        set: None,
+                    }
+                )]
+            );
+            assert_eq!(Builtin::ArrayBuffer(op).name(), format!("get {key}"));
+            assert_eq!(Builtin::ArrayBuffer(op).length(), 0);
+        }
+        for (op, length) in [
+            (ArrayBufferOp::Resize, 1),
+            (ArrayBufferOp::Slice, 2),
+            (ArrayBufferOp::Transfer, 0),
+            (ArrayBufferOp::TransferToFixedLength, 0),
+        ] {
+            let builtin = Builtin::ArrayBuffer(op);
+            assert_eq!(method_of(proto, builtin.name()), Some(builtin));
+            assert_eq!(builtin.length(), length);
+        }
+        assert_eq!(
+            own(proto, Key::Symbol(WellKnown::ToStringTag)),
+            [(FN_FACT_ATTRS, Value::Str("ArrayBuffer"))]
+        );
+        assert_eq!(
+            own(Intrinsic::Global, Key::Str("ArrayBuffer")),
+            [(METHOD_ATTRS, Value::Intrinsic(ctor))]
+        );
+        assert_eq!(ctor.watch_bit(), None);
+        assert_eq!(proto.watch_bit(), None);
     }
 
     #[test]

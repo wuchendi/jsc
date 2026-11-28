@@ -193,7 +193,7 @@ fn probe(
     mode: Mode,
     includes: &[&str],
 ) -> Result<Result<(), String>, String> {
-    let program = assemble::program(mode, "", &env.sta, &env.assert, includes);
+    let program = assemble::program(mode, "", &env.sta, &env.assert, includes, false);
     let name = format!("{}-probe-{index}", std::process::id());
     let out = exec::run(
         &env.args.jsc,
@@ -259,7 +259,8 @@ fn run_test(env: &Env, index: usize, path: &str) -> Result<Record, String> {
             .filter_map(|i| env.includes.get(i).map(String::as_str))
             .collect(),
     };
-    let program = assemble::program(mode, &source, &env.sta, &env.assert, &includes);
+    let detach = meta.includes.iter().any(|i| i == assemble::DETACH_INCLUDE);
+    let program = assemble::program(mode, &source, &env.sta, &env.assert, &includes, detach);
     let name = format!("{}-{index}", std::process::id());
     let out = exec::run(
         &env.args.jsc,

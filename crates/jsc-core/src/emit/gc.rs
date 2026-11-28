@@ -1419,6 +1419,16 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     );
     link(&mut f, GC_WEAK_REGS_GLOBAL);
     wasm!(f; Return, End);
+    // An ArrayBuffer (DESIGN.md §5.8.3): the prefix and its byte block (a
+    // `TYPE_RAW` leaf: marked, nothing inside traced). Only a program that
+    // can reach binary data carries the arm.
+    if helpers.has_binary() {
+        is(&mut f, abi::TYPE_ARRAYBUFFER);
+        raw(&mut f, abi::OBJ_PROPS_OFFSET);
+        jsval(&mut f, abi::OBJ_PROTO_OFFSET);
+        raw(&mut f, abi::AB_DATA_OFFSET);
+        wasm!(f; Return, End);
+    }
     // Strings, raw buffers, BigInts and free slots are leaves; the rest of the object
     // family (`1..=3`, `6..=10`) starts with `props` and `proto`.
     wasm!(f;
