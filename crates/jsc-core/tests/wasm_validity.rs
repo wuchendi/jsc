@@ -14,7 +14,7 @@ use jsc_core::emit::CompileOptions;
 /// wrapper constructor over a `BigInt`, and the `BigInt` gate
 /// (DESIGN.md §6.10.9): every gated operator site with the gate closed, and
 /// with it opened by the global object or a name only.
-const PROGRAMS: [&str; 23] = [
+const PROGRAMS: [&str; 24] = [
     "1",
     "console.log(1)",
     "1n",
@@ -42,6 +42,7 @@ const PROGRAMS: [&str; 23] = [
      let x = 1; x--; console.log(new B().m(), x > 0, 1 / 0, -0 === 0, typeof x)",
     "const k = 'Big' + 'Int'; const B = globalThis[k]; let x = B(5); x++; \
      console.log(-x, ~x, x ** 2n, x < 7, typeof x, !!x, x === 6n, Number(x))",
+    "let k = \"Big\" + \"Int\"; let x = globalThis[k](5); console.log(x * x, x > 2)",
     "const o = { BigInt: 1 }; let a = 1; a++; console.log(-a, ~a, a ** 2, a < 3, o.BigInt)",
     "try { Reflect.get(1n, 'x') } catch (e) { console.log(e instanceof TypeError) } \
      console.log(Reflect.ownKeys(Object(2n)).length, Reflect.has({ 1: 0 }, 1n)); \
