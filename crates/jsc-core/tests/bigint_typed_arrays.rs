@@ -11,7 +11,7 @@
 #![allow(clippy::expect_used)]
 
 mod common;
-use common::{assert_number, assert_output, assert_same_under_gc_stress, assert_string};
+use common::{assert_output, assert_same_under_gc_stress, assert_string};
 
 /// `err(f)`: the `name: message` of what `f` throws, or `none`; `TA` is
 /// `%TypedArray%`.
@@ -203,7 +203,9 @@ fn element_copying_methods() {
 
 /// `set` from arrays (through `ToBigInt`) and from typed arrays of either
 /// `BigInt` kind (an overlapping same-buffer source too); a source of the
-/// other content type throws.
+/// other content type throws a `TypeError`, after the length check
+/// (`SetTypedArrayFromTypedArray`: a source too long for the target is a
+/// `RangeError` first).
 #[test]
 fn set_across_kinds_and_content_types() {
     assert_string(
@@ -213,11 +215,12 @@ fn set_across_kinds_and_content_types() {
              const b = new ArrayBuffer(16), x = new BigInt64Array(b), y = new BigUint64Array(b, 8, 1);
              x[0] = -1n; y.set(x.subarray(0, 1));
              [u.join(), x[1], y[0], err(() => u.set(new Int8Array(1))),
-              err(() => new Int8Array(1).set(u)), err(() => u.set([1])),
-              err(() => new Float32Array(1).set([1n]))].join(';')",
+              err(() => new Int8Array(4).set(u)), err(() => new Int8Array(1).set(u)),
+              err(() => u.set([1])), err(() => new Float32Array(1).set([1n]))].join(';')",
         ),
         &format!(
-            "5,1,2,0;-1;18446744073709551615;{MIX};{MIX};TypeError: Cannot convert 1 to a BigInt;\
+            "5,1,2,0;-1;18446744073709551615;{MIX};{MIX};RangeError: offset is out of bounds;\
+             TypeError: Cannot convert 1 to a BigInt;\
              TypeError: Cannot convert a BigInt value to a number"
         ),
     );
@@ -327,17 +330,20 @@ fn rendering_digits_from_bits() {
     );
 }
 
-/// Exhaust the heap with live buffers of halving sizes (each failure is a
-/// caught `RangeError: out of memory`), then read `BigInt` elements through
-/// every kind of reader. A read whose `BigInt` allocation fails must throw
-/// the `RangeError`, never yield a wrong value: `bad` counts a wrong value
-/// (`1`) or another exception (`100`). Whether a given read still finds
-/// room depends on the allocator's size classes, so the test asserts only
-/// that no read is ever wrong.
+/// Exhaust the heap with live buffers of halving sizes, then read `BigInt`
+/// elements through every kind of reader. A read whose `BigInt` allocation
+/// fails must throw the `RangeError`, never yield a wrong value: `bad`
+/// counts a wrong value (`1`) or another exception (`100`). Whether a given
+/// read still finds room depends on the allocator's size classes, so the
+/// test asserts only that no read is ever wrong. A large byte block that
+/// does not fit is a caught `RangeError`, but the small ones (down to one
+/// byte) draw on the out-of-memory reserve, and a small request that fails
+/// once the reserve is spent is the fatal `Uncaught RangeError: out of
+/// memory` exit (DESIGN.md §5.6), which the run may end with instead,
+/// whether in the loop or in a read; it never prints a value.
 #[test]
 fn bigint_element_reads_never_wrong_out_of_memory() {
-    assert_number(
-        "const t = new BigInt64Array([5n, -7n]);
+    let src = "const t = new BigInt64Array([5n, -7n]);
          const u = new BigUint64Array([9n]);
          let keep = [];
          for (let i = 0; i < 4096; i++) keep.push(0);
@@ -366,9 +372,17 @@ fn bigint_element_reads_never_wrong_out_of_memory() {
          try { if (new BigUint64Array(t)[1] !== 2n ** 64n - 7n) bad = bad + 1; }
          catch (e) { if (!(e instanceof RangeError)) bad = bad + 100; }
          keep = 0;
-         bad",
-        0.0,
-    );
+         bad";
+    let done = common::exec(src, true).expect("program should compile and not trap");
+    if done.code == 0 {
+        assert_eq!(done.stdout, "0\n", "`{src}` read a wrong value");
+    } else {
+        assert_eq!(
+            (done.code, done.stdout.as_str(), done.stderr.as_str()),
+            (1, "", "Uncaught RangeError: out of memory\n"),
+            "`{src}` failed other than by running out of memory"
+        );
+    }
 }
 
 /// A `BigInt64Array` reached only through `globalThis` by a run-time key

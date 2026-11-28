@@ -214,7 +214,7 @@ fn data_view_float16() {
         &with_prelude(
             "const v = new DataView(new ArrayBuffer(4));
              const r = v.setFloat16(0, 1.5);
-             const a = [r, v.getUint8(0), v.getUint8(1), v.getFloat16(0), v.getFloat16(0, true)];
+             const a = [String(r), v.getUint8(0), v.getUint8(1), v.getFloat16(0), v.getFloat16(0, true)];
              v.setFloat16(2, -65504, true);
              a.push(v.getUint8(2), v.getUint8(3), v.getFloat16(2, true), v.getFloat16(2));
              v.setFloat16(0, 65520);
