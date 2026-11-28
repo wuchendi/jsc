@@ -819,11 +819,65 @@ pub(super) enum TypedArrayOp {
     Values,
     /// `%TypedArray%.prototype.entries()`.
     Entries,
+    /// `%TypedArray%.prototype.at`.
+    At,
+    /// `%TypedArray%.prototype.copyWithin`.
+    CopyWithin,
+    /// `%TypedArray%.prototype.every`.
+    Every,
+    /// `%TypedArray%.prototype.fill`.
+    Fill,
+    /// `%TypedArray%.prototype.filter`.
+    Filter,
+    /// `%TypedArray%.prototype.find`.
+    Find,
+    /// `%TypedArray%.prototype.findIndex`.
+    FindIndex,
+    /// `%TypedArray%.prototype.findLast`.
+    FindLast,
+    /// `%TypedArray%.prototype.findLastIndex`.
+    FindLastIndex,
+    /// `%TypedArray%.prototype.forEach`.
+    ForEach,
+    /// `%TypedArray%.prototype.includes`.
+    Includes,
+    /// `%TypedArray%.prototype.indexOf`.
+    IndexOf,
+    /// `%TypedArray%.prototype.join`.
+    Join,
+    /// `%TypedArray%.prototype.lastIndexOf`.
+    LastIndexOf,
+    /// `%TypedArray%.prototype.map`.
+    Map,
+    /// `%TypedArray%.prototype.reduce`.
+    Reduce,
+    /// `%TypedArray%.prototype.reduceRight`.
+    ReduceRight,
+    /// `%TypedArray%.prototype.reverse`.
+    Reverse,
+    /// `%TypedArray%.prototype.set`.
+    Set,
+    /// `%TypedArray%.prototype.slice`.
+    Slice,
+    /// `%TypedArray%.prototype.some`.
+    Some,
+    /// `%TypedArray%.prototype.sort`.
+    Sort,
+    /// `%TypedArray%.prototype.subarray`.
+    Subarray,
+    /// `%TypedArray%.prototype.toLocaleString`.
+    ToLocaleString,
+    /// `%TypedArray%.prototype.toReversed`.
+    ToReversed,
+    /// `%TypedArray%.prototype.toSorted`.
+    ToSorted,
+    /// `%TypedArray%.prototype.with`.
+    With,
 }
 
 impl TypedArrayOp {
     /// Every op, in [`Builtin::ALL`] order.
-    pub(super) const ALL: [TypedArrayOp; 10] = [
+    pub(super) const ALL: [TypedArrayOp; 37] = [
         Self::From,
         Self::Of,
         Self::Buffer,
@@ -834,6 +888,65 @@ impl TypedArrayOp {
         Self::Keys,
         Self::Values,
         Self::Entries,
+        Self::At,
+        Self::CopyWithin,
+        Self::Every,
+        Self::Fill,
+        Self::Filter,
+        Self::Find,
+        Self::FindIndex,
+        Self::FindLast,
+        Self::FindLastIndex,
+        Self::ForEach,
+        Self::Includes,
+        Self::IndexOf,
+        Self::Join,
+        Self::LastIndexOf,
+        Self::Map,
+        Self::Reduce,
+        Self::ReduceRight,
+        Self::Reverse,
+        Self::Set,
+        Self::Slice,
+        Self::Some,
+        Self::Sort,
+        Self::Subarray,
+        Self::ToLocaleString,
+        Self::ToReversed,
+        Self::ToSorted,
+        Self::With,
+    ];
+
+    /// The `%TypedArray.prototype%` methods of stage T3b
+    /// (`emit/builtins/typed_array_methods.rs`), in [`Self::ALL`] order.
+    pub(super) const METHODS: [TypedArrayOp; 27] = [
+        Self::At,
+        Self::CopyWithin,
+        Self::Every,
+        Self::Fill,
+        Self::Filter,
+        Self::Find,
+        Self::FindIndex,
+        Self::FindLast,
+        Self::FindLastIndex,
+        Self::ForEach,
+        Self::Includes,
+        Self::IndexOf,
+        Self::Join,
+        Self::LastIndexOf,
+        Self::Map,
+        Self::Reduce,
+        Self::ReduceRight,
+        Self::Reverse,
+        Self::Set,
+        Self::Slice,
+        Self::Some,
+        Self::Sort,
+        Self::Subarray,
+        Self::ToLocaleString,
+        Self::ToReversed,
+        Self::ToSorted,
+        Self::With,
     ];
 
     /// The string-keyed getters, with their property keys, in installation
@@ -858,14 +971,65 @@ impl TypedArrayOp {
             Self::Keys => "keys",
             Self::Values => "values",
             Self::Entries => "entries",
+            Self::At => "at",
+            Self::CopyWithin => "copyWithin",
+            Self::Every => "every",
+            Self::Fill => "fill",
+            Self::Filter => "filter",
+            Self::Find => "find",
+            Self::FindIndex => "findIndex",
+            Self::FindLast => "findLast",
+            Self::FindLastIndex => "findLastIndex",
+            Self::ForEach => "forEach",
+            Self::Includes => "includes",
+            Self::IndexOf => "indexOf",
+            Self::Join => "join",
+            Self::LastIndexOf => "lastIndexOf",
+            Self::Map => "map",
+            Self::Reduce => "reduce",
+            Self::ReduceRight => "reduceRight",
+            Self::Reverse => "reverse",
+            Self::Set => "set",
+            Self::Slice => "slice",
+            Self::Some => "some",
+            Self::Sort => "sort",
+            Self::Subarray => "subarray",
+            Self::ToLocaleString => "toLocaleString",
+            Self::ToReversed => "toReversed",
+            Self::ToSorted => "toSorted",
+            Self::With => "with",
         }
     }
 
     /// The builtin's `length`.
     fn length(self) -> u32 {
         match self {
-            Self::From => 1,
+            Self::From
+            | Self::At
+            | Self::Every
+            | Self::Fill
+            | Self::Filter
+            | Self::Find
+            | Self::FindIndex
+            | Self::FindLast
+            | Self::FindLastIndex
+            | Self::ForEach
+            | Self::Includes
+            | Self::IndexOf
+            | Self::Join
+            | Self::LastIndexOf
+            | Self::Map
+            | Self::Reduce
+            | Self::ReduceRight
+            | Self::Set
+            | Self::Some
+            | Self::Sort
+            | Self::ToSorted => 1,
+            Self::CopyWithin | Self::Slice | Self::Subarray | Self::With => 2,
             Self::Of
+            | Self::Reverse
+            | Self::ToLocaleString
+            | Self::ToReversed
             | Self::Buffer
             | Self::ByteLength
             | Self::ByteOffset
@@ -891,6 +1055,8 @@ impl TypedArrayOp {
             | Self::ByteOffset
             | Self::Length
             | Self::ToStringTag => None,
+            // The T3b methods.
+            _ => Some(Intrinsic::Prototype(BuiltinCtor::TypedArray)),
         }
     }
 }
@@ -2036,7 +2202,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 422] = [
+    pub(super) const ALL: [Builtin; 449] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -2555,6 +2721,33 @@ impl Builtin {
         Self::TypedArray(TypedArrayOp::ALL[8]),
         Self::TypedArray(TypedArrayOp::ALL[9]),
         Self::Species(SpeciesOp::Getter(BuiltinCtor::TypedArray)),
+        Self::TypedArray(TypedArrayOp::ALL[10]),
+        Self::TypedArray(TypedArrayOp::ALL[11]),
+        Self::TypedArray(TypedArrayOp::ALL[12]),
+        Self::TypedArray(TypedArrayOp::ALL[13]),
+        Self::TypedArray(TypedArrayOp::ALL[14]),
+        Self::TypedArray(TypedArrayOp::ALL[15]),
+        Self::TypedArray(TypedArrayOp::ALL[16]),
+        Self::TypedArray(TypedArrayOp::ALL[17]),
+        Self::TypedArray(TypedArrayOp::ALL[18]),
+        Self::TypedArray(TypedArrayOp::ALL[19]),
+        Self::TypedArray(TypedArrayOp::ALL[20]),
+        Self::TypedArray(TypedArrayOp::ALL[21]),
+        Self::TypedArray(TypedArrayOp::ALL[22]),
+        Self::TypedArray(TypedArrayOp::ALL[23]),
+        Self::TypedArray(TypedArrayOp::ALL[24]),
+        Self::TypedArray(TypedArrayOp::ALL[25]),
+        Self::TypedArray(TypedArrayOp::ALL[26]),
+        Self::TypedArray(TypedArrayOp::ALL[27]),
+        Self::TypedArray(TypedArrayOp::ALL[28]),
+        Self::TypedArray(TypedArrayOp::ALL[29]),
+        Self::TypedArray(TypedArrayOp::ALL[30]),
+        Self::TypedArray(TypedArrayOp::ALL[31]),
+        Self::TypedArray(TypedArrayOp::ALL[32]),
+        Self::TypedArray(TypedArrayOp::ALL[33]),
+        Self::TypedArray(TypedArrayOp::ALL[34]),
+        Self::TypedArray(TypedArrayOp::ALL[35]),
+        Self::TypedArray(TypedArrayOp::ALL[36]),
     ];
 
     /// The function's `name`.
@@ -3471,6 +3664,13 @@ fn typed_array_entries(entries: &mut Vec<Entry>) {
         key: Key::Symbol(WellKnown::Iterator),
         attrs: METHOD_ATTRS,
         value: Value::Method(Builtin::TypedArray(TypedArrayOp::Values)),
+    });
+    // `%TypedArray%.prototype.toString` is `%Array.prototype.toString%`.
+    entries.push(Entry {
+        intrinsic: proto,
+        key: Key::Str("toString"),
+        attrs: METHOD_ATTRS,
+        value: Value::Method(Builtin::ArrayToString),
     });
     for kind in ElementKind::ALL {
         let ctor = BuiltinCtor::Typed(kind);
@@ -4635,6 +4835,65 @@ mod tests {
             );
             assert_eq!(c.watch_bit(), None);
         }
+    }
+
+    #[test]
+    fn typed_array_prototype_methods() {
+        // DESIGN.md §5.8.7, stage T3b: every method on `%TypedArray.prototype%`
+        // under its name with its spec `length`, and `toString` the very
+        // function object of `Array.prototype.toString`.
+        let ta_proto = Intrinsic::Prototype(BuiltinCtor::TypedArray);
+        let lengths = [
+            ("at", 1),
+            ("copyWithin", 2),
+            ("every", 1),
+            ("fill", 1),
+            ("filter", 1),
+            ("find", 1),
+            ("findIndex", 1),
+            ("findLast", 1),
+            ("findLastIndex", 1),
+            ("forEach", 1),
+            ("includes", 1),
+            ("indexOf", 1),
+            ("join", 1),
+            ("lastIndexOf", 1),
+            ("map", 1),
+            ("reduce", 1),
+            ("reduceRight", 1),
+            ("reverse", 0),
+            ("set", 1),
+            ("slice", 2),
+            ("some", 1),
+            ("sort", 1),
+            ("subarray", 2),
+            ("toLocaleString", 0),
+            ("toReversed", 0),
+            ("toSorted", 1),
+            ("with", 2),
+        ];
+        assert_eq!(TypedArrayOp::METHODS.len(), lengths.len());
+        for (op, (key, length)) in TypedArrayOp::METHODS.into_iter().zip(lengths) {
+            let builtin = Builtin::TypedArray(op);
+            assert_eq!(builtin.name(), key);
+            assert_eq!(builtin.length(), length, "{key}");
+            assert_eq!(method_of(ta_proto, key), Some(builtin));
+            assert!(Builtin::ALL.contains(&builtin));
+        }
+        let registry = registry();
+        let to_string: Vec<_> = registry
+            .iter()
+            .filter(|e| e.intrinsic == ta_proto && e.key == Key::Str("toString"))
+            .map(|e| (e.attrs, e.value))
+            .collect();
+        assert_eq!(
+            to_string,
+            [(METHOD_ATTRS, Value::Method(Builtin::ArrayToString))]
+        );
+        assert_eq!(
+            method_of(Intrinsic::Prototype(BuiltinCtor::Array), "toString"),
+            Some(Builtin::ArrayToString)
+        );
     }
 
     #[test]

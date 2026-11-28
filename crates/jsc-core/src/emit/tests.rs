@@ -1482,6 +1482,26 @@ fn typed_array_bodies_validate() {
 }
 
 #[test]
+fn typed_array_method_bodies_validate() {
+    // The `%TypedArray.prototype%` methods of stage T3b (DESIGN.md §5.8.7),
+    // under a small and a large arity `K` (arguments past `K` take the
+    // spread path); every body must stay valid wasm.
+    let methods = "const t = new Int16Array([3, 1, 2]), u = new Float64Array(4);
+        const cb = (v, i) => v > i;
+        console.log(t.at(-1), t.copyWithin(0, 1), t.every(cb), t.fill(1, 1), t.filter(cb),
+            t.find(cb), t.findIndex(cb), t.findLast(cb), t.findLastIndex(cb), t.forEach(cb),
+            t.includes(2, 1), t.indexOf(2), t.join('-'), t.lastIndexOf(1, -1), t.map((v) => v * 2),
+            t.reduce((a, v) => a + v), t.reduceRight((a, v) => a + v, 0), t.reverse(),
+            u.set(t, 1), u.set([1, 2]), t.slice(1), t.some(cb), t.sort(), u.sort((a, b) => b - a),
+            t.subarray(1, 2), t.toLocaleString(), t.toReversed(), t.toSorted(), t.with(0, 9),
+            t.toString === Array.prototype.toString, String(t));";
+    validate(&compile(methods));
+    validate(&compile(&format!(
+        "function wide(a, b, c, d, e, f) {{ return a; }}\nwide();\n{methods}"
+    )));
+}
+
+#[test]
 fn data_view_bodies_validate() {
     // A program naming `DataView` carries the binary-data collector and
     // renderer arms and the `DataView` helpers (DESIGN.md §5.8); every body

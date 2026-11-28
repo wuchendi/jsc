@@ -44,9 +44,10 @@ mod proxy;
 mod string;
 mod symbol;
 mod typed_array;
+mod typed_array_methods;
 mod weak;
 
-use crate::emit::realm::{ArrayCopyOp, DateBodyOp, DateSetOp};
+use crate::emit::realm::{ArrayCopyOp, DateBodyOp, DateSetOp, TypedArrayOp};
 pub(super) use array::{CallArg, call_spilling, emit_array_search};
 pub(super) use async_iter::{
     emit_async_iterator_complete, emit_async_iterator_next, emit_async_iterator_return,
@@ -335,6 +336,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(iterator::STRINGS)
         .chain(array_buffer::strings())
         .chain(typed_array::strings())
+        .chain(typed_array_methods::strings())
         .chain(data_view::strings())
         .chain(proxy::strings())
         .chain([TYPE_ERROR_STACK_PREFIX])
@@ -478,6 +480,9 @@ fn emit_handle_family(
     match builtin {
         Builtin::ArrayBuffer(_) => array_buffer::emit(builtin, f, frame, strings, helpers),
         Builtin::DataView(_) => data_view::emit(builtin, f, frame, strings, helpers),
+        Builtin::TypedArray(op) if TypedArrayOp::METHODS.contains(&op) => {
+            typed_array_methods::emit(op, f, frame, strings, helpers);
+        }
         Builtin::TypedArray(_) => typed_array::emit(builtin, f, frame, strings, helpers),
         Builtin::Proxy(op) => proxy::emit(op, f, frame, strings, helpers),
         _ => weak::emit(builtin, f, frame, strings, helpers),
