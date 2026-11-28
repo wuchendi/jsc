@@ -4,11 +4,6 @@
 # missing (probed against jsc); partially working features stay enabled so
 # their failures are counted. Remove entries as support lands.
 
-# Proxy / Reflect (no globals)
-Proxy
-proxy-missing-checks
-Reflect*
-
 # Regular expressions (literals and the RegExp constructor are rejected)
 regexp-*
 RegExp.escape
