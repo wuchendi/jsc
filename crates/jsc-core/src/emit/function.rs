@@ -276,19 +276,35 @@ pub(super) fn emit_function(
     // Fresh unwinding state for this function body.
     helpers.unwind.borrow_mut().reset();
     emit_stack_guard(&mut function, scratch, helpers);
-    emit_stmts(
-        &func.body,
-        &mut function,
-        scratch,
-        strings,
-        helpers,
-        None,
-        None,
-    );
+    let body = |function: &mut FnBuilder<'_>| {
+        emit_stmts(&func.body, function, scratch, strings, helpers, None, None);
+    };
+    match constructed_this(func) {
+        Some(this) => object::with_object_local(this, || body(&mut function)),
+        None => body(&mut function),
+    }
     emit_call_depth_leave(&mut function, helpers);
     function.instruction(&Instruction::I64Const(UNDEFINED_BITS));
     function.instruction(&Instruction::End);
     finish_builder(function)
+}
+
+/// The `this` local of a base class constructor: the prologue snapshot
+/// `this = __this`, the only write to it, taken under `new` (the call guard
+/// throws otherwise), where `__this` is the allocated instance — so it
+/// always holds an object. `None` for every other function (a derived
+/// constructor's `this` starts in the TDZ; any other `this` may be a
+/// primitive).
+fn constructed_this(func: &IrFunction) -> Option<u32> {
+    if func.info.kind != FnKind::Class {
+        return None;
+    }
+    func.body.iter().find_map(|stmt| match stmt {
+        IrStmt::Expr(IrNode::Assign { local, value }) if matches!(**value, IrNode::ThisGlobal) => {
+            Some(*local)
+        }
+        _ => None,
+    })
 }
 
 /// Count a user function out of `$__call_depth` on an exit that falls off

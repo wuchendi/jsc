@@ -2970,21 +2970,44 @@ pub(super) fn emit_index_op_set_node(
     });
 }
 
+thread_local! {
+    /// The locals [`never_primitive`] knows hold an object (see
+    /// [`with_object_local`]).
+    static OBJECT_LOCALS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `emit` knowing that the local `local` holds an object throughout: a
+/// runtime body's `Set(O, ..)` target (an Object by the spec's typing: a
+/// `ToObject` result or a created array), or a base class constructor's
+/// `this` (the allocated instance). A member store on it emits no
+/// [`emit_primitive_set`] arm, so the body keeps neither `__set_bool` nor
+/// `__to_object` for it.
+pub(super) fn with_object_local<T>(local: u32, emit: impl FnOnce() -> T) -> T {
+    OBJECT_LOCALS.with_borrow_mut(|locals| locals.push(local));
+    let value = emit();
+    OBJECT_LOCALS.with_borrow_mut(Vec::pop);
+    value
+}
+
 /// Whether `node` provably evaluates to an object/array/function heap value (a
-/// fresh literal or instance), so a member store on it needs no
-/// primitive-receiver guard.
+/// fresh literal or instance, an assignment of one, or a local known to hold
+/// one), so a member store on it needs no primitive-receiver guard.
 fn never_primitive(node: &IrNode) -> bool {
-    matches!(
-        node,
-        IrNode::Object { .. }
-            | IrNode::Array(_)
-            | IrNode::ArraySpread(_)
-            | IrNode::Construct { .. }
-            | IrNode::MapNew { .. }
-            | IrNode::DateNew { .. }
-            | IrNode::FuncValue { .. }
-            | IrNode::DeclFunc(_)
-    )
+    match node {
+        IrNode::Assign { value, .. } => never_primitive(value),
+        IrNode::Local(local) => OBJECT_LOCALS.with_borrow(|locals| locals.contains(local)),
+        _ => matches!(
+            node,
+            IrNode::Object { .. }
+                | IrNode::Array(_)
+                | IrNode::ArraySpread(_)
+                | IrNode::Construct { .. }
+                | IrNode::MapNew { .. }
+                | IrNode::DateNew { .. }
+                | IrNode::FuncValue { .. }
+                | IrNode::DeclFunc(_)
+        ),
+    }
 }
 
 /// Whether `node` provably never evaluates to `null`/`undefined`, so a member

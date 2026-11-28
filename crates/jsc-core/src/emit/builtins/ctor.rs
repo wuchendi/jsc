@@ -392,13 +392,14 @@ fn array(k: u32) -> IrNode {
     let (body, capture) = Body::snapshotted(k, k + 1);
     let body = &body;
     let arr = body.temp(3);
+    // The store's base is the assignment of the fresh array, so it carries
+    // no primitive-receiver arm.
     let with_length = IrNode::Seq(vec![
-        IrNode::Assign {
-            local: arr,
-            value: Box::new(IrNode::Array(Vec::new())),
-        },
         IrNode::IndexSet {
-            obj: Box::new(IrNode::Local(arr)),
+            obj: Box::new(IrNode::Assign {
+                local: arr,
+                value: Box::new(IrNode::Array(Vec::new())),
+            }),
             index: Box::new(IrNode::Str(INDEX_LENGTH_KEY.into())),
             value: Box::new(body.arg(0)),
         },

@@ -149,6 +149,20 @@ fn set(o: u32, key: IrNode, v: u32) -> IrNode {
     }
 }
 
+/// Emit [`set`] and drop its value: `o` is an Object (the spec's `Set`
+/// target), so the store carries no primitive-receiver arm.
+fn emit_set(
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    (o, key, v): (u32, IrNode, u32),
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    crate::emit::object::with_object_local(o, || {
+        emit_drop(function, frame, &set(o, key, v), strings, helpers);
+    });
+}
+
 /// `DeletePropertyOrThrow(O, key)` (i64 locals).
 fn delete(o: u32, key: u32) -> IrNode {
     IrNode::ObjectDelete {
@@ -320,20 +334,14 @@ pub(super) fn emit_push(
         wasm!(function; LocalGet(flen), LocalGet(i), F64ConvertI32U, F64Add);
         wasm!(function; I64ReinterpretF64, LocalSet(kv));
         arg_at(function, frame, i, spread, v);
-        emit_drop(
-            function,
-            frame,
-            &set(o, IrNode::Local(kv), v),
-            strings,
-            helpers,
-        );
+        emit_set(function, frame, (o, IrNode::Local(kv), v), strings, helpers);
     });
     wasm!(function;
         LocalGet(flen), LocalGet(n), F64ConvertI32U, F64Add,
         I64ReinterpretF64, LocalSet(kv),
     );
     let length = IrNode::Str(INDEX_LENGTH_KEY.into());
-    emit_drop(function, frame, &set(o, length, kv), strings, helpers);
+    emit_set(function, frame, (o, length, kv), strings, helpers);
     wasm!(function; LocalGet(kv));
 }
 
@@ -366,7 +374,7 @@ pub(super) fn emit_pop(
         If(BlockType::Empty),
         I64Const(0.0f64.to_bits().cast_signed()), LocalSet(kv),
     );
-    emit_drop(function, frame, &set(o, length(), kv), strings, helpers);
+    emit_set(function, frame, (o, length(), kv), strings, helpers);
     wasm!(function; I64Const(UNDEFINED_BITS), Return, End);
     wasm!(function;
         LocalGet(len), F64Const(Ieee64::from(1.0)), F64Sub, I64ReinterpretF64, LocalSet(kv),
@@ -378,7 +386,7 @@ pub(super) fn emit_pop(
     emit_node(&read, function, frame.scratch(), strings, helpers);
     wasm!(function; LocalSet(v));
     emit_drop(function, frame, &delete(o, kv), strings, helpers);
-    emit_drop(function, frame, &set(o, length(), kv), strings, helpers);
+    emit_set(function, frame, (o, length(), kv), strings, helpers);
     wasm!(function; LocalGet(v));
 }
 
@@ -1377,7 +1385,7 @@ fn array_create(
         LocalSet(out),
     );
     let length = IrNode::Str(INDEX_LENGTH_KEY.into());
-    emit_drop(function, frame, &set(out, length, len), strings, helpers);
+    emit_set(function, frame, (out, length, len), strings, helpers);
 }
 
 /// `IsConstructor(c) ? Construct(c, args) : ArrayCreate(len)` into i64
@@ -1603,7 +1611,7 @@ fn set_length(
     helpers: Helpers<'_>,
 ) {
     let length = IrNode::Str(INDEX_LENGTH_KEY.into());
-    emit_drop(function, frame, &set(a, length, len), strings, helpers);
+    emit_set(function, frame, (a, length, len), strings, helpers);
 }
 
 /// `while k > 0 { k -= 1; body }` over the f64 local `k`.
@@ -3049,13 +3057,7 @@ fn set_at(
 ) {
     num(function, f);
     wasm!(function; LocalSet(kv));
-    emit_drop(
-        function,
-        frame,
-        &set(o, IrNode::Local(kv), v),
-        strings,
-        helpers,
-    );
+    emit_set(function, frame, (o, IrNode::Local(kv), v), strings, helpers);
 }
 
 /// `DeletePropertyOrThrow(o, f)` for the f64 index in local `f` (`kv` an i64

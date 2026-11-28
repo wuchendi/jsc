@@ -349,6 +349,45 @@ fn hello_world_stays_near_the_base() {
     assert!(shaken * 3 < size(src, true) * 2);
 }
 
+/// A member store whose base may be a primitive runs `ToObject(base).[[Set]]`
+/// through `__set_bool` (a full `[[Set]]` body, several KB). The runtime's own
+/// stores (`Array(n)`'s `length` write, the generic `Array.prototype` and
+/// `Object.assign` `Set`s, all on Objects) and a base class constructor's
+/// `this.x = ..` carry no such arm, so a program without a user store on a
+/// possibly-primitive base keeps neither: one such store adds over 2 KB (L1
+/// measured the arm at +4.7 KB on hello world), far more than its own
+/// function and store site (a few hundred bytes).
+#[test]
+fn primitive_store_arm_is_kept_only_by_user_stores() {
+    let hello = size("console.log('hi')", false);
+    let store = "function f(o) { o.x = 1 } f({}); console.log('hi')";
+    assert!(
+        size(store, false) > hello + 2_000,
+        "hello world is {hello} bytes"
+    );
+    let class = "class P { constructor(v) { this.v = v } }\nconsole.log(new P(1).v)";
+    let class_store = "class P { constructor(v) { this.v = v } }\n\
+        function f(o) { o.w = 2 }\nconst p = new P(1); f(p); console.log(p.v, p.w)";
+    let (class_size, class_store_size) = (size(class, false), size(class_store, false));
+    assert!(
+        class_store_size > class_size + 2_000,
+        "{class_size} vs {class_store_size}"
+    );
+    same(class, "1\nundefined");
+    same(class_store, "1 2\nundefined");
+    same(store, "hi\nundefined");
+}
+
+/// The runtime stores that lost their primitive arm still store.
+#[test]
+fn runtime_object_stores_still_run() {
+    same(
+        "const a = Array(3); const o = {}; Array.prototype.push.call(o, 7, 8);\n\
+         const t = Object.assign({}, {x: 1}); console.log(a.length, o.length, o[1], t.x)",
+        "3 2 8 1\nundefined",
+    );
+}
+
 /// Without a way to reach `%Reflect%` or a proxy, the `Reflect` and `Proxy`
 /// bodies are stubs that record no use. Naming `Reflect`, even only in a
 /// string, opens the `Reflect` gate: `Reflect.set` (kept by the `"set"`
