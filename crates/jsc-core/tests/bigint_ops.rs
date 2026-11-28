@@ -569,7 +569,7 @@ fn gate_opened_by_the_global_object() {
         (&format!("{big} const o = {{ v: x }}; o.v--; o.v"), "4n"),
         (
             &format!("{big} [x < 6, x > '4', typeof x, !!x, x === B(5)]"),
-            "[ true, true, 'bigint', true, true ]",
+            "[ true, true, bigint, true, true ]",
         ),
         (&format!("{big} Number(x) + 1"), "6"),
     ]);
