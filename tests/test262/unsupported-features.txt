@@ -12,9 +12,7 @@ legacy-regexp
 # Binary data: Float16Array, base64, DataView, Atomics (no constructors)
 Float16Array
 uint8array-base64
-stable-typedarray-sort
 immutable-arraybuffer
-align-detached-buffer-semantics-with-web-reality
 SharedArrayBuffer
 Atomics*
 
