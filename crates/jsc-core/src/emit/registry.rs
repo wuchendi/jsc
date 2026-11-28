@@ -775,7 +775,7 @@ const CONV: [Row<Conv>; 26] = [
         emit_own_desc(cx.strings, cx.helpers, cx.leaves)
     }),
     (Conv::SetIntegrity, (&[I64, I32], &[I32]), |cx| {
-        emit_set_integrity(cx.helpers, cx.leaves)
+        emit_set_integrity(cx.strings, cx.helpers, cx.leaves)
     }),
     (Conv::TestIntegrity, (&[I64, I32], &[I32]), |cx| {
         emit_test_integrity(cx.helpers, cx.leaves)

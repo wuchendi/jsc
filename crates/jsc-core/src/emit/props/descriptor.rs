@@ -201,6 +201,30 @@ pub(in crate::emit) fn emit_define_own(
             Call(helpers.proxy_define_own()), Return,
         );
     });
+    // A typed array's numeric key (DESIGN.md §5.8.5): an invalid index, or a
+    // descriptor making it non-configurable, non-enumerable, an accessor or
+    // non-writable, rejects; else a present `value` is written by
+    // `TypedArraySetElement` (its conversion may leave an exception pending).
+    emit_if_ta_numeric(&mut f, o, key, i, helpers, |f| {
+        emit_ta_valid(f, o, i, helpers);
+        wasm!(f; I32Eqz);
+        for bit in [ATTR_CONFIGURABLE, ATTR_ENUMERABLE, ATTR_WRITABLE] {
+            let both = (bit << DESC_HAS_SHIFT) | bit;
+            wasm!(f;
+                LocalGet(desc), I32Const(both), I32And, I32Const(bit << DESC_HAS_SHIFT), I32Eq, I32Or,
+            );
+        }
+        emit_flag(f, desc, accessor_desc);
+        wasm!(f;
+            I32Or,
+            If(BlockType::Empty), I32Const(DEFINE_REJECT), Return, End,
+            LocalGet(desc), I32Const(DESC_HAS_VALUE), I32And,
+            If(BlockType::Empty),
+            LocalGet(o), LocalGet(i), LocalGet(value), Call(helpers.ta_set_value()),
+            End,
+            I32Const(DEFINE_OK), Return,
+        );
+    });
     // A String wrapper's index: `IsCompatiblePropertyDescriptor` against its
     // virtual `{value: s[i], writable: false, enumerable: true,
     // configurable: false}`; nothing changes.
@@ -624,7 +648,9 @@ pub(in crate::emit) fn emit_to_desc(
 /// elements (holes are absent) have the default attributes and its table
 /// elements their own; a `String` wrapper's index is `{value: s[i],
 /// writable: false, enumerable: true, configurable: false}`; a `LAZY`
-/// function is materialized by the lookup. `e`, `i` are i32 scratch.
+/// function is materialized by the lookup; a typed array's valid index is
+/// `{value, writable, enumerable, configurable: true}` and an invalid
+/// numeric key absent (DESIGN.md §5.8.5). `e`, `i` are i32 scratch.
 fn emit_own_lookup(
     f: &mut FnBuilder<'_>,
     [o, key, e, i, a, v]: [u32; 6],
@@ -633,6 +659,17 @@ fn emit_own_lookup(
     helpers: Helpers<'_>,
 ) {
     wasm!(f; Block(BlockType::Empty));
+    emit_if_ta_numeric(f, o, key, i, helpers, |f| {
+        emit_ta_valid(f, o, i, helpers);
+        wasm!(f; I32Eqz, If(BlockType::Empty));
+        absent(f);
+        wasm!(f;
+            End,
+            LocalGet(o), LocalGet(i), Call(helpers.ta_get()), LocalSet(v),
+            I32Const(ATTRS_DEFAULT), LocalSet(a),
+            Br(2),
+        );
+    });
     emit_if_str_exotic(f, o, key, i, helpers, |f| {
         emit_str_exotic_value(f, o, i, helpers);
         wasm!(f; LocalSet(v), I32Const(ATTR_ENUMERABLE), LocalSet(a), Br(2));
@@ -972,8 +1009,15 @@ fn emit_live_entries<S: Sink>(
 /// are left untouched. A proxy runs the generic algorithm through its traps
 /// (DESIGN.md §6.11): `0` when its `preventExtensions` trap refuses; a
 /// rejected per-key define throws (`Cannot redefine property`); a throw
-/// leaves the exception pending and returns `0`.
-pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
+/// leaves the exception pending and returns `0`. A typed array (DESIGN.md
+/// §5.8.5): a variable-length one refuses `[[PreventExtensions]]` (`0`, no
+/// throw); one with elements becomes non-extensible, then its first
+/// element cannot be sealed or frozen (the `TypeError` is left pending, `0`).
+pub(in crate::emit) fn emit_set_integrity(
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
     let mut f = helper_builder(
         leaves,
         &[ROOT_JS, RAW_I32],
@@ -989,6 +1033,7 @@ pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>, leaves: &LeafSet
     emit_if_proxy(&mut f, o, helpers, |f| {
         emit_proxy_integrity(f, [obj, level, o, e, a, t], [ks, list, k, i, n], helpers);
     });
+    emit_ta_integrity(&mut f, [obj, level, o], strings, helpers);
     wasm!(f;
         LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq, LocalTee(t),
         If(BlockType::Empty),
@@ -1036,6 +1081,37 @@ pub(in crate::emit) fn emit_set_integrity(helpers: Helpers<'_>, leaves: &LeafSet
         End,
     );
     finish_builder(f)
+}
+
+/// The typed-array arm of `__set_integrity` (see [`emit_set_integrity`]),
+/// for the object `obj` (i64) whose base is in i32 `o`.
+fn emit_ta_integrity(
+    f: &mut FnBuilder<'_>,
+    [obj, level, o]: [u32; 3],
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    if !helpers.has_binary() {
+        return;
+    }
+    wasm!(f;
+        LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_TYPEDARRAY), I32Eq,
+        If(BlockType::Empty),
+        LocalGet(o), I32Load8U(m8(FLAGS)),
+        I32Const(i32::from(abi::TA_FLAG_LENGTH_TRACKING | abi::TA_FLAG_RESIZABLE_BUFFER)), I32And,
+        If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(level), I32Const(0), I32Ne,
+        LocalGet(o), Call(helpers.ta_length()), I32Const(0), I32Ne, I32And,
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(NOT_EXTENSIBLE), I32Or,
+        I32Store8(m8(FLAGS)),
+        LocalGet(obj), I64Const(HEAP_BITS | i64::from(static_key(strings, ""))),
+        I32Const(PROP_THROW_TA_FREEZE), I32Const(PROP_THROW_TA_SEAL),
+        LocalGet(level), I32Const(INTEGRITY_FROZEN), I32Eq, Select,
+        Call(helpers.prop_throw), I32Const(0), Return,
+        End,
+        End,
+    );
 }
 
 /// The proxy arm of `__set_integrity` (`SetIntegrityLevel` through the
@@ -1172,6 +1248,18 @@ pub(in crate::emit) fn emit_test_integrity(helpers: Helpers<'_>, leaves: &LeafSe
         I32Eqz,
         If(BlockType::Empty), LocalGet(level), I32Eqz, Return, End,
         LocalGet(level), I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
+    );
+    if helpers.has_binary() {
+        // A typed array's elements are configurable and writable (DESIGN.md
+        // §5.8.5): it is neither sealed nor frozen while it has any.
+        wasm!(f;
+            LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_TYPEDARRAY), I32Eq,
+            If(BlockType::Empty),
+            LocalGet(o), Call(helpers.ta_length()), If(BlockType::Empty), I32Const(0), Return, End,
+            End,
+        );
+    }
+    wasm!(f;
         LocalGet(level), I32Const(INTEGRITY_FROZEN), I32Eq,
         LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq, I32And,
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_LENGTH_READONLY), I32And, I32Eqz, I32And,
@@ -1233,6 +1321,11 @@ pub(in crate::emit) fn emit_own_enum(
             Else, I32Const(0), End,
             Return,
         );
+    });
+    // A typed array's valid index is enumerable; an invalid one is absent.
+    emit_if_ta_numeric(&mut f, o, key, i, helpers, |f| {
+        emit_ta_valid(f, o, i, helpers);
+        wasm!(f; Return);
     });
     emit_if_str_exotic(
         &mut f,
