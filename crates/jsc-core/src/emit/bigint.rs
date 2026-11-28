@@ -2148,6 +2148,9 @@ pub(super) fn emit_numeric_unary(helpers: Helpers<'_>, leaves: &LeafSet) -> Func
 /// The call graph of this family's helpers, for the leaf solver.
 pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
     let big = |h| helpers.bigint(h);
+    // `__same_value_zero` and `__map_hash`, which call the leaf `Eq` / `Hash`
+    // kernels whatever the `bigints` gate, declare them in `roots::helper_graph`
+    // (one entry per helper).
     vec![
         (big(Big::Trim), vec![]),
         (big(Big::Eq), vec![]),
