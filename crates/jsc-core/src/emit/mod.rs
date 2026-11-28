@@ -2046,7 +2046,13 @@ pub fn emit(program: &IrProgram, options: CompileOptions) -> Vec<u8> {
     module.section(&code);
 
     // Data section (after code): the string-literal blobs and the intern table.
-    let mut data = emit_data_section(&offsets, &intern, &program.functions, layout);
+    let mut data = emit_data_section(
+        &offsets,
+        &intern,
+        &program.functions,
+        layout,
+        helpers.bigints(),
+    );
     data.active(
         0,
         &ConstExpr::i32_const(roots_base),

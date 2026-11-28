@@ -80,7 +80,7 @@ const WASI_IMPORT_COUNT: u32 = 4;
 /// Each candidate leaf helper and its declared callees.
 pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
     use registry::Big;
-    let big = |h| helpers.bigint(h);
+    let big = |callee, kernel| with_kernel(helpers, callee, kernel);
     let mut graph = vec![
         (helpers.str_eq, vec![]),
         (helpers.str_cmp, vec![]),
@@ -89,12 +89,12 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
         (helpers.intern_find, vec![helpers.intern_slot]),
         (helpers.index_value, vec![]),
         (helpers.str_exotic_index(), vec![helpers.index_value]),
-        (helpers.same_value_zero, vec![helpers.str_eq, big(Big::Eq)]),
+        (helpers.same_value_zero, big(helpers.str_eq, Big::Eq)),
         (
             helpers.array_search,
             vec![helpers.same_value_zero, helpers.index_value],
         ),
-        (helpers.map_hash(), vec![helpers.str_hash, big(Big::Hash)]),
+        (helpers.map_hash(), big(helpers.str_hash, Big::Hash)),
         (
             helpers.map_find,
             vec![helpers.same_value_zero, helpers.map_hash()],
@@ -182,6 +182,17 @@ pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
     ];
     graph.extend(module_graphs(helpers));
     graph
+}
+
+/// `callee` and, when the `bigints` gate is open, the `BigInt` `kernel`: the
+/// callees of `__same_value_zero` / `__map_hash`, which carry no `BigInt` arm
+/// without the gate (DESIGN.md §6.10.9).
+fn with_kernel(helpers: Helpers<'_>, callee: u32, kernel: registry::Big) -> Vec<u32> {
+    let mut callees = vec![callee];
+    if helpers.bigints() {
+        callees.push(helpers.bigint(kernel));
+    }
+    callees
 }
 
 /// The callees of `__test_integrity` the leaf solver must see: none, or the

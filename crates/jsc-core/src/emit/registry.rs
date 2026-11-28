@@ -175,6 +175,17 @@ impl Group {
             Self::Gc => sink(gc::emit_helpers(helpers, leaves, gc)),
             Self::Extra => of(&EXTRA, cx, sink),
             Self::Binary => sink(binary::emit_helpers(strings, helpers, leaves)),
+            // Without the `bigints` gate no BigInt exists, so no kernel can
+            // run: each is an `unreachable` stub that looks up no string
+            // (DESIGN.md §6.10.9).
+            Self::Bigint if !helpers.bigints() => {
+                for _ in BIGINT {
+                    let mut stub = Function::new([]);
+                    stub.instruction(&wasm_encoder::Instruction::Unreachable);
+                    stub.instruction(&wasm_encoder::Instruction::End);
+                    sink(vec![stub]);
+                }
+            }
             Self::Bigint => of(&BIGINT, cx, sink),
         }
     }

@@ -128,6 +128,10 @@ pub(super) fn throw_if_bigint(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
+    // Without the `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    if !helpers.bigints() {
+        return;
+    }
     bigint::emit_is_bigint(f, v);
     throw_if(f, text, ret, scratch, strings, helpers);
 }

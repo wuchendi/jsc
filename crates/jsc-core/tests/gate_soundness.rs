@@ -157,3 +157,34 @@ fn computed_global_bigint() {
         "9n",
     );
 }
+
+/// With the `BigInt` gate closed the always-present helpers carry no `BigInt`
+/// arm (DESIGN.md §6.10.9); the paths they keep still behave.
+#[test]
+fn gate_closed_helpers_without_bigint_arms() {
+    prints(
+        "const m = new Map([[1, 'a'], [-0, 'z']]); const s = new Set([NaN, 2]); \
+         console.log(m.get(1), m.get(0), s.has(NaN), s.has(3))",
+        "a z true false",
+    );
+    prints(
+        "console.log(1 == '1', null == undefined, 0 == '', ({}) == '[object Object]', 2 == true)",
+        "true true true true false",
+    );
+    prints(
+        "console.log(String(1.5), String(null), String(true), String([1, 2]), typeof 'x', typeof {})",
+        "1.5 null true 1,2 string object",
+    );
+    prints(
+        "console.log(JSON.stringify({ a: [1, 'b', null], c: true }))",
+        r#"{"a":[1,"b",null],"c":true}"#,
+    );
+    prints(
+        "console.log(typeof Object(1), Object('ab').length, Object.keys({ p: 1 }).length)",
+        "object 2 1",
+    );
+    prints(
+        "try { const n = null; n.p; } catch (e) { console.log(e instanceof TypeError) }",
+        "true",
+    );
+}
