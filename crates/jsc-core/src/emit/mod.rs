@@ -399,6 +399,8 @@ const DATE_BLOCK_SIZE: i32 = abi::DATE_BLOCK_SIZE.cast_signed();
 /// The TYPE BYTE of a Symbol primitive block. Maps to `typeof` "symbol". See
 /// [`abi::TYPE_SYMBOL`] for the full layout.
 const TYPE_SYMBOL: i32 = abi::TYPE_SYMBOL as i32;
+/// TYPE BYTE of a `BigInt` primitive; see [`abi::TYPE_BIGINT`].
+const TYPE_BIGINT: i32 = abi::TYPE_BIGINT as i32;
 const SYMBOL_DESCRIPTION_OFFSET: u64 = abi::SYMBOL_DESCRIPTION_OFFSET as u64;
 
 /// `%Symbol.prototype%` (DESIGN.md §7.9): where a property read
@@ -935,6 +937,15 @@ impl Unwind {
     }
 }
 
+/// Whether a program can reach binary data (DESIGN.md §5.8.5).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BinaryData {
+    /// No binary-data object can exist.
+    Unreachable,
+    /// The program names a binary-data constructor or the global object.
+    Reachable,
+}
+
 /// The DESIGN.md §6.11 reachability gate: whether the program can create a
 /// proxy — it names `Proxy` (an identifier, a member or property name, a
 /// string) or reaches the global object. When closed, the property helpers
@@ -1140,6 +1151,9 @@ struct Helpers<'a> {
     /// Whether the program tests an intrinsics dirty bit (DESIGN.md §6.4). When
     /// `false`, `__set` / `__define` / `__delete` do not set the bits.
     dirty_tracking: bool,
+    /// Whether the program can reach binary data (DESIGN.md §5.8.5). When
+    /// not, the collector and the renderer leave out their binary-data arms.
+    binary: BinaryData,
     /// Whether the program can create a proxy (DESIGN.md §6.11 reachability
     /// gate; see [`Helpers::proxies`]).
     proxy_gate: ProxyGate,
@@ -1408,6 +1422,36 @@ impl Helpers<'_> {
         self.conv(registry::Conv::SymbolGet)
     }
 
+    /// Whether the program can reach binary data ([`Self::binary`]).
+    fn has_binary(self) -> bool {
+        self.binary == BinaryData::Reachable
+    }
+
+    /// `__ab_alloc(size) -> block | 0` (see [`binary`]).
+    fn ab_alloc(self) -> u32 {
+        self.group(registry::Group::Binary)
+    }
+
+    /// `__render_binary(p, depth)` (see [`binary`]).
+    fn render_binary(self) -> u32 {
+        self.group(registry::Group::Binary) + 1
+    }
+
+    /// `__dv_length(view) -> i32` (see [`binary`]).
+    fn dv_length(self) -> u32 {
+        self.group(registry::Group::Binary) + 2
+    }
+
+    /// `__dv_get(addr, kind, swap) -> i64` (see [`binary`]).
+    fn dv_get(self) -> u32 {
+        self.group(registry::Group::Binary) + 3
+    }
+
+    /// `__dv_set(addr, kind, n, swap)` (see [`binary`]).
+    fn dv_set(self) -> u32 {
+        self.group(registry::Group::Binary) + 4
+    }
+
     /// `__super_get(home, key, recv) -> i64` (see [`props::emit_super_get`]).
     fn super_get(self) -> u32 {
         self.conv(registry::Conv::SuperGet)
@@ -1589,6 +1633,8 @@ struct FnLayout {
 }
 
 mod array;
+mod bigint;
+mod binary;
 mod builder;
 mod builtins;
 mod convert;

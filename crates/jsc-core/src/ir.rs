@@ -563,11 +563,15 @@ pub enum BuiltinCtor {
     WeakRef,
     /// `FinalizationRegistry`.
     FinalizationRegistry,
+    /// `ArrayBuffer` (DESIGN.md §5.8).
+    ArrayBuffer,
+    /// `DataView` (DESIGN.md §5.8).
+    DataView,
 }
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 24] = [
+    pub(crate) const ALL: [BuiltinCtor; 26] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -592,6 +596,8 @@ impl BuiltinCtor {
         Self::WeakSet,
         Self::WeakRef,
         Self::FinalizationRegistry,
+        Self::ArrayBuffer,
+        Self::DataView,
     ];
 
     /// The constructor's global name (also its `name`).
@@ -614,6 +620,8 @@ impl BuiltinCtor {
             Self::WeakSet => "WeakSet",
             Self::WeakRef => "WeakRef",
             Self::FinalizationRegistry => "FinalizationRegistry",
+            Self::ArrayBuffer => "ArrayBuffer",
+            Self::DataView => "DataView",
         }
     }
 
@@ -986,6 +994,16 @@ pub enum IrNode {
     /// header, the length in UTF-16 code units, then Latin-1 bytes or (with
     /// `STR_FLAG_TWO_BYTE`) UTF-16LE units.
     Str(JsStr),
+    /// A `BigInt` literal (DESIGN.md §6.10.1) in canonical form: the magnitude as
+    /// little-endian `u32` limbs with a nonzero top limb (empty for `0n`) and
+    /// the sign (`false` for `0n`). It lowers to a heap jsval pointing at a
+    /// static `TYPE_BIGINT` block (`abi::BIGINT_ZERO` for `0n`).
+    BigInt {
+        /// The sign: `true` for a negative value.
+        neg: bool,
+        /// The magnitude limbs, least significant first.
+        limbs: Box<[u32]>,
+    },
     /// A boolean literal (`true`/`false`).
     Bool(bool),
     /// The `null` literal.
@@ -2613,6 +2631,7 @@ impl IrNode {
         match self {
             IrNode::Num(_)
             | IrNode::Str(_)
+            | IrNode::BigInt { .. }
             | IrNode::Bool(_)
             | IrNode::Null
             | IrNode::Undefined
@@ -2853,6 +2872,7 @@ impl IrNode {
         match self {
             IrNode::Num(_)
             | IrNode::Str(_)
+            | IrNode::BigInt { .. }
             | IrNode::Bool(_)
             | IrNode::Null
             | IrNode::Undefined

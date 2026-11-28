@@ -91,7 +91,7 @@ const OPEN_TRAILING: &str = " { ";
 const CLOSE_OBJECT: &str = " }";
 
 /// The static strings the renderer writes or looks properties up by.
-pub(super) const STRINGS: [&str; 61] = [
+pub(super) const STRINGS: [&str; 62] = [
     "",
     "true",
     "false",
@@ -130,6 +130,7 @@ pub(super) const STRINGS: [&str; 61] = [
     "[Number: ",
     "[Boolean: ",
     "[Symbol: ",
+    "[BigInt: ",
     "Promise { <pending> }",
     "Promise { ",
     "Promise { <rejected> ",
@@ -206,10 +207,12 @@ impl Helpers<'_> {
     fn out_cp(self) -> u32 {
         self.render_base() + 4
     }
-    fn out_str(self) -> u32 {
+    /// `__out_str(s)`.
+    pub(super) fn out_str(self) -> u32 {
         self.render_base() + 5
     }
-    fn out_uint(self) -> u32 {
+    /// `__out_uint(n)`.
+    pub(super) fn out_uint(self) -> u32 {
         self.render_base() + 6
     }
     /// `__out_flush(fd)`: write the whole buffer to `fd` and reset it.
@@ -683,7 +686,7 @@ fn emit_render_heap(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet
         Return,
         End,
     );
-    render_leaf(&mut f, strings, helpers, p, ty, i);
+    render_leaf(&mut f, strings, helpers, [p, depth, ty, i]);
     wasm!(f; End);
     finish_builder(f)
 }
@@ -694,9 +697,7 @@ fn render_leaf(
     f: &mut FnBuilder<'_>,
     strings: &StrOffsets,
     helpers: Helpers<'_>,
-    p: u32,
-    ty: u32,
-    tmp: u32,
+    [p, depth, ty, tmp]: [u32; 4],
 ) {
     let is = |f: &mut FnBuilder<'_>, kind: i32| {
         wasm!(f; LocalGet(ty), I32Const(kind), I32Eq, If(BlockType::Empty));
@@ -705,6 +706,14 @@ fn render_leaf(
     wasm!(f; LocalGet(p), Call(helpers.out_str()), Return, End);
     is(f, TYPE_SYMBOL);
     render_symbol(f, strings, helpers, p, tmp);
+    wasm!(f; Return, End);
+    // A BigInt: its decimal digits and `n` (DESIGN.md §6.10.2).
+    is(f, i32::from(abi::TYPE_BIGINT));
+    box_heap(f, p);
+    wasm!(f;
+        I32Const(10), Call(helpers.bigint(super::registry::Big::ToString)), Call(helpers.out_str()),
+    );
+    lit(f, strings, helpers, super::bigint::SUFFIX);
     wasm!(f; Return, End);
     for (kind, open) in [(TYPE_MAP, "Map("), (TYPE_SET, "Set(")] {
         is(f, kind);
@@ -731,6 +740,13 @@ fn render_leaf(
         LocalGet(p), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, Call(helpers.date_text()),
         I32WrapI64, Call(helpers.out_str()), Return, End,
     );
+    // Binary data (DESIGN.md §5.8.8), only in a program that can reach it.
+    if helpers.has_binary() {
+        is(f, i32::from(abi::TYPE_ARRAYBUFFER));
+        wasm!(f; LocalGet(p), LocalGet(depth), Call(helpers.render_binary()), Return, End);
+        is(f, i32::from(abi::TYPE_DATAVIEW));
+        wasm!(f; LocalGet(p), LocalGet(depth), Call(helpers.render_binary()), Return, End);
+    }
     lit(f, strings, helpers, "undefined");
 }
 
@@ -1009,8 +1025,12 @@ fn render_wrapper(
     wasm!(f; If(BlockType::Empty));
     bracketed(f, "[Symbol: ");
     wasm!(f; Else);
+    class_is(f, abi::CLASS_BIGINT);
+    wasm!(f; If(BlockType::Empty));
+    bracketed(f, "[BigInt: ");
+    wasm!(f; Else);
     bracketed(f, "[Boolean: ");
-    wasm!(f; End, End, End);
+    wasm!(f; End, End, End, End);
     props_call(f, strings, helpers, (p, depth, first), 0, OPEN_TRAILING);
     wasm!(f; LocalGet(first), I32Eqz, If(BlockType::Empty));
     lit(f, strings, helpers, CLOSE_OBJECT);
@@ -1045,10 +1065,11 @@ fn emit_render_object(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafS
     props_call(&mut f, strings, helpers, (p, depth, first), 1, OPEN_OBJECT);
     close_list(&mut f, strings, helpers, first, "{}", CLOSE_OBJECT);
     wasm!(f; Return, End);
-    // The four wrapper classes: `BOOLEAN`/`NUMBER`/`STRING` are consecutive.
+    // The five wrapper classes: `BOOLEAN`/`NUMBER`/`STRING` are consecutive.
     wasm!(f;
         LocalGet(class), I32Const(i32::from(abi::CLASS_BOOLEAN)), I32Sub, I32Const(3), I32LtU,
         LocalGet(class), I32Const(i32::from(abi::CLASS_SYMBOL)), I32Eq, I32Or,
+        LocalGet(class), I32Const(i32::from(abi::CLASS_BIGINT)), I32Eq, I32Or,
         If(BlockType::Empty),
     );
     render_wrapper(&mut f, strings, helpers, (p, depth, class, first, prim));
@@ -1371,7 +1392,7 @@ fn emit_render_lookup(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 }
 
 /// `__heap_object(v) -> p`: the base of an object-family heap value that
-/// carries a `props` slot (not a string, array or symbol), or `0`.
+/// carries a `props` slot (not a string, array, symbol or `BigInt`), or `0`.
 fn emit_heap_object(leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_JS], &[RAW_I32]);
     let (v, ty) = (0, 1);
@@ -1381,6 +1402,7 @@ fn emit_heap_object(leaves: &LeafSet) -> Function {
         LocalGet(v), I32WrapI64, I32Load8U(m8(0)), LocalTee(ty), I32Const(TYPE_STRING), I32Ne,
         LocalGet(ty), I32Const(TYPE_ARRAY), I32Ne, I32And,
         LocalGet(ty), I32Const(TYPE_SYMBOL), I32Ne, I32And,
+        LocalGet(ty), I32Const(i32::from(abi::TYPE_BIGINT)), I32Ne, I32And,
         If(BlockType::Empty), LocalGet(v), I32WrapI64, Return, End,
         End,
         I32Const(0),

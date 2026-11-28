@@ -182,7 +182,8 @@ fn empty_entry(set: bool) -> &'static [i64] {
 
 /// Push `1` when the jsval in `local` can be held weakly (`CanBeHeldWeakly`,
 /// design/runtime-memory.md §6.1): an object, or a symbol that is not in the
-/// `Symbol.for` registry (the well-known symbols qualify), else `0`.
+/// `Symbol.for` registry (the well-known symbols qualify), else `0` (a
+/// `BigInt` included).
 pub(super) fn emit_can_be_held_weakly(function: &mut impl Sink, local: u32) {
     emit_is_pointer(function, local);
     wasm!(function; If(BlockType::Result(ValType::I32)));
@@ -195,6 +196,11 @@ pub(super) fn emit_can_be_held_weakly(function: &mut impl Sink, local: u32) {
         I32Load8U(MemArg { offset: u64::from(abi::HEADER_FLAGS_OFFSET), align: 0, memory_index: 0 }),
         I32Const(i32::from(abi::SYMBOL_FLAG_REGISTERED)), I32And, I32Eqz,
         I32Or, I32And,
+    );
+    // A BigInt is a primitive, never held weakly.
+    emit_load_type_byte(function, local);
+    wasm!(function;
+        I32Const(i32::from(abi::TYPE_BIGINT)), I32Ne, I32And,
         Else, I32Const(0), End,
     );
 }

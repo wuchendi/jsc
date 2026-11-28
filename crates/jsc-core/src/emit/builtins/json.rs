@@ -76,16 +76,22 @@ fn box_heap(function: &mut FnBuilder<'_>) {
 }
 
 /// Push `1` when the jsval in `local` is a wrapper object (`TYPE_OBJECT`
-/// class `BOOLEAN`, `NUMBER` or `STRING`).
+/// class `BOOLEAN`, `NUMBER`, `STRING` or `BIGINT`).
 fn is_any_wrapper(function: &mut FnBuilder<'_>, local: u32) {
+    let class = MemArg {
+        offset: u64::from(abi::HEADER_CLASS_OFFSET),
+        align: 0,
+        memory_index: 0,
+    };
     emit_is_pointer(function, local);
     wasm!(function;
         If(BlockType::Result(ValType::I32)),
         LocalGet(local), I32WrapI64, I32Load8U(MemArg { offset: 0, align: 0, memory_index: 0 }),
         I32Const(TYPE_OBJECT), I32Eq,
-        LocalGet(local), I32WrapI64,
-        I32Load8U(MemArg { offset: u64::from(abi::HEADER_CLASS_OFFSET), align: 0, memory_index: 0 }),
+        LocalGet(local), I32WrapI64, I32Load8U(class),
         I32Const(i32::from(abi::CLASS_BOOLEAN)), I32Sub, I32Const(3), I32LtU,
+        LocalGet(local), I32WrapI64, I32Load8U(class),
+        I32Const(i32::from(abi::CLASS_BIGINT)), I32Eq, I32Or,
         I32And,
         Else, I32Const(0), End,
     );
@@ -485,8 +491,12 @@ pub(in crate::emit) fn emit_json_rep(
         box_heap(f);
         wasm!(f; LocalSet(key), End);
     };
+    // `GetV(value, "toJSON")` of an object or a BigInt (through
+    // `%BigInt.prototype%`).
     emit_is_object(&mut f, value);
+    bigint::emit_is_bigint(&mut f, value);
     wasm!(f;
+        I32Or,
         If(BlockType::Empty),
         LocalGet(value), I32Const(tok("toJSON")), Call(helpers.get), LocalSet(to_json),
     );
@@ -505,6 +515,17 @@ pub(in crate::emit) fn emit_json_rep(
     return_if_pending(&mut f);
     wasm!(f; End);
     unwrap_primitive(&mut f, value);
+    // A BigInt left after `toJSON` and the replacer cannot be serialized.
+    bigint::emit_is_bigint(&mut f, value);
+    wasm!(f; If(BlockType::Empty));
+    emit_throw_error(
+        &callee_type_error(bigint::BIGINT_JSON),
+        &mut f,
+        scratch,
+        strings,
+        helpers,
+    );
+    wasm!(f; End);
     wasm!(f; LocalGet(value), I64Const(UNDEFINED_BITS), I64Eq);
     emit_is_function(&mut f, value, helpers);
     wasm!(f; I32Or);

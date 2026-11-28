@@ -1419,6 +1419,22 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     );
     link(&mut f, GC_WEAK_REGS_GLOBAL);
     wasm!(f; Return, End);
+    // An ArrayBuffer (DESIGN.md §5.8.3): the prefix and its byte block (a
+    // `TYPE_RAW` leaf: marked, nothing inside traced). Only a program that
+    // can reach binary data carries the arm.
+    if helpers.has_binary() {
+        is(&mut f, abi::TYPE_ARRAYBUFFER);
+        raw(&mut f, abi::OBJ_PROPS_OFFSET);
+        jsval(&mut f, abi::OBJ_PROTO_OFFSET);
+        raw(&mut f, abi::AB_DATA_OFFSET);
+        wasm!(f; Return, End);
+        // A DataView: the prefix and its buffer.
+        is(&mut f, abi::TYPE_DATAVIEW);
+        raw(&mut f, abi::OBJ_PROPS_OFFSET);
+        jsval(&mut f, abi::OBJ_PROTO_OFFSET);
+        raw(&mut f, abi::DV_BUFFER_OFFSET);
+        wasm!(f; Return, End);
+    }
     // A proxy: its private-entry table, the `null` prototype, `env` (itself
     // or `undefined`), the target and the handler (`null` once revoked).
     is(&mut f, abi::TYPE_PROXY);
@@ -1428,7 +1444,7 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     jsval(&mut f, abi::PROXY_TARGET_OFFSET);
     jsval(&mut f, abi::PROXY_HANDLER_OFFSET);
     wasm!(f; Return, End);
-    // Strings, raw buffers and free slots are leaves; the rest of the object
+    // Strings, raw buffers, BigInts and free slots are leaves; the rest of the object
     // family (`1..=3`, `6..=10`) starts with `props` and `proto`.
     wasm!(f;
         LocalGet(ty), I32Eqz, LocalGet(ty), I32Const(i32::from(abi::TYPE_DATE)), I32GtU, I32Or,
@@ -1465,6 +1481,7 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         LocalGet(b), I32Load8U(m8(abi::HEADER_CLASS_OFFSET)), LocalTee(ty),
         I32Const(i32::from(abi::CLASS_BOOLEAN)), I32Sub, I32Const(2), I32LeU,
         LocalGet(ty), I32Const(i32::from(abi::CLASS_SYMBOL)), I32Eq, I32Or,
+        LocalGet(ty), I32Const(i32::from(abi::CLASS_BIGINT)), I32Eq, I32Or,
         If(BlockType::Empty),
     );
     jsval(&mut f, abi::WRAPPER_VALUE_OFFSET);
