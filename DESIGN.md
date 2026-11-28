@@ -364,7 +364,10 @@ of an own-key list, whose values reach user code only through a
 `note_listed_values` body; a descriptor it returns reaches only
 attribute checks or `__own_desc`. A family the program cannot reach still
 emits `unreachable` stubs that record no use (`builtins::gated_off`:
-`Proxy` under the proxy gate, `Reflect` under the `Reflect` gate). Breaking
+`Proxy` under the proxy gate, `Reflect` under the `Reflect` gate, the
+binary-data builtins and `__render_binary` / `__ta_canonical` under
+`has_binary`, §5.8.5), and the static strings only such stubs would look up
+are not interned (`builtins::gated_strings`, `builtins::strings(binary)`). Breaking
 the rule is what made every program the full runtime after the `Reflect`
 merge (`Reflect.set` reached via `"constructor"` → `Map` → `"set"`), and
 every proxy program after it (`__own_prop`, `__proxy_own_keys`).
@@ -1531,9 +1534,10 @@ prototype (`Entry::is_binary`) is a shaking root — not as an internal
 builtin, a symbol-keyed entry, an accessor half, or under a string key a
 kept body looks up (a global name, a prototype's `constructor`). Since no
 shared helper calls a `Group::Binary` helper without the gate, the binary
-builtin bodies and the `Group::Binary` helpers are stubbed; only the realm
-image's binary intrinsic blocks and the static strings remain, as the data
-segments are not shaken. With the gate open shaking is unchanged, and a
+builtin bodies and the `Group::Binary` helpers are stubbed (the bodies and
+the two string-reading helpers even unshaken), and their static strings are
+not interned; only the realm image's binary intrinsic blocks, with their key
+and method-name strings, remain, as the data segments are not shaken. With the gate open shaking is unchanged, and a
 program indexing with computed keys keeps the whole runtime as today.
 
 Inline `ta[k]` (gated): `emit/object.rs::emit_index_dynamic` gains a second
