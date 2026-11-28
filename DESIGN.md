@@ -3113,3 +3113,4 @@ steps.
 - Sloppy mode: strict mode only, permanently or not.
 - `RegExp` engine: written for the guest, or an existing engine compiled in
   (decide before phase 5).
+  Proposed design: `design/regexp.md` (a guest engine, awaiting approval).
