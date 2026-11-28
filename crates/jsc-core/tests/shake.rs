@@ -221,3 +221,82 @@ fn async_paths_are_kept() {
         );
     }
 }
+
+/// The shaken `console.log("hi")` module: 432 056 bytes at 11ca248, plus
+/// about 20 KB of `BigInt` code and data, a few KB of `Proxy` / `Reflect`
+/// strings and gated arms, and the binary-data strings (data segments are
+/// not shaken; the binary-data bodies are, DESIGN.md §5.8.5): about 470 KB,
+/// bounded with headroom for `gc_stress`. The `Reflect` merge had left every
+/// program at the full runtime (~1.2 MB): the renderer's `"constructor"`
+/// lookup keeps the `Map` constructor, its `"set"` lookup kept `Reflect.set`,
+/// and that body's run-time-key use left the module whole (DESIGN.md §6.11).
+const HELLO_BOUND: usize = 520_000;
+
+#[test]
+fn hello_world_stays_near_the_base() {
+    let src = "console.log('hi')";
+    let shaken = size(src, false);
+    assert!(shaken < HELLO_BOUND, "hello world is {shaken} bytes");
+    assert!(shaken * 3 < size(src, true) * 2);
+}
+
+/// Without a way to reach `%Reflect%` or a proxy, the `Reflect` and `Proxy`
+/// bodies are stubs that record no use. Naming `Reflect`, even only in a
+/// string, opens the `Reflect` gate: `Reflect.set` (kept by the `"set"`
+/// lookups) then has its real body, so the module grows beyond a twin that
+/// differs only in the string's text.
+#[test]
+fn reflect_and_proxy_bodies_are_stubbed_when_unreachable() {
+    let program = |s: &str| {
+        format!("const m = new Map([[1, 2]]); m.set(3, 4); const s = '{s}'; m.size + s.length - 7")
+    };
+    let (plain, named) = (program("Refract"), program("Reflect"));
+    let (plain_size, named_size) = (size(&plain, false), size(&named, false));
+    assert!(
+        plain_size + 100 < named_size,
+        "{plain_size} vs {named_size}"
+    );
+    assert!(plain_size * 3 < size(&plain, true) * 2);
+    same(&plain, "2");
+    same(&named, "2");
+    // The full runtime stubs them too: the gate is a compile-time fact.
+    assert!(size(&plain, true) + 100 < size(&named, true));
+}
+
+/// A program calling one `Reflect` function keeps it (and only what it
+/// reaches): the module stays well below the full runtime even though the
+/// runtime looks up `"set"` / `"get"` on objects of its own. (Naming `get`
+/// anywhere, `m.get(1)` included, would count `Reflect.get`'s run-time-key
+/// use; these programs avoid it.)
+#[test]
+fn one_reflect_function_keeps_it_and_still_shakes() {
+    let src = "const m = new Map([[1, 2]]); \
+               Reflect.getPrototypeOf(m) === Map.prototype ? m.size : 0";
+    assert!(size(src, false) * 3 < size(src, true) * 2);
+    same(src, "1");
+    let src = "Reflect.apply(Math.max, undefined, [1, 3, 2]) + Reflect.has({ a: 1 }, 'a')";
+    assert!(size(src, false) * 3 < size(src, true) * 2);
+    same(src, "4");
+    let src = "const o = {}; Reflect.set(o, 'a', 5); Reflect.deleteProperty(o, 'b'); o.a";
+    assert!(size(src, false) * 3 < size(src, true) * 2);
+    same(src, "5");
+}
+
+/// `Reflect.get` under a key built at run time can hand out any builtin:
+/// naming it keeps the runtime whole.
+#[test]
+fn reflect_get_keeps_the_runtime() {
+    let src = "const k = ['m', 'a', 'p'].join(''); \
+               Reflect.get(Array.prototype, k).call([1, 2], x => x * 2).join()";
+    assert_eq!(size(src, false), size(src, true));
+    same(src, "2,4");
+}
+
+/// `Proxy` built with `Reflect` as its handler forwards every trap.
+#[test]
+fn reflect_handler_proxy_runs_shaken() {
+    same(
+        "const p = new Proxy({ a: 1 }, Reflect); p.b = 2; ('a' in p) + p.a + p.b",
+        "4",
+    );
+}

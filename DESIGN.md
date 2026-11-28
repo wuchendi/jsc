@@ -326,7 +326,19 @@ kept runtime body returns or redefines a property its caller picks by a
 run-time key (`shake::note_runtime_key`: `Object.getOwnPropertyDescriptor(s)`,
 `__lookupGetter__` / `__lookupSetter__`, `Object.defineProperty`,
 `defineProperties` and `create`, and `JSON.stringify` for its property
-list): either can reach a builtin by a name no body mentions. `console.log('hi')` is 432 KB shaken and 890 KB whole. The data
+list): either can reach a builtin by a name no body mentions. The realm match
+is by key text alone, whatever object the key is looked up on: the
+renderer's `"constructor"` lookup (always kept with `_start`) keeps every
+constructor, the `Map` constructor's `"set"` keeps every builtin named `set`.
+So a body with a run-time-key use must never sit under a common name in a
+program that cannot call it. Rule (§6.11): a family the program cannot reach
+emits `unreachable` stubs that record no use (`builtins::gated_off`:
+`Proxy` under the proxy gate, `Reflect` under the `Reflect` gate), and a
+`Reflect` function's run-time-key use counts only when user code names it
+(`shake::unnamed_reflect`). Breaking it is what made every program the full
+runtime after the `Reflect` merge (`Reflect.set` reached via `"constructor"`
+→ `Map` → `"set"`). `console.log('hi')` was 432 KB shaken and 890 KB whole
+at the phase-4 close. The data
 segments are not shaken. `CompileOptions::full_runtime` turns the shake off.
 
 **Table.** A funcref table of exactly `n + 2 + 366` entries (min = max), filled
@@ -391,8 +403,11 @@ None is exported.
 unhandled rejection (`__first_unhandled()`, the oldest by creation `seq`)
 is reported as `Uncaught (in promise) <value>` the same way. On a clean finish, a module compiled with `CompileOptions::print_completion`
 renders the completion value as one line on fd 1 (`jsc -p`, §9); the default
-emit discards it. Finally `_start` flushes a line left unfinished on fd 1 by a
-throwing `console.log` argument, and returns (exit code `0`).
+emit discards it. Finally `_start` flushes a line left unfinished on fd 1 and
+returns (exit code `0`). Every `console.log` argument is evaluated before
+anything is printed, so a throwing argument never leaves a partial line; the
+flush is for a line the renderer itself cut short (the out-of-memory
+`RangeError`, or the depth `RangeError` while streaming the arguments).
 
 **Shadow stack.** `[0, abi::SHADOW_STACK_SIZE)` (1 MiB, 16 pages) holds the
 shadow stack, growing down from its end (§5.7). Its body is `[8, SS_SIZE)`:
@@ -3463,7 +3478,24 @@ are rejected by every receiver test, so most guards are already safe:
   them).
 - Runtime shaking: the proxy arms exist only under `proxies` (above);
   `Proxy` and `Reflect` are realm entries kept by their key lookups like
-  every global.
+  every global. Because that match ignores the object a key is looked up
+  on, the trap names (`get`, `set`, `has`, `apply`, `construct`, ...) keep
+  the like-named `Reflect` functions and the internal `Proxy` builtins are
+  always kept, so both families are gated at emission
+  (`builtins::gated_off`): with `proxies` closed every `Builtin::Proxy` body
+  is an `unreachable` stub, and with the **`Reflect` gate** closed
+  (`Helpers::reflect()`, `ReflectGate`, `sections.rs::program_has_reflect`:
+  the program names `Reflect` — a global read or write or the string
+  `"Reflect"` — or holds the global object) every `Builtin::Reflect` body
+  is. A stub records no shake use. With the gate open, `Reflect.get` and
+  `Reflect.getOwnPropertyDescriptor` (which hand out the value under a
+  run-time key), `Reflect.defineProperty` and `Reflect.ownKeys` record a
+  run-time-key use (§4.2), but it leaves the module whole only when the
+  program's own code names that function (`shake::unnamed_reflect`):
+  reached only through a runtime lookup of its common name (a proxy trap
+  with `Reflect` as handler, the `Map` constructor's `"set"`), it is handed
+  keys the program already wrote. `has`, `deleteProperty` and `set` record
+  none (a boolean, or the program's own value stored).
 
 **Reflect** (`emit/builtins/reflect.rs`, a new `ReflectFn` enum of thirteen
 variants in `emit/realm.rs` — distinct from the existing `ReflectOp`, which
@@ -3539,7 +3571,8 @@ image order; no watch bit; not inline namespaces):
 - The proxy builtins are one variant `Builtin::Proxy(ProxyOp)` (`Ctor`,
   `Revocable`, `Revoke`, and `Call`, the call trampoline)
   dispatched by `builtins/proxy.rs::emit`. The revoke function and the
-  trampoline are internal (installed nowhere, so shaking keeps them). The
+  trampoline are internal (installed nowhere, so shaking keeps them; with
+  `proxies` closed they are stubs). The
   `ReflectFn` bodies dispatch from `builtins/mod.rs`.
 
 **Stages** (files in scope per stage; each adds, never reorganizes, in the
