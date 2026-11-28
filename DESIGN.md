@@ -317,8 +317,9 @@ conversion of a run-time value to a property key. Kept, to a fixpoint: `main`,
 the user functions, the settlers and `_start`; every function a kept body
 calls; every builtin or callable intrinsic a kept body names; every builtin
 installed in the realm (§6.4) under a string key a kept body looks up, under
-a symbol key, as an accessor half, or under no key at all; and the prototype
-chain of every kept intrinsic. The module is left whole when user code
+a symbol key, as an accessor half, or under no key at all (none of which
+counts for a binary-data builtin or entry in a program that cannot reach
+binary data, §5.8.5); and the prototype chain of every kept intrinsic. The module is left whole when user code
 converts a value that is not a literal or a plain numeric expression to a
 property key (`o[k]`, a computed key, `k in o`, `delete o[k]`), or when a
 kept runtime body returns or redefines a property its caller picks by a
@@ -1474,9 +1475,19 @@ constructor, or an `IrNode::Str` equal to one of those names (a static
 `this` that could reach a constructor by a computed name). A binary program
 also needs the accessor dispatch of `__get` (the `length` / `buffer` /
 `byteLength` / `byteOffset` getters), so the same names are added to
-`program_has_accessors`. Runtime shaking (§4.2) is unchanged: the builtin
-bodies are realm methods, kept or stubbed by the existing rules; a program
-indexing with computed keys keeps the whole runtime as today.
+`program_has_accessors`. Runtime shaking (§4.2) applies the same gate to
+the realm: with `has_binary` false no binary-data builtin (the
+`ArrayBuffer`, `DataView` and `TypedArray` builtin families, the
+binary-data constructors and their `get [@@species]`, `Builtin::is_binary`)
+and no realm entry owned by or naming a binary-data constructor or
+prototype (`Entry::is_binary`) is a shaking root — not as an internal
+builtin, a symbol-keyed entry, an accessor half, or under a string key a
+kept body looks up (a global name, a prototype's `constructor`). Since no
+shared helper calls a `Group::Binary` helper without the gate, the binary
+builtin bodies and the `Group::Binary` helpers are stubbed; only the realm
+image's binary intrinsic blocks and the static strings remain, as the data
+segments are not shaken. With the gate open shaking is unchanged, and a
+program indexing with computed keys keeps the whole runtime as today.
 
 Inline `ta[k]` (gated): `emit/object.rs::emit_index_dynamic` gains a second
 arm after the `TYPE_ARRAY` arm — type byte `25` and a number key — that

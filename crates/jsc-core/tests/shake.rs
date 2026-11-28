@@ -50,6 +50,58 @@ fn proxy_helpers_are_dropped_without_proxy() {
     same(named, "3");
 }
 
+/// A program that cannot reach binary data keeps no binary-data builtin, no
+/// `Group::Binary` helper and no binary arm (DESIGN.md §5.8.5): naming a
+/// typed-array constructor grows the shaken module by the typed-array
+/// runtime.
+#[test]
+fn binary_helpers_are_dropped_without_binary() {
+    let plain = "console.log('hi')";
+    let named = "console.log('hi'); new Uint8Array(1)";
+    let (plain_size, named_size) = (size(plain, false), size(named, false));
+    assert!(
+        plain_size + 20_000 < named_size,
+        "{plain_size} vs {named_size}"
+    );
+    assert!(size(plain, false) * 2 < size(plain, true));
+}
+
+/// Hello world pays nothing for the binary-data runtime: its shaken module is
+/// smaller than one naming the three binary-data globals by more than their
+/// constructors, getters and helpers.
+#[test]
+fn hello_world_pays_nothing_for_binary_data() {
+    let plain = "console.log('hi')";
+    let named = "console.log('hi', typeof ArrayBuffer, typeof DataView, typeof Uint8Array)";
+    let (plain_size, named_size) = (size(plain, false), size(named, false));
+    assert!(
+        plain_size + 80_000 < named_size,
+        "{plain_size} vs {named_size}"
+    );
+}
+
+/// Binary data reached through the global object, by a literal or a computed
+/// name, keeps what it uses.
+#[test]
+fn binary_data_through_the_global_object_is_kept() {
+    same("new globalThis['Uint8Array'](3).length", "3");
+    same(
+        "const a = new globalThis['Float64Array']([1.5, 2]); a[1] += a[0]; a[1]",
+        "3.5",
+    );
+    let src = "const k = ['Uint8', 'Array'].join(''); const a = new globalThis[k](2); a[1] = 7; a[1] + a.length";
+    assert_eq!(size(src, false), size(src, true));
+    same(src, "9");
+    same(
+        "new DataView(new ArrayBuffer(4)).byteLength + new Uint8Array([1, 2]).buffer.byteLength",
+        "6",
+    );
+    same(
+        "Object.prototype.toString.call(new Int16Array(1)) + [...new Uint8Array([4, 5])].join()",
+        "[object Int16Array]4,5",
+    );
+}
+
 /// A key built at run time can name any builtin: the module stays whole.
 #[test]
 fn dynamic_string_keys_keep_the_runtime() {
@@ -171,15 +223,14 @@ fn async_paths_are_kept() {
 }
 
 /// The shaken `console.log("hi")` module: 432 056 bytes at 11ca248, plus
-/// about 200 KB the binary-data and `BigInt` work added since (the typed-array
-/// constructors and `%TypedArray%.prototype` accessors are kept by the
-/// `"constructor"` / accessor rules), plus a few KB of `Proxy` / `Reflect`
-/// strings. Above this bound a runtime body with a run-time-key use is kept
-/// again: the `Reflect` merge left every program at the full runtime
-/// (~1.18 MB) because the renderer's `"constructor"` lookup keeps the `Map`
-/// constructor, its `"set"` lookup kept `Reflect.set`, and that body's
-/// run-time-key use left the module whole (DESIGN.md §6.11).
-const HELLO_BOUND: usize = 700_000;
+/// about 20 KB of `BigInt` code and data, a few KB of `Proxy` / `Reflect`
+/// strings and gated arms, and the binary-data strings (data segments are
+/// not shaken; the binary-data bodies are, DESIGN.md §5.8.5): about 470 KB,
+/// bounded with headroom for `gc_stress`. The `Reflect` merge had left every
+/// program at the full runtime (~1.2 MB): the renderer's `"constructor"`
+/// lookup keeps the `Map` constructor, its `"set"` lookup kept `Reflect.set`,
+/// and that body's run-time-key use left the module whole (DESIGN.md §6.11).
+const HELLO_BOUND: usize = 520_000;
 
 #[test]
 fn hello_world_stays_near_the_base() {

@@ -15,6 +15,12 @@
 //!   internal ones), and every callable intrinsic so installed or on the
 //!   prototype chain of a kept one.
 //!
+//! In a program that cannot reach binary data (`Helpers::has_binary` false)
+//! none of these realm rules applies to a binary-data builtin or to an entry
+//! of, or naming, a binary-data constructor or prototype ([`Entry::is_binary`]):
+//! nothing else can hand out such a value, so their bodies are stubbed unless a
+//! kept body names them.
+//!
 //! A program is left whole when its own code converts a run-time value that
 //! may be a string to a property key (a computed member access), or when it
 //! keeps a runtime body that reads or redefines a property chosen by a
@@ -32,7 +38,7 @@ use std::collections::HashSet;
 use wasm_encoder::{Encode, Function, Instruction};
 use wasmparser::{BinaryReader, FunctionBody, Operator};
 
-use super::realm::{self, Builtin, Intrinsic, Key, ReflectFn, Value};
+use super::realm::{self, Builtin, Entry, Intrinsic, Key, ReflectFn, Value};
 use super::roots::{classify_is_numeric, never_string};
 use super::{Helpers, IMPORT_FUNC_COUNT, IrNode, StrOffsets};
 
@@ -264,6 +270,9 @@ pub(super) fn shake(
         return;
     }
     let registry = realm::registry();
+    // Without binary data no binary realm entry or builtin is a root.
+    let binary = helpers.has_binary();
+    let live = |entry: &Entry| binary || !entry.is_binary();
     let mut shaker = Shaker {
         bodies,
         uses,
@@ -286,12 +295,15 @@ pub(super) fn shake(
             .iter()
             .any(|entry| matches!(entry.key, Key::Str(_)) && entry.value == Value::Method(builtin))
             || realm::intrinsics().any(|intrinsic| intrinsic.call() == Some(builtin));
-        if !named {
+        if !named && (binary || !builtin.is_binary()) {
             shaker.keep_builtin(builtin);
         }
     }
     for entry in &registry {
-        if matches!(entry.key, Key::Symbol(_)) || matches!(entry.value, Value::Accessor { .. }) {
+        if live(entry)
+            && (matches!(entry.key, Key::Symbol(_))
+                || matches!(entry.value, Value::Accessor { .. }))
+        {
             shaker.obtain_value(entry.value);
         }
     }
@@ -300,9 +312,10 @@ pub(super) fn shake(
         shaker.drain();
         for entry in &registry {
             let Key::Str(key) = entry.key else { continue };
-            if strings
-                .peek(key)
-                .is_some_and(|offset| shaker.strings.contains(&offset))
+            if live(entry)
+                && strings
+                    .peek(key)
+                    .is_some_and(|offset| shaker.strings.contains(&offset))
             {
                 shaker.obtain_value(entry.value);
             }
