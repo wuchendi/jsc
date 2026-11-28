@@ -358,7 +358,8 @@ fn slice_errors() {
 /// `transfer` / `transferToFixedLength` hand the bytes to a fresh buffer
 /// (the current length by default, else `ToIndex(newLength)`) and detach
 /// the receiver: its lengths read `0`, `detached` is `true`, resizability is
-/// kept.
+/// kept. A buffer's lengths are read before it is itself transferred: a
+/// detached buffer's `byteLength` and `maxByteLength` are `0`.
 #[test]
 fn transfer_detaches() {
     assert_string(
@@ -379,15 +380,17 @@ fn transfer_detaches() {
     assert_string(
         "const r = new ArrayBuffer(4, { maxByteLength: 16 });
          const t = r.transfer(10);
+         const before = [t.resizable, t.byteLength, t.maxByteLength];
          const f = t.transferToFixedLength();
          const g = new ArrayBuffer(4, { maxByteLength: 8 }).transferToFixedLength(6);
          const h = new ArrayBuffer(4, { maxByteLength: 8 }).transferToFixedLength(9);
          const k = new ArrayBuffer(2, { maxByteLength: 8 }).transfer();
          k.resize(8);
-         [t.resizable, t.byteLength, t.maxByteLength, r.resizable, r.detached, r.maxByteLength,
-          f.resizable, f.byteLength, f.maxByteLength, t.detached, g.resizable, g.byteLength,
+         [before, r.resizable, r.detached, r.maxByteLength,
+          f.resizable, f.byteLength, f.maxByteLength, t.detached, t.resizable, t.byteLength,
+          t.maxByteLength, g.resizable, g.byteLength,
           g.maxByteLength, h.byteLength, k.byteLength, k.maxByteLength].join()",
-        "true,10,16,true,true,0,false,10,10,true,false,6,6,9,8,8",
+        "true,10,16,true,true,0,false,10,10,true,true,0,0,false,6,6,9,8,8",
     );
     // A subclass instance transfers into a plain `ArrayBuffer`.
     assert_string(
