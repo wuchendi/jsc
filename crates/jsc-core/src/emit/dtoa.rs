@@ -979,13 +979,15 @@ fn emit_msg_str(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) ->
         If(BlockType::Result(ValType::I32)),
         I32Const(static_key(strings, OBJECT_TEXT)),
         Else,
-        LocalGet(v), Call(helpers.prim_str()),
     );
     // A BigInt reads `1n`, as in the console.
     bigint::emit_is_bigint(&mut f, v);
     wasm!(f;
-        If(BlockType::Empty),
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(v), Call(helpers.prim_str()),
         I32Const(static_key(strings, bigint::SUFFIX)), Call(helpers.concat),
+        Else,
+        LocalGet(v), Call(helpers.prim_str()),
         End,
         End,
         End,

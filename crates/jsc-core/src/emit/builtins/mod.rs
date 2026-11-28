@@ -25,6 +25,7 @@ mod array_buffer;
 mod async_iter;
 mod bigint;
 mod ctor;
+mod data_view;
 mod date;
 mod date_parse;
 mod error;
@@ -331,6 +332,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(async_iter::strings())
         .chain(iterator::STRINGS)
         .chain(array_buffer::strings())
+        .chain(data_view::strings())
         .chain(bigint::STRINGS)
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
@@ -357,9 +359,6 @@ fn emit_builtin_body(
     helpers: Helpers<'_>,
 ) {
     match builtin {
-        Builtin::WeakOp { .. } | Builtin::WeakCell(_) | Builtin::ArrayBuffer(_) => {
-            emit_handle_family(builtin, f, frame, strings, helpers);
-        }
         Builtin::FunctionPrototype => wasm!(f; I64Const(UNDEFINED_BITS)),
         Builtin::HasOwnProperty => object::emit_has_own_property(f, frame, strings, helpers),
         Builtin::ObjectToString => object::emit_to_string(f, frame, strings, helpers),
@@ -455,12 +454,14 @@ fn emit_builtin_body(
         | Builtin::ObjectStatic(_)
         | Builtin::IsArray
         | Builtin::DateNow => emit_fragment(builtin, f, frame, strings, helpers),
+        // `WeakOp`, `WeakCell`, `ArrayBuffer`, `DataView`.
+        _ => emit_handle_family(builtin, f, frame, strings, helpers),
     }
 }
 
-/// Emit the body of a weak-collection ([`weak::emit`]) or `ArrayBuffer`
-/// ([`array_buffer::emit`]) method into `f`: the families with a type byte
-/// of their own.
+/// Emit the body of a weak-collection ([`weak::emit`]), `ArrayBuffer`
+/// ([`array_buffer::emit`]) or `DataView` ([`data_view::emit`]) method into
+/// `f`: the families with a type byte of their own.
 fn emit_handle_family(
     builtin: Builtin,
     f: &mut FnBuilder<'_>,
@@ -468,10 +469,10 @@ fn emit_handle_family(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
-    if let Builtin::ArrayBuffer(_) = builtin {
-        array_buffer::emit(builtin, f, frame, strings, helpers);
-    } else {
-        weak::emit(builtin, f, frame, strings, helpers);
+    match builtin {
+        Builtin::ArrayBuffer(_) => array_buffer::emit(builtin, f, frame, strings, helpers),
+        Builtin::DataView(_) => data_view::emit(builtin, f, frame, strings, helpers),
+        _ => weak::emit(builtin, f, frame, strings, helpers),
     }
 }
 
@@ -486,8 +487,8 @@ fn emit_global(builtin: Builtin, f: &mut FnBuilder<'_>, frame: Frame, helpers: H
 
 /// Emit the IR [`fragment`] body of `builtin` into `f`; the weak
 /// constructors (`WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`)
-/// go to [`weak::emit`] instead, `ArrayBuffer` to [`array_buffer::emit`] and
-/// `BigInt` to [`bigint::emit_ctor`].
+/// go to [`weak::emit`] instead, `ArrayBuffer` to [`array_buffer::emit`],
+/// `DataView` to [`data_view::emit`] and `BigInt` to [`bigint::emit_ctor`].
 fn emit_fragment(
     builtin: Builtin,
     f: &mut FnBuilder<'_>,
@@ -501,6 +502,10 @@ fn emit_fragment(
     }
     if builtin == Builtin::Ctor(BuiltinCtor::ArrayBuffer) {
         array_buffer::emit(builtin, f, frame, strings, helpers);
+        return;
+    }
+    if builtin == Builtin::Ctor(BuiltinCtor::DataView) {
+        data_view::emit(builtin, f, frame, strings, helpers);
         return;
     }
     if builtin == Builtin::Ctor(BuiltinCtor::BigInt) {

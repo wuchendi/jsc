@@ -722,6 +722,8 @@ fn render_leaf(
     if helpers.has_binary() {
         is(f, i32::from(abi::TYPE_ARRAYBUFFER));
         wasm!(f; LocalGet(p), LocalGet(depth), Call(helpers.render_binary()), Return, End);
+        is(f, i32::from(abi::TYPE_DATAVIEW));
+        wasm!(f; LocalGet(p), LocalGet(depth), Call(helpers.render_binary()), Return, End);
     }
     lit(f, strings, helpers, "undefined");
 }

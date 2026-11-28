@@ -1428,6 +1428,12 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         jsval(&mut f, abi::OBJ_PROTO_OFFSET);
         raw(&mut f, abi::AB_DATA_OFFSET);
         wasm!(f; Return, End);
+        // A DataView: the prefix and its buffer.
+        is(&mut f, abi::TYPE_DATAVIEW);
+        raw(&mut f, abi::OBJ_PROPS_OFFSET);
+        jsval(&mut f, abi::OBJ_PROTO_OFFSET);
+        raw(&mut f, abi::DV_BUFFER_OFFSET);
+        wasm!(f; Return, End);
     }
     // Strings, raw buffers, BigInts and free slots are leaves; the rest of the object
     // family (`1..=3`, `6..=10`) starts with `props` and `proto`.

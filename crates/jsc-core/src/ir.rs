@@ -570,13 +570,15 @@ pub enum BuiltinCtor {
     FinalizationRegistry,
     /// `ArrayBuffer` (DESIGN.md §5.8).
     ArrayBuffer,
+    /// `DataView` (DESIGN.md §5.8).
+    DataView,
     /// `BigInt` (DESIGN.md §6.10.7): callable, `new` throws.
     BigInt,
 }
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 26] = [
+    pub(crate) const ALL: [BuiltinCtor; 27] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -602,6 +604,7 @@ impl BuiltinCtor {
         Self::WeakRef,
         Self::FinalizationRegistry,
         Self::ArrayBuffer,
+        Self::DataView,
         Self::BigInt,
     ];
 
@@ -626,6 +629,7 @@ impl BuiltinCtor {
             Self::WeakRef => "WeakRef",
             Self::FinalizationRegistry => "FinalizationRegistry",
             Self::ArrayBuffer => "ArrayBuffer",
+            Self::DataView => "DataView",
             Self::BigInt => "BigInt",
         }
     }
