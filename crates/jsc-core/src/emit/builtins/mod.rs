@@ -61,6 +61,7 @@ pub(super) use iter::{
 pub(super) use json::{emit_json_indent, emit_json_rep, emit_json_revive};
 pub(super) use namespace::fragment;
 use number::NumberFormat;
+pub(super) use object_static::emit_with_array_length;
 pub(super) use promise::emit_promise_self_error;
 pub(super) use string::{MAX_STRING_LENGTH, emit_is_whitespace, inline_str_cmp};
 

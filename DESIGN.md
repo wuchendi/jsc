@@ -532,7 +532,7 @@ Arrays additionally: `4` `SPARSE`, `8` `JOINING` (set while `join` runs, so a
 cyclic element joins as `""`), `16` `LENGTH_READONLY` (`length` is
 non-writable; only on a `DICTIONARY` array), `32` `DICTIONARY` (§5.4). None of
 the array bits is ever cleared (except `JOINING`).
-Proxies (`TYPE_PROXY`, phase 5b, planned, §6.11) keep the prefix shape but
+Proxies (`TYPE_PROXY`, phase 5b, §6.11) keep the prefix shape but
 are not in the object family; their flags reuse `CONSTRUCTOR` (`8`) and
 `SELF_ALLOC` (`32`), and header byte 3 holds `1` `PROXY_CLASS_CALLABLE`.
 
@@ -559,7 +559,7 @@ are not in the object family; their flags reuse `CONSTRUCTOR` (`8`) and
 | `17` `TYPE_WEAKREF` | `WeakRef` | prefix, `weak_next: u32 @16`, pad, `target: i64 @24` (weak; `undefined` once collected) | 32 | `object` |
 | `18` `TYPE_FINREG` | `FinalizationRegistry` | prefix, `weak_next: u32 @16`, `cells: u32 @20` → weak `TYPE_ELEMS` of `(target, held, token)` triples, `cleanup: i64 @24`, `flags: u32 @32` (`1` `FINREG_FLAG_JOB_QUEUED`), `job_next: u32 @36` (the `$__fin_jobs` link) | 40 | `object` |
 | `19` `TYPE_RAW` | internal raw buffer | header, `len: u32 @4`, `len` bytes from `@8`, no references (the grown intern table, `Math.sumPrecise` accumulator) | 8 + `len` | — |
-| `20` `TYPE_PROXY` | Proxy exotic object (phase 5b, planned, §6.11) | header (flags `8` `CONSTRUCTOR`, `32` `SELF_ALLOC`; byte 3 `1` `PROXY_CLASS_CALLABLE`), `props: u32 @4` (private entries only), `proto: i64 @8` (always `null`), `func_idx: u32 @16` (the `ProxyCall` slot when callable), reserved `u32 @20`, `env: i64 @24` (itself when callable), `target: i64 @32`, `handler: i64 @40` (both `null` once revoked) | 48 | `function` when callable, else `object` |
+| `20` `TYPE_PROXY` | Proxy exotic object (phase 5b, §6.11) | header (flags `8` `CONSTRUCTOR`, `32` `SELF_ALLOC`; byte 3 `1` `PROXY_CLASS_CALLABLE`), `props: u32 @4` (private entries only), `proto: i64 @8` (always `null`), `func_idx: u32 @16` (the `ProxyCall` slot when callable), reserved `u32 @20`, `env: i64 @24` (itself when callable), `target: i64 @32`, `handler: i64 @40` (both `null` once revoked) | 48 | `function` when callable, else `object` |
 | `14` `TYPE_SYMBOL` | Symbol primitive | header (flags: `4` `SYMBOL_FLAG_REGISTERED`, `8` `SYMBOL_FLAG_PRIVATE` (a private name, §7.6, phase 5a); bits `1`/`2` always clear), reserved `u32 @4` = 0, `description: i64 @8` (string or `undefined`) | 16 | `symbol` |
 | `21` `TYPE_BIGINT` | BigInt primitive (§6.10) | header (flags: `1` `BIGINT_FLAG_NEG`), `len: u32 @4` (limb count), `u32` limbs × `len` @8, little-endian, canonical | `8 + 4·len`, rounded | `bigint` |
 
@@ -1060,7 +1060,7 @@ and never nests (`$__gc_busy`).
   | `12` `TYPE_PROPS` | entries `k < count @4` at `16 + 16k`: raw key `@+0` (`0` = tombstone), jsval value `@+8` |
   | `13` `TYPE_ELEMS` | jsval slots `@8 + 8i` for every `i < cap @4` (not `len`, so a stale slot can only retain); a store flagged `ELEMS_FLAG_WEAK` is marked but none of its slots is traced |
   | `14` `TYPE_SYMBOL` | jsval `description @8` |
-  | `20` `TYPE_PROXY` (phase 5b, planned, §6.11) | raw `props @4`, jsvals `proto @8`, `env @24`, `target @32`, `handler @40` |
+  | `20` `TYPE_PROXY` (phase 5b, §6.11) | raw `props @4`, jsvals `proto @8`, `env @24`, `target @32`, `handler @40` |
   | `15` `TYPE_WEAKMAP`, `16` `TYPE_WEAKSET` | raw `entries @20` (the weak store: marked, not traced); the handle is linked into `$__gc_weak` through `weak_next` unless already linked this cycle |
   | `17` `TYPE_WEAKREF` | nothing past the prefix (`target @24` is weak); linked into `$__gc_weak_refs` |
   | `18` `TYPE_FINREG` | jsval `cleanup @24`, raw `cells @20` (the weak store: marked, not traced) and each cell's `held` value (slot `3i + 1`; targets and tokens are weak); linked into `$__gc_weak_regs` |
@@ -1782,7 +1782,7 @@ function-index order:
 | promises (§6.7) | the self-resolution `TypeError` constructor `() -> i64` that `__promise_settle` rejects with |
 | well-known symbols | `__symbol_get(v, sym)` — `Get(v, sym)`, looking only in the tables on `v`'s chain that have `HAS_SYMBOL_KEYS` (`undefined` when none does; the well-known symbol consult sites, §6.4); an accessor hit always calls its getter, even in a program compiled without the accessor dispatch of `__get`, since builtins alone read the realm's `get [@@species]` and `%Iterator.prototype%`'s `get [@@toStringTag]` |
 | `super` references (§6.3) | `__super_get(home, key, recv)`, `__super_set(home, key, v, recv)` |
-| proxies (§6.11, phase 5b, planned), appended after the collector's | `__proxy_trap(p, name)`, `__proxy_get_proto`, `__proxy_set_proto`, `__proxy_is_extensible`, `__proxy_prevent_ext`, `__proxy_own_prop`, `__proxy_define_own`, `__proxy_has`, `__proxy_get`, `__proxy_set`, `__proxy_delete`, `__proxy_own_keys`; the generic `__get_proto(v)`, `__own_prop(obj, key, list)`, `__desc_compatible(ext, d, cur)`, `__is_array(v)`, `__set_bool(target, key, v, recv)` |
+| proxies (§6.11, phase 5b), appended after the collector's | `__proxy_trap(p, name)`, `__proxy_get_proto`, `__proxy_set_proto`, `__proxy_is_extensible`, `__proxy_prevent_ext`, `__proxy_own_prop`, `__proxy_define_own`, `__proxy_has`, `__proxy_get`, `__proxy_set`, `__proxy_delete`, `__proxy_own_keys`; the generic `__get_proto(v)`, `__own_prop(obj, key, list)`, `__desc_compatible(ext, d, cur)`, `__is_array(v)`, `__set_bool(target, key, v, recv)` |
 | private names (§7.6) | `__private_find(o, key)`, `__private_add(o, key, v, attrs, name)`, `__private_get(o, key, name)`, `__private_set(o, key, v, name)`, `__private_brand(o, v, brand, name, mode)`, `__private_in(o, brand, name)` |
 | output (§6.9) | `__out_reserve(need)`, `__path_reserve(need)`, `__refs_reserve(need)`, `__out_byte(b)`, `__out_cp(cp)`, `__out_str(s)`, `__out_uint(n)`, `__out_flush(fd)`, `__report(fd, prefix, v)` |
 | renderer (§6.9) | `__render_top(v)`, `__render(v, depth)`, `__render_heap(p, depth)`, `__render_array(p, depth)`, `__render_object(p, depth)`, `__render_function(p, depth)`, `__render_props(..)`, `__render_entry(e, quote, first, open, depth)`, `__render_key(key, quote)`, `__render_lookup(o, key)`, `__heap_object(v)`, `__str_of(v)`, `__fn_name(v)`, `__date_text(v)` |
@@ -1818,8 +1818,8 @@ object unchanged.
 `__get`, `__set`, `__has`, `__delete`, `__define`, `__own_keys`,
 `__for_in_keys`, `__copy_data`, and the descriptor helpers (`emit/props.rs`,
 `emit/props/descriptor.rs`) are the only code that reads or writes property
-tables. Keys are interned `u32`s. Phase 5b adds a proxy arm to each of them
-(§6.11, planned): a proxy as the object or anywhere on a prototype chain
+tables. Keys are interned `u32`s. Each of them has a proxy arm
+(§6.11, phase 5b): a proxy as the object or anywhere on a prototype chain
 hands the operation to its traps.
 
 - **`__get(recv, key)`** — `OrdinaryGet`. Each object on the chain (`recv`,
@@ -2102,7 +2102,7 @@ then a call with `this = recv`; it also throws for a nullish receiver. Its
 `call_indirect`. Array fast paths keep the `props == 0` and `proto` checks
 even when the program is intrinsics-sealed: the sealed analysis does not cover
 an own property shadowing a builtin (`a.push = f` is honoured).
-§6.11 (phase 5b, planned) lists which guards stay correct when a proxy is a
+§6.11 (phase 5b) lists which guards stay correct when a proxy is a
 receiver or sits on a prototype chain, and the two (`__protos_indexless`,
 `__symbol_get`) plus the `instanceof` walk that need a proxy test.
 
@@ -2387,7 +2387,7 @@ call site's check (§5.6). The rules:
   `FinalizationRegistry {}` (contents never listed; a subclass instance
   renders the same form);
 - cycles as `<ref *1> { self: [Circular *1] }`;
-- (phase 5b, planned, §6.11) a proxy as its target, without running a trap;
+- (phase 5b, §6.11) a proxy as its target, without running a trap;
   a revoked one as `<Revoked Proxy>`.
 
 Private-name entries (§7.6) are never enumerable, so the renderer does not list
@@ -2963,24 +2963,24 @@ helpers.
 | **B2b** operators | `BinOp::Exp`, `Negate`, `BitNot`, `ToNumeric`, `NumericStep`; `emit_numeric_binary`, `__numeric_op`, `__numeric_unary`; every kernel of §6.10.4 except `as_n`; `__add` BigInt path; relational `__compare`; `emit_inc_dec`; root classification and `yields_number`; opcount reasons | `ir.rs`, `codegen/{expr,generator}.rs`, `emit/{numeric,bigint,convert,expr,roots}.rs`, `tests/opcount/snapshot.tsv` | new `tests/bigint_ops.rs` (every operator and compound form, relational operators vs number / string incl. `NaN`, `±Infinity`, non-integral numbers and unparsable strings, mixed-type `TypeError`s, `>>>` / unary `+` `TypeError`, division / remainder signs and `RangeError`, `**` negative exponent, bitwise and shifts on negatives across limb boundaries, huge shift counts, `++`/`--` on locals, cells, globals, members, generator slots, multi-limb `*` and `/` cross-checked against known products); a `gc_stress` variant module in the same file (`CompileOptions::gc_stress = 1`) over multi-limb loops (factorial of 200, a Fibonacci accumulator, divmod round trips) so every allocation collects while operands are live |
 | **B3** built-ins | `BigInt` ctor, `asIntN` / `asUintN` (`__bigint_as_n`), `%BigInt.prototype%` methods and `@@toStringTag`, `toString(radix)`, `Number(1n)` (`ConvertOp::NumberCall`), `__bigint_to_i64` / `__bigint_from_i64` | `ir.rs`, `codegen/*` (the `Number(..)` inline call), `emit/realm.rs`, new `emit/builtins/bigint.rs`, `emit/builtins/{mod,number}.rs`, `emit/bigint.rs` | new `tests/bigint_builtins.rs` (constructor coercions incl. strings in every radix, whitespace, syntax errors, `new BigInt` `TypeError`, `RangeError` for non-integers, `asIntN` / `asUintN` edge widths 0 / 1 / 64 / 65 and negative inputs, `toString` radices 2..36 on multi-limb values, `thisBigIntValue` errors, `Number(2n**1024n)` = `Infinity`, round-half-even at `2^53 + 1`), with a `gc_stress` variant for the radix conversions |
 | **B4** closeout | `BigInt` out of `unsupported-features.txt`; the §13 / §14 BigInt lines; `null[1n]` names the key `'1'` | `tests/test262/unsupported-features.txt`, `emit/object.rs`, `DESIGN.md` | `tests/bigint.rs` nullish-key message; a `gc_stress` bitwise / `++` `--` test in `tests/bigint_ops.rs` |
-### 6.11 Proxy and Reflect (phase 5b, in progress)
+### 6.11 Proxy and Reflect (phase 5b)
 
-**Status: P2a, P2b and P3 implemented** (the proxy block, `%Proxy%`,
+**Status: implemented** (stages P2a-P4): the proxy block, `%Proxy%`,
 `Proxy.revocable`, the eleven object internal methods with their
 invariants, callable / constructor proxies, the integration paths and the
-`Reflect` namespace, below); P4 is still design. Until P4 the test262 runner keeps skipping the
-`Proxy`, `proxy-missing-checks` and `Reflect*` features (§10). The
-subsection names the code that changes so an implementer does not have to
-re-derive it; "Stages" records where P2a departed from the plan.
+`Reflect` namespace. The test262 runner no longer skips the `Proxy`,
+`proxy-missing-checks` and `Reflect*` features. The subsection names the
+code each part lives in; "Stages" records where the stages departed from
+the plan.
 
 **Scope.** ECMA-262 Proxy exotic objects (§10.5: all thirteen internal
 methods with every invariant check, `ProxyCreate`, `Proxy.revocable`) and the
-`Reflect` namespace (§28.1: all thirteen functions). P4 drops all three
-feature flags: `proxy-missing-checks` names the invariant checks that
+`Reflect` namespace (§28.1: all thirteen functions). None of the three
+feature flags is skipped: `proxy-missing-checks` names the invariant checks that
 ES2020-ES2022 added (`deleteProperty` on a non-extensible target,
 `getOwnPropertyDescriptor` / `defineProperty` reporting a non-writable view of
 a writable non-configurable target property; three tests). They are part of
-the current spec and this design implements them, so the flag goes with the
+the current spec and are implemented, so the flag is enabled with the
 other two.
 
 **Block.** A proxy is a `TYPE_PROXY = 20` block of 48 bytes
@@ -3581,17 +3581,19 @@ shared files):
   (`object_static.rs::own_key_list`, parameterized by the `__own_keys`
   mode) for the `LAZY` and array-`length` handling. The `ReflectFn` bodies
   dispatch through `builtins/mod.rs::emit_handle_family` (the main dispatch
-  is at its line limit). No registry helper rows. Known gap (P2a's forward,
-  not `Reflect`): a trap-less proxy's `[[OwnPropertyKeys]]` forwards
-  `__own_keys(target, OWN_ALL_KEYS)`, which omits an array target's
-  `length` and a `LAZY` function target's unmaterialized keys, so
-  `Reflect.ownKeys(new Proxy([], {}))` lacks `"length"` and the
-  non-configurable-key invariant does not see it.
-- **P4 — closeout.** Remove `Proxy`, `proxy-missing-checks` and `Reflect*`
-  from `tests/test262/unsupported-features.txt`; refresh the baseline from CI;
-  rewrite this subsection in the present tense (dropping "planned"); update
-  §5.1 / §5.2 / §5.7 / §6.2 / §7.6, §13 (the new limitations below, and the
-  per-family failure table) and §14.
+  is at its line limit). No registry helper rows. The array-`length`
+  insertion is `object_static.rs::emit_with_array_length`, which
+  `__proxy_own_keys` also uses: the target's list (trap-less forward and the
+  `ownKeys` invariant check) materializes a `LAZY` function target and
+  includes an array target's `length`.
+- **P4 — closeout.** `Proxy`, `proxy-missing-checks` and `Reflect*` are
+  removed from `tests/test262/unsupported-features.txt`; the baseline refresh
+  comes from the CI run. **Delivered**, with one fix to P2a: the target's
+  `[[OwnPropertyKeys]]` list (the trap-less forward and the `ownKeys`
+  invariant check) used `__own_keys(target, OWN_ALL_KEYS)`, which omits an
+  array target's `length` and a `LAZY` function target's keys; it now
+  materializes the target and inserts `length` (above, P3). The §13 per-family
+  failure table keeps its counts until the next CI recount.
 
 A different split would not be materially better: P2a is the largest stage
 (every property helper), but its arms share one protocol helper and one test
@@ -3647,26 +3649,23 @@ trampoline, so they review well on their own.
   rest parameter and `Date` under a bound-function `newTarget` whose
   `prototype` is an accessor; with an `assert_same_under_gc_stress`
   twin.
-- P4 — no new tests; the test262 run is the gate. No opcount row should
-  move (the arms are compiled out without `proxies`); a row that moves needs
-  its `reason` cell.
+- P4 — `proxy.rs`: the target's full key list (array, lazy function and
+  proxy targets, trap-less and as the `ownKeys` invariant's reference, with a
+  `gc_stress` twin); otherwise the test262 run is the gate. No opcount row
+  moves (the arms are compiled out without `proxies`).
 
-**Expected test262 effect.** 1555 tests carry a `Proxy`, `Reflect*` or
-`proxy-missing-checks` feature; 989 of them carry no other skipped feature
-and are strict-compatible (built-ins/Proxy 261, Reflect 153, Object 89,
-Array 77, Date 49, String 38, Math 36, Promise 35, JSON 24, Function 22, ...).
-While the flags stay (P2a-P3) only untagged tests that happen to use a proxy
-or `Reflect` move (about 380 files mention either; harness files
-`deepEqual.js` and `wellKnownIntrinsicObjects.js` use `Reflect.ownKeys` /
-name `%Proxy%`): roughly +20..60 after P2a, +10..30 after P2b, +60..120
-after P3. P4 adds the 989 to the eligible set; at the 85-90 % pass rate of
-comparable families that is about +850 passes. Known remaining failure
-classes: tests whose other half needs `RegExp`, `eval` or the `Function`
-constructor without a feature tag; `Array.prototype` methods whose generic
-loops clamp lengths to `2^32 - 1` (§13) observed through a proxy `length`;
-`Object.defineProperties` reading its keys before its descriptors (§13), which
-a proxy makes observable; and deep proxy chains (each level a nested helper
-call, unguarded like the renderer, §13).
+**test262 effect.** With the flags removed, about 1050 tests become
+eligible (1061 strict-compatible tests carry a `Proxy`, `Reflect*` or
+`proxy-missing-checks` feature and no other skipped one; 11 of them include
+`nativeFunctionMatcher.js`, which does not compile): built-ins/Proxy 260,
+Reflect 153, Object 89, Array 77, TypedArrayConstructors 60, Date 49,
+TypedArray 40, String 38, Math 36, Promise 35, JSON 24, DataView 24,
+Function 22, ... (421 include `isConstructor.js`, which needs
+`Reflect.construct`). The failure classes left are other sections' gaps:
+`RegExp` literals without a feature tag (§13), the `%TypedArray%.prototype`
+methods other than the getters and iterators (§5.8), the `Function`
+constructor and `eval` (§14 open decisions), and the generic `Array`
+loops' `2^32 - 1` length clamp (§13) observed through a proxy `length`.
 
 ---
 
@@ -4229,17 +4228,15 @@ invisibility and the early errors — and static blocks.
   Walks that read raw table keys must skip it: `__own_keys`' symbol pass
   (`OWN_SYMBOLS`: `getOwnPropertySymbols`; `OWN_ALL_KEYS`: object rest
   `__rest`, `Object.assign`, `defineProperties` / `create`,
-  `getOwnPropertyDescriptors`, and `Reflect.ownKeys` / object spread once
-  they land) lists a symbol key only when it lacks `SYMBOL_FLAG_PRIVATE`; the
+  `getOwnPropertyDescriptors`, `Reflect.ownKeys` and object spread) lists a symbol key only when it lacks `SYMBOL_FLAG_PRIVATE`; the
   string modes (`Object.keys/values/entries`, `getOwnPropertyNames`,
   `JSON.stringify`, `__for_in_keys`) already skip every symbol.
   `__set_integrity` (`freeze` / `seal` / `preventExtensions`) leaves private
   entries' attrs untouched and `__test_integrity` (`isFrozen` /
   `isSealed`) ignores them. The renderer (`emit/render.rs`) lists
   only `ENUMERABLE` entries, so it never shows one. A private key appended to a watched intrinsic's table only
-  sets its dirty bit. There is no `Proxy` yet; the phase-5b design (§6.11)
-  keeps private entries in the proxy's own table, so private operations act
-  on the proxy and never trap.
+  sets its dirty bit. A proxy keeps private entries in its own table
+  (§6.11), so private operations act on the proxy and never trap.
 
 **Static blocks** (phase 5a, built in P4). `static { .. }` lowers to a lifted
 zero-parameter method function (`lower_lifted_function`, method kind, not
@@ -4821,7 +4818,9 @@ Each item below is current behaviour of this tree.
   and the realm image are in every module.
 - The call-stack guard (§6.6) counts user-function calls only. Recursion
   inside the runtime that depends on data depth (`JSON.parse` /
-  `JSON.stringify` nesting, the console renderer) is unguarded, and a host
+  `JSON.stringify` nesting, the console renderer, a chain of proxies whose
+  levels forward without a trap: each level is a nested helper call) is
+  unguarded, and a host
   with a smaller stack than the `jsc` runner (`node:wasi`, a browser) can
   exhaust it before 10 000 calls: both end in a host trap, not a
   `RangeError`.
@@ -4846,11 +4845,9 @@ Each item below is current behaviour of this tree.
 - `Symbol.iterator` and the other `Symbol.*` statics are not folded at
   compile time: a sealed `Symbol` compiles to the intrinsic's address, and the
   member is an ordinary `__get` on it.
-- Not available: `RegExp` (literals and constructor), `Proxy`, `Reflect`,
+- Not available: `RegExp` (literals and constructor),
   the `%TypedArray%.prototype` methods other than the getters and iterators,
-  `Float16Array`, the BigInt typed arrays, `Intl`, `eval`. `Proxy` and
-  `Reflect` are phase 5b work in progress: designed (§6.11), not
-  implemented, and their test262 features are still skipped.
+  `Float16Array`, the BigInt typed arrays, `Intl`, `eval`.
   The `Function` constructor throws `TypeError`.
 - A BigInt holds at most `2^24` bits (`RangeError: Maximum BigInt size
   exceeded`, §6.10.1; V8 allows `2^30`), and `BigInt.prototype.toLocaleString` ignores its locales
@@ -5045,14 +5042,13 @@ steps.
 - All remaining early errors.
 - ES modules: `import`/`export` across files, bundled at compile time into one
   module.
-- `RegExp`, typed arrays, `ArrayBuffer`, `DataView`, `Proxy`,
-  `Reflect`; `BigInt` (phase 5b, done: §6.10).
+- `RegExp`, typed arrays, `ArrayBuffer`, `DataView`; `BigInt` (phase 5b,
+  done: §6.10).
 - Phase 5b binary data (`ArrayBuffer`, typed arrays, `DataView`): designed
   in §5.8 (type tags `24`..`26`; `20` is `TYPE_PROXY`, `21` is
   `TYPE_BIGINT`, `22` / `23` spare), implemented in stages T2, T3a, T4, T3b, T5a, T5b, T6
   (§5.8.10).
-  `Reflect` (phase 5b; the `Proxy` / `Reflect` design is §6.11, stages
-  P2a-P4).
+- `Proxy` and `Reflect` (phase 5b, done; §6.11, stages P2a-P4).
 
 ### Phase 6 — Performance
 

@@ -669,7 +669,25 @@ pub(super) fn own_key_list(
     emit_load_type_byte(function, v);
     wasm!(function;
         I32Const(TYPE_ARRAY), I32Ne, If(BlockType::Empty), LocalGet(kv), Return, End,
-        LocalGet(kv), I32WrapI64, LocalTee(ks), I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
+        LocalGet(kv), I32WrapI64, LocalSet(ks),
+    );
+    emit_with_array_length(function, [ks, res, n, i, length], kv, strings, helpers);
+    wasm!(function; LocalGet(res), I64ExtendI32U, I64Const(HEAP_BITS), I64Or);
+}
+
+/// Copy the `__own_keys` list of an array (i32 rooted base `ks`) into a
+/// fresh array in i32 rooted base `res` with `"length"` inserted after the
+/// integer keys (an array's `length` is not a table entry). `n`, `i` and
+/// `length` are raw i32 and `kv` i64 scratch.
+pub(in crate::emit) fn emit_with_array_length(
+    function: &mut FnBuilder<'_>,
+    [ks, res, n, i, length]: [u32; 5],
+    kv: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    wasm!(function;
+        LocalGet(ks), I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
         I32Const(0), Call(helpers.new_array()), LocalSet(res),
         I32Const(1), LocalSet(length),
     );
@@ -703,10 +721,7 @@ pub(super) fn own_key_list(
         If(BlockType::Empty),
     );
     push_length(function);
-    wasm!(function;
-        End,
-        LocalGet(res), I64ExtendI32U, I64Const(HEAP_BITS), I64Or,
-    );
+    wasm!(function; End);
 }
 
 /// `Object.getOwnPropertySymbols(O)`: every own symbol key of `ToObject(O)`,
