@@ -256,17 +256,16 @@ reinterpret directly. Consequently NaN tests compare bits directly, and a
 computed NaN can never alias a boolean, `null`, `undefined`, or pointer.
 
 **`typeof`.** `typeof` yields an interned heap string: the type index
-(`number`, `boolean`, `undefined`, `object`, `string`, `function`, `symbol`
-— `abi::TYPEOF_STRINGS`) selects the data-segment offset of the matching word,
+(`number`, `boolean`, `undefined`, `object`, `string`, `function`, `symbol`,
+`bigint` — `abi::TYPEOF_STRINGS`) selects the data-segment offset of the matching word,
 so `typeof x === "number"`, concatenation, and `.length` all go through
 ordinary string machinery. `TYPE_FUNCTION` blocks report `"function"`, strings
-`"string"`, `TYPE_SYMBOL` blocks `"symbol"`, every other heap kind `"object"`. `typeof` of an unresolvable
-global name is `"undefined"` and never throws. BigInt design (§6.10, lands in B2a): `TYPE_BIGINT`
-blocks report `"bigint"`, the eighth `TYPEOF_STRINGS` entry, and `0n` joins
-the falsy values below.
+`"string"`, `TYPE_SYMBOL` blocks `"symbol"`, `TYPE_BIGINT` blocks `"bigint"`
+(§6.10), every other heap kind `"object"`. `typeof` of an unresolvable
+global name is `"undefined"` and never throws.
 
-**Truthiness.** Falsy is exactly `false`, `null`, `undefined`, `±0`, `NaN`, and
-the empty string; every other value — including `[]`, `{}`, wrapper objects, and
+**Truthiness.** Falsy is exactly `false`, `null`, `undefined`, `±0`, `NaN`,
+`0n`, and the empty string; every other value — including `[]`, `{}`, wrapper objects, and
 every function — is truthy.
 
 ### 4.2 Module layout
@@ -562,7 +561,7 @@ are not in the object family; their flags reuse `CONSTRUCTOR` (`8`) and
 | `19` `TYPE_RAW` | internal raw buffer | header, `len: u32 @4`, `len` bytes from `@8`, no references (the grown intern table, `Math.sumPrecise` accumulator) | 8 + `len` | — |
 | `20` `TYPE_PROXY` | Proxy exotic object (phase 5b, planned, §6.11) | header (flags `8` `CONSTRUCTOR`, `32` `SELF_ALLOC`; byte 3 `1` `PROXY_CLASS_CALLABLE`), `props: u32 @4` (private entries only), `proto: i64 @8` (always `null`), `func_idx: u32 @16` (the `ProxyCall` slot when callable), reserved `u32 @20`, `env: i64 @24` (itself when callable), `target: i64 @32`, `handler: i64 @40` (both `null` once revoked) | 48 | `function` when callable, else `object` |
 | `14` `TYPE_SYMBOL` | Symbol primitive | header (flags: `4` `SYMBOL_FLAG_REGISTERED`, `8` `SYMBOL_FLAG_PRIVATE` (a private name, §7.6, phase 5a); bits `1`/`2` always clear), reserved `u32 @4` = 0, `description: i64 @8` (string or `undefined`) | 16 | `symbol` |
-| `21` `TYPE_BIGINT` | BigInt primitive (design, lands in B2a: §6.10) | header (flags: `1` `BIGINT_FLAG_NEG`), `len: u32 @4` (limb count), `u32` limbs × `len` @8, little-endian, canonical | `8 + 4·len`, rounded | `bigint` |
+| `21` `TYPE_BIGINT` | BigInt primitive (§6.10) | header (flags: `1` `BIGINT_FLAG_NEG`), `len: u32 @4` (limb count), `u32` limbs × `len` @8, little-endian, canonical | `8 + 4·len`, rounded | `bigint` |
 
 **`TYPE_OBJECT` classes** (header byte 3): `0` `CLASS_ORDINARY`, `1`
 `CLASS_ERROR` (an Error instance: its kind is its prototype, §7.7), `2`
@@ -585,7 +584,9 @@ holds the generator state `0` suspended-start, `1` suspended-yield, `2`
 running, `3` completed; the underlying iterator at `32`, its `next` at
 `40`, the counter or remaining limit (`f64`) at `48`, the callback at `56`,
 a `flatMap`'s inner iterator at `64` (`undefined` while none is open) and
-its `next` at `72`); no host reads the payload).
+its `next` at `72`); no host reads the payload), `9` `CLASS_BIGINT` (a BigInt
+wrapper, created only by `ToObject`, `[[BigIntData]]` at
+`WRAPPER_VALUE_OFFSET`).
 
 Notes per kind:
 
@@ -1041,11 +1042,11 @@ and never nests (`$__gc_busy`).
 
   | type | references traced (offsets from the base) |
   |---|---|
-  | `0` `TYPE_STRING`, `19` `TYPE_RAW`, `0xFF` `TYPE_FREE` | none (leaves) |
+  | `0` `TYPE_STRING`, `19` `TYPE_RAW`, `21` `TYPE_BIGINT`, `0xFF` `TYPE_FREE` | none (leaves) |
   | object family (`1`–`3`, `6`–`10`, `15`–`18`) | prefix: raw `props @4`, jsval `proto @8`; then per kind below |
   | `1` `TYPE_ARRAY` | raw `elems @20` |
   | `2` `TYPE_OBJECT` classes `0` ordinary, `1` error, `2` arguments, `6` global | prefix only (an inline table is reached through `props`) |
-  | `2` classes `3` / `4` / `5` / `7` wrappers | jsval `@16` |
+  | `2` classes `3` / `4` / `5` / `7` / `9` wrappers | jsval `@16` |
   | `2` class `8` iterators | jsval `@16`; kinds `>= 16` (the `Iterator.from` wrapper `16`, the lazy helpers `17..=21`, the async-from-sync iterator `32`) also jsvals `@32`, `@40`; helpers also `@56`, `@64`, `@72` (`@24`, `@28` and a helper's `f64 @48` are not references) |
   | `3` `TYPE_FUNCTION` | jsval `env @24` (a bound function's `[target, boundThis, ...args]` array, a settler's resolving record) |
   | `4` `TYPE_ENV` | jsval slots `@8 + 8k`, `k < count @4`: closure envs, generator frames, async-generator request records, promise reaction / job / thenable-job records, resolving-function records, `Array.fromAsync` state |
@@ -1756,6 +1757,7 @@ function-index order:
 | number to string (§6.5) | `__umul128`, `__ryu_pow5`, `__ryu_mul_shift`, `__ryu_mp5`, `__ryu_d2d(bits)` (Ryu shortest digits), `__scratch_str(ptr, len)`, `__num_to_str(bits)` (`Number::toString`), `__prim_str(v)` (`ToString` of a primitive), `__msg_str(v)` (the text of any value in an error message), `__dec_expand(bits)` (the exact decimal expansion), `__num_format(bits, mode, f)` (`toFixed` / `toExponential` / `toPrecision`), `__num_radix(bits, radix)` |
 | string to number (§6.5) | `__num_unit`, `__str_ws`, `__dec_parse(data, start, end)`, `__dec_slow`, `__dec_round`, `__dec_left`, `__dec_right`, `__digit_span`, `__radix_pow2`, `__radix_fold`, `__string_to_number(s)`, `__to_number_prim(v)`, `__parse_float(v)`, `__parse_int(v, radix)` |
 | clock, random | `__now()`, `__random()` (§6.5) |
+| BigInt (§6.10) | `__bigint_new(len, neg)`, `__bigint_trim(p)`, `__bigint_eq(a, b)`, `__bigint_cmp_mag(a, b)`, `__bigint_cmp(a, b)`, `__bigint_cmp_num(a, x)`, `__bigint_hash(p)`, `__bigint_to_string(v, radix)`, `__string_to_bigint(s)`, `__bigint_to_f64(p)`, `__bigint_from_f64(x)`, `__to_numeric(v)`, `__to_bigint(v)`, `__bigint_loose_eq(a, b)` (the last group, after the extra helpers) |
 | misc | `__gen_to_array(gen)`, `__nullish_throw(recv, key, set)`, `__prop_throw(recv, key, mode)`, `__box_f64(x)`, `__to_number(v)` |
 | trampolines | `__invoke1(fn, arg)` (the promise jobs' callback trampoline), `__async_step(gen, sent)` (the `async` driver's step trampoline), the two `new Promise` settlers |
 | constructors | `new_string(len, two_byte)`, `__new_array(len)` |
@@ -2346,6 +2348,7 @@ call site's check (§5.6). The rules:
   (shortest round-trip digits, exponential form at `>= 1e21` and `< 1e-6`,
   `-0` prints `0`); strings unquoted, also inside containers, with a lone
   surrogate written as U+FFFD (what Node writes); symbols `Symbol(a)` / `Symbol()`;
+  BigInts as their decimal digits and `n` (`-12n`, §6.10.2);
 - arrays `[ 1, <1 empty item>, 3, foo: 1 ]` (holes as runs, then own named
   properties); objects `{ a: 1, b: 2 }` from their own enumerable properties
   in own-key order (enumerable symbol keys last, as `[Symbol(a)]: 1`),
@@ -2357,7 +2360,7 @@ call site's check (§5.6). The rules:
 - `CLASS_ERROR` objects as `Name: message` (name and message looked up along the
   prototype chain without running getters);
 - wrappers as `[Number: 1]` / `[String: 'ab']` / `[Boolean: true]` /
-  `[Symbol: Symbol(a)]`, from their `[[PrimitiveValue]]` (a String wrapper's
+  `[Symbol: Symbol(a)]` / `[BigInt: 1n]`, from their `[[PrimitiveValue]]` (a String wrapper's
   virtual indices are not listed);
 - `Map(N)` / `Set(N)`, `Promise { 42 }` / `Promise { <pending> }` /
   `Promise { <rejected> r }`, dates as ISO 8601 UTC (`Invalid Date` for a
@@ -2374,10 +2377,13 @@ them.
 
 ### 6.10 BigInt
 
-> **Design, not yet implemented** (phase 5b, workstream L2-B). This section
-> is the contract for stages B2a / B2b / B3 / B4 (table at the end); each
-> stage turns its part of this text into a description of the implementation
-> and drops the "lands in" notes it fulfils. ECMA-262 §6.1.6.2 (the BigInt
+> **Partly implemented** (phase 5b, workstream L2-B). Stage B2a (the value,
+> literals, conversions, equality, hashing, property keys, JSON, the wrapper
+> and the empty `%BigInt.prototype%`) is implemented as described; the
+> operators (B2b), the `BigInt` builtins (B3) and the closeout (B4) are still
+> the design (table at the end). Each stage turns its part of this text into
+> a description of the implementation and drops the "lands in" notes it
+> fulfils. ECMA-262 §6.1.6.2 (the BigInt
 > type), §7.1 (conversions), §13 (operators), §21.2 (the BigInt object).
 
 #### 6.10.1 Value and block layout
@@ -2400,19 +2406,24 @@ is ToBoolean for both strings and BigInts (§6.10.2).
 
 - **Canonical form**, an invariant of every block a jsval can reach: the top
   limb is nonzero, zero is `len = 0` with the sign flag clear (there is no
-  `-0n`). Every producer finishes with `__bigint_trim(p)` (lower `len` past
-  high zero limbs, clear the sign of a zero), so equality, hashing and
-  comparison can work on the stored words directly.
+  `-0n`). Every producer finishes with `__bigint_trim(p) -> i64` (lower `len`
+  past high zero limbs and return the jsval, `BIGINT_ZERO` for a zero), so
+  equality, hashing and comparison can work on the stored words directly.
 - **Immutable.** A block is written only between its allocation and the
   moment its jsval is first published (returned from the producing helper);
   afterwards it is shared freely (operands are never reused as results,
   scratch work happens in unpublished blocks).
 - **Static blocks.** Literals are static data-segment blobs in the same
-  layout (`emit/sections.rs` lays them out next to the string literals,
-  deduplicated by value through a `BigIntOffsets` table keyed on
-  `(neg, limbs)`, as `StrOffsets` is for strings). `abi::BIGINT_ZERO` is a
-  static `0n` that every zero result returns without allocating, and the
-  dummy result of a helper that throws (`RangeError`, out of memory).
+  layout: `collect_strings` (`emit/sections.rs`) lays every distinct nonzero
+  literal out after the string blobs, deduplicated by value in the
+  `bigints` table of `StrOffsets` (keyed on `(neg, limbs)`;
+  `StrOffsets::bigint_bits` is the literal's jsval), so a program without a
+  BigInt literal keeps its layout. `abi::BIGINT_ZERO` is the static `0n`
+  (also every `0n` literal): an 8-byte block at a fixed address in the
+  alignment slack between `DEC_POWERS` and `NUM_SCRATCH_ADDR`, its type byte
+  written by a one-byte data segment in every module, returned by every zero
+  result without allocating and as the dummy result of a helper that throws
+  (`RangeError`, out of memory).
 - **Maximum size.** `abi::BIGINT_MAX_LIMBS = 1 << 19` (2^24 bits, a 2 MiB
   block, well under the 512 MiB memory cap). `__bigint_new(len, neg) -> i32`
   (the only allocator of BigInt blocks; `__alloc`, zeroed) throws
@@ -2424,8 +2435,8 @@ is ToBoolean for both strings and BigInts (§6.10.2).
   computing.
 - **GC.** No outgoing references: `__gc_trace` already returns early for
   every type byte above `TYPE_DATE` (the leaf rule shared with strings and
-  `TYPE_RAW`), so tracing needs no code; B2a adds `21` to the leaf row of
-  the §5.7 table. The sweeper reclaims by slot class / span (§5.6) and never
+  `TYPE_RAW`), so tracing needs no code; `21` is in the leaf row of the
+  §5.7 table. The sweeper reclaims by slot class / span (§5.6) and never
   reads `len`, so no size function is needed.
 - **No small-value fast path.** The free NaN-box tags (`0b100`, `0b110`,
   `0b111`) could hold an inline small BigInt, but every hot path that today
@@ -2436,52 +2447,54 @@ is ToBoolean for both strings and BigInts (§6.10.2).
   BigInt to the paths that already handle heap values; BigInt arithmetic
   speed is not a phase-5b goal, and literals cost no allocation.
 
-**Wrapper objects.** `Object(1n)` / `ToObject(1n)` is a `TYPE_OBJECT`
-of the new class `CLASS_BIGINT = 9` (24 bytes, `[[BigIntData]]` at
+**Wrapper objects.** `Object(1n)` / `ToObject(1n)` (`__to_object`) is a
+`TYPE_OBJECT` of class `CLASS_BIGINT = 9` (24 bytes, `[[BigIntData]]` at
 `WRAPPER_VALUE_OFFSET`, proto `%BigInt.prototype%`), traced like the other
-wrapper classes (jsval `@16`; `__gc_trace`'s wrapper class list gains `9`).
-No other new heap kind is needed.
+wrapper classes (jsval `@16`), rendered `[BigInt: 1n]`, unwrapped by
+`JSON.stringify`. `%BigInt.prototype%` is `Intrinsic::BigIntPrototype`, an
+ordinary object over `%Object.prototype%`, empty until B3. No other new
+heap kind is needed.
 
 #### 6.10.2 Type tests, `typeof`, ToBoolean, rendering
 
 - **Primitive, not object.** Every site that tells a symbol (a heap
-  primitive) from an object must also tell a BigInt: today these are the
-  `TYPE_SYMBOL` / `emit_is_symbol` sites (≈ 40 across `emit/props.rs`,
-  `emit/expr.rs` (`emit_is_object`), `emit/render.rs`, `emit/realm.rs`,
-  `emit/value.rs`, `emit/convert.rs`, `emit/numeric.rs`, `emit/object.rs`,
-  `emit/mod.rs`, `emit/gc.rs`, `emit/builtins/{json,mod,symbol,weak}.rs`).
-  B2a audits each one; a BigInt joins the primitive side everywhere (it is
-  never `CanBeHeldWeakly`, `IsObject` is false, `instanceof` is false, it has
-  no own properties). Add `emit_is_bigint(local)` next to `emit_is_symbol`
-  in `emit/value.rs` (same shape).
+  primitive) from an object also tells a BigInt (`emit_is_bigint(local)` in
+  `emit/bigint.rs`, the shape of `emit_is_symbol`): `emit_is_object` tests
+  the type byte against `TYPE_BIGINT` too, so `IsObject`, `instanceof`,
+  `ToPrimitive` and the store guards treat it as a primitive; it is never
+  `CanBeHeldWeakly`. Unlike a symbol (whose reserved word `@4` reads as "no
+  own properties"), a BigInt's `len` sits where an object keeps `props`, so
+  the helpers that walk any non-string heap value test for it first:
+  `__heap_object` (renderer), `__own_keys` (empty), `__has_own` (`false`),
+  `__delete` (no-op) and `__for_in_keys` (no keys).
 - **Primitive receivers.** `__get` / `__set` / `__has`-style lookups with a
   BigInt receiver start at `%BigInt.prototype%` (the two primitive-receiver
   dispatch blocks of `emit/props.rs` that pick `%Symbol.prototype%` /
-  `%Number.prototype%`); a write to a BigInt receiver is the strict-mode
-  `TypeError` that numbers get. `__to_object` (`emit/builtins/mod.rs`)
-  wraps a BigInt in a `CLASS_BIGINT` wrapper.
-- **`typeof`** is `"bigint"`: `abi::TYPEOF_STRINGS` gains an eighth entry
-  `"bigint"` (index 7), and the heap arm of `emit_typeof_node`
-  (`emit/expr.rs`) one more layered `select` (`type == TYPE_BIGINT ? 7`).
+  `%Number.prototype%`, and `__symbol_get`); a write to a BigInt receiver is
+  the strict-mode `TypeError` that numbers get (`Cannot create property 'x'
+  on bigint '1n'`). `__to_object` (`emit/builtins/mod.rs`) wraps a BigInt
+  in a `CLASS_BIGINT` wrapper.
+- **`typeof`** is `"bigint"`: `abi::TYPEOF_STRINGS[7]`, picked by one more
+  layered `select` (`type == TYPE_BIGINT ? 7`) in the heap arm of
+  `emit_typeof_node` (`emit/expr.rs`).
 - **ToBoolean**: `0n` is falsy, every other BigInt truthy. In `emit_cond`
-  (`emit/stmt.rs`) the heap arm's non-string branch, today the constant `1`,
-  becomes `type != TYPE_BIGINT | len @4 != 0`; the number and string
-  paths are unchanged. Every other ToBoolean site (`__json_rep`, filter /
-  find callbacks, `Boolean(v)`) goes through `emit_cond` or must get the same
-  test (B2a greps for `emit_load_str_len` truthiness sites).
+  (`emit/stmt.rs`) the heap arm's non-string branch is
+  `type != TYPE_BIGINT | len @4 != 0`; the number and string paths are
+  unchanged. Every ToBoolean site (`!`, `&&` / `||`, conditions, `Boolean(v)`,
+  the array callbacks) goes through `emit_cond`.
 - **Rendering** (`emit/render.rs`, `__render_heap`): a BigInt prints as its
   decimal digits plus `n` (`1n`, `-12n`), the same at top level, inside
   arrays / objects / Map and Set entries (`[ 1n, 2n ]`, `{ a: 1n }`,
   `Map(1) { 1n => 1 }`); a wrapper as `[BigInt: 1n]`. The digits come from
   `__bigint_to_string(v, 10)` followed by `__out_str`; its allocation may
   run out of memory like the render buffers (§6.9). `__msg_str` (error
-  message text) renders `1n` the same way; `__prim_str` (ToString) has no
-  `n`.
+  message text) appends the `n` too; `__prim_str` (ToString) has no `n`.
 
 #### 6.10.3 Conversions
 
-All conversion helpers live in a new `emit/bigint.rs` (registered in
-`emit/registry.rs` and tree-shaken by `emit/shake.rs` like every helper: a
+All conversion helpers live in `emit/bigint.rs` (the `Big` group of
+`emit/registry.rs`, the last helper group, tree-shaken by `emit/shake.rs`
+like every helper: a
 program with no BigInt literal, no `BigInt` reference and no
 `TYPE_BIGINT`-producing builtin emits none of them; the shared conversion
 helpers (`__to_string`, `__loose_eq`, ..) call them only behind a type-byte
@@ -2490,10 +2503,10 @@ test, so a program without BigInts keeps them out of its module).
 | operation | helper / site | rule |
 |---|---|---|
 | ToPrimitive | `__to_primitive` | a BigInt is a primitive (returned as is); a `CLASS_BIGINT` wrapper unwraps through `%BigInt.prototype%.valueOf` like any object |
-| ToNumeric | `__to_numeric(v) -> i64` | `ToPrimitive(v, number)`; a BigInt is returned, anything else goes through `__to_number_prim` |
-| ToNumber | `__to_number_prim` | a BigInt throws `TypeError: Cannot convert a BigInt value to a number` (so unary `+`, `Math.*`, `isNaN`, `isFinite`, `Date` arguments, `ToIntegerOrInfinity` all throw) |
+| ToNumeric | `__to_numeric(v) -> i64` | `ToPrimitive(v, number)`; a BigInt is returned, anything else goes through `__to_number` |
+| ToNumber | `__to_number` | after `ToPrimitive`, a BigInt throws `TypeError: Cannot convert a BigInt value to a number` next to the symbol check (so unary `+`, `Math.*`, `isNaN`, `isFinite`, `Date` arguments, `ToIntegerOrInfinity` all throw); `__to_number_prim` is only reached with a non-BigInt primitive |
 | ToString | `__prim_str` | decimal digits, no `n`, sign `-`: `__bigint_to_string(v, 10)`. Covers `String(v)`, template literals, `+` with a string, `join`, the default `sort` comparison, `ToPropertyKey` |
-| ToBigInt | `__to_bigint(v) -> i64` | `ToPrimitive(v, number)`, then: BigInt itself; `true` / `false` → `1n` / `0n`; string → `StringToBigInt`, failure `SyntaxError: Cannot convert <s> to a BigInt`; `undefined`, `null`, number, symbol → `TypeError` |
+| ToBigInt | `__to_bigint(v) -> i64` | `ToPrimitive(v, number)`, then: BigInt itself; `true` / `false` → `1n` / `0n`; string → `StringToBigInt`, failure `SyntaxError: Cannot convert <s> to a BigInt`; `undefined`, `null`, number, symbol → `TypeError: Cannot convert <x> to a BigInt` (`<x>` the `__msg_str` text) |
 | StringToBigInt | `__string_to_bigint(s) -> i64` | below; returns `UNDEFINED_BITS` on failure (callers map it to `SyntaxError` / `false`) |
 | NumberToBigInt | `__bigint_from_f64(x: f64) -> i64` | the caller has checked `IsIntegralNumber` (else `RangeError: The number <x> cannot be converted to a BigInt because it is not an integer`, also for `NaN` / `±Infinity`); `|x| < 2^64` via `i64.trunc_f64_u`, else the 53-bit mantissa shifted by `exponent - 52` |
 | BigInt → Number | `__bigint_to_f64(p) -> f64` | exact round-half-even: bit length `L`; `L <= 64` → `f64.convert_i64_u` of the low 64 bits (wasm rounds to nearest, ties to even); else the top 64 bits with bit 0 OR-ed with "any lower bit set" (sticky; the rounding position is bit 10, so the result is correctly rounded), converted, times `2^(L-64)` (built from its exponent bits; `L > 1024` → `Infinity`); negate for the sign |
@@ -2505,21 +2518,23 @@ remainder is `0n`. Then either `0x`/`0X`, `0o`/`0O`, `0b`/`0B` followed by at
 least one digit of that radix and nothing else (no sign), or an optional `+`
 / `-` followed by at least one decimal digit and nothing else. No numeric
 separators, no `n` suffix, no `.`, exponent, `Infinity`; any two-byte unit
-fails. Power-of-two radices pack bits directly into a block of
-`ceil(digits·log2(r) / 32)` limbs (O(n)); decimal allocates
-`ceil(digits / 9) + 1` limbs (10^9 < 2^30) and folds 9-digit chunks with an
-in-place multiply-add `acc = acc·10^k + chunk` over the limbs written so far
-(O(n²) limb steps: about 1.2·10^5 for a 10 000-digit string), then trims.
+fails. Every radix allocates `digits / 8 + 2` limbs (at most 4 bits per
+digit) and folds `k`-digit chunks (`r^k <= 2^32 - 1`: 9 decimal, 8 hex, 10
+octal, 31 binary digits) with an in-place multiply-add
+`acc = acc·r^k + chunk` over the limbs written so far (O(n²) limb steps:
+about 1.2·10^5 for a 10 000-digit decimal string), then trims; a separate
+O(n) bit packing for the power-of-two radices was not worth its code.
 
-**ToString(radix)** (`__bigint_to_string(v, radix: i32) -> i64`, radix
-`2..=36`, lowercase digits): `0n` is `"0"`; a magnitude of at most two limbs
-formats from one `u64` (`i64.div_u` / `rem_u`). Power-of-two radices emit
-bit groups from the top (O(n)). Any other radix copies the magnitude into an
-unpublished scratch block and repeatedly divides it in place by the largest
-`r^k <= 2^32 - 1` (`10^9` for decimal; one-limb division with an `i64`
-dividend, O(n) per step), collecting `k`-digit chunks in a `TYPE_RAW`
-buffer; then one Latin-1 string of the exact length is filled from the most
-significant chunk (unpadded) down (padded to `k` digits). O(n²) overall.
+**ToString(radix)** (`__bigint_to_string(v, radix: i32) -> i32`, a string
+base; radix `2..=36`, lowercase digits): `0n` is `"0"`. Every radix copies
+the magnitude into an unpublished `TYPE_RAW` scratch block and repeatedly
+divides it in place by the largest `r^k <= 2^32 - 1` (`10^9` for decimal;
+one-limb division with an `i64` dividend, O(n) per step), collecting
+`k`-digit chunks in a second `TYPE_RAW` buffer (at most `2·len + 1`: `r^k >
+2^26`); then one Latin-1 string of the exact length is filled from the least
+significant chunk (padded to `k` digits) up to the most significant one
+(unpadded), and the sign. O(n²) overall; out of memory returns the static
+empty string with the `RangeError` pending.
 
 #### 6.10.4 Arithmetic kernels
 
@@ -2645,29 +2660,31 @@ argument (`Math.floor(a - b)` with BigInts must throw).
 
 #### 6.10.6 Equality, comparison, hashing
 
-- **Strict equality** (`emit_strict_eq`): the then-condition `is_string(s0)
-  & is_string(s1)` becomes `is_str_or_big(s0) & is_str_or_big(s1)` (type
-  byte `TYPE_STRING` or `TYPE_BIGINT`; a non-pointer takes the same three
-  instructions as today), and the then-branch calls `__bigint_eq` when
-  either type byte is `TYPE_BIGINT`, else `__str_eq` (a string and a BigInt
-  are unequal: `__bigint_eq` returns `0`). The number / identity `select`
-  is unchanged. `switch` cases use the same emitter.
-- **SameValue / SameValueZero** (`emit_same_value` in
-  `emit/props/descriptor.rs`, `__same_value_zero` in `emit/runtime.rs`,
-  `__array_search` for `includes` / `indexOf` (strict equality), and every
-  other `__str_eq` caller that implements an equality — about 30 call sites
-  in `emit/{runtime,mod,object,numeric,props}.rs`,
-  `emit/builtins/{array,date}.rs`): two BigInts compare by value
-  (`__bigint_eq`). `Object.is(1n, 1n)` is `true`; `[1n].includes(1n)` is
-  `true`.
+- **Strict equality** (`emit_strict_eq`): the then-condition is
+  `emit_is_str_or_bigint(s0) & emit_is_str_or_bigint(s1)` (type byte
+  `TYPE_STRING` or `TYPE_BIGINT`; a non-pointer takes the same three
+  instructions as before), and the then-branch calls `__bigint_eq` when
+  either type byte is nonzero (`TYPE_BIGINT`), else `__str_eq` (a string
+  and a BigInt are unequal: `__bigint_eq` returns `0`). The number /
+  identity `select` is unchanged. `switch` cases and `Array.prototype.indexOf`
+  use the same emitter.
+- **SameValue / SameValueZero**: `__same_value_zero` (`emit/runtime.rs`)
+  calls `__bigint_eq` when its first operand is a BigInt; `emit_same_value`
+  (`Object.is`, `defineProperty` value checks), `includes` and the Map / Set
+  probes all reach it. The remaining `__str_eq` callers compare against a
+  static string, not two values. `Object.is(1n, 1n)` is `true`;
+  `[1n].includes(1n)` is `true`.
 - **Map / Set keys**: `__same_value_zero` as above; `__map_hash` hashes a
   BigInt with `__bigint_hash`, so equal values share a bucket.
-- **Loose equality** (`__loose_eq`, after booleans became numbers): two
+- **Loose equality** (`__loose_eq`, after booleans became numbers and an
+  object against a primitive became its `ToPrimitive`; the BigInt arm is
+  `__bigint_loose_eq`, before the identity fallback): two
   BigInts → `__bigint_eq`; BigInt and number → `__bigint_cmp_num == 0`
   (`NaN` / infinities unequal, `1n == 1.5` false, no rounding); BigInt and
-  string → `StringToBigInt`, failure → `false`; an object against a BigInt
-  → `ToPrimitive` and retry (the BigInt counts as a primitive); BigInt
-  against `null` / `undefined` / symbol → `false`.
+  string → `StringToBigInt`, failure (or the size `RangeError` of a huge
+  string, cleared) → `false`; an object against a BigInt → `ToPrimitive`
+  and retry (the BigInt counts as a primitive); BigInt against `null` /
+  `undefined` / symbol → `false`.
 - **Relational** (`__compare`, reached when the operands are not two strings
   or two numbers): after `ToPrimitive` (hint number), BigInt / BigInt →
   `__bigint_cmp`; BigInt / string → `StringToBigInt` of the string
@@ -2681,19 +2698,19 @@ argument (`Math.floor(a - b)` with BigInts must throw).
 
 - **Property keys.** `{1n: v}`, `class { 1n() {} }`, `{1n: a} = o` key on
   the decimal string, computed at compile time from the literal
-  (`value.to_string()`): `codegen/expr.rs` (~2491, object literals and class
-  members) and `codegen/stmt.rs` (~2316, patterns) map
-  `PropName::BigInt` to the same path as a string key instead of the
-  compile error. `o[1n]`, `1n in o`, `delete o[1n]` and every runtime key
-  go through `__to_key` (`emit/props.rs`), which gains a BigInt branch:
-  `__bigint_to_string(v, 10)`, then intern (so `o[1n]` and `o["1"]` and
+  (`value.to_string()`): `lower_prop_key` (`codegen/expr.rs`, object
+  literals) and `prop_key_name` (`codegen/stmt.rs`, class members and
+  patterns) map `PropName::BigInt` to a static string key. `o[1n]`,
+  `1n in o`, `delete o[1n]` and every runtime key go through `__to_key`
+  (`emit/props.rs`), whose `__to_string` fallback reaches `__prim_str`, so a
+  BigInt key is `__bigint_to_string(v, 10)`, interned (`o[1n]`, `o["1"]` and
   `a[1]` are the same key; an array-index string keeps the index path).
 - **JSON.stringify** (`__json_rep`, `emit/builtins/json.rs`): a BigInt
-  value, or a `CLASS_BIGINT` wrapper after unwrapping, first consults
-  `toJSON` (`GetV`, i.e. through `%BigInt.prototype%`, so a user-installed
-  `BigInt.prototype.toJSON` works) and the replacer as for objects; a
-  BigInt still left throws `TypeError: Do not know how to serialize a
-  BigInt`, at any nesting depth. `__json_str` never sees one.
+  value consults `toJSON` (`GetV`, i.e. through `%BigInt.prototype%`, so a
+  user-installed `BigInt.prototype.toJSON` works) and the replacer as an
+  object does; a `CLASS_BIGINT` wrapper is then unwrapped like the other
+  wrappers; a BigInt still left throws `TypeError: Do not know how to
+  serialize a BigInt`, at any nesting depth. `__json_str` never sees one.
 - **`BigInt`** (`BuiltinCtor::BigInt` in `ir.rs`, the realm entries in
   `emit/realm.rs` appended after the existing constructors, bodies in a new
   `emit/builtins/bigint.rs` following `emit/builtins/number.rs`): `BigInt(v)`
@@ -2740,18 +2757,20 @@ moved row gets a reason cell in the stage that moves it:
 3. B2a: `typeof` (one more `select`, every `typeof` site), `IsObject` (one
    more type-byte test on heap values), ToBoolean of a non-string heap value
    (the `len` test), strict equality of two strings (the BigInt type test
-   before `__str_eq`).
+   before `__str_eq`); in the guest, the BigInt tests of
+   `__same_value_zero`, `__map_hash`, `__loose_eq`'s fallback, `__to_number`,
+   `__prim_str`, `__msg_str`, `__to_object`, `__json_rep`, the primitive
+   receiver dispatch of `__get` and the `__own_keys` / `__has_own` /
+   `__delete` / `__for_in_keys` guards, and the realm image growing by
+   `%BigInt.prototype%` (later static addresses and intern slots shift).
 4. B2b: the non-local update forms (`NumericStep` replaces the `__add`-based
    desugaring of `o.x++`, `cell++`, `global++`).
 
-**Diagnostics** (§8). Gone with B2a: `BigInt literals are not supported`
-(`codegen/expr.rs` ~3207), `unsupported object key: BigInt keys are not
-supported`, `unsupported property key: BigInt keys are not supported`, and
-the tests asserting them (`tests/pattern_keys.rs`
-`bigint_pattern_key_is_rejected`, `bigint_class_member_key_is_rejected`,
-and any BigInt case in `tests/unsupported.rs`) — rewritten as passing
-tests. Nothing BigInt-specific remains a compile error; every BigInt error is
-a run-time `TypeError` / `RangeError` / `SyntaxError` as listed above.
+**Diagnostics** (§8). Nothing BigInt-specific is a compile error (the
+literal and literal-key diagnostics are gone; their `tests/pattern_keys.rs`
+cases are positive tests); every BigInt error is a run-time `TypeError` /
+`RangeError` / `SyntaxError` as listed above. Until B2b an operator on a
+BigInt throws the `ToNumber` `TypeError` rather than computing.
 
 **Conformance.** `BigInt` leaves `tests/test262/unsupported-features.txt`
 in B4. Of the ≈ 1 500 tests tagged `BigInt`, about 325 become eligible on
@@ -3492,16 +3511,18 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
   `**` and `Math.pow` share one inline implementation.
 - **Bitwise and shift** `& | ^ ~ << >> >>>` and their compound forms, with
   ToInt32 / ToUint32 on the operands.
-- **BigInt** (design, §6.10.5–6.10.6; lands in B2a / B2b): every operator
-  above applies ToNumeric instead of ToNumber on its non-number path; two
-  BigInts use the BigInt kernels, a BigInt mixed with a number throws
-  `TypeError` (except `+` with a string, and the comparisons, which are
-  exact), unary `+` and `>>>` throw for a BigInt, and `**` leaves the
-  `Math.pow` lowering for its own `BinOp::Exp`. Equality and
-  SameValue(Zero) compare BigInts by value.
+- **BigInt** (§6.10.5–6.10.6): equality, SameValue(Zero) and `+` with a
+  string are implemented (B2a); every other operator still applies
+  ToNumber, which throws a `TypeError` for a BigInt. Design (lands in B2b):
+  every operator above applies ToNumeric instead of ToNumber on its
+  non-number path; two BigInts use the BigInt kernels, a BigInt mixed with a
+  number throws `TypeError` (except `+` with a string, and the comparisons,
+  which are exact), unary `+` and `>>>` throw for a BigInt, and `**` leaves
+  the `Math.pow` lowering for its own `BinOp::Exp`.
 - **Relational** `< > <= >=` (§6.5).
 - **Strict equality** `===` / `!==`: numbers numerically (`NaN !== NaN`,
-  `+0 === -0`), strings by byte content, everything else by identity bits.
+  `+0 === -0`), strings by byte content, BigInts by value, everything else
+  by identity bits.
 - **Loose equality** `==` / `!=` (`__loose_eq`): booleans are first normalized
   to numbers; `null` and `undefined` equal each other and nothing else; two
   numbers compare as `f64`; two strings by content; number vs. string converts
@@ -4331,8 +4352,7 @@ without its `\r`. A span-less error prints its bare message. Because
 is recovered with `downcast_ref`.
 
 Representative messages: `cannot assign to constant binding: c`,
-`regular expression literals are not supported`, `BigInt literals are not
-supported`, `with statements are not supported`,
+`regular expression literals are not supported`, `with statements are not supported`,
 `async generator functions are unsupported`, `Invalid left-hand side in
 assignment`, `private name #x is not defined`.
 
@@ -4673,8 +4693,6 @@ Each item below is current behaviour of this tree.
 - An `arguments` object has no own `callee` (the strict-mode
   `%ThrowTypeError%` accessor is absent): `arguments.callee` reads
   `undefined`.
-- A BigInt literal property key (`{1n: v}`, `class { 1n() {} }`, `{1n: a} =
-  o`) is a compile error (`BigInt` is not available).
 - `super` outside a class body (an object-literal method) is a compile
   error.
 

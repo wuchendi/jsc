@@ -932,13 +932,20 @@ fn shortest_layout(f: &mut FnBuilder<'_>, ptr: u32, count: u32, point: u32, p: u
     wasm!(f; End, End);
 }
 
-/// `__prim_str(v: i64) -> i32`: `ToString` of a number, boolean, `null` or
-/// `undefined`.
+/// `__prim_str(v: i64) -> i32`: `ToString` of a number, boolean, `null`,
+/// `undefined` or `BigInt` (its decimal digits, DESIGN.md §6.10.3).
 fn emit_prim_str(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let v = 0;
-    // `v` is never a heap reference here, so it needs no root.
+    // `v` is a heap reference only when a BigInt, which `__bigint_to_string`
+    // roots itself, so it needs no root here.
     let mut f = helper_builder(leaves, &[RAW_I64], &[]);
     let at = |text: &str| static_key(strings, text);
+    bigint::emit_is_bigint(&mut f, v);
+    wasm!(f;
+        If(BlockType::Empty),
+        LocalGet(v), I32Const(10), Call(helpers.bigint(registry::Big::ToString)), Return,
+        End,
+    );
     emit_is_number(&mut f, v);
     wasm!(f;
         If(BlockType::Result(ValType::I32)),
@@ -958,7 +965,8 @@ fn emit_prim_str(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -
 }
 
 /// `__msg_str(v: i64) -> i32`: the text of any value in an error message: like
-/// `ToString`, but a symbol is its `SymbolDescriptiveString` and an object
+/// `ToString`, but a symbol is its `SymbolDescriptiveString`, a `BigInt` has
+/// its `n` suffix, and an object
 /// stays unconverted (`[object Object]`), so it never throws or runs user code.
 fn emit_msg_str(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let v = 0;
@@ -971,7 +979,16 @@ fn emit_msg_str(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) ->
         If(BlockType::Result(ValType::I32)),
         I32Const(static_key(strings, OBJECT_TEXT)),
         Else,
+    );
+    // A BigInt reads `1n`, as in the console.
+    bigint::emit_is_bigint(&mut f, v);
+    wasm!(f;
+        If(BlockType::Result(ValType::I32)),
         LocalGet(v), Call(helpers.prim_str()),
+        I32Const(static_key(strings, bigint::SUFFIX)), Call(helpers.concat),
+        Else,
+        LocalGet(v), Call(helpers.prim_str()),
+        End,
         End,
         End,
         End,

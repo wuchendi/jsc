@@ -81,6 +81,10 @@ pub(super) enum Intrinsic {
     /// `CLASS_ERROR` object with the own non-enumerable `message` and
     /// `stack`; not reachable from the global object.
     OutOfMemoryError,
+    /// `%BigInt.prototype%` (DESIGN.md §6.10.7): the `proto` of a `BigInt`
+    /// receiver and of its `CLASS_BIGINT` wrapper; an empty ordinary object
+    /// until the `BigInt` builtins land.
+    BigIntPrototype,
     /// `%Proxy%` (DESIGN.md §6.11): a constructor without `prototype`, its
     /// one static `revocable`.
     Proxy,
@@ -259,7 +263,8 @@ impl Intrinsic {
             | Self::Console
             | Self::Prototype(_)
             | Self::IteratorPrototype
-            | Self::AsyncIteratorPrototype => Some(Self::ObjectPrototype),
+            | Self::AsyncIteratorPrototype
+            | Self::BigIntPrototype => Some(Self::ObjectPrototype),
             Self::IterPrototype(_)
             | Self::GeneratorPrototype
             | Self::WrapForValidIteratorPrototype
@@ -428,10 +433,12 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
                 .into_iter()
                 .flat_map(|ctor| [Intrinsic::Ctor(ctor), Intrinsic::Prototype(ctor)]),
         )
+        .chain([Intrinsic::BigIntPrototype])
 }
 
 /// The binary-data constructors (DESIGN.md §5.8.7), whose constructor and
-/// prototype intrinsics follow every other intrinsic in the image.
+/// prototype intrinsics follow every other intrinsic in the image but
+/// `%BigInt.prototype%`.
 const BINARY_CTORS: [BuiltinCtor; 2] = [BuiltinCtor::ArrayBuffer, BuiltinCtor::DataView];
 
 /// A builtin function body with the uniform ABI (see [`super::builtins`]).

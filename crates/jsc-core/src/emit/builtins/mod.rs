@@ -818,6 +818,14 @@ pub(super) fn emit_to_object(
         intrinsic_bits(SYMBOL_PROTOTYPE, helpers),
     );
     wasm!(f; Else);
+    bigint::emit_is_bigint(&mut f, v);
+    wasm!(f; If(BlockType::Empty));
+    wrap(
+        &mut f,
+        abi::CLASS_BIGINT,
+        intrinsic_bits(Intrinsic::BigIntPrototype, helpers),
+    );
+    wasm!(f; Else);
     emit_is_number(&mut f, v);
     wasm!(f; If(BlockType::Empty));
     wrap(&mut f, abi::CLASS_NUMBER, ctor_proto(BuiltinCtor::Number));
@@ -828,7 +836,7 @@ pub(super) fn emit_to_object(
     );
     wrap(&mut f, abi::CLASS_BOOLEAN, ctor_proto(BuiltinCtor::Boolean));
     wasm!(f;
-        End, End, End,
+        End, End, End, End,
     );
     emit_alloc_const(&mut f, helpers, abi::WRAPPER_BLOCK_SIZE.cast_signed());
     wasm!(f;

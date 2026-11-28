@@ -1553,6 +1553,7 @@ fn empty_program_helpers<R>(check: impl FnOnce(super::Helpers<'_>, &[u8]) -> R) 
 /// safepoints; the Map probes and the renderer's pure lookups are not.
 #[test]
 fn leaf_set_matches_the_call_graph() {
+    use super::registry::Big;
     empty_program_helpers(|helpers, _| {
         let leaves = super::roots::leaf_set(helpers);
         for helper in [helpers.prop_find, helpers.private_find(), helpers.alloc] {
@@ -1572,8 +1573,31 @@ fn leaf_set_matches_the_call_graph() {
             helpers.heap_object(),
             helpers.str_of(),
             helpers.fn_name(),
+            helpers.same_value_zero,
+            helpers.map_hash(),
         ] {
             assert!(leaves.is_leaf(helper), "function {helper} must be a leaf");
+        }
+        // The BigInt kernels that never allocate (DESIGN.md §6.10.4).
+        for helper in [
+            Big::Trim,
+            Big::Eq,
+            Big::CmpMag,
+            Big::Cmp,
+            Big::CmpNum,
+            Big::Hash,
+            Big::ToF64,
+        ] {
+            assert!(
+                leaves.is_leaf(helpers.bigint(helper)),
+                "{helper:?} must be a leaf"
+            );
+        }
+        for helper in [Big::New, Big::ToString, Big::FromString, Big::FromF64] {
+            assert!(
+                !leaves.is_leaf(helpers.bigint(helper)),
+                "{helper:?} must be a safepoint"
+            );
         }
     });
 }
