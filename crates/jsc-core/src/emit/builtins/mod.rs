@@ -43,6 +43,7 @@ mod promise;
 mod proxy;
 mod string;
 mod symbol;
+mod typed_array;
 mod weak;
 
 use crate::emit::realm::{ArrayCopyOp, DateBodyOp, DateSetOp};
@@ -105,6 +106,7 @@ pub(super) fn fragments(k: u32) -> Vec<IrNode> {
     nodes.extend(async_iter::fragments(k));
     nodes.extend(iterator::fragments());
     nodes.extend(array_buffer::fragments(k));
+    nodes.extend(typed_array::fragments(k));
     nodes
 }
 
@@ -332,6 +334,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(async_iter::strings())
         .chain(iterator::STRINGS)
         .chain(array_buffer::strings())
+        .chain(typed_array::strings())
         .chain(data_view::strings())
         .chain(proxy::strings())
         .chain([TYPE_ERROR_STACK_PREFIX])
@@ -456,15 +459,15 @@ fn emit_builtin_body(
         | Builtin::ObjectStatic(_)
         | Builtin::IsArray
         | Builtin::DateNow => emit_fragment(builtin, f, frame, strings, helpers),
-        // `WeakOp`, `WeakCell`, `ArrayBuffer`, `DataView`, `Proxy`.
+        // `WeakOp`, `WeakCell`, `ArrayBuffer`, `DataView`, `TypedArray`, `Proxy`.
         _ => emit_handle_family(builtin, f, frame, strings, helpers),
     }
 }
 
 /// Emit the body of a weak-collection ([`weak::emit`]), `ArrayBuffer`
-/// ([`array_buffer::emit`]), `DataView` ([`data_view::emit`]) or `Proxy`
-/// ([`proxy::emit`]) builtin into `f`: the families with a type byte of their
-/// own.
+/// ([`array_buffer::emit`]), `DataView` ([`data_view::emit`]), typed-array
+/// ([`typed_array::emit`]) or `Proxy` ([`proxy::emit`]) builtin into `f`:
+/// the families with a type byte of their own.
 fn emit_handle_family(
     builtin: Builtin,
     f: &mut FnBuilder<'_>,
@@ -475,6 +478,7 @@ fn emit_handle_family(
     match builtin {
         Builtin::ArrayBuffer(_) => array_buffer::emit(builtin, f, frame, strings, helpers),
         Builtin::DataView(_) => data_view::emit(builtin, f, frame, strings, helpers),
+        Builtin::TypedArray(_) => typed_array::emit(builtin, f, frame, strings, helpers),
         Builtin::Proxy(op) => proxy::emit(op, f, frame, strings, helpers),
         _ => weak::emit(builtin, f, frame, strings, helpers),
     }
@@ -492,7 +496,8 @@ fn emit_global(builtin: Builtin, f: &mut FnBuilder<'_>, frame: Frame, helpers: H
 /// Emit the IR [`fragment`] body of `builtin` into `f`; the weak
 /// constructors (`WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry`)
 /// go to [`weak::emit`] instead, `ArrayBuffer` to [`array_buffer::emit`],
-/// `DataView` to [`data_view::emit`].
+/// `DataView` to [`data_view::emit`], the concrete typed-array constructors
+/// to [`typed_array::emit`].
 fn emit_fragment(
     builtin: Builtin,
     f: &mut FnBuilder<'_>,
@@ -510,6 +515,10 @@ fn emit_fragment(
     }
     if builtin == Builtin::Ctor(BuiltinCtor::DataView) {
         data_view::emit(builtin, f, frame, strings, helpers);
+        return;
+    }
+    if let Builtin::Ctor(BuiltinCtor::Typed(_)) = builtin {
+        typed_array::emit(builtin, f, frame, strings, helpers);
         return;
     }
     let body = fragment(builtin, frame.k).unwrap_or(IrNode::Undefined);
