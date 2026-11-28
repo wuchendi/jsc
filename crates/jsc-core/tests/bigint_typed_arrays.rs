@@ -1,16 +1,17 @@
 //! Integration tests: the `BigInt` typed arrays and the `DataView` `BigInt`
-//! accessors (DESIGN.md §5.8, stage T5b): `BigInt64Array` /
+//! accessors (DESIGN.md §6.2, stage T5b): `BigInt64Array` /
 //! `BigUint64Array` facts and constructor overloads, the content-type
 //! `TypeError`s, 64-bit wraparound, `TypedArraySetElement`'s `ToBigInt`
 //! errors, every `%TypedArray.prototype%` method that converts or compares
 //! elements, `getBigInt64` / `getBigUint64` / `setBigInt64` /
 //! `setBigUint64` in both byte orders and their step order, rendering, and
-//! the allocating element reads under `gc_stress`.
+//! the allocating element reads under `gc_stress` and with the heap
+//! exhausted.
 
 #![allow(clippy::expect_used)]
 
 mod common;
-use common::{assert_output, assert_same_under_gc_stress, assert_string};
+use common::{assert_number, assert_output, assert_same_under_gc_stress, assert_string};
 
 /// `err(f)`: the `name: message` of what `f` throws, or `none`; `TA` is
 /// `%TypedArray%`.
@@ -309,5 +310,63 @@ fn bigint_element_reads_survive_gc_stress() {
         "-478287558082125n BigInt64Array(2) [ 29n, -31885837205504n ] \
          BigUint64Array(2) [ 29n, 18446712187872346112n ] [ 29n, -31885837205504n ] \
          BigInt64Array(2) [ -31885837205504n, 29n ] 9223372036854775808n\n",
+    );
+}
+
+/// The renderer prints a `BigInt` element straight from its 64 bits: zero,
+/// both `i64` extremes, the largest `u64`, and the powers of ten around the
+/// widest digit count.
+#[test]
+fn rendering_digits_from_bits() {
+    assert_output(
+        "console.log(new BigInt64Array([0n, -1n, 9n, 10n, -(2n ** 63n), 2n ** 63n - 1n]));
+         console.log(new BigUint64Array([10n ** 19n, 10n ** 19n - 1n, 2n ** 64n - 1n, 0n]));",
+        "BigInt64Array(6) [ 0n, -1n, 9n, 10n, -9223372036854775808n, 9223372036854775807n ]\n\
+         BigUint64Array(4) [ 10000000000000000000n, 9999999999999999999n, \
+         18446744073709551615n, 0n ]\n",
+    );
+}
+
+/// Exhaust the heap with live buffers of halving sizes (each failure is a
+/// caught `RangeError: out of memory`), then read `BigInt` elements through
+/// every kind of reader. A read whose `BigInt` allocation fails must throw
+/// the `RangeError`, never yield a wrong value: `bad` counts a wrong value
+/// (`1`) or another exception (`100`). Whether a given read still finds
+/// room depends on the allocator's size classes, so the test asserts only
+/// that no read is ever wrong.
+#[test]
+fn bigint_element_reads_never_wrong_out_of_memory() {
+    assert_number(
+        "const t = new BigInt64Array([5n, -7n]);
+         const u = new BigUint64Array([9n]);
+         let keep = [];
+         for (let i = 0; i < 4096; i++) keep.push(0);
+         let n = 0;
+         for (let size = 1 << 28; size >= 1; ) {
+           try { keep[n] = new ArrayBuffer(size); n = n + 1; }
+           catch (e) { size = size >>> 1; }
+         }
+         let bad = 0;
+         try { if (t[0] !== 5n) bad = bad + 1; }
+         catch (e) { if (!(e instanceof RangeError)) bad = bad + 100; }
+         try { if (u[0] !== 9n) bad = bad + 1; }
+         catch (e) { if (!(e instanceof RangeError)) bad = bad + 100; }
+         try { if (t.at(1) !== -7n) bad = bad + 1; }
+         catch (e) { if (!(e instanceof RangeError)) bad = bad + 100; }
+         try { if (t.includes(5n) !== true) bad = bad + 1; }
+         catch (e) { if (!(e instanceof RangeError)) bad = bad + 100; }
+         try { if (t.indexOf(-7n) !== 1) bad = bad + 1; }
+         catch (e) { if (!(e instanceof RangeError)) bad = bad + 100; }
+         try { for (const x of t) { if (x !== 5n) bad = bad + 1; break; } }
+         catch (e) { if (!(e instanceof RangeError)) bad = bad + 100; }
+         try { if (Object.values(t)[1] !== -7n) bad = bad + 1; }
+         catch (e) { if (!(e instanceof RangeError)) bad = bad + 100; }
+         try { if (Object.getOwnPropertyDescriptor(t, 0).value !== 5n) bad = bad + 1; }
+         catch (e) { if (!(e instanceof RangeError)) bad = bad + 100; }
+         try { if (new BigUint64Array(t)[1] !== 2n ** 64n - 7n) bad = bad + 1; }
+         catch (e) { if (!(e instanceof RangeError)) bad = bad + 100; }
+         keep = 0;
+         bad",
+        0.0,
     );
 }

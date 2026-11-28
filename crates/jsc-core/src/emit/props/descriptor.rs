@@ -201,7 +201,7 @@ pub(in crate::emit) fn emit_define_own(
             Call(helpers.proxy_define_own()), Return,
         );
     });
-    // A typed array's numeric key (DESIGN.md §5.8.5): an invalid index, or a
+    // A typed array's numeric key (DESIGN.md §6.3): an invalid index, or a
     // descriptor making it non-configurable, non-enumerable, an accessor or
     // non-writable, rejects; else a present `value` is written by
     // `TypedArraySetElement` (its conversion may leave an exception pending).
@@ -650,7 +650,7 @@ pub(in crate::emit) fn emit_to_desc(
 /// writable: false, enumerable: true, configurable: false}`; a `LAZY`
 /// function is materialized by the lookup; a typed array's valid index is
 /// `{value, writable, enumerable, configurable: true}` and an invalid
-/// numeric key absent (DESIGN.md §5.8.5). `e`, `i` are i32 scratch.
+/// numeric key absent (DESIGN.md §6.3). `e`, `i` are i32 scratch.
 fn emit_own_lookup(
     f: &mut FnBuilder<'_>,
     [o, key, e, i, a, v]: [u32; 6],
@@ -666,6 +666,16 @@ fn emit_own_lookup(
         wasm!(f;
             End,
             LocalGet(o), LocalGet(i), Call(helpers.ta_get()), LocalSet(v),
+        );
+        if helpers.bigints() {
+            // A `BigInt` element read allocates; out of memory leaves the
+            // `RangeError` pending: leave as for a miss (the caller
+            // propagates) before the placeholder value is described.
+            wasm!(f; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
+            absent(f);
+            wasm!(f; End);
+        }
+        wasm!(f;
             I32Const(ATTRS_DEFAULT), LocalSet(a),
             Br(2),
         );
@@ -1009,7 +1019,7 @@ fn emit_live_entries<S: Sink>(
 /// (DESIGN.md §6.11): `0` when its `preventExtensions` trap refuses; a
 /// rejected per-key define throws (`Cannot redefine property`); a throw
 /// leaves the exception pending and returns `0`. A typed array (DESIGN.md
-/// §5.8.5): a variable-length one refuses `[[PreventExtensions]]` (`0`, no
+/// §6.3): a variable-length one refuses `[[PreventExtensions]]` (`0`, no
 /// throw); one with elements becomes non-extensible, then its first
 /// element cannot be sealed or frozen (the `TypeError` is left pending, `0`).
 pub(in crate::emit) fn emit_set_integrity(
@@ -1250,7 +1260,7 @@ pub(in crate::emit) fn emit_test_integrity(helpers: Helpers<'_>, leaves: &LeafSe
     );
     if helpers.has_binary() {
         // A typed array's elements are configurable and writable (DESIGN.md
-        // §5.8.5): it is neither sealed nor frozen while it has any.
+        // §6.3): it is neither sealed nor frozen while it has any.
         wasm!(f;
             LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_TYPEDARRAY), I32Eq,
             If(BlockType::Empty),
