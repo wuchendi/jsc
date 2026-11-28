@@ -11,9 +11,10 @@
 //! equality and hashing read the stored words directly. Limb arithmetic uses
 //! `i64` intermediates read as unsigned.
 //!
-//! Every helper is called only behind a `TYPE_BIGINT` type test (or from
-//! another `BigInt` helper), so the tree shaker drops them from a program that
-//! never holds a `BigInt`.
+//! Every helper is called only behind a `TYPE_BIGINT` type test, a
+//! `Helpers::bigints` branch, or from another `BigInt` helper; with the
+//! `bigints` gate closed every body is an `unreachable` stub (DESIGN.md
+//! §6.10.9).
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
@@ -2149,13 +2150,19 @@ pub(super) fn emit_numeric_unary(helpers: Helpers<'_>, leaves: &LeafSet) -> Func
 pub(super) fn helper_graph(helpers: Helpers<'_>) -> Vec<(u32, Vec<u32>)> {
     let big = |h| helpers.bigint(h);
     // `__same_value_zero` and `__map_hash`, which call the leaf `Eq` / `Hash`
-    // kernels whatever the `bigints` gate, declare them in `roots::helper_graph`
-    // (one entry per helper).
+    // kernels when the `bigints` gate is open, declare them in
+    // `roots::helper_graph` (one entry per helper). With the gate closed every
+    // kernel is a callee-free stub ([`registry`]).
+    let cmp = if helpers.bigints() {
+        vec![big(Big::CmpMag)]
+    } else {
+        vec![]
+    };
     vec![
         (big(Big::Trim), vec![]),
         (big(Big::Eq), vec![]),
         (big(Big::CmpMag), vec![]),
-        (big(Big::Cmp), vec![big(Big::CmpMag)]),
+        (big(Big::Cmp), cmp),
         (big(Big::CmpNum), vec![]),
         (big(Big::Hash), vec![]),
         (big(Big::ToF64), vec![]),

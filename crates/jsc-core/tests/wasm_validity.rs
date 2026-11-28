@@ -13,8 +13,11 @@ use jsc_core::emit::CompileOptions;
 /// `BigInt` keys and values through a proxy or `Reflect`, the `Number`
 /// wrapper constructor over a `BigInt`, and the `BigInt` gate
 /// (DESIGN.md §6.10.9): every gated operator site with the gate closed, and
-/// with it opened by the global object or a name only.
-const PROGRAMS: [&str; 24] = [
+/// with it opened by the global object or a name only, and the
+/// always-present helpers whose `BigInt` arms the closed gate drops (`Map` /
+/// `Set` keys, loose `==`, `String`, `typeof`, JSON, wrappers, own-key and
+/// `for-in` guards, a nullish `TypeError`).
+const PROGRAMS: [&str; 26] = [
     "1",
     "console.log(1)",
     "1n",
@@ -47,6 +50,12 @@ const PROGRAMS: [&str; 24] = [
     "try { Reflect.get(1n, 'x') } catch (e) { console.log(e instanceof TypeError) } \
      console.log(Reflect.ownKeys(Object(2n)).length, Reflect.has({ 1: 0 }, 1n)); \
      console.log(Number(2n), new Number(3n).valueOf(), typeof new Number(1n))",
+    "const m = new Map([[1, 'a'], [-0, 'b']]); const s = new Set([NaN]); \
+     console.log(m.get(0), s.has(NaN), m, s, 1 == '1', null == undefined, ({}) == '[object Object]', \
+     String(1.5), String(null), typeof s, `${[1, 2]}`)",
+    "const o = { a: 1, b: [2] }; delete o.b; for (const k in o) console.log(k, Object.hasOwn(o, k)); \
+     console.log(JSON.stringify({ x: [1, 'y', null] }), Object.keys('ab'), Object(1) instanceof Number, \
+     'x'.length, (1).toFixed(1)); try { const n = null; n.p; } catch (e) { console.log(e.message) }",
 ];
 
 fn validate(src: &str, full_runtime: bool, gc_stress: u32) {

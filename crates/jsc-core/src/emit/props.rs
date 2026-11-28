@@ -1319,16 +1319,19 @@ fn emit_get_from(
     );
     let bits = intrinsic_bits(SYMBOL_PROTOTYPE, helpers);
     wasm!(f; I32Const(u32::try_from(bits & 0xffff_ffff).unwrap_or(0).cast_signed()), LocalSet(o));
-    // A BigInt receiver starts at `%BigInt.prototype%`.
-    let bits = intrinsic_bits(Intrinsic::BigIntPrototype, helpers);
-    wasm!(f;
-        End,
-        LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_BIGINT), I32Eq,
-        If(BlockType::Empty),
-        I32Const(u32::try_from(bits & 0xffff_ffff).unwrap_or(0).cast_signed()), LocalSet(o),
-        End,
-        Else,
-    );
+    // A BigInt receiver starts at `%BigInt.prototype%`; without the
+    // `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    wasm!(f; End);
+    if helpers.bigints() {
+        let bits = intrinsic_bits(Intrinsic::BigIntPrototype, helpers);
+        wasm!(f;
+            LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_BIGINT), I32Eq,
+            If(BlockType::Empty),
+            I32Const(u32::try_from(bits & 0xffff_ffff).unwrap_or(0).cast_signed()), LocalSet(o),
+            End,
+        );
+    }
+    wasm!(f; Else);
     emit_is_number(&mut f, recv);
     wasm!(f;
         If(BlockType::Empty),
@@ -1426,9 +1429,14 @@ pub(super) fn emit_symbol_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
     f.instruction(&proto_base(realm::prototype_of(BuiltinCtor::String)));
     wasm!(f; LocalSet(o), End, LocalGet(p), I32Const(TYPE_SYMBOL), I32Eq, If(BlockType::Empty));
     f.instruction(&proto_base(SYMBOL_PROTOTYPE));
-    wasm!(f; LocalSet(o), End, LocalGet(p), I32Const(TYPE_BIGINT), I32Eq, If(BlockType::Empty));
-    f.instruction(&proto_base(Intrinsic::BigIntPrototype));
-    wasm!(f; LocalSet(o), End, Else);
+    wasm!(f; LocalSet(o), End);
+    // Without the `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    if helpers.bigints() {
+        wasm!(f; LocalGet(p), I32Const(TYPE_BIGINT), I32Eq, If(BlockType::Empty));
+        f.instruction(&proto_base(Intrinsic::BigIntPrototype));
+        wasm!(f; LocalSet(o), End);
+    }
+    wasm!(f; Else);
     emit_is_number(&mut f, v);
     wasm!(f; If(BlockType::Empty));
     f.instruction(&proto_base(realm::prototype_of(BuiltinCtor::Number)));
@@ -1911,6 +1919,20 @@ pub(super) fn emit_has_own(
     emit_has_lookup(strings, helpers, true, leaves)
 }
 
+/// Set `o` to the block base on the stack, first returning `0` for a
+/// `BigInt`, which has no own properties (and no `props` slot); none exists
+/// without the `bigints` gate (DESIGN.md §6.10.9), so the test is left out.
+fn set_base_unless_bigint(f: &mut impl Sink, o: u32, helpers: Helpers<'_>) {
+    if helpers.bigints() {
+        wasm!(f;
+            LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_BIGINT), I32Eq,
+            If(BlockType::Empty), I32Const(0), Return, End,
+        );
+    } else {
+        wasm!(f; LocalSet(o));
+    }
+}
+
 /// The body of [`emit_has`] (`own` = `false`) and [`emit_has_own`].
 fn emit_has_lookup(
     strings: &StrOffsets,
@@ -1939,10 +1961,10 @@ fn emit_has_lookup(
     emit_is_pointer(&mut f, obj);
     wasm!(f;
         I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
-        LocalGet(obj), I32WrapI64, LocalTee(o),
-        // A BigInt has no own properties (and no `props` slot).
-        I32Load8U(m8(0)), I32Const(TYPE_BIGINT), I32Eq,
-        If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(obj), I32WrapI64,
+    );
+    set_base_unless_bigint(&mut f, o, helpers);
+    wasm!(f;
         Loop(BlockType::Empty),
         LocalGet(o), I32Load8U(m8(0)), LocalSet(t),
     );
@@ -2056,7 +2078,12 @@ pub(super) fn emit_delete(
         LocalGet(key), I32Eqz, If(BlockType::Empty), I32Const(1), Return, End,
         LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalTee(t),
         I32Const(TYPE_STRING), I32Eq, LocalGet(t), I32Const(TYPE_SYMBOL), I32Eq, I32Or,
-        LocalGet(t), I32Const(TYPE_BIGINT), I32Eq, I32Or,
+    );
+    // Without the `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    if helpers.bigints() {
+        wasm!(f; LocalGet(t), I32Const(TYPE_BIGINT), I32Eq, I32Or);
+    }
+    wasm!(f;
         If(BlockType::Empty), I32Const(1), Return, End,
     );
     emit_if_proxy(&mut f, o, helpers, |f| {
@@ -2922,9 +2949,12 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
     // A non-heap value or a BigInt (no `props` slot) has no own keys.
     emit_is_pointer(&mut f, obj);
     wasm!(f; I32Eqz);
-    bigint::emit_is_bigint(&mut f, obj);
+    // Without the `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    if helpers.bigints() {
+        bigint::emit_is_bigint(&mut f, obj);
+        wasm!(f; I32Or);
+    }
     wasm!(f;
-        I32Or,
         If(BlockType::Empty), I32Const(0), Call(new_array),
     );
     emit_box_heap(&mut f);
@@ -3360,7 +3390,12 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
         If(BlockType::Result(ValType::I32)),
         LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalTee(i),
         I32Const(TYPE_SYMBOL), I32Ne,
-        LocalGet(i), I32Const(TYPE_BIGINT), I32Ne, I32And,
+    );
+    // Without the `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    if helpers.bigints() {
+        wasm!(f; LocalGet(i), I32Const(TYPE_BIGINT), I32Ne, I32And);
+    }
+    wasm!(f;
         Else, I32Const(0), End,
         If(BlockType::Empty),
     );

@@ -321,9 +321,10 @@ fn declare_error_scratch(b: &mut FnBuilder<'_>) {
 
 /// Every static string the builtin bodies reference. Interned in every
 /// program, except that the binary-data families' strings are interned only
-/// when `binary` (DESIGN.md §4.2): their bodies are otherwise stubs
+/// when `binary` (DESIGN.md §4.2), and the `BigInt` builtins' only when
+/// `bigints` (DESIGN.md §6.10.9): their bodies are otherwise stubs
 /// ([`gated_off`]) that look up none.
-pub(super) fn strings(binary: bool) -> impl Iterator<Item = &'static str> {
+pub(super) fn strings(binary: bool, bigints: bool) -> impl Iterator<Item = &'static str> {
     let binary_families = binary
         .then(|| {
             array_buffer::strings()
@@ -356,7 +357,7 @@ pub(super) fn strings(binary: bool) -> impl Iterator<Item = &'static str> {
         .chain(iterator::STRINGS)
         .chain(binary_families)
         .chain(proxy_strings())
-        .chain(bigint::STRINGS)
+        .chain(bigints.then_some(bigint::STRINGS).into_iter().flatten())
         .chain(base64)
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
@@ -393,13 +394,16 @@ pub(super) fn emit_builtin(
 /// Whether `builtin` belongs to a family the program cannot reach (DESIGN.md
 /// §6.11, §4.2): a `Proxy` builtin while no proxy can exist, a `Reflect`
 /// function while `%Reflect%` cannot be held, a binary-data builtin
-/// ([`Builtin::is_binary`]) while binary data cannot be reached. Its body is then an `unreachable` stub
+/// ([`Builtin::is_binary`]) while binary data cannot be reached, a `BigInt`
+/// builtin ([`Builtin::is_bigint`]) while the `bigints` gate is closed
+/// (DESIGN.md §6.10.9). Its body is then an `unreachable` stub
 /// that records no shake uses, so a name-only registry match (`"get"`,
 /// `"set"`, `"apply"`, ...) keeps nothing behind it.
 fn gated_off(builtin: Builtin, helpers: Helpers<'_>) -> bool {
     match builtin {
         Builtin::Proxy(_) => !helpers.proxies(),
         Builtin::Reflect(_) => !helpers.reflect(),
+        _ if builtin.is_bigint() => !helpers.bigints(),
         _ => builtin.is_binary() && !helpers.has_binary(),
     }
 }
@@ -906,14 +910,17 @@ pub(super) fn emit_to_object(
         intrinsic_bits(SYMBOL_PROTOTYPE, helpers),
     );
     wasm!(f; Else);
-    bigint::emit_is_bigint(&mut f, v);
-    wasm!(f; If(BlockType::Empty));
-    wrap(
-        &mut f,
-        abi::CLASS_BIGINT,
-        intrinsic_bits(Intrinsic::BigIntPrototype, helpers),
-    );
-    wasm!(f; Else);
+    // Without the `bigints` gate no BigInt exists (DESIGN.md §6.10.9).
+    if helpers.bigints() {
+        bigint::emit_is_bigint(&mut f, v);
+        wasm!(f; If(BlockType::Empty));
+        wrap(
+            &mut f,
+            abi::CLASS_BIGINT,
+            intrinsic_bits(Intrinsic::BigIntPrototype, helpers),
+        );
+        wasm!(f; Else);
+    }
     emit_is_number(&mut f, v);
     wasm!(f; If(BlockType::Empty));
     wrap(&mut f, abi::CLASS_NUMBER, ctor_proto(BuiltinCtor::Number));
@@ -923,8 +930,11 @@ pub(super) fn emit_to_object(
         I32Eqz, If(BlockType::Empty), LocalGet(v), Return, End,
     );
     wrap(&mut f, abi::CLASS_BOOLEAN, ctor_proto(BuiltinCtor::Boolean));
+    if helpers.bigints() {
+        wasm!(f; End);
+    }
     wasm!(f;
-        End, End, End, End,
+        End, End, End,
     );
     emit_alloc_const(&mut f, helpers, abi::WRAPPER_BLOCK_SIZE.cast_signed());
     wasm!(f;
