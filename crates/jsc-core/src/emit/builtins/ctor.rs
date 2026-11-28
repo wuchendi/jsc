@@ -245,6 +245,9 @@ pub(super) fn fragment(ctor: BuiltinCtor, k: u32) -> IrNode {
         | BuiltinCtor::WeakSet
         | BuiltinCtor::WeakRef
         | BuiltinCtor::FinalizationRegistry => body.requires_new(ctor, body.proto(ctor)),
+        // The "requires 'new'" check only: `array_buffer::emit_ctor` converts
+        // the arguments before it reads the prototype.
+        BuiltinCtor::ArrayBuffer => body.requires_new(ctor, IrNode::Undefined),
         // Under `K = 0` the executor of a spread construct (a subclass's
         // implicit `super(...args)`, a species construct) is in the spread
         // argument array, read after the `new.target.prototype` lookup.

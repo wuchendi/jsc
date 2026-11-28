@@ -1450,6 +1450,19 @@ fn builtin_bodies_validate() {
 }
 
 #[test]
+fn array_buffer_bodies_validate() {
+    // A program naming `ArrayBuffer` carries the binary-data collector and
+    // renderer arms (DESIGN.md §5.8.5); every body must stay valid wasm.
+    validate(&compile(
+        "const b = new ArrayBuffer(8, { maxByteLength: 16 });
+        b.resize(12);
+        const c = b.slice(1, -1), d = b.transfer(4), e = d.transferToFixedLength();
+        console.log(ArrayBuffer.isView(b), b.detached, c.byteLength, d.maxByteLength,
+            e.resizable, b, c, ArrayBuffer[Symbol.species] === ArrayBuffer)",
+    ));
+}
+
+#[test]
 fn computed_and_numeric_pattern_keys_validate() {
     // Pattern keys converted into locals, in statement and expression
     // position, a generator, a rest exclusion list, and numeric class keys.
