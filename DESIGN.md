@@ -2751,9 +2751,10 @@ very large exponent / shift tests that hit the 2^24-bit cap where V8 allows
 | **B4** closeout | remove `BigInt` from `unsupported-features.txt`; delete the §13 BigInt lines (the `RegExp, BigInt, ..` "not available" line, the limitation-table row, the BigInt property-key line, the §14 roadmap mention); test262 baseline / history from CI; fold this section's design notes into present-tense text | `tests/test262/*`, `DESIGN.md` | test262 delta recorded (target ≈ +300 of the 325 newly eligible) |
 ### 6.11 Proxy and Reflect (phase 5b, in progress)
 
-**Status: P2a implemented** (the proxy block, `%Proxy%`, `Proxy.revocable`
-and the eleven object internal methods with their invariants, below); P2b,
-P3 and P4 are still design. Until P4 the test262 runner keeps skipping the
+**Status: P2a and P2b implemented** (the proxy block, `%Proxy%`,
+`Proxy.revocable`, the eleven object internal methods with their
+invariants, callable / constructor proxies and the integration paths,
+below); P3 and P4 are still design. Until P4 the test262 runner keeps skipping the
 `Proxy`, `proxy-missing-checks` and `Reflect*` features (§10). The
 subsection names the code that changes so an implementer does not have to
 re-derive it; "Stages" records where P2a departed from the plan.
@@ -2796,16 +2797,17 @@ so a revoked callable proxy is still callable for `typeof` and `IsCallable`
   `TYPE_PROXY` with `PROXY_CLASS_CALLABLE`, else `"object"`.
 - **`IsCallable`**: `emit_is_function` (`emit/value.rs`) becomes the
   `IsCallable` test: kind `TYPE_FUNCTION`, or kind `TYPE_PROXY` with
-  `PROXY_CLASS_CALLABLE`. Its 53 call sites (P2b audits each) are
-  `IsCallable` uses followed by a call through `func_idx` / `env`, which is
-  valid on a callable proxy; the sites that read other `TYPE_FUNCTION`
-  internals switch to a new `emit_is_function_block` (kind test only): `Function.prototype.toString`
-  (the info-table name), `bind` (flags and `proto`), `__fn_name` and
-  `__render_function` (§6.9). The `BOUND` test of `instanceof` and the
-  `env` identity test of `BoundCall` stay as they are: a proxy never carries
-  flag `64`, and its `env` is itself.
+  `PROXY_CLASS_CALLABLE` (it takes `Helpers` and adds the proxy arm only
+  under the gate below). Its call sites are `IsCallable` uses followed by a
+  call through `func_idx` / `env`, which is valid on a callable proxy. The
+  kind test alone is `emit_is_function_block`, used by `BoundCall`'s
+  `new.target` identity test (it reads `env`); `Function.prototype.toString`
+  and `bind` accept a callable proxy and test the kind themselves under the
+  gate (below); `__fn_name` and `__render_function` (§6.9) already test
+  the kind byte directly. The `BOUND` test of `instanceof` stays as it is: a
+  proxy never carries flag `64`.
 - **`IsConstructor`**: `emit_is_constructor` (`emit/expr.rs`) accepts kind
-  `TYPE_FUNCTION` or `TYPE_PROXY` with flag `8`.
+  `TYPE_FUNCTION` or (under the gate) `TYPE_PROXY` with flag `8`.
 - **`emit_is_object`**: a proxy is an object (not a string or symbol)
   already.
 - **GC** (`__gc_trace`, `emit/gc.rs`): a new arm for kind `20` traces raw
@@ -3122,9 +3124,9 @@ throws `TypeError: Constructor Proxy requires 'new'`; a non-object target or
 handler throws `TypeError: Cannot create proxy with a non-object as target or
 handler` (a revoked proxy is an acceptable target or handler); then the block
 above (`gc::emit_alloc_const`, 48 bytes), callable / constructor bits from
-`emit_is_function` / `emit_is_constructor` of the target, or the same bits
-of a proxy target (`builtins/proxy.rs::proxy_bits`, until P2b widens those
-tests). Both arguments are
+`emit_is_function` / `emit_is_constructor` of the target (which accept a
+proxy target); a callable one gets the `ProxyOp::Call` funcref slot in
+`func_idx` and itself in `env`. Both arguments are
 read before any user code runs (there is none), so no snapshot.
 
 **Integration paths.**
@@ -3135,9 +3137,9 @@ read before any user code runs (there is none), so no snapshot.
   trap on a proxy `C`); `IsCallable(C)` accepts a callable proxy;
   `OrdinaryHasInstance` reads `Get(C, "prototype")` (trap) and its chain walk
   (`emit_proto_chain_match`, `emit/object.rs`, used by the generic tail and
-  by the sealed fast arm) calls `__get_proto` on a `TYPE_PROXY` link instead
-  of loading `proto @8` (the `getPrototypeOf` trap, exceptions propagated).
-  `isPrototypeOf` walks the same way.
+  by the sealed fast arm) calls `__get_proto` for every step under the gate
+  instead of loading `proto @8` (the `getPrototypeOf` trap on a proxy link,
+  exceptions propagated). `isPrototypeOf` walks the same way.
 - **`Object.prototype.toString`** (`builtins/object.rs::emit_to_string`): for a
   proxy, the builtin tag comes first (spec order): `__is_array` (may throw) →
   `"Array"`, else `PROXY_CLASS_CALLABLE` → `"Function"`, else `"Object"`;
@@ -3279,7 +3281,7 @@ image order; no watch bit; not inline namespaces):
 - Global object: `Proxy` and `Reflect`, writable, configurable, not
   enumerable.
 - The proxy builtins are one variant `Builtin::Proxy(ProxyOp)` (`Ctor`,
-  `Revocable`, `Revoke`; P2b adds the call trampoline as another `ProxyOp`)
+  `Revocable`, `Revoke`, and `Call`, the call trampoline)
   dispatched by `builtins/proxy.rs::emit`. The revoke function and the
   trampoline are internal (installed nowhere, so shaking keeps them). The
   `ReflectFn` bodies dispatch from `builtins/mod.rs`.
@@ -3329,6 +3331,24 @@ shared files):
   users (`emit/expr.rs` `IsArray`, `builtins/array.rs`, `builtins/json.rs`,
   `builtins/object.rs` `toString`), `emit/object.rs` (`instanceof` walk,
   `isPrototypeOf`), `builtins/function.rs` (`toString`, `bind`).
+  **Delivered**, with these departures: `emit_is_function` and
+  `emit_is_constructor` take `Helpers` and emit their proxy arm only under
+  the gate (so without it every call site is byte-identical);
+  `emit_is_function_block` replaces it only at `BoundCall`'s `new.target`
+  identity test, while `toString` / `bind` keep the widened test and branch
+  on the kind under the gate. `__is_array` is an `Extra` row in
+  `emit/props/proxy.rs` (after `ProxyOwnKeys`). The trampoline reuses
+  `function.rs`'s `store_args`, `call_with_array` and `bound_construct`
+  (its locals match the bound trampoline's), and the non-object `construct`
+  result is a plain `TypeError` text, so no new `__prop_throw` mode
+  (`33`..`35` stay free). `FlattenIntoArray` asks `IsArray` only while depth
+  remains (a revoked proxy element of `flat(0)` does not throw).
+  `__json_revive` takes the static strings (the `length` key) and walks a
+  proxy value like an object or, when `IsArray`, by `length` and index;
+  `JSON.stringify`'s replacer list and array form read a proxy by `Get` of
+  `length` and each index. `Object.prototype.toString` computes a proxy's
+  builtin tag before the `@@toStringTag` read; other objects keep the old
+  order (no other builtin tag can throw).
 - **P3 — Reflect.** `emit/builtins/reflect.rs` (new), `ReflectFn` and
   `%Reflect%` in `emit/realm.rs`, `builtins/mod.rs`, the
   `CreateListFromArrayLike` factoring in `builtins/function.rs`. No

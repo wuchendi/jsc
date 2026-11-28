@@ -2,9 +2,9 @@
 //! A proxy is a [`abi::TYPE_PROXY`] block; its internal methods live in
 //! `emit/props/proxy.rs`.
 
+use super::array::push_call;
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use super::array::push_call;
 use crate::emit::realm::ProxyOp;
 
 /// The `TypeError` of `Proxy(..)` called without `new`.
