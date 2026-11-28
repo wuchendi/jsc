@@ -184,6 +184,8 @@ pub enum MathOp {
     Atanh,
     /// `Math.random()` — a host pseudo-random number in `[0, 1)`.
     Random,
+    /// `Math.f16round(x)` — nearest IEEE binary16 value (DESIGN.md §5.8.6).
+    F16round,
 }
 
 /// An array higher-order method: `map`/`filter`/`reduce`/`forEach` (see
@@ -583,15 +585,16 @@ pub enum BuiltinCtor {
     DataView,
     /// `%TypedArray%` (DESIGN.md §5.8.7): abstract, not a global.
     TypedArray,
-    /// A concrete typed-array constructor (`Int8Array` .. `Float64Array`).
+    /// A concrete typed-array constructor (`Int8Array` .. `Float64Array`,
+    /// `Float16Array` included).
     Typed(ElementKind),
     /// `BigInt` (DESIGN.md §6.10.7): callable, `new` throws.
     BigInt,
 }
 
 /// A typed-array element kind (DESIGN.md §5.8.6), in the spec's Table 71
-/// order. `Float16Array` (kind `7`) and the `BigInt` kinds (`10`, `11`) are
-/// not installed yet; their kind numbers stay reserved.
+/// order. The `BigInt` kinds (`10`, `11`) are not installed yet; their kind
+/// numbers stay reserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElementKind {
     /// `Int8Array`.
@@ -608,6 +611,8 @@ pub enum ElementKind {
     Int32,
     /// `Uint32Array`.
     Uint32,
+    /// `Float16Array`.
+    Float16,
     /// `Float32Array`.
     Float32,
     /// `Float64Array`.
@@ -616,7 +621,7 @@ pub enum ElementKind {
 
 impl ElementKind {
     /// Every installed kind, in kind order.
-    pub(crate) const ALL: [ElementKind; 9] = [
+    pub(crate) const ALL: [ElementKind; 10] = [
         Self::Int8,
         Self::Uint8,
         Self::Uint8Clamped,
@@ -624,6 +629,7 @@ impl ElementKind {
         Self::Uint16,
         Self::Int32,
         Self::Uint32,
+        Self::Float16,
         Self::Float32,
         Self::Float64,
     ];
@@ -638,6 +644,7 @@ impl ElementKind {
             Self::Uint16 => 4,
             Self::Int32 => 5,
             Self::Uint32 => 6,
+            Self::Float16 => 7,
             Self::Float32 => 8,
             Self::Float64 => 9,
         }
@@ -653,6 +660,7 @@ impl ElementKind {
             Self::Uint16 => "Uint16Array",
             Self::Int32 => "Int32Array",
             Self::Uint32 => "Uint32Array",
+            Self::Float16 => "Float16Array",
             Self::Float32 => "Float32Array",
             Self::Float64 => "Float64Array",
         }
@@ -662,7 +670,7 @@ impl ElementKind {
     pub(crate) fn shift(self) -> u8 {
         match self {
             Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 0,
-            Self::Int16 | Self::Uint16 => 1,
+            Self::Int16 | Self::Uint16 | Self::Float16 => 1,
             Self::Int32 | Self::Uint32 | Self::Float32 => 2,
             Self::Float64 => 3,
         }
@@ -676,7 +684,7 @@ impl ElementKind {
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 37] = [
+    pub(crate) const ALL: [BuiltinCtor; 38] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -711,6 +719,7 @@ impl BuiltinCtor {
         Self::Typed(ElementKind::Uint16),
         Self::Typed(ElementKind::Int32),
         Self::Typed(ElementKind::Uint32),
+        Self::Typed(ElementKind::Float16),
         Self::Typed(ElementKind::Float32),
         Self::Typed(ElementKind::Float64),
         Self::BigInt,

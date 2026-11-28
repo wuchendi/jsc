@@ -23,6 +23,7 @@ macro_rules! wasm {
 mod array;
 mod array_buffer;
 mod async_iter;
+mod base64;
 mod bigint;
 mod ctor;
 mod data_view;
@@ -344,6 +345,7 @@ pub(super) fn strings() -> impl Iterator<Item = &'static str> {
         .chain(proxy::strings())
         .chain(reflect::strings())
         .chain(bigint::STRINGS)
+        .chain(base64::strings())
         .chain([TYPE_ERROR_STACK_PREFIX])
 }
 
@@ -467,7 +469,7 @@ fn emit_builtin_body(
         | Builtin::IsArray
         | Builtin::DateNow => emit_fragment(builtin, f, frame, strings, helpers),
         // `WeakOp`, `WeakCell`, `ArrayBuffer`, `DataView`, `TypedArray`, `Proxy`,
-        // `Reflect`.
+        // `Reflect`, `Base64`.
         _ => emit_handle_family(builtin, f, frame, strings, helpers),
     }
 }
@@ -493,6 +495,7 @@ fn emit_handle_family(
         Builtin::TypedArray(_) => typed_array::emit(builtin, f, frame, strings, helpers),
         Builtin::Proxy(op) => proxy::emit(op, f, frame, strings, helpers),
         Builtin::Reflect(op) => reflect::emit(op, f, frame, strings, helpers),
+        Builtin::Base64(op) => base64::emit(op, f, frame, strings, helpers),
         _ => weak::emit(builtin, f, frame, strings, helpers),
     }
 }

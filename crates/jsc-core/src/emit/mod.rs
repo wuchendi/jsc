@@ -1560,6 +1560,16 @@ impl Helpers<'_> {
         self.group(registry::Group::Binary) + 13
     }
 
+    /// `__f16_encode(x) -> i32` (see [`binary`]).
+    fn f16_encode(self) -> u32 {
+        self.group(registry::Group::Binary) + 14
+    }
+
+    /// `__f16_decode(h) -> i64` (see [`binary`]).
+    fn f16_decode(self) -> u32 {
+        self.group(registry::Group::Binary) + 15
+    }
+
     /// `__super_get(home, key, recv) -> i64` (see [`props::emit_super_get`]).
     fn super_get(self) -> u32 {
         self.conv(registry::Conv::SuperGet)

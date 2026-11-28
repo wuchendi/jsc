@@ -460,7 +460,7 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
 /// The binary-data constructors (DESIGN.md §5.8.7), whose constructor and
 /// prototype intrinsics follow every other intrinsic in the image but
 /// `%BigInt.prototype%`.
-const BINARY_CTORS: [BuiltinCtor; 12] = [
+const BINARY_CTORS: [BuiltinCtor; 13] = [
     BuiltinCtor::ArrayBuffer,
     BuiltinCtor::DataView,
     BuiltinCtor::TypedArray,
@@ -471,6 +471,7 @@ const BINARY_CTORS: [BuiltinCtor; 12] = [
     BuiltinCtor::Typed(ElementKind::Uint16),
     BuiltinCtor::Typed(ElementKind::Int32),
     BuiltinCtor::Typed(ElementKind::Uint32),
+    BuiltinCtor::Typed(ElementKind::Float16),
     BuiltinCtor::Typed(ElementKind::Float32),
     BuiltinCtor::Typed(ElementKind::Float64),
 ];
@@ -734,6 +735,9 @@ pub(super) enum Builtin {
     Reflect(ReflectFn),
     /// A `BigInt` static or `%BigInt.prototype%` method (DESIGN.md §6.10.7).
     BigInt(BigIntOp),
+    /// A `Uint8Array` base64 / hex static or prototype method (DESIGN.md
+    /// §5.8.7, `emit/builtins/base64.rs`).
+    Base64(Base64Op),
 }
 
 /// The `DataView` builtins of DESIGN.md §5.8.7 other than the constructor.
@@ -754,15 +758,16 @@ pub(super) enum DataViewOp {
 
 impl DataViewOp {
     /// The element kinds with get / set methods: `(kind, getter name, setter
-    /// name)`, in §5.8.6 kind order (no `Uint8Clamped`; no `Float16`, no
-    /// `BigInt` kinds yet).
-    pub(super) const KINDS: [(ElementKind, &'static str, &'static str); 8] = [
+    /// name)`, in §5.8.6 kind order (no `Uint8Clamped`; no `BigInt` kinds
+    /// yet).
+    pub(super) const KINDS: [(ElementKind, &'static str, &'static str); 9] = [
         (ElementKind::Int8, "getInt8", "setInt8"),
         (ElementKind::Uint8, "getUint8", "setUint8"),
         (ElementKind::Int16, "getInt16", "setInt16"),
         (ElementKind::Uint16, "getUint16", "setUint16"),
         (ElementKind::Int32, "getInt32", "setInt32"),
         (ElementKind::Uint32, "getUint32", "setUint32"),
+        (ElementKind::Float16, "getFloat16", "setFloat16"),
         (ElementKind::Float32, "getFloat32", "setFloat32"),
         (ElementKind::Float64, "getFloat64", "setFloat64"),
     ];
@@ -1163,6 +1168,62 @@ impl ArrayBufferOp {
             | Self::MaxByteLength
             | Self::Resizable
             | Self::Detached => None,
+        }
+    }
+}
+
+/// The `Uint8Array` base64 / hex builtins of DESIGN.md §5.8.7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Base64Op {
+    /// `Uint8Array.fromBase64(string, options)`.
+    FromBase64,
+    /// `Uint8Array.fromHex(string)`.
+    FromHex,
+    /// `Uint8Array.prototype.toBase64(options)`.
+    ToBase64,
+    /// `Uint8Array.prototype.toHex()`.
+    ToHex,
+    /// `Uint8Array.prototype.setFromBase64(string, options)`.
+    SetFromBase64,
+    /// `Uint8Array.prototype.setFromHex(string)`.
+    SetFromHex,
+}
+
+impl Base64Op {
+    /// The statics of `%Uint8Array%`, in installation order.
+    pub(super) const STATICS: [Builtin; 2] = [
+        Builtin::Base64(Self::FromBase64),
+        Builtin::Base64(Self::FromHex),
+    ];
+
+    /// The builtin's `name`.
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::FromBase64 => "fromBase64",
+            Self::FromHex => "fromHex",
+            Self::ToBase64 => "toBase64",
+            Self::ToHex => "toHex",
+            Self::SetFromBase64 => "setFromBase64",
+            Self::SetFromHex => "setFromHex",
+        }
+    }
+
+    /// The builtin's `length`.
+    fn length(self) -> u32 {
+        match self {
+            Self::ToBase64 | Self::ToHex => 0,
+            Self::FromBase64 | Self::FromHex | Self::SetFromBase64 | Self::SetFromHex => 1,
+        }
+    }
+
+    /// The prototype holding this builtin as a method (`None` for the
+    /// statics).
+    fn prototype(self) -> Option<Intrinsic> {
+        match self {
+            Self::FromBase64 | Self::FromHex => None,
+            Self::ToBase64 | Self::ToHex | Self::SetFromBase64 | Self::SetFromHex => {
+                Some(Intrinsic::Prototype(BuiltinCtor::Typed(ElementKind::Uint8)))
+            }
         }
     }
 }
@@ -2064,6 +2125,7 @@ fn math_name(op: MathOp) -> &'static str {
         MathOp::Acosh => "acosh",
         MathOp::Atanh => "atanh",
         MathOp::Random => "random",
+        MathOp::F16round => "f16round",
     }
 }
 
@@ -2326,7 +2388,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 468] = [
+    pub(super) const ALL: [Builtin; 478] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -2891,6 +2953,16 @@ impl Builtin {
         Self::TypedArray(TypedArrayOp::ALL[34]),
         Self::TypedArray(TypedArrayOp::ALL[35]),
         Self::TypedArray(TypedArrayOp::ALL[36]),
+        Self::Ctor(BuiltinCtor::Typed(ElementKind::Float16)),
+        Self::DataView(DataViewOp::Get(ElementKind::Float16)),
+        Self::DataView(DataViewOp::Set(ElementKind::Float16)),
+        Self::Math(MathOp::F16round),
+        Self::Base64(Base64Op::FromBase64),
+        Self::Base64(Base64Op::FromHex),
+        Self::Base64(Base64Op::ToBase64),
+        Self::Base64(Base64Op::ToHex),
+        Self::Base64(Base64Op::SetFromBase64),
+        Self::Base64(Base64Op::SetFromHex),
     ];
 
     /// The function's `name`.
@@ -2941,6 +3013,7 @@ impl Builtin {
             }
             Self::Symbol(op) => op.name(),
             Self::BigInt(op) => op.name(),
+            Self::Base64(op) => op.name(),
             Self::DateMethod(op) => op.name(),
             Self::DateBody(op) => op.name(),
             Self::CollectionOp { op, .. } | Self::WeakOp { op, .. } => op.name(),
@@ -3097,6 +3170,7 @@ impl Builtin {
             Self::ObjectReflect(op) => op.length(),
             Self::Symbol(op) => op.length(),
             Self::BigInt(op) => op.length(),
+            Self::Base64(op) => op.length(),
             Self::Species(op) => op.length(),
             Self::Iterator(op) => op.length(),
             Self::ArrayBuffer(op) => op.length(),
@@ -3169,6 +3243,7 @@ impl Builtin {
             Self::ArrayBuffer(op) => return op.prototype(),
             Self::DataView(op) => return op.prototype(),
             Self::TypedArray(op) => return op.prototype(),
+            Self::Base64(op) => return op.prototype(),
             Self::BigInt(BigIntOp::ToString | BigIntOp::ToLocaleString | BigIntOp::ValueOf) => {
                 return Some(Intrinsic::BigIntPrototype);
             }
@@ -3279,11 +3354,13 @@ impl Intrinsic {
 
 impl Builtin {
     /// Whether this belongs to a binary-data family: an `ArrayBuffer`,
-    /// `DataView` or typed-array builtin, a binary-data constructor, or the
-    /// `get [@@species]` of one.
+    /// `DataView`, typed-array or `Uint8Array` base64 / hex builtin, a
+    /// binary-data constructor, or the `get [@@species]` of one.
     pub(super) fn is_binary(self) -> bool {
         match self {
-            Self::ArrayBuffer(_) | Self::DataView(_) | Self::TypedArray(_) => true,
+            Self::ArrayBuffer(_) | Self::DataView(_) | Self::TypedArray(_) | Self::Base64(_) => {
+                true
+            }
             Self::Ctor(ctor) | Self::Species(SpeciesOp::Getter(ctor)) => is_binary_ctor(ctor),
             _ => false,
         }
@@ -3350,7 +3427,7 @@ const NUMBER_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 49] = [
+const GLOBALS: [(&str, u32, Value); 50] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -3545,6 +3622,11 @@ const GLOBALS: [(&str, u32, Value); 49] = [
         "Uint32Array",
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::Uint32))),
+    ),
+    (
+        "Float16Array",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::Float16))),
     ),
     (
         "Float32Array",
@@ -3851,8 +3933,9 @@ fn array_buffer_entries(entries: &mut Vec<Entry>) {
 /// The `%TypedArray%` entries past [`constructor_entries`] (DESIGN.md
 /// §5.8.7): its statics `from` / `of` and `get [@@species]`; the `%TypedArray.prototype%` getters,
 /// `get [@@toStringTag]` (configurable, non-enumerable accessors without a
-/// setter) and `[@@iterator]` (the `values` function object); and each
-/// concrete constructor's and prototype's constant `BYTES_PER_ELEMENT`.
+/// setter) and `[@@iterator]` (the `values` function object); the
+/// `Uint8Array` base64 / hex statics; and each concrete constructor's and
+/// prototype's constant `BYTES_PER_ELEMENT`.
 fn typed_array_entries(entries: &mut Vec<Entry>) {
     let (ctor, proto) = (
         Intrinsic::Ctor(BuiltinCtor::TypedArray),
@@ -3905,6 +3988,12 @@ fn typed_array_entries(entries: &mut Vec<Entry>) {
         attrs: METHOD_ATTRS,
         value: Value::Method(Builtin::ArrayToString),
     });
+    entries.extend(Base64Op::STATICS.map(|builtin| Entry {
+        intrinsic: Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::Uint8)),
+        key: Key::Str(builtin.name()),
+        attrs: METHOD_ATTRS,
+        value: Value::Method(builtin),
+    }));
     for kind in ElementKind::ALL {
         let ctor = BuiltinCtor::Typed(kind);
         for intrinsic in [Intrinsic::Ctor(ctor), Intrinsic::Prototype(ctor)] {
@@ -5148,6 +5237,50 @@ mod tests {
             method_of(Intrinsic::Prototype(BuiltinCtor::Array), "toString"),
             Some(Builtin::ArrayToString)
         );
+    }
+
+    #[test]
+    fn float16_and_base64_entries() {
+        // DESIGN.md §5.8.7, stage T5a: the base64 / hex statics on
+        // `%Uint8Array%` and methods on its prototype (binary builtins), the
+        // Float16 `DataView` pair, and `Math.f16round` (not binary).
+        let uint8 = BuiltinCtor::Typed(ElementKind::Uint8);
+        let float16 = BuiltinCtor::Typed(ElementKind::Float16);
+        for (op, owner, length) in [
+            (Base64Op::FromBase64, Intrinsic::Ctor(uint8), 1),
+            (Base64Op::FromHex, Intrinsic::Ctor(uint8), 1),
+            (Base64Op::ToBase64, Intrinsic::Prototype(uint8), 0),
+            (Base64Op::ToHex, Intrinsic::Prototype(uint8), 0),
+            (Base64Op::SetFromBase64, Intrinsic::Prototype(uint8), 1),
+            (Base64Op::SetFromHex, Intrinsic::Prototype(uint8), 1),
+        ] {
+            let builtin = Builtin::Base64(op);
+            assert_eq!(builtin.name(), op.name());
+            assert_eq!(builtin.length(), length, "{}", op.name());
+            assert_eq!(method_of(owner, op.name()), Some(builtin));
+            assert!(Builtin::ALL.contains(&builtin) && builtin.is_binary());
+        }
+        assert_eq!(
+            method_of(
+                Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::Int8)),
+                "fromHex"
+            ),
+            None
+        );
+        let dv = Intrinsic::Prototype(BuiltinCtor::DataView);
+        let get = Builtin::DataView(DataViewOp::Get(ElementKind::Float16));
+        let set = Builtin::DataView(DataViewOp::Set(ElementKind::Float16));
+        assert_eq!(method_of(dv, "getFloat16"), Some(get));
+        assert_eq!(method_of(dv, "setFloat16"), Some(set));
+        assert_eq!((get.length(), set.length()), (1, 2));
+        let f16round = Builtin::Math(MathOp::F16round);
+        assert_eq!(method_of(Intrinsic::Math, "f16round"), Some(f16round));
+        assert_eq!(f16round.length(), 1);
+        assert!(!f16round.is_binary());
+        assert_eq!(BuiltinCtor::from_name("Float16Array"), Some(float16));
+        assert_eq!(ElementKind::Float16.kind(), 7);
+        assert_eq!(ElementKind::Float16.size(), 2);
+        assert!(Intrinsic::Ctor(float16).is_binary());
     }
 
     #[test]

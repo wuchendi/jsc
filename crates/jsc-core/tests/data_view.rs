@@ -441,15 +441,15 @@ fn coercion_order() {
 }
 
 /// The getters' and methods' receiver checks, their descriptors, `name` and
-/// `length`, and `@@toStringTag`; `Float16` and the `BigInt` pairs are not
-/// installed yet.
+/// `length`, and `@@toStringTag`; the `BigInt` pairs are not installed
+/// yet.
 #[test]
 fn prototype_shape_and_receivers() {
     assert_string(
         "const P = DataView.prototype;
          ['getInt8', 'setInt8', 'getUint8', 'setUint8', 'getInt16', 'setInt16', 'getUint16',
           'setUint16', 'getInt32', 'setInt32', 'getUint32', 'setUint32', 'getFloat32',
-          'setFloat32', 'getFloat64', 'setFloat64'].map((n) => {
+          'setFloat32', 'getFloat64', 'setFloat64', 'getFloat16', 'setFloat16'].map((n) => {
             const d = Object.getOwnPropertyDescriptor(P, n);
             return [n, d.value.length, d.value.name === n, d.writable, d.enumerable,
                     d.configurable].join(':');
@@ -461,7 +461,8 @@ fn prototype_shape_and_receivers() {
          getInt32:1:true:true:false:true setInt32:2:true:true:false:true \
          getUint32:1:true:true:false:true setUint32:2:true:true:false:true \
          getFloat32:1:true:true:false:true setFloat32:2:true:true:false:true \
-         getFloat64:1:true:true:false:true setFloat64:2:true:true:false:true",
+         getFloat64:1:true:true:false:true setFloat64:2:true:true:false:true \
+         getFloat16:1:true:true:false:true setFloat16:2:true:true:false:true",
     );
     assert_string(
         "const P = DataView.prototype;
@@ -471,11 +472,11 @@ fn prototype_shape_and_receivers() {
             return [k, typeof d.get, d.set === undefined, d.enumerable, d.configurable,
                     d.get.name, d.get.length].join(':');
           }).concat([t.value, t.writable, t.enumerable, t.configurable,
-                     typeof P.getFloat16, typeof P.getBigInt64, typeof P.setBigUint64]).join(' ')",
+                     typeof P.getBigInt64, typeof P.setBigUint64]).join(' ')",
         "buffer:function:true:false:true:get buffer:0 \
          byteLength:function:true:false:true:get byteLength:0 \
          byteOffset:function:true:false:true:get byteOffset:0 \
-         DataView false false true undefined undefined undefined",
+         DataView false false true undefined undefined",
     );
     assert_string(
         &with_err(
