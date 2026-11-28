@@ -2192,7 +2192,7 @@ fn bigint_gate_triggers() {
     }
 }
 
-/// Holding the global object opens the binary-data gate (DESIGN.md §5.8.5):
+/// Holding the global object opens the binary-data gate (DESIGN.md §6.4):
 /// an escaping `globalThis` lowers to a global-object lookup, not the
 /// constant address, and must count as well as a top-level `this`.
 #[test]

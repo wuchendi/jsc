@@ -260,7 +260,7 @@ impl Intrinsic {
         match self {
             Self::ObjectPrototype | Self::SymbolRegistry | Self::ArrayUnscopables => None,
             // The concrete typed-array prototypes inherit from
-            // `%TypedArray.prototype%` (DESIGN.md §5.8.7).
+            // `%TypedArray.prototype%` (DESIGN.md §7.9).
             Self::Prototype(BuiltinCtor::Typed(_)) => {
                 Some(Self::Prototype(BuiltinCtor::TypedArray))
             }
@@ -289,7 +289,7 @@ impl Intrinsic {
                 Some(Self::Ctor(BuiltinCtor::Error(ErrorKind::Error)))
             }
             // The concrete typed-array constructors inherit from
-            // `%TypedArray%` (DESIGN.md §5.8.7).
+            // `%TypedArray%` (DESIGN.md §7.9).
             Self::Ctor(BuiltinCtor::Typed(_)) => Some(Self::Ctor(BuiltinCtor::TypedArray)),
             Self::Ctor(_) | Self::Proxy => Some(Self::FunctionPrototype),
         }
@@ -457,7 +457,7 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
         .chain([Intrinsic::BigIntPrototype])
 }
 
-/// The binary-data constructors (DESIGN.md §5.8.7), whose constructor and
+/// The binary-data constructors (DESIGN.md §7.9), whose constructor and
 /// prototype intrinsics follow every other intrinsic in the image but
 /// `%BigInt.prototype%`.
 const BINARY_CTORS: [BuiltinCtor; 15] = [
@@ -723,27 +723,27 @@ pub(super) enum Builtin {
     /// `%IteratorPrototype%` accessor half (DESIGN.md §7.9).
     Iterator(IteratorOp),
     /// An `ArrayBuffer` static, `%ArrayBuffer.prototype%` method or getter
-    /// (DESIGN.md §5.8.7, `emit/builtins/array_buffer.rs`).
+    /// (DESIGN.md §7.9, `emit/builtins/array_buffer.rs`).
     ArrayBuffer(ArrayBufferOp),
-    /// A `%DataView.prototype%` method or getter (DESIGN.md §5.8.7,
+    /// A `%DataView.prototype%` method or getter (DESIGN.md §7.9,
     /// `emit/builtins/data_view.rs`).
     DataView(DataViewOp),
     /// A `Proxy` builtin (DESIGN.md §6.11).
     Proxy(ProxyOp),
     /// A `%TypedArray%` static, `%TypedArray.prototype%` getter or iterator
-    /// method (DESIGN.md §5.8.7, `emit/builtins/typed_array.rs`).
+    /// method (DESIGN.md §7.9, `emit/builtins/typed_array.rs`).
     TypedArray(TypedArrayOp),
     /// A `Reflect` function (DESIGN.md §6.11, `emit/builtins/reflect.rs`).
     Reflect(ReflectFn),
     /// A `BigInt` static or `%BigInt.prototype%` method (DESIGN.md §6.10.7).
     BigInt(BigIntOp),
     /// A `Uint8Array` base64 / hex static or prototype method (DESIGN.md
-    /// §5.8.7, `emit/builtins/base64.rs`).
+    /// §7.9, `emit/builtins/base64.rs`).
     Base64(Base64Op),
 }
 
-/// The `DataView` builtins of DESIGN.md §5.8.7 other than the constructor.
-/// A get / set method carries its element kind (§5.8.6).
+/// The `DataView` builtins of DESIGN.md §7.9 other than the constructor.
+/// A get / set method carries its element kind (§6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DataViewOp {
     /// The getter of `DataView.prototype.buffer`.
@@ -760,7 +760,7 @@ pub(super) enum DataViewOp {
 
 impl DataViewOp {
     /// The element kinds with get / set methods: `(kind, getter name, setter
-    /// name)`, in §5.8.6 kind order (no `Uint8Clamped`).
+    /// name)`, in §6.2 kind order (no `Uint8Clamped`).
     pub(super) const KINDS: [(ElementKind, &'static str, &'static str); 11] = [
         (ElementKind::Int8, "getInt8", "setInt8"),
         (ElementKind::Uint8, "getUint8", "setUint8"),
@@ -818,7 +818,7 @@ impl DataViewOp {
     }
 }
 
-/// The `%TypedArray%` builtins of DESIGN.md §5.8.7 other than the
+/// The `%TypedArray%` builtins of DESIGN.md §7.9 other than the
 /// constructors and `get [@@species]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TypedArrayOp {
@@ -1084,7 +1084,7 @@ impl TypedArrayOp {
     }
 }
 
-/// The `ArrayBuffer` builtins of DESIGN.md §5.8.7 other than the
+/// The `ArrayBuffer` builtins of DESIGN.md §7.9 other than the
 /// constructor and `get [@@species]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ArrayBufferOp {
@@ -1175,7 +1175,7 @@ impl ArrayBufferOp {
     }
 }
 
-/// The `Uint8Array` base64 / hex builtins of DESIGN.md §5.8.7.
+/// The `Uint8Array` base64 / hex builtins of DESIGN.md §7.9.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Base64Op {
     /// `Uint8Array.fromBase64(string, options)`.
@@ -3321,7 +3321,7 @@ pub(super) struct Entry {
 }
 
 impl Entry {
-    /// Whether the entry belongs to binary data (DESIGN.md §5.8.5): it is an
+    /// Whether the entry belongs to binary data (DESIGN.md §6.4): it is an
     /// own property of a binary-data constructor or prototype, or its value
     /// is one, or a builtin of a binary-data family. Runtime shaking ignores
     /// such an entry in a program that cannot reach binary data.
@@ -3950,7 +3950,7 @@ fn array_buffer_entries(entries: &mut Vec<Entry>) {
 }
 
 /// The `%TypedArray%` entries past [`constructor_entries`] (DESIGN.md
-/// §5.8.7): its statics `from` / `of` and `get [@@species]`; the `%TypedArray.prototype%` getters,
+/// §7.9): its statics `from` / `of` and `get [@@species]`; the `%TypedArray.prototype%` getters,
 /// `get [@@toStringTag]` (configurable, non-enumerable accessors without a
 /// setter) and `[@@iterator]` (the `values` function object); the
 /// `Uint8Array` base64 / hex statics; and each concrete constructor's and
@@ -4917,7 +4917,7 @@ mod tests {
 
     #[test]
     fn array_buffer_intrinsics_follow_every_other() {
-        // DESIGN.md §5.8.7: `%ArrayBuffer%` and its prototype are appended
+        // DESIGN.md §7.9: `%ArrayBuffer%` and its prototype are appended
         // to the image; the constructor is `SELF_ALLOC`, `length` 1.
         let all: Vec<Intrinsic> = intrinsics().collect();
         let ctor = Intrinsic::Ctor(BuiltinCtor::ArrayBuffer);
@@ -4996,7 +4996,7 @@ mod tests {
 
     #[test]
     fn data_view_intrinsics_follow_array_buffer() {
-        // DESIGN.md §5.8.7: `%DataView%` and its prototype follow the
+        // DESIGN.md §7.9: `%DataView%` and its prototype follow the
         // `ArrayBuffer` pair; the constructor is `SELF_ALLOC`, `length` 1.
         let all: Vec<Intrinsic> = intrinsics().collect();
         let ctor = Intrinsic::Ctor(BuiltinCtor::DataView);
@@ -5064,7 +5064,7 @@ mod tests {
 
     #[test]
     fn typed_array_intrinsics_follow_array_buffer() {
-        // DESIGN.md §5.8.7: `%TypedArray%`, its prototype, then each concrete
+        // DESIGN.md §7.9: `%TypedArray%`, its prototype, then each concrete
         // constructor and prototype in kind order, after `%ArrayBuffer%` and
         // `%DataView%`, before `%BigInt.prototype%`.
         let all: Vec<Intrinsic> = intrinsics().collect();
@@ -5139,7 +5139,7 @@ mod tests {
 
     #[test]
     fn typed_array_prototype_entries() {
-        // DESIGN.md §5.8.7: the `%TypedArray.prototype%` iterator methods
+        // DESIGN.md §7.9: the `%TypedArray.prototype%` iterator methods
         // (`[@@iterator]` is `values`), and each concrete constructor's facts.
         let ta = Intrinsic::Ctor(BuiltinCtor::TypedArray);
         let ta_proto = Intrinsic::Prototype(BuiltinCtor::TypedArray);
@@ -5201,7 +5201,7 @@ mod tests {
 
     #[test]
     fn typed_array_prototype_methods() {
-        // DESIGN.md §5.8.7, stage T3b: every method on `%TypedArray.prototype%`
+        // DESIGN.md §7.9, stage T3b: every method on `%TypedArray.prototype%`
         // under its name with its spec `length`, and `toString` the very
         // function object of `Array.prototype.toString`.
         let ta_proto = Intrinsic::Prototype(BuiltinCtor::TypedArray);
@@ -5260,7 +5260,7 @@ mod tests {
 
     #[test]
     fn float16_and_base64_entries() {
-        // DESIGN.md §5.8.7, stage T5a: the base64 / hex statics on
+        // DESIGN.md §7.9, stage T5a: the base64 / hex statics on
         // `%Uint8Array%` and methods on its prototype (binary builtins), the
         // Float16 `DataView` pair, and `Math.f16round` (not binary).
         let uint8 = BuiltinCtor::Typed(ElementKind::Uint8);
