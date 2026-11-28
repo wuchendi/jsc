@@ -82,8 +82,20 @@ fn console_renders_the_n_suffix() {
     assert_output("console.log(1n, -2n)", "1n -2n\n");
     assert_output("console.log([1n, 2n])", "[ 1n, 2n ]\n");
     assert_output("console.log({ a: 1n })", "{ a: 1n }\n");
-    assert_output("console.log(new Map([[1n, 1]]))", "Map(1) { 1n => 1 }\n");
-    assert_output("console.log(new Set([2n]))", "Set(1) { 2n }\n");
+    // Map and Set render as `Map(N)` / `Set(N)` without entries (DESIGN.md
+    // §6.9), whatever the key or value type.
+    assert_output("console.log(new Map([[1n, 1]]))", "Map(1)\n");
+    assert_output("console.log(new Set([2n]))", "Set(1)\n");
+    assert_output("console.log(new Map([[1, 2n]]))", "Map(1)\n");
+    assert_output("console.log([new Map([[1n, [2n]]])])", "[ Map(1) ]\n");
+    assert_output(
+        &format!("console.log(new Map([[{TWO_200}n, 1], [-{TWO_200}n, 2]]))"),
+        "Map(2)\n",
+    );
+    assert_output(
+        "let m = new Map([[1n, 'a']]); console.log(m.get(1n), m.has(1), new Set([1n, 1n]).size)",
+        "a false 1\n",
+    );
     assert_output(
         &format!("console.log({TWO_200}n)"),
         &format!("{TWO_200}n\n"),
@@ -281,5 +293,17 @@ fn multi_limb_conversions_survive_collections() {
              console.log(-{TWO_200}n)"
         ),
         &format!("1640 k true\n-{TWO_200}n\n"),
+    );
+}
+
+#[test]
+fn map_with_bigint_keys_survives_collections() {
+    assert_same_under_gc_stress(
+        &format!(
+            "let m = new Map(); \
+             for (let i = 0; i < 50; i++) m.set({TWO_200}n + BigInt(i), [i]); \
+             console.log(m, m.size, m.get({TWO_200}n + 49n)[0], m.has({TWO_200}n + 50n))"
+        ),
+        "Map(50) 50 49 false\n",
     );
 }
