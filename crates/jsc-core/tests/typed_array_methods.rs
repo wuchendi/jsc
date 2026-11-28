@@ -617,3 +617,91 @@ fn allocating_methods_under_gc_stress() {
         "150 true true true true 25|-23|49 24|-24 48,24,-24 48,24,-24\n",
     );
 }
+
+/// `copyWithin` whose `start` / `end` conversion detaches the buffer (the
+/// test262 `coerced-values-*-detached*` cases, `-prototype` swapping the
+/// receiver's prototype for an array of the same length): `count > 0`, so
+/// the re-validation after the conversions throws for every kind.
+#[test]
+fn copy_within_detach_during_coercion() {
+    let ctors = KINDS.join(", ");
+    assert_string(
+        &with_prelude(&format!(
+            "const out = [];
+             for (const C of [{ctors}]) {{
+               const array = Array.from({{ length: 200 }}, () => 7);
+               let ta = new C(array);
+               out.push(err(() => ta.copyWithin(0, {{ valueOf() {{ ta.buffer.transfer(); return 100; }} }}, 150)));
+               ta = new C(array);
+               out.push(err(() => ta.copyWithin(0, 100, {{ valueOf() {{ ta.buffer.transfer(); return 150; }} }})));
+               ta = new C(array);
+               out.push(err(() => ta.copyWithin(0, 100, {{ valueOf() {{
+                 ta.buffer.transfer(); Object.setPrototypeOf(ta, array); return 101; }} }})));
+             }}
+             out.every((s) => s === 'TypeError: Cannot perform %TypedArray%.prototype.copyWithin \
+on a detached or out-of-bounds TypedArray') + ' ' + out.length"
+        )),
+        "true 27",
+    );
+}
+
+/// The exact test262 setup of the `coerced-values-*-detached*` cases: a
+/// 10000-element source array made by `length` growth then `fill` (a
+/// `SPARSE` array, DESIGN.md §5.4), and the detach in `end`'s `valueOf`.
+/// Must terminate with the `TypeError`.
+#[test]
+fn copy_within_detach_during_coercion_large_source() {
+    assert_string(
+        &with_prelude(
+            "const array = [];
+             array.length = 10000;
+             array.fill(7, 0);
+             const ta = new Uint8Array(array);
+             err(() => ta.copyWithin(0, 100, { valueOf() { ta.buffer.transfer(); return 900; } }))",
+        ),
+        "TypeError: Cannot perform %TypedArray%.prototype.copyWithin on a detached or \
+         out-of-bounds TypedArray",
+    );
+}
+
+/// `copyWithin` whose conversions shrink a resizable buffer (test262
+/// `coerced-target-start-end-shrink`): a fixed-length view that goes out of
+/// bounds throws; a length-tracking one copies within the new length only
+/// (`count` clamped to the shrunk byte limit, in either direction).
+#[test]
+fn copy_within_shrink_during_coercion() {
+    let ctors = KINDS.join(", ");
+    assert_string(
+        &with_prelude(&format!(
+            "const out = [];
+             for (const C of [{ctors}]) {{
+               const n = C.BYTES_PER_ELEMENT;
+               const rab = new ArrayBuffer(4 * n, {{ maxByteLength: 8 * n }});
+               const fixed = new C(rab, 0, 4);
+               const evil = {{ valueOf() {{ rab.resize(2 * n); return 2; }} }};
+               out.push(err(() => fixed.copyWithin(evil, 0, 1)));
+               rab.resize(4 * n);
+               out.push(err(() => fixed.copyWithin(0, evil, 3)));
+               rab.resize(4 * n);
+               out.push(err(() => fixed.copyWithin(0, 1, evil)));
+               const cases = [[evil, 0], [0, evil], [evil, 1], [1, evil]].map(([t, s]) => {{
+                 const r = new ArrayBuffer(4 * n, {{ maxByteLength: 8 * n }});
+                 const lt = new C(r);
+                 lt.set([0, 1, 2, 3]);
+                 const shrink = {{ valueOf() {{ r.resize(3 * n); return 2; }} }};
+                 lt.copyWithin(t === evil ? shrink : t, s === evil ? shrink : s);
+                 return lt.join();
+               }});
+               out.push(cases.join('/'));
+             }}
+             const msg = 'TypeError: Cannot perform %TypedArray%.prototype.copyWithin on a \
+detached or out-of-bounds TypedArray';
+             const rows = [];
+             for (let i = 0; i < out.length; i += 4) {{
+               rows.push((out[i] === msg && out[i + 1] === msg && out[i + 2] === msg) + ' ' + out[i + 3]);
+             }}
+             [...new Set(rows)].join('|')"
+        )),
+        "true 0,1,0/2,1,2/0,1,1/0,2,2",
+    );
+}
