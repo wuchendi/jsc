@@ -800,7 +800,10 @@ fn emit_assign(
         index: Box::new(IrNode::Local(kv)),
         value: Box::new(IrNode::Local(v)),
     };
-    emit_drop(function, frame, &store, strings, helpers);
+    // `to` is `ToObject(target)`: no primitive-receiver arm.
+    crate::emit::object::with_object_local(to, || {
+        emit_drop(function, frame, &store, strings, helpers);
+    });
     wasm!(function;
         End,
         LocalGet(at), I32Const(1), I32Add, LocalSet(at),

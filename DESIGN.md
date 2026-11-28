@@ -1440,7 +1440,12 @@ hands the operation to its traps.
   `ToObject(base).[[Set]](k, v, base)` through `__set_bool`: an inherited setter
   runs with `this` = the primitive and a proxy on the chain runs its `set`
   trap; any refusal (no setter, a non-writable property, or the primitive
-  receiver itself) throws `Cannot create property 'k' on string 'abc'`. On
+  receiver itself) throws `Cannot create property 'k' on string 'abc'`. The
+  arm is emitted only where the base may be a primitive: not on a fresh
+  literal or instance, an assignment of one, a base class constructor's
+  `this`, or a runtime body's `Set(O, ..)` target (an Object by the spec's
+  typing; `object::with_object_local`), so a program without such a user
+  store keeps no `__set_bool`. On
   `null`/`undefined` they throw `Cannot set properties of undefined (setting 'k')`.
 - **`__super_get(home, key, recv)` / `__super_set(home, key, v, recv)`** —
   `home.[[Get]](key, recv)` / `home.[[Set]](key, v, recv)` for a `super`
