@@ -860,8 +860,8 @@ pub(crate) const FINREG_BLOCK_SIZE: u32 = OBJ_PREFIX_SIZE + 24;
 /// (a cleanup job is queued).
 pub(crate) const FINREG_FLAG_JOB_QUEUED: u32 = 1;
 
-// Type bytes `20..=23` are reserved for the parallel Proxy and BigInt
-// workstreams (DESIGN.md §5.8.1); the binary-data kinds start at `24`.
+// Type byte `20` is [`TYPE_PROXY`] and `21` [`TYPE_BIGINT`]; `22` and `23` are
+// spare (DESIGN.md §5.8.1); the binary-data kinds start at `24`.
 
 /// TYPE BYTE of an `ArrayBuffer` (DESIGN.md §5.8.3): the object-family
 /// prefix, then `[data:u32 @16][byte_length:u32 @20][max_byte_length:u32

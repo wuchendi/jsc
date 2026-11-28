@@ -9,9 +9,6 @@ Proxy
 proxy-missing-checks
 Reflect*
 
-# BigInt (literals rejected at compile time)
-BigInt
-
 # Regular expressions (literals and the RegExp constructor are rejected)
 regexp-*
 RegExp.escape
