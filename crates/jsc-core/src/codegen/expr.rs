@@ -4,6 +4,7 @@ use super::*;
 use swc_common::{Span, Spanned};
 
 use crate::error::CompileError;
+use crate::ir::KEY_SECOND;
 
 impl LowerCtx<'_> {
     /// The `await` of the already lowered `arg` in the current body (see
@@ -1559,10 +1560,13 @@ impl LowerCtx<'_> {
     ) -> anyhow::Result<IrNode> {
         let recv = self.lower_expr(&member.obj)?;
         let pure = args.iter().all(pure_arg);
+        let constant_key = literal_key_call(name, &args);
         // A `null`/`undefined` receiver throws on the method lookup, before
         // any argument runs: with side-effect-free arguments the generic call
-        // throws it (no path before it reads the receiver as an object).
-        let recv = if pure {
+        // throws it (no path before it reads the receiver as an object); a
+        // constant-key `ProtoMethod` (read right after the receiver) guards it
+        // itself.
+        let recv = if pure || constant_key {
             recv
         } else {
             nullish_check(recv, name)
@@ -1643,6 +1647,7 @@ impl LowerCtx<'_> {
                     recv: recv(),
                     key: name.to_owned(),
                     kinds,
+                    constant_key,
                 }),
             });
             Box::new(IrNode::Local(local))
@@ -3061,6 +3066,23 @@ fn pure_arg(arg: &IrNode) -> bool {
             | IrNode::FuncValue { .. }
             | IrNode::DeclFunc(_)
     )
+}
+
+/// Whether `recv.name(args)` is `Reflect.get(o, 'x')` or its kin: `name` is
+/// one of [`KEY_SECOND`] and the key `args[1]` a literal, which names no
+/// builtin for runtime shaking ([`IrNode::ProtoMethod`]'s `constant_key`).
+fn literal_key_call(name: &str, args: &[IrNode]) -> bool {
+    KEY_SECOND.contains(&name)
+        && args.get(1).is_some_and(|key| {
+            matches!(
+                key,
+                IrNode::Str(_)
+                    | IrNode::Num(_)
+                    | IrNode::Bool(_)
+                    | IrNode::Null
+                    | IrNode::Undefined
+            )
+        })
 }
 
 /// Wrap a builtin member access's receiver in an [`IrNode::NullishCheck`] so a

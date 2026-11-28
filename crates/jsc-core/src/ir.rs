@@ -1033,6 +1033,13 @@ impl DateOp {
     }
 }
 
+/// The method names of the builtins whose run-time key is their second
+/// argument: `Reflect.get`, `Reflect` / `Object.getOwnPropertyDescriptor`,
+/// `Reflect` / `Object.defineProperty`. A call `o.m(a, key)` with `m` one of
+/// these and a constant `key` names no builtin for runtime shaking
+/// (DESIGN.md §4.2).
+pub const KEY_SECOND: [&str; 3] = ["get", "getOwnPropertyDescriptor", "defineProperty"];
+
 /// The receiver family of a guarded builtin-method fast path
 /// ([`IrNode::ProtoGuard`]): the kind byte (or bytes) it tests and the realm
 /// prototype the receiver's `proto` must be.
@@ -2108,13 +2115,19 @@ pub enum IrNode {
     ProtoMethod {
         /// Whether the program is intrinsics-sealed (no dirty-bit test).
         sealed: bool,
-        /// The receiver read (a local, evaluated and nullish-checked before
-        /// this node).
+        /// The receiver read (a local, evaluated and, unless `constant_key`,
+        /// nullish-checked before this node).
         recv: Box<IrNode>,
         /// The method name.
         key: String,
         /// The receiver families of the call's fast paths, in their order.
         kinds: Vec<ProtoKind>,
+        /// Whether `key` is one of [`KEY_SECOND`] and the call's second
+        /// argument is a literal: `recv` is then not nullish-checked before
+        /// this node, which guards it first, and neither the guard nor the
+        /// read names a builtin for runtime shaking (`Reflect.get(o, 'x')`
+        /// shakes like `o.x`, DESIGN.md §4.2).
+        constant_key: bool,
     },
     /// Read the `__this` wasm global. Emitted ONLY in a function/arrow
     /// prologue to snapshot the current `this` into the function's local `this`
