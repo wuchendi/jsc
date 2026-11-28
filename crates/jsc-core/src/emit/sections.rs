@@ -114,11 +114,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         } else {
             BinaryData::Unreachable
         },
-        proxy_gate: if program_has_proxies(program) {
-            ProxyGate::Open
-        } else {
-            ProxyGate::Closed
-        },
+        proxy_gate: proxy_gate(program),
+        reflect_gate: reflect_gate(program),
         bigint_gate: bigint_gate(program),
         unicode: layout.unicode,
         fn_info: layout.info,
@@ -1410,6 +1407,38 @@ fn program_has_proxies(program: &IrProgram) -> bool {
         IrNode::Str(s) => s == "Proxy",
         IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
             global.name == "Proxy"
+        }
+        IrNode::Intrinsic(GlobalIntrinsic::Global) => true,
+        _ => false,
+    })
+}
+
+/// The [`ProxyGate`] of `program` ([`program_has_proxies`]).
+fn proxy_gate(program: &IrProgram) -> ProxyGate {
+    if program_has_proxies(program) {
+        ProxyGate::Open
+    } else {
+        ProxyGate::Closed
+    }
+}
+
+/// The [`ReflectGate`] of `program` ([`program_has_reflect`]).
+fn reflect_gate(program: &IrProgram) -> ReflectGate {
+    if program_has_reflect(program) {
+        ReflectGate::Open
+    } else {
+        ReflectGate::Closed
+    }
+}
+
+/// Whether the program can hold `%Reflect%` (DESIGN.md §6.11): it names
+/// `Reflect` as a global, a member or property key or a string literal, or
+/// it holds the global object (which can find `Reflect` by a run-time key).
+fn program_has_reflect(program: &IrProgram) -> bool {
+    program_any(program, |n| match n {
+        IrNode::Str(s) => s == "Reflect",
+        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
+            global.name == "Reflect"
         }
         IrNode::Intrinsic(GlobalIntrinsic::Global) => true,
         _ => false,
