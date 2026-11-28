@@ -97,27 +97,35 @@ impl Body {
 
     /// The new instance's prototype (`GetPrototypeFromConstructor`):
     /// `new.target.prototype` when constructing and that is an object, else
-    /// `ctor.prototype` (non-writable, so always the realm's). Uses temp 0.
+    /// (after `GetFunctionRealm(new.target)`, which throws for a revoked
+    /// proxy on its chain) `ctor.prototype` (non-writable, so always the
+    /// realm's). Uses temps 0 and 1 (`new.target`, which the `prototype`
+    /// read's user code may replace in `$__new_target`; every caller assigns
+    /// temp 1 only after this).
     fn proto(&self, ctor: BuiltinCtor) -> IrNode {
         let own = IrNode::Intrinsic(GlobalIntrinsic::Ctor(ctor));
         let prototype = |obj: IrNode| IrNode::Index {
             obj: Box::new(obj),
             index: Box::new(IrNode::Str("prototype".into())),
         };
-        let p = self.temp(0);
+        let (p, c) = (self.temp(0), self.temp(1));
         IrNode::Seq(vec![
             IrNode::Assign {
-                local: p,
-                value: Box::new(prototype(ternary(
+                local: c,
+                value: Box::new(ternary(
                     self.constructing(),
                     IrNode::NewTargetGlobal,
                     own.clone(),
-                ))),
+                )),
+            },
+            IrNode::Assign {
+                local: p,
+                value: Box::new(prototype(IrNode::Local(c))),
             },
             ternary(
                 IrNode::IsObject(Box::new(IrNode::Local(p))),
                 IrNode::Local(p),
-                prototype(own),
+                IrNode::Seq(vec![IrNode::FunctionRealm(c), prototype(own)]),
             ),
         ])
     }

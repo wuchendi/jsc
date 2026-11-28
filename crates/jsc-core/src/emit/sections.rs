@@ -1330,6 +1330,7 @@ pub(super) fn collect_node<'a>(node: &'a IrNode, strs: &mut Strs<'a>) {
         | IrNode::ExcValue
         | IrNode::ThisGlobal
         | IrNode::NewTargetGlobal
+        | IrNode::FunctionRealm(_)
         | IrNode::IsConstructCall(_)
         | IrNode::ArgCount(_)
         | IrNode::Hole

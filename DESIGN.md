@@ -3307,9 +3307,13 @@ the spec orders before `GetPrototypeFromConstructor` stay before it:
 `Promise`'s `IsCallable(executor)`, `Date`'s time-value conversions (the
 Date is allocated first and its `proto` replaced), `WeakRef`'s
 `CanBeHeldWeakly(target)`, `FinalizationRegistry`'s
-`IsCallable(cleanupCallback)`; the builtin bodies' realm fallback runs no
-`GetFunctionRealm` check (a revoked proxy `newTarget` whose `prototype`
-read returns a non-object falls back silently).
+`IsCallable(cleanupCallback)`. `Body::proto`'s realm fallback runs the same
+`GetFunctionRealm(newTarget)` walk as the construct site (the IR node
+`FunctionRealm` over `newTarget` saved before the `prototype` read; both
+emit `expr.rs::emit_function_realm`), so a revoked proxy `newTarget` throws
+there too; the binary-data constructors' own `GetPrototypeFromConstructor`
+(`typed_array.rs::proto_from_ctor`, `ArrayBuffer`, `DataView`) still falls
+back without it.
 
 **Realm entries** (`emit/realm.rs`, appended after `%OutOfMemoryError%` in
 image order; no watch bit; not inline namespaces):

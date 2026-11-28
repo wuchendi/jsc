@@ -1069,8 +1069,10 @@ fn callable_proxies_survive_gc_stress() {
 
 /// A base constructor reached through a proxy `newTarget` whose `prototype`
 /// read revokes it and returns a non-object: `GetFunctionRealm` of the now
-/// revoked proxy throws before the body runs; a live proxy (or a proxy chain)
-/// falls back to `%Object.prototype%`.
+/// revoked proxy throws before the body runs — through `new`,
+/// `Reflect.construct`, `super(..)` and a bound function's construct; a live
+/// proxy (or a proxy chain) falls back to `%Object.prototype%` and runs the
+/// body.
 #[test]
 fn construct_revoked_new_target_throws() {
     assert_type_errors(
@@ -1085,16 +1087,67 @@ fn construct_revoked_new_target_throws() {
             "const inner = Proxy.revocable(function () {}, {});
            const outer = new Proxy(inner.proxy, { get() { inner.revoke(); return 1; } });
            Reflect.construct(function () {}, [], outer)",
+            "class A {}
+           class B extends A { constructor() { super(); } }
+           const h = Proxy.revocable(function () {}, { get() { h.revoke(); } });
+           Reflect.construct(B, [], h.proxy)",
+            "function F() {}
+           const h = Proxy.revocable(function () {}, { get() { h.revoke(); } });
+           Reflect.construct(F.bind(null), [], h.proxy)",
         ],
     );
+    // The first construct throws before `F` runs; the second (a live chain)
+    // runs it.
     assert_string(
         "let ran = false;
          function F() { ran = true; }
          const h = Proxy.revocable(function () {}, { get() { h.revoke(); } });
-         try { Reflect.construct(F, [], h.proxy); } catch (e) {}
+         let threw = false;
+         try { Reflect.construct(F, [], h.proxy); } catch (e) { threw = e instanceof TypeError; }
+         const first = ran;
          const p = new Proxy(function () {}, { get() { return 1; } });
          const o = Reflect.construct(F, [], new Proxy(p, {}));
-         [ran, Object.getPrototypeOf(o) === Object.prototype].join()",
-        "false,true",
+         [threw, first, ran, Object.getPrototypeOf(o) === Object.prototype].join()",
+        "true,false,true,true",
     );
+}
+
+/// The builtin constructors' `GetPrototypeFromConstructor` fallback runs the
+/// same `GetFunctionRealm` walk: a `newTarget` revoked by its own
+/// `prototype` read throws (also when the trap's own `new` replaced
+/// `$__new_target`), a subclass's implicit `super(..args)` included; a live
+/// proxy chain falls back to the constructor's realm prototype.
+#[test]
+fn builtin_construct_revoked_new_target_throws() {
+    assert_type_errors(
+        "const h = Proxy.revocable(function () {}, { get() { h.revoke(); } });",
+        &[
+            "Reflect.construct(Map, [], h.proxy)",
+            "Reflect.construct(WeakMap, [], h.proxy)",
+            "Reflect.construct(Error, ['m'], h.proxy)",
+            "Reflect.construct(AggregateError, [[]], h.proxy)",
+            "Reflect.construct(Array, [3], h.proxy)",
+            "Reflect.construct(Date, [0], h.proxy)",
+            "Reflect.construct(Promise, [function () {}], h.proxy)",
+            "Reflect.construct(Boolean, [true], h.proxy)",
+            "class M extends Map {}
+             Reflect.construct(M, [], h.proxy)",
+        ],
+    );
+    assert_type_errors(
+        "",
+        &[
+            "const h = Proxy.revocable(function () {}, { get() { new Set(); h.revoke(); } });
+           Reflect.construct(Map, [], h.proxy)",
+        ],
+    );
+    let live = "const p = new Proxy(function () {}, { get() { new Set(); return 1; } });
+         const q = new Proxy(p, {});
+         console.log([
+           Object.getPrototypeOf(Reflect.construct(Map, [], q)) === Map.prototype,
+           Object.getPrototypeOf(Reflect.construct(Error, ['m'], q)) === Error.prototype,
+           Reflect.construct(Array, [1, 2], q).length,
+           Object.getPrototypeOf(Reflect.construct(Date, [0], q)) === Date.prototype,
+         ].join());";
+    assert_same_under_gc_stress(live, "true,true,2,true\n");
 }

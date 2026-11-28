@@ -2187,6 +2187,12 @@ pub enum IrNode {
     /// Read the `__new_target` wasm global. Emitted ONLY in the prologue of a
     /// function that references `new.target`, guarded by the construct marker.
     NewTargetGlobal,
+    /// `GetFunctionRealm(C)` of a builtin constructor's
+    /// `GetPrototypeFromConstructor` fallback, for the constructor held in
+    /// the local (which it clobbers): a revoked proxy on its proxy chain
+    /// throws (there is one realm, so nothing else is computed); `undefined`.
+    /// A no-op in a program without proxies.
+    FunctionRealm(u32),
     /// Whether the `argc` local carries the construct marker `-(n + 1)` (its
     /// number is negative), as a boolean.
     IsConstructCall(u32),
@@ -2819,6 +2825,7 @@ impl IrNode {
             | IrNode::ExcValue
             | IrNode::ThisGlobal
             | IrNode::NewTargetGlobal
+            | IrNode::FunctionRealm(_)
             | IrNode::IsConstructCall(_)
             | IrNode::ArgCount(_)
             | IrNode::Hole
@@ -3063,6 +3070,7 @@ impl IrNode {
             | IrNode::ExcValue
             | IrNode::ThisGlobal
             | IrNode::NewTargetGlobal
+            | IrNode::FunctionRealm(_)
             | IrNode::IsConstructCall(_)
             | IrNode::ArgCount(_)
             | IrNode::Hole
