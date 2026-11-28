@@ -350,13 +350,16 @@ fn hello_world_stays_near_the_base() {
 }
 
 /// A member store whose base may be a primitive runs `ToObject(base).[[Set]]`
-/// through `__set_bool` (a full `[[Set]]` body, several KB). The runtime's own
-/// stores (`Array(n)`'s `length` write, the generic `Array.prototype` and
+/// through `__set_bool` (a full `[[Set]]` body). The runtime's own stores
+/// (`Array(n)`'s `length` write, the generic `Array.prototype` and
 /// `Object.assign` `Set`s, all on Objects) and a base class constructor's
-/// `this.x = ..` carry no such arm, so a program without a user store on a
-/// possibly-primitive base keeps neither: one such store adds over 2 KB (L1
-/// measured the arm at +4.7 KB on hello world), far more than its own
-/// function and store site (a few hundred bytes).
+/// `this.x = ..` carry no such arm, so hello world keeps none: one user store
+/// adds over 2 KB there (the arm plus the plain store path `__set` /
+/// `__define`, which hello world does not keep either; L1 measured +4.7 KB).
+/// Next to a class program, which already keeps the plain store path, the
+/// increment is only `__set_bool` and the new function (CI measured 1740
+/// bytes), so the class pair is checked by stub, not by size
+/// (`emit::tests::primitive_store_arm_keeps_set_bool_only_for_user_stores`).
 #[test]
 fn primitive_store_arm_is_kept_only_by_user_stores() {
     let hello = size("console.log('hi')", false);
@@ -368,11 +371,6 @@ fn primitive_store_arm_is_kept_only_by_user_stores() {
     let class = "class P { constructor(v) { this.v = v } }\nconsole.log(new P(1).v)";
     let class_store = "class P { constructor(v) { this.v = v } }\n\
         function f(o) { o.w = 2 }\nconst p = new P(1); f(p); console.log(p.v, p.w)";
-    let (class_size, class_store_size) = (size(class, false), size(class_store, false));
-    assert!(
-        class_store_size > class_size + 2_000,
-        "{class_size} vs {class_store_size}"
-    );
     same(class, "1\nundefined");
     same(class_store, "1 2\nundefined");
     same(store, "hi\nundefined");

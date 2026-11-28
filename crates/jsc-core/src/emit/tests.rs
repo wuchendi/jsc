@@ -2077,6 +2077,30 @@ fn shaken_stubs<R>(src: &str, check: impl FnOnce(bool, super::Helpers<'_>, &[boo
     )
 }
 
+/// The primitive-store arm (`ToObject(base).[[Set]]` through `__set_bool`)
+/// is emitted only at a user store whose base may be a primitive: hello
+/// world and a base class constructor's `this.v = v` (its `this` is the
+/// allocated instance) leave `__set_bool` a stub; a store on a parameter
+/// keeps it.
+#[test]
+fn primitive_store_arm_keeps_set_bool_only_for_user_stores() {
+    let class = "class P { constructor(v) { this.v = v } }\nconsole.log(new P(1).v)";
+    let class_store = "class P { constructor(v) { this.v = v } }\n\
+        function f(o) { o.w = 2 }\nconst p = new P(1); f(p); console.log(p.v, p.w)";
+    let cases = [
+        ("console.log('hi')", true),
+        (class, true),
+        ("function f(o) { o.x = 1 } f({}); console.log('hi')", false),
+        (class_store, false),
+    ];
+    for (src, stubbed) in cases {
+        shaken_stubs(src, |_, helpers, stubs| {
+            let index = (helpers.set_bool() - super::IMPORT_FUNC_COUNT) as usize;
+            assert_eq!(stubs[index], stubbed, "`__set_bool` stubbed in `{src}`");
+        });
+    }
+}
+
 /// The `BigInt` kernels only the numeric operators, `ToNumeric` and
 /// `Number(x)` reference (DESIGN.md §6.10.9).
 const OPERATOR_KERNELS: [super::registry::Big; 5] = [
