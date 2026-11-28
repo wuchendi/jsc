@@ -321,3 +321,25 @@ fn array_buffer_layout_matches_design() {
     );
     assert_eq!(u64::from(BYTE_LENGTH_MAX), MEMORY_MAX_PAGES * 65_536);
 }
+
+/// Pins the `DataView` layout to `DESIGN.md` §5.8.3: a 32 B view with
+/// `buffer` @16, `byte_offset` @20, `byte_length` @24; flags
+/// `LENGTH_TRACKING` = 2, `RESIZABLE_BUFFER` = 4.
+#[test]
+fn data_view_layout_matches_design() {
+    use super::{
+        BLOCK_ALIGN, DV_BLOCK_SIZE, DV_BUFFER_OFFSET, DV_BYTE_LENGTH_OFFSET, DV_BYTE_OFFSET_OFFSET,
+        DV_FLAG_LENGTH_TRACKING, DV_FLAG_RESIZABLE_BUFFER,
+    };
+    assert_eq!(
+        [
+            DV_BUFFER_OFFSET,
+            DV_BYTE_OFFSET_OFFSET,
+            DV_BYTE_LENGTH_OFFSET,
+            DV_BLOCK_SIZE
+        ],
+        [16, 20, 24, 32]
+    );
+    assert_eq!(DV_BLOCK_SIZE % BLOCK_ALIGN, 0);
+    assert_eq!((DV_FLAG_LENGTH_TRACKING, DV_FLAG_RESIZABLE_BUFFER), (2, 4));
+}

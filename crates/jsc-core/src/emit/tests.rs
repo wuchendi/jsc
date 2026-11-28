@@ -1463,6 +1463,22 @@ fn array_buffer_bodies_validate() {
 }
 
 #[test]
+fn data_view_bodies_validate() {
+    // A program naming `DataView` carries the binary-data collector and
+    // renderer arms and the `DataView` helpers (DESIGN.md §5.8); every body
+    // must stay valid wasm.
+    validate(&compile(
+        "const b = new ArrayBuffer(8, { maxByteLength: 16 });
+        const v = new DataView(b, 1), w = new DataView(b, 0, 8);
+        v.setInt8(0, -1); v.setUint8(1, 2); v.setInt16(0, -2, true); v.setUint16(2, 3);
+        v.setInt32(0, -4); v.setUint32(1, 5, true); v.setFloat32(0, 1.5); w.setFloat64(0, NaN);
+        console.log(v.getInt8(0), v.getUint8(1), v.getInt16(0, true), v.getUint16(2),
+            v.getInt32(0), v.getUint32(1, true), v.getFloat32(0), w.getFloat64(0, true),
+            v.buffer === b, v.byteLength, v.byteOffset, v, w, ArrayBuffer.isView(v))",
+    ));
+}
+
+#[test]
 fn computed_and_numeric_pattern_keys_validate() {
     // Pattern keys converted into locals, in statement and expression
     // position, a generator, a rest exclusion list, and numeric class keys.
