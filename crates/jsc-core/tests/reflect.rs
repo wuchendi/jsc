@@ -387,6 +387,13 @@ fn construct_bound_and_proxy() {
          [a.tag, Object.getPrototypeOf(m) === proto].join()",
         "p,true",
     );
+    // The collection constructors look the adder up on the new object, whose
+    // prototype comes from `newTarget`: a `newTarget.prototype` without `set`
+    // makes a non-empty iterable throw.
+    assert_uncaught(
+        "function NT() {} Reflect.construct(Map, [[[1, 2]]], NT)",
+        "TypeError: 'undefined' returned for property 'set' of object '#<Map>' is not a function",
+    );
 }
 
 // --- property functions ---------------------------------------------------------------------
@@ -716,6 +723,7 @@ fn functions_survive_gc_stress() {
         "const out = [];
          function F(...xs) { this.n = xs.length; }
          function NT() {}
+         NT.prototype = Object.create(Map.prototype);
          for (let i = 0; i < 10; i++) {
            const o = { ['k' + i]: i, [Symbol('s')]: i };
            Reflect.defineProperty(o, 'd' + i, { value: [i], enumerable: true });
