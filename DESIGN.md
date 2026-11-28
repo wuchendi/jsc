@@ -3522,6 +3522,15 @@ listed is rejected at compile time with a spanned diagnostic (§8) or noted in
 - **Block scoping.** Name resolution walks a compile-time scope stack: every
   `{}` block, loop body, `for` head, and `catch` clause pushes a frame. Each
   `let`/`const` gets a fresh wasm local; inner declarations shadow outer ones.
+  The `let`/`const`/`class` bindings of a block or function body are declared
+  on entry, in their TDZ, so every reference in the list — a closure in the
+  binding's own initializer or in an earlier statement included — resolves
+  to them. A reference from the same function before the declaration throws
+  `ReferenceError: Cannot access 'n' before initialization`; a closure that
+  can run earlier (one created before the declaration, or a hoisted function
+  declaration of the list) reads the cell TDZ-checked, the cell then being
+  created holding `HOLE` on entry. `main`'s outermost scope uses module cells
+  instead, and `switch` case clauses keep in-order binding.
 - **`const`.** Rebinding a `const` (by `=`, compound assignment, `++`/`--`) is a
   compile-time error; mutating the referenced object/array is allowed.
 - **Closures.** Capture analysis marks every binding referenced from an inner
@@ -4656,10 +4665,13 @@ Each item below is current behaviour of this tree.
   no `import()`.
 - Strict-mode semantics only: sloppy-mode constructs (`with`, implicit globals)
   are rejected or throw, and the test262 runner skips `noStrict` tests.
-- TDZ is enforced only for module cells and parameters; reading a
-  block-scoped binding before its declaration inside the same function
-  resolves to the enclosing binding (or the global object) instead of
-  throwing.
+- TDZ is not enforced for `switch` case-clause bindings: a `let`/`const`
+  declared in one clause and read before its declaration (textually earlier,
+  or from a clause its declaration was skipped by) resolves to the enclosing
+  binding (or the global object), or reads the uninitialized local. A
+  read in `main`'s own code of a top-level `let`/`const`/`class` before its
+  declaration is a global-object lookup (a `ReferenceError` unless the
+  global object has that property).
 - A top-level function declaration is not assignable (`f = ..` is a compile
   error) in a program whose top-level declarations stay `main` bindings
   (§6.4).

@@ -144,17 +144,32 @@ impl LowerCtx<'_> {
     /// textual position, recurse through its own name, and be mutually
     /// recursive with its siblings.
     ///
-    /// The declaration names are bound first (so the statements resolve them),
-    /// then the other statements are lowered, and only then the declaration
-    /// bodies — once every binding of the list is declared, so a body may
-    /// capture a `let`/`const` declared later. Such a captured binding's cell is
-    /// created up front (holding `undefined` until its declaration runs) so the
-    /// hoisted closures share it; its declaration then stores into that cell.
+    /// The list's `let`/`const`/`class` bindings are declared first, in their
+    /// TDZ (see [`Self::predeclare_lexical`]), then the declaration names are
+    /// bound (so the statements resolve them), then the other statements are
+    /// lowered, and only then the declaration bodies — which may run before a
+    /// lexical binding of the list is initialized, so their closures read it
+    /// TDZ-checked.
     ///
     /// A generator (`env_backed`) frame keeps the in-order lowering.
     pub(super) fn lower_stmts(
         &mut self,
         stmts: &[Stmt],
+        out: &mut Vec<IrStmt>,
+    ) -> anyhow::Result<()> {
+        let start = out.len();
+        let lexical = self.predeclare_lexical(stmts, out);
+        let result = self.lower_stmts_hoisting(stmts, &lexical, out);
+        self.settle_lexical(&lexical, out, start);
+        result
+    }
+
+    /// [`Self::lower_stmts`] once the list's lexical bindings (ids `lexical`)
+    /// are declared.
+    fn lower_stmts_hoisting(
+        &mut self,
+        stmts: &[Stmt],
+        lexical: &[u32],
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
         let fns: Vec<&FnDecl> = stmts
@@ -192,40 +207,17 @@ impl LowerCtx<'_> {
                 self.lower_stmt(stmt, &mut rest)?;
             }
         }
-        // Hoist the cell of every captured binding the list declares: create it
-        // in the prefix and turn its declaration into a store into that cell.
-        for local in self.innermost_cell_locals() {
-            if fn_locals.contains(&local) {
-                continue;
-            }
-            for stmt in &mut rest {
-                let IrStmt::Decl {
-                    local: decl_local,
-                    init: IrNode::CellNew(value),
-                } = stmt
-                else {
-                    continue;
-                };
-                if *decl_local != local {
-                    continue;
-                }
-                let value = std::mem::replace(value.as_mut(), IrNode::Undefined);
-                *stmt = IrStmt::Decl {
-                    local: self.fresh(),
-                    init: IrNode::CellSet {
-                        cell: Box::new(IrNode::Local(local)),
-                        value: Box::new(value),
-                    },
-                };
-                prefix.push(IrStmt::Decl {
-                    local,
-                    init: IrNode::CellNew(Box::new(IrNode::Undefined)),
-                });
-                break;
-            }
+        // A hoisted declaration may be called before a lexical binding of the
+        // list is initialized: its closures check the binding's TDZ.
+        self.frame().lexical_tdz.extend(lexical.iter().copied());
+        let mut values = Vec::with_capacity(fns.len());
+        for fn_decl in fns {
+            values.push(self.lower_nested_fn_value(fn_decl)?);
         }
-        for (fn_decl, local) in fns.into_iter().zip(fn_locals) {
-            let value = self.lower_nested_fn_value(fn_decl)?;
+        for id in lexical {
+            self.frame().lexical_tdz.remove(id);
+        }
+        for (value, local) in values.into_iter().zip(fn_locals) {
             // A store into the pre-created cell is bound as a `Decl` of a
             // scratch local so it never becomes `main`'s completion value.
             prefix.push(if self.is_cell(local) {
@@ -243,6 +235,127 @@ impl LowerCtx<'_> {
         out.extend(prefix);
         out.extend(rest);
         Ok(())
+    }
+
+    /// Declare the `let`/`const`/`class` bindings of the statement list
+    /// `stmts` up front, each in its TDZ until its declaration initializes it
+    /// (DESIGN.md §7.1): a reference lowered before that point — in the
+    /// binding's own initializer, or in an earlier statement — resolves to it
+    /// rather than to an enclosing binding or the global object, throwing a
+    /// `ReferenceError` from the same frame and checking the cell for the
+    /// hole from a closure. A boxed cell is created (holding the hole) in
+    /// `out`, before any closure of the list can capture it. Returns the ids
+    /// declared.
+    pub(super) fn predeclare_lexical(&mut self, stmts: &[Stmt], out: &mut Vec<IrStmt>) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for (name, id, mutable) in lexical_bindings(stmts) {
+            let local = self.declare(&name, mutable, id);
+            self.frame().lexical_tdz.insert(id);
+            ids.push(id);
+            if let Some(slot) = self.env_slot_for_local(local) {
+                if self.shared.captured.contains(&id) {
+                    out.push(IrStmt::Expr(IrNode::CellSet {
+                        cell: Box::new(IrNode::EnvLoad(slot)),
+                        value: Box::new(IrNode::Hole),
+                    }));
+                }
+            } else if self.is_cell(local) {
+                out.push(IrStmt::Decl {
+                    local,
+                    init: IrNode::CellNew(Box::new(IrNode::Hole)),
+                });
+            }
+        }
+        ids
+    }
+
+    /// Undo the up-front cell of each binding [`Self::predeclare_lexical`]
+    /// declared (ids `ids`, its statements at `out[start..]`) that no closure
+    /// referenced while in its TDZ: nothing can observe the hole, so the
+    /// declaration creates the cell with its value (`CellNew(value)`) instead
+    /// of storing into a pre-created one — or, for a generator's environment
+    /// cell, the hole store is dropped. A declaration nested in other IR (a
+    /// destructuring under an iterator-close guard) keeps the store.
+    pub(super) fn settle_lexical(&mut self, ids: &[u32], out: &mut Vec<IrStmt>, start: usize) {
+        for id in ids {
+            let frame = self.frame();
+            frame.lexical_tdz.remove(id);
+            if frame.lexical_early.remove(id) {
+                continue;
+            }
+            if let Some(&slot) = frame.env_index.get(id) {
+                let hole_store = out[start..].iter().position(|stmt| {
+                    matches!(stmt, IrStmt::Expr(IrNode::CellSet { cell, value })
+                        if matches!(**cell, IrNode::EnvLoad(s) if s == slot)
+                            && matches!(**value, IrNode::Hole))
+                });
+                if let Some(i) = hole_store {
+                    out.remove(start + i);
+                }
+                continue;
+            }
+            let Some(&local) = frame.by_id.get(id) else {
+                continue;
+            };
+            let prefix = out[start..].iter().position(|stmt| {
+                matches!(stmt, IrStmt::Decl { local: l, init: IrNode::CellNew(v) }
+                    if *l == local && matches!(**v, IrNode::Hole))
+            });
+            let init = out[start..].iter().position(|stmt| {
+                matches!(stmt, IrStmt::Decl { init: IrNode::CellSet { cell, .. }, .. }
+                    if matches!(**cell, IrNode::Local(l) if l == local))
+            });
+            let (Some(prefix), Some(init)) = (prefix, init) else {
+                continue;
+            };
+            if let IrStmt::Decl {
+                init: IrNode::CellSet { value, .. },
+                ..
+            } = &mut out[start + init]
+            {
+                let value = std::mem::replace(value.as_mut(), IrNode::Undefined);
+                out[start + init] = IrStmt::Decl {
+                    local,
+                    init: IrNode::CellNew(Box::new(value)),
+                };
+                out.remove(start + prefix);
+            }
+        }
+    }
+
+    /// The local of the block-scoped binding `name` (id `id`) declared ahead by
+    /// [`Self::predeclare_lexical`] and still in its TDZ, if any.
+    fn predeclared_local(&mut self, name: &str, id: u32) -> Option<u32> {
+        let frame = self.frame();
+        if !frame.lexical_tdz.contains(&id) {
+            return None;
+        }
+        frame
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).filter(|b| b.id == id))
+            .map(|b| b.local)
+    }
+
+    /// Initialize the predeclared binding `local` (id `id`) with `value`,
+    /// ending its TDZ: a store into its existing cell, or the `Decl` of its
+    /// plain local.
+    fn init_predeclared(&mut self, local: u32, id: u32, value: IrNode, out: &mut Vec<IrStmt>) {
+        self.frame().lexical_tdz.remove(&id);
+        if self.env_slot_for_local(local).is_none() && self.is_cell(local) {
+            // Bound as a `Decl` of a scratch local so the store never becomes
+            // `main`'s completion value.
+            out.push(IrStmt::Decl {
+                local: self.fresh(),
+                init: IrNode::CellSet {
+                    cell: Box::new(IrNode::Local(local)),
+                    value: Box::new(value),
+                },
+            });
+        } else {
+            self.push_binding(local, value, out);
+        }
     }
 
     /// Lower a `let`/`const`/`var` declaration. A declarator with no initializer
@@ -287,7 +400,13 @@ impl LowerCtx<'_> {
         out: &mut Vec<IrStmt>,
     ) -> anyhow::Result<()> {
         let name = class_decl.ident.sym.as_ref();
-        let local = self.declare(name, true, class_decl.ident.span.lo.0);
+        let id = class_decl.ident.span.lo.0;
+        if let Some(local) = self.predeclared_local(name, id) {
+            let value = self.lower_class(&class_decl.class, &JsStr::from(name), true, None)?;
+            self.init_predeclared(local, id, value, out);
+            return Ok(());
+        }
+        let local = self.declare(name, true, id);
         let value = self.lower_class(&class_decl.class, &JsStr::from(name), true, None)?;
         self.push_binding(local, value, out);
         Ok(())
@@ -1097,6 +1216,12 @@ impl LowerCtx<'_> {
             } else {
                 self.push_binding(local, value, out);
             }
+            return;
+        }
+        if !self.binding_var
+            && let Some(local) = self.predeclared_local(name, id)
+        {
+            self.init_predeclared(local, id, value, out);
             return;
         }
         if self.binding_var {
