@@ -371,9 +371,17 @@ pub(super) fn emit_object_builtin_node(
     };
     function.instruction(&Instruction::I32Const(mode));
     function.instruction(&Instruction::Call(helpers.own_keys));
-    if helpers.has_accessors && (mode != OWN_KEYS || helpers.proxies()) {
+    if reads_may_throw(helpers) && (mode != OWN_KEYS || helpers.proxies()) {
         emit_propagate_if_pending(function, helpers);
     }
+}
+
+/// Whether a property read can leave an exception pending: a getter or a
+/// proxy trap may throw, or a `BigInt` typed-array element read may run out
+/// of memory allocating its value (only with binary data and the `BigInt`
+/// gate both reachable).
+fn reads_may_throw(helpers: Helpers<'_>) -> bool {
+    helpers.has_accessors || (helpers.has_binary() && helpers.bigints())
 }
 
 /// Emit a `key in obj` membership test, leaving a `true`/`false` jsval on
@@ -2290,8 +2298,9 @@ fn emit_str_index_boxed(function: &mut impl Sink, s0: u32, s1: u32, helpers: Hel
 /// A receiver that may be `null`/`undefined` (see [`never_nullish`]) is guarded
 /// by [`emit_nullish_guard`] once both operands are stashed; `checked = false`
 /// skips the guard for a caller that already ran it on the same receiver. When
-/// the program has accessors, a getter may have thrown inside `__get`, so the
-/// read is followed by the pending-exception check.
+/// the program has accessors, a getter may have thrown inside `__get` (or a
+/// `BigInt` typed-array element read run out of memory), so the read is
+/// followed by the pending-exception check ([`reads_may_throw`]).
 pub(super) fn emit_index_node(
     obj: &IrNode,
     index: &IrNode,
@@ -2332,7 +2341,7 @@ pub(super) fn emit_index_node(
         IrNode::Str(_) => emit_get_call(function, s0, index, s1, strings, helpers),
         _ => emit_index_dynamic(function, scratch, s0, s1, strings, helpers),
     }
-    if helpers.has_accessors {
+    if reads_may_throw(helpers) {
         emit_propagate_if_pending(function, helpers);
     }
 }
@@ -2466,7 +2475,7 @@ fn emit_index_dynamic(
     function.instruction(&Instruction::End);
     function.instruction(&Instruction::End);
     if helpers.has_binary() {
-        // TYPED ARRAY (DESIGN.md §5.8.5): a number key is the element or
+        // TYPED ARRAY (DESIGN.md §6.3): a number key is the element or
         // `undefined`, never the chain (`__ta_index_get`).
         emit_typed_array_number_key(function, s0, s1);
         function.instruction(&Instruction::If(BlockType::Empty));
@@ -2485,7 +2494,7 @@ fn emit_index_dynamic(
 }
 
 /// Push `1` when the heap receiver in `s0` is a typed array and the key
-/// jsval in `s1` a number (the inline `ta[k]` arms, DESIGN.md §5.8.5).
+/// jsval in `s1` a number (the inline `ta[k]` arms, DESIGN.md §6.3).
 fn emit_typed_array_number_key(function: &mut impl Sink, s0: u32, s1: u32) {
     emit_load_type_byte(function, s0);
     function.instruction(&Instruction::I32Const(i32::from(abi::TYPE_TYPEDARRAY)));
@@ -2595,7 +2604,7 @@ pub(super) fn emit_index_set_node(
     function.instruction(&Instruction::Else);
     if helpers.has_binary() {
         // A typed array under a number key: `__ta_index_set` (the value's
-        // `ToNumber` first, then the checked store; DESIGN.md §5.8.5).
+        // `ToNumber` first, then the checked store; DESIGN.md §6.3).
         emit_typed_array_number_key(function, s0, s1);
         function.instruction(&Instruction::If(BlockType::Empty));
         enter_frame(helpers);

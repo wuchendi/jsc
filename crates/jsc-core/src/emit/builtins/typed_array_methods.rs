@@ -1,4 +1,4 @@
-//! The `%TypedArray.prototype%` methods of stage T3b (DESIGN.md §5.8.7):
+//! The `%TypedArray.prototype%` methods of stage T3b (DESIGN.md §7.9):
 //! `at`, `copyWithin`, `every`, `fill`, `filter`, `find`, `findIndex`,
 //! `findLast`, `findLastIndex`, `forEach`, `includes`, `indexOf`, `join`,
 //! `lastIndexOf`, `map`, `reduce`, `reduceRight`, `reverse`, `set`, `slice`,
@@ -13,7 +13,7 @@
 //! element read or write in between goes through `__ta_get` / `__ta_set` /
 //! `__ta_set_value`, which re-check the index against the live buffer, so a
 //! buffer detached or shrunk by user code reads `undefined` and ignores
-//! writes (DESIGN.md §5.8.4). The bulk copies of `copyWithin`, `set` and
+//! writes (DESIGN.md §6.2). The bulk copies of `copyWithin`, `set` and
 //! `slice` re-derive their byte range from the witness taken after the last
 //! user-code step.
 
@@ -51,7 +51,7 @@ macro_rules! method_names {
     };
 }
 
-/// The receiver name of each method (DESIGN.md §5.8.4).
+/// The receiver name of each method (DESIGN.md §6.2).
 const NAMES: [(TypedArrayOp, &str); 27] = method_names![
     At => "at",
     CopyWithin => "copyWithin",
@@ -142,7 +142,7 @@ const TEXTS: [CalleeErrorText<'static>; 6] = [
 /// The `join` / `toLocaleString` separator.
 const COMMA: &str = ",";
 
-/// The first `BigInt` element kind (DESIGN.md §5.8.6).
+/// The first `BigInt` element kind (DESIGN.md §6.2).
 const FIRST_BIGINT_KIND: i32 = 10;
 
 /// The static strings of this family.
@@ -320,9 +320,21 @@ impl L {
 }
 
 /// `v = __ta_get(ta, k)` for the typed array in i64 `ta` and the i32
-/// index in local `k`.
+/// index in local `k`, then [`return_if_element_pending`].
 fn get(function: &mut FnBuilder<'_>, ta: u32, k: u32, v: u32, helpers: Helpers<'_>) {
     wasm!(function; LocalGet(ta), I32WrapI64, LocalGet(k), Call(helpers.ta_get()), LocalSet(v));
+    return_if_element_pending(function, helpers);
+}
+
+/// After an element read: a `BigInt` element read allocates its value, and
+/// out of memory leaves the `RangeError` pending with a placeholder value,
+/// so return (the exception stays pending) before that value is used. Only
+/// with the program's `BigInt` gate open (no `BigInt` typed array exists
+/// otherwise, and a Number read never throws).
+fn return_if_element_pending(function: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
+    if helpers.bigints() {
+        return_if_pending(function);
+    }
 }
 
 /// `__ta_set(ta, k, v)` of the number in i64 `v`.
@@ -410,7 +422,7 @@ fn content_types_differ(function: &mut FnBuilder<'_>, a: u32, b: u32) {
 
 /// The value conversion of `TypedArraySetElement` for the typed array in
 /// i64 `ta` of the jsval in i64 `v` into i64 `out`: `ToBigInt` for a `BigInt`
-/// kind (DESIGN.md §5.8.6; only with the program's `BigInt` gate open, as no
+/// kind (DESIGN.md §6.2; only with the program's `BigInt` gate open, as no
 /// `BigInt` typed array exists otherwise), else `ToNumber`; a throw returns.
 fn to_element(function: &mut FnBuilder<'_>, ta: u32, v: u32, out: u32, helpers: Helpers<'_>) {
     if helpers.bigints() {
@@ -1078,12 +1090,12 @@ fn set_from_typed_array(
     );
     return_if_pending(function);
     count_loop(function, l.k, slen, |function| {
+        get(function, source, l.k, l.v, helpers);
         wasm!(function; LocalGet(l.list));
         emit_array_elems(function);
         wasm!(function;
             LocalGet(l.k), I32Const(3), I32Shl, I32Add,
-            LocalGet(source), I32WrapI64, LocalGet(l.k), Call(helpers.ta_get()),
-            I64Store(elem_slot(0)),
+            LocalGet(l.v), I64Store(elem_slot(0)),
         );
     });
     wasm!(function; I32Const(0), LocalSet(l.k));
@@ -1097,9 +1109,9 @@ fn set_from_typed_array(
     });
     wasm!(function; I64Const(UNDEFINED_BITS), Return, End);
     count_loop(function, l.k, slen, |function| {
+        get(function, source, l.k, l.v, helpers);
         wasm!(function;
-            LocalGet(l.o), I32WrapI64, LocalGet(at), LocalGet(l.k), I32Add,
-            LocalGet(source), I32WrapI64, LocalGet(l.k), Call(helpers.ta_get()),
+            LocalGet(l.o), I32WrapI64, LocalGet(at), LocalGet(l.k), I32Add, LocalGet(l.v),
             Call(helpers.ta_set()),
         );
     });
@@ -1208,9 +1220,12 @@ fn emit_slice(function: &mut FnBuilder<'_>, l: L, strings: &StrOffsets, helpers:
     );
     count_loop(function, l.i[3], l.n, |function| {
         wasm!(function;
-            LocalGet(l.out), I32WrapI64, LocalGet(l.i[3]),
             LocalGet(l.o), I32WrapI64, LocalGet(l.k), LocalGet(l.i[3]), I32Add, Call(helpers.ta_get()),
-            Call(helpers.ta_set()),
+            LocalSet(l.v),
+        );
+        return_if_element_pending(function, helpers);
+        wasm!(function;
+            LocalGet(l.out), I32WrapI64, LocalGet(l.i[3]), LocalGet(l.v), Call(helpers.ta_set()),
         );
     });
     wasm!(function; End, End, LocalGet(l.out));

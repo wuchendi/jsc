@@ -974,7 +974,7 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     finish_builder(f)
 }
 
-/// The typed-array arm of `__define` (DESIGN.md §5.8.5): a numeric key never
+/// The typed-array arm of `__define` (DESIGN.md §6.3): a numeric key never
 /// reaches the table of the typed array in i32 `o` — a valid index with the
 /// default attributes is `TypedArraySetElement` of `v`, anything else the
 /// redefinition `TypeError` (left pending). `i` is i32 scratch.
@@ -1213,7 +1213,7 @@ fn emit_exotic_index(function: &mut impl Sink, key: u32, i: u32, helpers: Helper
 /// Kind byte of a typed array (see [`abi::TYPE_TYPEDARRAY`]).
 const TYPE_TYPEDARRAY: i32 = abi::TYPE_TYPEDARRAY as i32;
 
-/// The integer-indexed exotic arm (DESIGN.md §5.8.5), emitted only in a
+/// The integer-indexed exotic arm (DESIGN.md §6.3), emitted only in a
 /// program that can reach binary data: when the object-family block in i32
 /// local `o` is a typed array and the `key` (i32 local, nonzero; interned or
 /// a fresh index string from `__own_keys`) is a canonical numeric string,
@@ -1735,7 +1735,7 @@ fn emit_set_from(
 }
 
 /// The typed-array arm of [`emit_set_from`]'s chain walk at the object in
-/// i32 `q` (DESIGN.md §5.8.5): the first typed array on the way decides a
+/// i32 `q` (DESIGN.md §6.3): the first typed array on the way decides a
 /// numeric key — the receiver itself (`own` for `__set`; the jsval `this`
 /// for the explicit-receiver forms) takes `TypedArraySetElement` of `v`
 /// (success, or the form's failure when its conversion throws); on the chain
@@ -2466,7 +2466,7 @@ pub(super) fn emit_protos_indexless(helpers: Helpers<'_>, leaves: &LeafSet) -> F
     }
     emit_is_string_wrapper(&mut f, o);
     wasm!(f; I32Or);
-    // A typed-array prototype answers its own indices (DESIGN.md §5.8.5).
+    // A typed-array prototype answers its own indices (DESIGN.md §6.3).
     if helpers.has_binary() {
         wasm!(f; LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_TYPEDARRAY), I32Eq, I32Or);
     }
@@ -2561,7 +2561,7 @@ pub(super) fn emit_proto_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
     if helpers.proxies() {
         wasm!(f; LocalGet(q));
     }
-    // A typed-array prototype decides (DESIGN.md §5.8.5): a valid index is a
+    // A typed-array prototype decides (DESIGN.md §6.3): a valid index is a
     // writable data property there (the own element is created), an invalid
     // one a silent success.
     if helpers.has_binary() {
@@ -3028,7 +3028,7 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
         Else,
     );
     // A String wrapper lists its virtual indices `0..n` first, as does a
-    // typed array (its current length, DESIGN.md §5.8.5).
+    // typed array (its current length, DESIGN.md §6.3).
     emit_is_string_wrapper(&mut f, o);
     wasm!(f;
         If(BlockType::Result(ValType::I32)),
@@ -3204,8 +3204,16 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
             LocalGet(t), I32Const(TYPE_TYPEDARRAY), I32Eq,
             If(BlockType::Result(ValType::I64)),
             LocalGet(o), LocalGet(n), Call(helpers.ta_get()),
-            Else,
         );
+        if helpers.bigints() {
+            // A `BigInt` element read allocates; out of memory leaves the
+            // `RangeError` pending: return the list as it stands (the
+            // caller propagates) before the placeholder value is stored.
+            wasm!(f; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), LocalGet(out));
+            emit_box_heap(&mut f);
+            wasm!(f; Return, End);
+        }
+        wasm!(f; Else);
         emit_elem_load(&mut f, o, n, helpers.sparse_get());
         wasm!(f; End);
     } else {
@@ -3304,7 +3312,7 @@ fn emit_for_in_prescan(
     }
     emit_is_string_or_array_kind(f, i);
     if helpers.has_binary() {
-        // A typed array's indices are exotic keys too (DESIGN.md §5.8.5).
+        // A typed array's indices are exotic keys too (DESIGN.md §6.3).
         wasm!(f; LocalGet(i), I32Const(TYPE_TYPEDARRAY), I32Eq, I32Or);
     }
     wasm!(f;
