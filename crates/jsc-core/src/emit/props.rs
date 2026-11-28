@@ -35,7 +35,9 @@ macro_rules! wasm {
 }
 
 mod descriptor;
+mod proxy;
 pub(super) use descriptor::*;
+pub(super) use proxy::*;
 
 /// Kind byte of an own-property table (see [`abi::TYPE_PROPS`]).
 const TYPE_PROPS: i32 = abi::TYPE_PROPS as i32;
@@ -737,7 +739,9 @@ pub(super) fn emit_str_exotic_index(helpers: Helpers<'_>, leaves: &LeafSet) -> F
 /// is formatted in-guest; anything else goes through `__to_string`. The
 /// resulting string is then interned (`insert`) or looked up (`0` on a miss).
 /// A lookup still interns a canonical array index, so an array or string
-/// element is found by an index key that no property ever used.
+/// element is found by an index key that no property ever used. When the
+/// program can hold proxies every conversion interns (a trap receives the
+/// key itself, DESIGN.md §6.11).
 pub(super) fn emit_to_key(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -749,6 +753,10 @@ pub(super) fn emit_to_key(
         &[ROOT_BASE, ROOT_BASE, RAW_F64],
     );
     let (v, insert, s, r, d) = (0, 1, 2, 3, 4);
+    if helpers.proxies() {
+        // A trap must receive the real key: every conversion interns.
+        wasm!(f; I32Const(1), LocalSet(insert));
+    }
     emit_is_string(&mut f, v);
     wasm!(f;
         If(BlockType::Empty),
@@ -854,7 +862,9 @@ const DEFINE_LOCALS: [LocalClass; 7] = [
 /// slot is rewritten; when the new table cannot be had (out of memory,
 /// design/runtime-memory.md §5.8) nothing changes and the `RangeError` is
 /// left pending. A watched table sets its dirty bit when the program
-/// tracks them.
+/// tracks them. On a proxy a public key goes through the `defineProperty`
+/// trap with the complete descriptor (a rejection throws `PROXY_FALSISH`);
+/// a private name is appended to the proxy's own table (DESIGN.md §6.11).
 pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(
         leaves,
@@ -871,6 +881,7 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         emit_box_heap(f);
         wasm!(f; I32Const(mode), Call(helpers.prop_throw), Return);
     };
+    emit_define_proxy(&mut f, [o, key, v, attrs, n], helpers);
     wasm!(f;
         LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e), I32Eqz,
         If(BlockType::Empty),
@@ -958,10 +969,7 @@ pub(super) fn emit_define(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         I32Store8(m8(P_TFLAGS)),
         End,
     );
-    if helpers.dirty_tracking {
-        wasm!(f; LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalSet(p));
-        emit_mark_dirty(&mut f, p);
-    }
+    emit_store_dirty(&mut f, o, p, helpers);
     wasm!(f; End);
     finish_builder(f)
 }
@@ -1052,6 +1060,58 @@ pub(super) fn emit_fn_materialize(
     define(&mut f, ATTR_WRITABLE);
     wasm!(f; End, End);
     finish_builder(f)
+}
+
+/// The proxy arm of `__define` (§6.11): a public key on a proxy `o` goes
+/// through `__proxy_define_own` with the complete descriptor `(v, attrs)`
+/// (an `ACCESSOR` value split into its getter and setter), a rejection
+/// throwing `PROXY_FALSISH`, and returns; a private name falls through to the
+/// proxy's own table. `b` is i32 scratch.
+fn emit_define_proxy(
+    function: &mut FnBuilder<'_>,
+    [o, key, v, attrs, b]: [u32; 5],
+    helpers: Helpers<'_>,
+) {
+    if !helpers.proxies() {
+        return;
+    }
+    let both = DESC_HAS_ENUMERABLE | DESC_HAS_CONFIGURABLE;
+    wasm!(function; LocalGet(key));
+    emit_is_private_key(function);
+    wasm!(function;
+        I32Eqz,
+        LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_PROXY), I32Eq, I32And,
+        If(BlockType::Empty),
+        LocalGet(o), LocalGet(key),
+        LocalGet(attrs), I32Const(ATTR_ACCESSOR), I32And, LocalTee(b),
+        If(BlockType::Result(ValType::I32)),
+        LocalGet(attrs), I32Const(ATTR_ENUMERABLE | ATTR_CONFIGURABLE), I32And,
+        I32Const(both | DESC_HAS_GET | DESC_HAS_SET), I32Or,
+        Else,
+        LocalGet(attrs), I32Const(ATTRS_DEFAULT), I32And,
+        I32Const(both | DESC_HAS_VALUE | DESC_HAS_WRITABLE), I32Or,
+        End,
+        I64Const(UNDEFINED_BITS), LocalGet(v), LocalGet(b), Select,
+        LocalGet(b), If(BlockType::Result(ValType::I64)),
+        LocalGet(v), I32WrapI64, I64Load(m64(ACCESSOR_GET_OFFSET)),
+        Else, I64Const(UNDEFINED_BITS), End,
+        LocalGet(b), If(BlockType::Result(ValType::I64)),
+        LocalGet(v), I32WrapI64, I64Load(m64(ACCESSOR_SET_OFFSET)),
+        Else, I64Const(UNDEFINED_BITS), End,
+        Call(helpers.proxy_define_own()),
+        I32Const(DEFINE_REJECT), I32Eq, GlobalGet(EXC_PENDING_GLOBAL), I32Eqz, I32And,
+        If(BlockType::Empty),
+        LocalGet(o),
+    );
+    emit_box_heap(function);
+    wasm!(function; LocalGet(key));
+    emit_box_heap(function);
+    wasm!(function;
+        I32Const(PROP_THROW_PROXY_FALSISH), Call(helpers.prop_throw),
+        End,
+        Return,
+        End,
+    );
 }
 
 /// Materialize the `LAZY` function whose block base is in i32 local `o` (a
@@ -1210,6 +1270,10 @@ fn emit_get_from(
         Loop(BlockType::Empty),
         LocalGet(o), I32Load8U(m8(0)), LocalSet(t),
     );
+    // A proxy on the way takes the rest of the lookup (§6.11).
+    emit_if_proxy(&mut f, o, helpers, |f| {
+        wasm!(f; LocalGet(o), LocalGet(key), LocalGet(this), Call(helpers.proxy_get()), Return);
+    });
     emit_is_string_or_array_kind(&mut f, t);
     wasm!(f; If(BlockType::Empty));
     emit_exotic_get(&mut f, o, t, key, i, e, p, strings, helpers);
@@ -1303,6 +1367,12 @@ pub(super) fn emit_symbol_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
         End,
         End,
         Loop(BlockType::Empty),
+    );
+    // A proxy on the way takes the rest of the lookup (§6.11).
+    emit_if_proxy(&mut f, o, helpers, |f| {
+        wasm!(f; LocalGet(o), LocalGet(sym), LocalGet(v), Call(helpers.proxy_get()), Return);
+    });
+    wasm!(f;
         LocalGet(o), I32Load(m32(OBJ_PROPS)), LocalTee(p),
         If(BlockType::Empty),
         LocalGet(p), I32Load8U(m8(P_TFLAGS)), I32Const(HAS_SYMBOL_KEYS), I32And,
@@ -1348,7 +1418,7 @@ pub(super) fn emit_symbol_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
 /// dirty bit when the program tracks them (an add does so in `__define`). A
 /// throw leaves the exception pending.
 pub(super) fn emit_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
-    emit_set_from(None, helpers, leaves)
+    emit_set_from(SetForm::Set, None, helpers, leaves)
 }
 
 /// `__super_set(home: i64, key: i32, v: i64, recv: i64)`: `home.[[Set]](key,
@@ -1362,51 +1432,168 @@ pub(super) fn emit_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 /// a writable one takes the value in place; an exotic own key (an array
 /// element or `length`) is updated with `__define_own` of `{value}`, and a
 /// missing key is created with `CreateDataProperty` (a non-extensible `recv`
-/// throws). A throw leaves the exception pending.
+/// throws). A proxy `recv` takes the store through its
+/// `getOwnPropertyDescriptor` and `defineProperty` traps, a proxy on the
+/// chain through its `set` trap (DESIGN.md §6.11). A throw leaves the
+/// exception pending.
 pub(super) fn emit_super_set(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
     leaves: &LeafSet,
 ) -> Function {
-    emit_set_from(Some(strings), helpers, leaves)
+    emit_set_from(SetForm::Super, Some(strings), helpers, leaves)
 }
 
-/// The body of [`emit_set`] (`receiver` = `None`) and [`emit_super_set`]
-/// (an extra receiver param; `Some` carries the static key offsets).
-fn emit_set_from(
-    receiver: Option<&StrOffsets>,
+/// `__set_bool(target: i64, key: i32, v: i64, recv: i64) -> i32`:
+/// `target.[[Set]](key, v, recv)` returning its boolean — the walk of
+/// [`emit_super_set`] where every failure (a setter-less accessor, a
+/// read-only property, a primitive or refusing receiver, a falsish `set`
+/// trap) returns `0` instead of throwing; `1` on success. It backs the
+/// trap-less `[[Set]]` of a proxy (DESIGN.md §6.11). A throw (a setter's, a
+/// trap's) leaves the exception pending.
+pub(super) fn emit_set_bool(
+    strings: &StrOffsets,
     helpers: Helpers<'_>,
     leaves: &LeafSet,
 ) -> Function {
+    emit_set_from(SetForm::Bool, Some(strings), helpers, leaves)
+}
+
+/// The three bodies of `[[Set]]`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetForm {
+    /// `__set`: the walk starts at the receiver; failures throw.
+    Set,
+    /// `__super_set`: an explicit receiver; failures throw.
+    Super,
+    /// `__set_bool`: an explicit receiver; failures return `0`.
+    Bool,
+}
+
+impl SetForm {
+    /// Fail with the `__prop_throw` `mode` for `recv` / `key` (or return `0`).
+    fn fail(self, f: &mut impl Sink, recv: u32, key: u32, mode: i32, helpers: Helpers<'_>) {
+        if self == Self::Bool {
+            wasm!(f; I32Const(0), Return);
+        } else {
+            emit_prop_throw_return(f, recv, key, mode, helpers);
+        }
+    }
+
+    /// Return after a success.
+    fn ok(self, f: &mut impl Sink) {
+        if self == Self::Bool {
+            wasm!(f; I32Const(1));
+        }
+        wasm!(f; Return);
+    }
+
+    /// Return the failure value when an exception is pending.
+    fn check(self, f: &mut impl Sink) {
+        wasm!(f; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty));
+        if self == Self::Bool {
+            wasm!(f; I32Const(0));
+        }
+        wasm!(f; Return, End);
+    }
+}
+
+/// The proxy arm of the `[[Set]]` walk (§6.11): a proxy `q` on the way
+/// takes the rest of the store through `__proxy_set`; a falsish result
+/// fails (`a` is i32 scratch).
+fn emit_set_proxy(
+    f: &mut FnBuilder<'_>,
+    form: SetForm,
+    [q, key, v, this, a]: [u32; 5],
+    helpers: Helpers<'_>,
+) {
+    emit_if_proxy(f, q, helpers, |f| {
+        wasm!(f; LocalGet(q), LocalGet(key), LocalGet(v), LocalGet(this), Call(helpers.proxy_set()));
+        if form == SetForm::Bool {
+            wasm!(f; Return);
+        } else {
+            wasm!(f; LocalSet(a));
+            form.check(f);
+            wasm!(f; LocalGet(a), I32Eqz, If(BlockType::Empty));
+            form.fail(f, this, key, PROP_THROW_PROXY_FALSISH, helpers);
+            wasm!(f; End, Return);
+        }
+    });
+}
+
+/// The accessor hit of the `[[Set]]` walk (entry `e`, attributes `a`): its
+/// setter is called with `this` (the owner `q` as callee scratch, `s` the
+/// setter), a getter-only accessor fails. Only emitted when the program has
+/// accessors.
+fn emit_set_accessor(
+    f: &mut FnBuilder<'_>,
+    form: SetForm,
+    [e, a, s, q]: [u32; 4],
+    [this, key, v]: [u32; 3],
+    helpers: Helpers<'_>,
+) {
+    if !helpers.has_accessors {
+        return;
+    }
+    wasm!(f;
+        LocalGet(a), I32Const(ATTR_ACCESSOR), I32And,
+        If(BlockType::Empty),
+        LocalGet(e), I64Load(m64(E_VALUE)), I32WrapI64, I64Load(m64(ACCESSOR_SET_OFFSET)),
+        LocalSet(s),
+    );
+    emit_is_function(f, s);
+    wasm!(f; If(BlockType::Empty));
+    emit_accessor_call(f, s, this, Some(v), q, helpers);
+    wasm!(f; Drop);
+    form.ok(f);
+    wasm!(f; End);
+    form.fail(f, this, key, PROP_THROW_GETTER_ONLY, helpers);
+    wasm!(f; End);
+}
+
+/// The body of [`emit_set`], [`emit_super_set`] and [`emit_set_bool`] (the
+/// last two take an extra receiver param; `strings` carries the static key
+/// offsets they need).
+fn emit_set_from(
+    form: SetForm,
+    strings: Option<&StrOffsets>,
+    helpers: Helpers<'_>,
+    leaves: &LeafSet,
+) -> Function {
+    let receiver = form != SetForm::Set;
     let mut f = FnBuilder::new(leaves);
     f.param(ROOT_JS);
     f.param(ROOT_BASE);
     f.param(ROOT_JS);
-    if receiver.is_some() {
+    if receiver {
         f.param(ROOT_JS);
     }
-    for class in [ROOT_BASE, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, ROOT_JS] {
-        f.local(class); // o, q, e, own, a, s
+    for class in [
+        ROOT_BASE, ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, ROOT_JS, ROOT_BASE,
+    ] {
+        f.local(class); // o, q, e, own, a, s, list
     }
-    let shift = u32::from(receiver.is_some());
+    let shift = u32::from(receiver);
     let (recv, key, v) = (0, 1, 2);
-    let (o, q, e, own, a, s) = (
+    let (o, q, e, own, a, s, list) = (
         3 + shift,
         4 + shift,
         5 + shift,
         6 + shift,
         7 + shift,
         8 + shift,
+        9 + shift,
     );
-    let this = if receiver.is_some() { 3 } else { recv };
+    let this = if receiver { 3 } else { recv };
     wasm!(f;
         LocalGet(recv), I32WrapI64, LocalTee(o), LocalSet(q),
-        I32Const(i32::from(receiver.is_none())), LocalSet(own),
+        I32Const(i32::from(!receiver)), LocalSet(own),
         Block(BlockType::Empty), Loop(BlockType::Empty),
     );
+    emit_set_proxy(&mut f, form, [q, key, v, this, a], helpers);
     // A String wrapper's index is a read-only data property.
     emit_if_str_exotic(&mut f, q, key, a, helpers, |f| {
-        emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
+        form.fail(f, this, key, PROP_THROW_READ_ONLY, helpers);
     });
     wasm!(f;
         LocalGet(q), LocalGet(key), Call(helpers.prop_find), LocalTee(e), BrIf(1),
@@ -1423,27 +1610,14 @@ fn emit_set_from(
         If(BlockType::Empty),
         LocalGet(e), I32Load(m32(E_ATTRS)), LocalSet(a),
     );
-    if helpers.has_accessors {
-        wasm!(f;
-            LocalGet(a), I32Const(ATTR_ACCESSOR), I32And,
-            If(BlockType::Empty),
-            LocalGet(e), I64Load(m64(E_VALUE)), I32WrapI64, I64Load(m64(ACCESSOR_SET_OFFSET)),
-            LocalSet(s),
-        );
-        emit_is_function(&mut f, s);
-        wasm!(f; If(BlockType::Empty));
-        emit_accessor_call(&mut f, s, this, Some(v), q, helpers);
-        wasm!(f; Drop, Return, End);
-        emit_prop_throw_return(&mut f, this, key, PROP_THROW_GETTER_ONLY, helpers);
-        wasm!(f; End);
-    }
+    emit_set_accessor(&mut f, form, [e, a, s, q], [this, key, v], helpers);
     wasm!(f;
         LocalGet(a), I32Const(ATTR_WRITABLE), I32And, I32Eqz,
         If(BlockType::Empty),
     );
-    emit_prop_throw_return(&mut f, this, key, PROP_THROW_READ_ONLY, helpers);
+    form.fail(&mut f, this, key, PROP_THROW_READ_ONLY, helpers);
     wasm!(f; End);
-    let Some(strings) = receiver else {
+    let Some(strings) = strings else {
         wasm!(f;
             LocalGet(own),
             If(BlockType::Empty),
@@ -1467,27 +1641,74 @@ fn emit_set_from(
     };
     // A writable data property or a miss: the receiver takes the value.
     wasm!(f; End);
-    emit_receiver_set(&mut f, [this, key, v], [o, e, a], strings, helpers);
+    emit_receiver_set(
+        &mut f,
+        form,
+        [this, key, v],
+        [o, e, a, list],
+        strings,
+        helpers,
+    );
+    if form == SetForm::Bool {
+        wasm!(f; I32Const(1));
+    }
     wasm!(f; End);
     finish_builder(f)
 }
 
-/// The receiver half of [`emit_super_set`] (`OrdinarySetWithOwnDescriptor`
-/// steps 2.b-e): store the jsval `v` under the interned `key` on the jsval
-/// `this`, with the i32 scratch locals `o`, `e`, `a`.
+/// The receiver half of [`emit_super_set`] / [`emit_set_bool`]
+/// (`OrdinarySetWithOwnDescriptor` steps 2.b-e): store the jsval `v` under
+/// the interned `key` on the jsval `this`, with the i32 scratch locals `o`,
+/// `e`, `a` and the rooted `list`. A proxy receiver goes through its
+/// `getOwnPropertyDescriptor` and `defineProperty` traps (§6.11).
 fn emit_receiver_set(
-    f: &mut impl Sink,
+    f: &mut FnBuilder<'_>,
+    form: SetForm,
     [this, key, v]: [u32; 3],
-    [o, e, a]: [u32; 3],
+    [o, e, a, list]: [u32; 4],
     strings: &StrOffsets,
     helpers: Helpers<'_>,
 ) {
     emit_is_object(f, this);
     wasm!(f; I32Eqz, If(BlockType::Empty));
-    emit_prop_throw_return(f, this, key, PROP_THROW_PRIMITIVE, helpers);
+    form.fail(f, this, key, PROP_THROW_PRIMITIVE, helpers);
     wasm!(f; End, LocalGet(this), I32WrapI64, LocalSet(o));
+    emit_if_proxy(f, o, helpers, |f| {
+        wasm!(f;
+            I32Const(0), Call(helpers.new_array()), LocalSet(list),
+            LocalGet(this), LocalGet(key), LocalGet(list), Call(helpers.own_prop()), LocalSet(a),
+        );
+        form.check(f);
+        wasm!(f; LocalGet(a), If(BlockType::Result(ValType::I32)));
+        // An existing accessor or read-only property refuses; a writable one
+        // is redefined with `{value}`.
+        wasm!(f;
+            LocalGet(list), I32Load(m32(ARRAY_ELEMS_OFFSET)), I64Load(m64(ELEMS_DATA_OFFSET)),
+            F64ReinterpretI64, I32TruncSatF64U, LocalTee(a), I32Const(DESC_HAS_GET), I32And,
+            If(BlockType::Empty),
+        );
+        form.fail(f, this, key, PROP_THROW_GETTER_ONLY, helpers);
+        wasm!(f; End, LocalGet(a), I32Const(ATTR_WRITABLE), I32And, I32Eqz, If(BlockType::Empty));
+        form.fail(f, this, key, PROP_THROW_READ_ONLY, helpers);
+        wasm!(f;
+            End,
+            I32Const(DESC_HAS_VALUE),
+            Else,
+            I32Const(DESC_DATA_DEFAULT),
+            End,
+            LocalSet(a),
+            LocalGet(o), LocalGet(key), LocalGet(a), LocalGet(v),
+            I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS),
+            Call(helpers.define_own()), LocalSet(a),
+        );
+        form.check(f);
+        wasm!(f; LocalGet(a), I32Const(DEFINE_OK), I32Ne, If(BlockType::Empty));
+        form.fail(f, this, key, PROP_THROW_PROXY_FALSISH, helpers);
+        wasm!(f; End);
+        form.ok(f);
+    });
     emit_if_str_exotic(f, o, key, a, helpers, |f| {
-        emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
+        form.fail(f, this, key, PROP_THROW_READ_ONLY, helpers);
     });
     wasm!(f;
         LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
@@ -1496,7 +1717,7 @@ fn emit_receiver_set(
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_LENGTH_READONLY), I32And,
         If(BlockType::Empty),
     );
-    emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
+    form.fail(f, this, key, PROP_THROW_READ_ONLY, helpers);
     wasm!(f;
         End,
         End,
@@ -1506,36 +1727,38 @@ fn emit_receiver_set(
     );
     if helpers.has_accessors {
         wasm!(f; LocalGet(a), I32Const(ATTR_ACCESSOR), I32And, If(BlockType::Empty));
-        emit_prop_throw_return(f, this, key, PROP_THROW_GETTER_ONLY, helpers);
+        form.fail(f, this, key, PROP_THROW_GETTER_ONLY, helpers);
         wasm!(f; End);
     }
     wasm!(f;
         LocalGet(a), I32Const(ATTR_WRITABLE), I32And, I32Eqz,
         If(BlockType::Empty),
     );
-    emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
+    form.fail(f, this, key, PROP_THROW_READ_ONLY, helpers);
     wasm!(f; End, LocalGet(e), LocalGet(v), I64Store(m64(E_VALUE)));
     emit_store_dirty(f, o, a, helpers);
+    form.ok(f);
     // An exotic own key keeps its attributes; a missing one is created.
     wasm!(f;
-        Return,
         End,
         LocalGet(o), LocalGet(key),
         I32Const(DESC_HAS_VALUE), I32Const(DESC_DATA_DEFAULT),
         LocalGet(key), LocalGet(this), Call(helpers.has_own()), Select,
         LocalGet(v), I64Const(UNDEFINED_BITS), I64Const(UNDEFINED_BITS),
         Call(helpers.define_own()), LocalSet(a),
-        GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), Return, End,
+    );
+    form.check(f);
+    wasm!(f;
         LocalGet(a), I32Const(DEFINE_NOT_EXTENSIBLE), I32Eq,
         If(BlockType::Empty),
     );
-    emit_prop_throw_return(f, this, key, PROP_THROW_NOT_EXTENSIBLE, helpers);
+    form.fail(f, this, key, PROP_THROW_NOT_EXTENSIBLE, helpers);
     wasm!(f;
         End,
         LocalGet(a), I32Const(DEFINE_REJECT), I32Eq,
         If(BlockType::Empty),
     );
-    emit_prop_throw_return(f, this, key, PROP_THROW_READ_ONLY, helpers);
+    form.fail(f, this, key, PROP_THROW_READ_ONLY, helpers);
     wasm!(f; End);
 }
 
@@ -1555,8 +1778,8 @@ fn emit_store_dirty(function: &mut impl Sink, o: u32, table: u32, helpers: Helpe
 /// it exotically (`length`, an in-range index whose store slot is not a
 /// hole) or a `String` wrapper owning it (an index), or when its own table
 /// has it (an array's named keys, and a `SPARSE` array's elements past its
-/// store). A primitive `obj` throws the `in`
-/// `TypeError` (left pending, result `0`).
+/// store). A proxy on the way answers with its `has` trap (DESIGN.md §6.11).
+/// A primitive `obj` throws the `in` `TypeError` (left pending, result `0`).
 pub(super) fn emit_has(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     emit_has_lookup(strings, helpers, false, leaves)
 }
@@ -1581,9 +1804,9 @@ fn emit_has_lookup(
     let mut f = helper_builder(
         leaves,
         &[ROOT_BASE, ROOT_JS],
-        &[ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, ROOT_JS],
+        &[ROOT_BASE, RAW_I32, RAW_I32, RAW_I32, ROOT_JS, ROOT_BASE],
     );
-    let (key, obj, o, t, i, a, p) = (0, 1, 2, 3, 4, 5, 6);
+    let (key, obj, o, t, i, a, p, list) = (0, 1, 2, 3, 4, 5, 6, 7);
     if !own {
         // `key in primitive` is a TypeError.
         emit_is_object(&mut f, obj);
@@ -1606,6 +1829,17 @@ fn emit_has_lookup(
         Loop(BlockType::Empty),
         LocalGet(o), I32Load8U(m8(0)), LocalSet(t),
     );
+    // A proxy on the way answers through its traps (§6.11).
+    emit_if_proxy(&mut f, o, helpers, |f| {
+        if own {
+            wasm!(f;
+                I32Const(0), Call(helpers.new_array()), LocalSet(list),
+                LocalGet(o), LocalGet(key), LocalGet(list), Call(helpers.proxy_own_prop()), Return,
+            );
+        } else {
+            wasm!(f; LocalGet(o), LocalGet(key), Call(helpers.proxy_has()), Return);
+        }
+    });
     emit_is_string_or_array_kind(&mut f, t);
     wasm!(f;
         If(BlockType::Empty),
@@ -1662,14 +1896,19 @@ fn emit_has_lookup(
     finish_builder(f)
 }
 
-/// `__delete(obj: i64, key: i32)`: delete the own property `key` of an
-/// object-family `obj` by tombstoning its entry (key `0`, value `undefined`,
-/// `live` decremented); a non-configurable property throws. On an array an
-/// in-range index becomes a hole and `length` (non-configurable) throws; its
-/// named keys (and a `SPARSE` array's elements past its store) are table
-/// entries. A `String` wrapper's index (non-configurable) throws. A primitive
-/// (a string, symbol or `BigInt` included) is left unchanged. A delete on a watched
-/// table sets its dirty bit when the program tracks them.
+/// `__delete(obj: i64, key: i32, strict: i32) -> i32`: `[[Delete]]` of the
+/// own property `key` of an object-family `obj` by tombstoning its entry
+/// (key `0`, value `undefined`, `live` decremented); `1` when deleted or
+/// absent, `0` when non-configurable — with `strict` set (the `delete`
+/// operator, `DeletePropertyOrThrow`) that throws instead (left pending). On
+/// an array an in-range index becomes a hole and `length` (non-configurable)
+/// refuses; its named keys (and a `SPARSE` array's elements past its store)
+/// are table entries. A `String` wrapper's index (non-configurable) refuses.
+/// A primitive (a string, symbol or `BigInt` included) is left unchanged
+/// (`1`). A proxy asks its `deleteProperty` trap (DESIGN.md §6.11): a
+/// falsish result is `0`, or with `strict` the `PROXY_FALSISH` `TypeError`.
+/// A delete on a watched table sets its dirty bit when the program tracks
+/// them.
 pub(super) fn emit_delete(
     strings: &StrOffsets,
     helpers: Helpers<'_>,
@@ -1677,24 +1916,40 @@ pub(super) fn emit_delete(
 ) -> Function {
     let mut f = helper_builder(
         leaves,
-        &[ROOT_JS, ROOT_BASE],
+        &[ROOT_JS, ROOT_BASE, RAW_I32],
         &[ROOT_BASE, RAW_I32, RAW_I32, RAW_I32],
     );
-    let (obj, key, o, e, t, i) = (0, 1, 2, 3, 4, 5);
+    let (obj, key, strict, o, e, t, i) = (0, 1, 2, 3, 4, 5, 6);
+    // Refuse: `0`, or with `strict` the `TypeError` of `mode`.
+    let refuse = |f: &mut FnBuilder<'_>, mode: i32| {
+        wasm!(f; LocalGet(strict), I32Eqz, If(BlockType::Empty), I32Const(0), Return, End);
+        wasm!(f; LocalGet(obj), LocalGet(key));
+        emit_box_heap(f);
+        wasm!(f; I32Const(mode), Call(helpers.prop_throw), I32Const(0), Return);
+    };
     emit_is_pointer(&mut f, obj);
     wasm!(f;
-        I32Eqz, If(BlockType::Empty), Return, End,
-        LocalGet(key), I32Eqz, If(BlockType::Empty), Return, End,
+        I32Eqz, If(BlockType::Empty), I32Const(1), Return, End,
+        LocalGet(key), I32Eqz, If(BlockType::Empty), I32Const(1), Return, End,
         LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalTee(t),
         I32Const(TYPE_STRING), I32Eq, LocalGet(t), I32Const(TYPE_SYMBOL), I32Eq, I32Or,
         LocalGet(t), I32Const(TYPE_BIGINT), I32Eq, I32Or,
-        If(BlockType::Empty), Return, End,
+        If(BlockType::Empty), I32Const(1), Return, End,
+    );
+    emit_if_proxy(&mut f, o, helpers, |f| {
+        wasm!(f;
+            LocalGet(o), LocalGet(key), Call(helpers.proxy_delete()), LocalTee(e),
+            GlobalGet(EXC_PENDING_GLOBAL), I32Or, If(BlockType::Empty), LocalGet(e), Return, End,
+        );
+        refuse(f, PROP_THROW_PROXY_FALSISH);
+    });
+    wasm!(f;
         LocalGet(t), I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
         LocalGet(key), I32Const(static_key(strings, INDEX_LENGTH_KEY)), I32Eq,
         If(BlockType::Empty),
     );
-    emit_prop_throw_return(&mut f, obj, key, PROP_THROW_DELETE, helpers);
+    refuse(&mut f, PROP_THROW_DELETE);
     wasm!(f; End);
     emit_exotic_index(&mut f, key, i, helpers);
     wasm!(f;
@@ -1717,22 +1972,20 @@ pub(super) fn emit_delete(
     );
     emit_elem_addr(&mut f, o, i);
     wasm!(f;
-        I64Const(HOLE_BITS), I64Store(m64(ELEMS_DATA_OFFSET)), Return,
+        I64Const(HOLE_BITS), I64Store(m64(ELEMS_DATA_OFFSET)), I32Const(1), Return,
         End,
         End,
         End,
     );
     // A String wrapper's index is non-configurable.
-    emit_if_str_exotic(&mut f, o, key, i, helpers, |f| {
-        emit_prop_throw_return(f, obj, key, PROP_THROW_DELETE, helpers);
-    });
+    emit_if_str_exotic(&mut f, o, key, i, helpers, |f| refuse(f, PROP_THROW_DELETE));
     wasm!(f;
         LocalGet(o), LocalGet(key), Call(helpers.prop_find), LocalTee(e), I32Eqz,
-        If(BlockType::Empty), Return, End,
+        If(BlockType::Empty), I32Const(1), Return, End,
         LocalGet(e), I32Load(m32(E_ATTRS)), I32Const(ATTR_CONFIGURABLE), I32And, I32Eqz,
         If(BlockType::Empty),
     );
-    emit_prop_throw_return(&mut f, obj, key, PROP_THROW_DELETE, helpers);
+    refuse(&mut f, PROP_THROW_DELETE);
     wasm!(f;
         End,
         LocalGet(e), I64Const(0), I64Store(m64(0)),
@@ -1743,7 +1996,7 @@ pub(super) fn emit_delete(
     if helpers.dirty_tracking {
         emit_mark_dirty(&mut f, e);
     }
-    wasm!(f; End);
+    wasm!(f; I32Const(1), End);
     finish_builder(f)
 }
 
@@ -2058,11 +2311,12 @@ pub(super) fn emit_sparse_set(helpers: Helpers<'_>, define: bool, leaves: &LeafS
 /// `__protos_indexless(o: i32) -> i32`: `1` when nothing on the `proto`
 /// chain of the object-family block `o` can hold an integer-index property —
 /// no prototype is an array outside dictionary mode or a `String` wrapper and
-/// none has a table flagged `HAS_INDEX_KEYS` — so every index `o` does not own
+/// none has a table flagged `HAS_INDEX_KEYS` and none is a proxy — so every
+/// index `o` does not own
 /// is absent; else `0`. A dictionary-mode array (`%Array.prototype%`) keeps
 /// every element in its table, so its table flag covers it. The builtins'
 /// array fast paths that read a hole as absent run only under it.
-pub(super) fn emit_protos_indexless(leaves: &LeafSet) -> Function {
+pub(super) fn emit_protos_indexless(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_BASE], &[ROOT_JS, RAW_I32]);
     let (o, p, t) = (0, 1, 2);
     wasm!(f;
@@ -2075,6 +2329,10 @@ pub(super) fn emit_protos_indexless(leaves: &LeafSet) -> Function {
         LocalGet(p), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
         LocalGet(o), I32Load8U(m8(FLAGS)), I32Const(ARRAY_DICTIONARY), I32And, I32Eqz, I32And,
     );
+    if helpers.proxies() {
+        // A proxy may answer any index (§6.11).
+        wasm!(f; LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_PROXY), I32Eq, I32Or);
+    }
     emit_is_string_wrapper(&mut f, o);
     wasm!(f;
         I32Or,
@@ -2151,9 +2409,27 @@ pub(super) fn emit_proto_set(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
     emit_is_pointer(&mut f, p);
     wasm!(f;
         I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
+        LocalGet(p), I32WrapI64, LocalTee(q),
+    );
+    // A proxy prototype consumes the store through its `set` trap (§6.11).
+    if helpers.proxies() {
+        wasm!(f; Drop);
+    }
+    emit_if_proxy(&mut f, q, helpers, |f| {
+        wasm!(f;
+            LocalGet(q), LocalGet(k), LocalGet(v), LocalGet(recv), Call(helpers.proxy_set()),
+            GlobalGet(EXC_PENDING_GLOBAL), I32Or, If(BlockType::Empty), I32Const(1), Return, End,
+            I32Const(1),
+        );
+        emit_prop_throw_return(f, recv, k, PROP_THROW_PROXY_FALSISH, helpers);
+    });
+    if helpers.proxies() {
+        wasm!(f; LocalGet(q));
+    }
+    wasm!(f;
         // A present store element of an array prototype is a writable data
         // property (an attributed one lives in a dictionary array's table).
-        LocalGet(p), I32WrapI64, LocalTee(q), I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
+        I32Load8U(m8(0)), I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
         LocalGet(i), LocalGet(q), I32Load(m32(ARRAY_LEN_OFFSET)), I32LtU,
         LocalGet(q), I32Load(m32(ARRAY_ELEMS_OFFSET)), LocalTee(e), I32Const(0), I32Ne, I32And,
@@ -2512,6 +2788,12 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
     wasm!(f;
         Return, End,
         LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalSet(t),
+    );
+    // A proxy lists its keys through its traps (§6.11).
+    emit_if_proxy(&mut f, o, helpers, |f| {
+        wasm!(f; LocalGet(o), LocalGet(mode), Call(helpers.proxy_own_keys()), Return);
+    });
+    wasm!(f;
         I32Const(0), LocalSet(j),
         // OWN_SYMBOLS: only a table with HAS_SYMBOL_KEYS has any.
         LocalGet(mode), I32Const(OWN_SYMBOLS), I32Eq,
@@ -2813,11 +3095,70 @@ const FOR_IN_LOCALS: [LocalClass; 11] = [
     RAW_I32,
 ];
 
+/// The prescan of `__for_in_keys`: `j` = whether some prototype of the
+/// object `o` may contribute a key — a string/array (exotic keys), a proxy
+/// (§6.11), or a table holding a live enumerable entry; a proxy `o` always
+/// takes the walk. `cur`, `m`, `i`, `n`, `cursor` are scratch.
+fn emit_for_in_prescan(
+    f: &mut FnBuilder<'_>,
+    [o, cur, j, m, i, n, cursor]: [u32; 7],
+    helpers: Helpers<'_>,
+) {
+    wasm!(f;
+        LocalGet(o), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(cur),
+        // j = whether some prototype may contribute a key: a string/array
+        // (exotic keys), a proxy (§6.11), or a table holding a live
+        // enumerable entry. A proxy `obj` always takes the walk.
+        I32Const(0), LocalSet(j),
+    );
+    emit_if_proxy(f, o, helpers, |f| wasm!(f; I32Const(1), LocalSet(j)));
+    wasm!(f; Block(BlockType::Empty), Loop(BlockType::Empty));
+    if helpers.proxies() {
+        wasm!(f; LocalGet(j), BrIf(1));
+    }
+    emit_is_pointer(f, cur);
+    wasm!(f;
+        I32Eqz, BrIf(1),
+        LocalGet(cur), I32WrapI64, LocalTee(m), I32Load8U(m8(0)), LocalSet(i),
+    );
+    if helpers.proxies() {
+        wasm!(f;
+            LocalGet(i), I32Const(TYPE_PROXY), I32Eq,
+            If(BlockType::Empty), I32Const(1), LocalSet(j), Br(2), End,
+        );
+    }
+    emit_is_string_or_array_kind(f, i);
+    wasm!(f;
+        If(BlockType::Empty), I32Const(1), LocalSet(j), Br(2), End,
+        LocalGet(m), I32Load(m32(OBJ_PROPS)), LocalTee(n),
+        If(BlockType::Empty),
+        LocalGet(n), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(n), I32Add,
+        I32Const(P_HEADER), I32Add, LocalSet(i),
+        LocalGet(n), I32Const(P_HEADER), I32Add, LocalSet(cursor),
+        Block(BlockType::Empty), Loop(BlockType::Empty),
+        LocalGet(cursor), LocalGet(i), I32GeU, BrIf(1),
+        LocalGet(cursor), I32Load(m32(E_KEY)), I32Const(0), I32Ne,
+        LocalGet(cursor), I32Load(m32(E_ATTRS)), I32Const(ATTR_ENUMERABLE), I32And, I32Const(0), I32Ne,
+        I32And,
+        If(BlockType::Empty), I32Const(1), LocalSet(j), Br(5), End,
+        LocalGet(cursor), I32Const(ENTRY), I32Add, LocalSet(cursor),
+        Br(0),
+        End, End,
+        End,
+        LocalGet(m), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(cur),
+        Br(0),
+        End, End,
+    );
+}
+
 /// `__for_in_keys(obj: i64) -> i64`: the `for-in` key snapshot — `obj`'s own
 /// enumerable string keys, then each prototype's enumerable keys not already
 /// seen (a key seen at a nearer level, enumerable or not, shadows it). An
 /// object whose prototypes have no enumerable property (an ordinary object
-/// over `%Object.prototype%`) is just its own keys.
+/// over `%Object.prototype%`) is just its own keys. A proxy level lists its
+/// keys through its `ownKeys` and `getOwnPropertyDescriptor` traps, and the
+/// next level is its `getPrototypeOf` trap's result (DESIGN.md §6.11; a
+/// throw leaves the exception pending).
 pub(super) fn emit_for_in_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_JS], &FOR_IN_LOCALS);
     let obj = 0;
@@ -2840,38 +3181,9 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
     wasm!(f;
         I32Eqz,
         If(BlockType::Empty),
-        LocalGet(o), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(cur),
-        // j = whether some prototype may contribute a key: a string/array
-        // (exotic keys) or a table holding a live enumerable entry.
-        I32Const(0), LocalSet(j),
-        Block(BlockType::Empty), Loop(BlockType::Empty),
     );
-    emit_is_pointer(&mut f, cur);
+    emit_for_in_prescan(&mut f, [o, cur, j, m, i, n, cursor], helpers);
     wasm!(f;
-        I32Eqz, BrIf(1),
-        LocalGet(cur), I32WrapI64, LocalTee(m), I32Load8U(m8(0)), LocalSet(i),
-    );
-    emit_is_string_or_array_kind(&mut f, i);
-    wasm!(f;
-        If(BlockType::Empty), I32Const(1), LocalSet(j), Br(2), End,
-        LocalGet(m), I32Load(m32(OBJ_PROPS)), LocalTee(n),
-        If(BlockType::Empty),
-        LocalGet(n), I32Load(m32(P_COUNT)), I32Const(4), I32Shl, LocalGet(n), I32Add,
-        I32Const(P_HEADER), I32Add, LocalSet(i),
-        LocalGet(n), I32Const(P_HEADER), I32Add, LocalSet(cursor),
-        Block(BlockType::Empty), Loop(BlockType::Empty),
-        LocalGet(cursor), LocalGet(i), I32GeU, BrIf(1),
-        LocalGet(cursor), I32Load(m32(E_KEY)), I32Const(0), I32Ne,
-        LocalGet(cursor), I32Load(m32(E_ATTRS)), I32Const(ATTR_ENUMERABLE), I32And, I32Const(0), I32Ne,
-        I32And,
-        If(BlockType::Empty), I32Const(1), LocalSet(j), Br(5), End,
-        LocalGet(cursor), I32Const(ENTRY), I32Add, LocalSet(cursor),
-        Br(0),
-        End, End,
-        End,
-        LocalGet(m), I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(cur),
-        Br(0),
-        End, End,
         LocalGet(j),
         If(BlockType::Empty),
         I32Const(0), Call(new_array),
@@ -2888,6 +3200,14 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
     wasm!(f;
         I32Eqz, BrIf(1),
         LocalGet(cur), I32Const(OWN_ALL), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
+    );
+    if helpers.proxies() {
+        // A trap may throw (§6.11).
+        wasm!(f;
+            GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+        );
+    }
+    wasm!(f;
         I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
         I32Const(0), LocalSet(i),
         Block(BlockType::Empty), Loop(BlockType::Empty),
@@ -2905,11 +3225,26 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
         If(BlockType::Empty),
         LocalGet(out), I32WrapI64, LocalGet(k), Call(helpers.array_push), Drop,
         End,
+    );
+    if helpers.proxies() {
+        wasm!(f; GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End);
+    }
+    wasm!(f;
         End,
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),
         End, End,
-        LocalGet(cur), I32WrapI64, I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(cur),
+    );
+    if helpers.proxies() {
+        // The next level is `[[GetPrototypeOf]]` (a proxy's trap, §6.11).
+        wasm!(f;
+            LocalGet(cur), Call(helpers.get_proto()), LocalSet(cur),
+            GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), I64Const(UNDEFINED_BITS), Return, End,
+        );
+    } else {
+        wasm!(f; LocalGet(cur), I32WrapI64, I64Load(m64(OBJ_PROTO_OFFSET)), LocalSet(cur));
+    }
+    wasm!(f;
         Br(0),
         End, End,
         LocalGet(out), Return,
@@ -2959,21 +3294,45 @@ pub(super) fn emit_copy_data(helpers: Helpers<'_>, leaves: &LeafSet) -> Function
     );
     emit_box_heap(&mut f);
     wasm!(f; LocalSet(k));
-    // Push whether the key is (still) own and enumerable.
+    if helpers.proxies() {
+        // A key not excluded that is (still) own and enumerable is copied;
+        // the exclusion test comes first (a proxy source observes the
+        // `[[GetOwnProperty]]`, §6.11).
+        emit_array_contains(&mut f, x, k, j, m);
+        wasm!(f;
+            I32Eqz,
+            If(BlockType::Empty),
+            LocalGet(obj),
+            If(BlockType::Result(ValType::I32)),
+            LocalGet(src), LocalGet(k), I32WrapI64, Call(helpers.own_enum()),
+            Else, I32Const(1), End,
+            If(BlockType::Empty),
+        );
+    } else {
+        // Push whether the key is (still) own and enumerable.
+        wasm!(f;
+            LocalGet(obj),
+            If(BlockType::Result(ValType::I32)),
+            LocalGet(src), LocalGet(j), Call(helpers.own_enum()),
+            Else, I32Const(1), End,
+        );
+        emit_array_contains(&mut f, x, k, j, m);
+        wasm!(f; I32Eqz, I32And, If(BlockType::Empty));
+    }
     wasm!(f;
-        LocalGet(obj),
-        If(BlockType::Result(ValType::I32)),
-        LocalGet(src), LocalGet(j), Call(helpers.own_enum()),
-        Else, I32Const(1), End,
-    );
-    emit_array_contains(&mut f, x, k, j, m);
-    wasm!(f;
-        I32Eqz, I32And,
-        If(BlockType::Empty),
         LocalGet(dst), LocalGet(k), I32WrapI64,
         LocalGet(src), LocalGet(k), I32WrapI64, Call(helpers.get),
         I32Const(ATTRS_DEFAULT), Call(helpers.define),
         End,
+    );
+    if helpers.proxies() {
+        // A trap may throw: stop at once (§6.11).
+        wasm!(f;
+            End,
+            GlobalGet(EXC_PENDING_GLOBAL), If(BlockType::Empty), LocalGet(out), Return, End,
+        );
+    }
+    wasm!(f;
         LocalGet(i), I32Const(1), I32Add, LocalSet(i),
         Br(0),
         End, End,

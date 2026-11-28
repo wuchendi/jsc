@@ -225,7 +225,7 @@ fn oom_in_microtask_rejects_the_job() {
 }
 
 /// One program per builtin family under `emit/builtins/`; `compile` fails the
-/// test on an invalid module. Proxy and typed arrays do not exist yet.
+/// test on an invalid module. Typed arrays do not exist yet.
 #[test]
 fn every_compiled_module_validates() {
     for src in [
@@ -249,6 +249,9 @@ fn every_compiled_module_validates() {
         "[1].values().map((x) => x).toArray()",
         "new Error('e'); new TypeError('e'); new RangeError('e'); new AggregateError([])",
         "parseInt('1'); parseFloat('1.5'); isNaN(1); isFinite(1); globalThis",
+        "const p = new Proxy({ a: 1 }, { get(t, k) { return t[k]; } }); p.a; p.b = 2; 'a' in p;
+         delete p.a; Object.keys(p); Object.freeze(p); Object.getPrototypeOf(p);
+         for (const k in p) k; ({ ...p }); Proxy.revocable({}, {}).revoke()",
     ] {
         compile(src, false).expect("compiles");
         compile(src, true).expect("compiles with print_completion");

@@ -46,6 +46,14 @@ fn m64(offset: u64) -> MemArg {
     }
 }
 
+/// Return from the body when a proxy trap left an exception pending (only
+/// a program that can hold proxies runs one here, DESIGN.md §6.11).
+fn return_if_trap_threw(function: &mut FnBuilder<'_>, helpers: Helpers<'_>) {
+    if helpers.proxies() {
+        return_if_pending(function);
+    }
+}
+
 /// Emit the body of the `Object` static `op`.
 pub(super) fn emit(
     op: ReflectOp,
@@ -64,10 +72,10 @@ pub(super) fn emit(
             emit_get_own_property_descriptors(function, frame, strings, helpers);
         }
         ReflectOp::PreventExtensions => {
-            emit_set_level(INTEGRITY_NON_EXTENSIBLE, function, frame, helpers);
+            emit_set_level(INTEGRITY_NON_EXTENSIBLE, function, frame, strings, helpers);
         }
-        ReflectOp::Seal => emit_set_level(INTEGRITY_SEALED, function, frame, helpers),
-        ReflectOp::Freeze => emit_set_level(INTEGRITY_FROZEN, function, frame, helpers),
+        ReflectOp::Seal => emit_set_level(INTEGRITY_SEALED, function, frame, strings, helpers),
+        ReflectOp::Freeze => emit_set_level(INTEGRITY_FROZEN, function, frame, strings, helpers),
         ReflectOp::IsExtensible => {
             emit_test_level(INTEGRITY_NON_EXTENSIBLE, function, frame, helpers);
         }
@@ -269,9 +277,10 @@ fn object_define_properties(
     let (ks, n, i, key) = (frame.base(0), frame.i32(1), frame.i32(2), frame.base(3));
     let (list, result) = (frame.base(4), frame.x32(1));
     arg_to_object(function, frame, 1, props, strings, helpers);
+    wasm!(function; LocalGet(props), I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalSet(ks));
+    return_if_trap_threw(function, helpers);
     wasm!(function;
-        LocalGet(props), I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
-        I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
+        LocalGet(ks), I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
         I32Const(0), Call(helpers.new_array()), LocalSet(list),
     );
     // key = the interned key `ks[i]`.
@@ -301,8 +310,11 @@ fn object_define_properties(
     // `result` counts the read keys until the apply pass reuses it as scratch.
     wasm!(function; I32Const(0), LocalSet(result));
     each(function, &|function| {
+        wasm!(function; LocalGet(props), LocalGet(key), Call(helpers.own_enum()));
+        if helpers.proxies() {
+            wasm!(function; GlobalGet(EXC_PENDING_GLOBAL), I32Eqz, I32And);
+        }
         wasm!(function;
-            LocalGet(props), LocalGet(key), Call(helpers.own_enum()),
             If(BlockType::Empty),
             LocalGet(props), LocalGet(key), Call(helpers.get), LocalSet(attrs),
         );
@@ -318,6 +330,7 @@ fn object_define_properties(
             End,
         );
     });
+    return_if_trap_threw(function, helpers);
     wasm!(function; LocalGet(result), LocalSet(n));
     each(function, &|function| {
         emit_apply(function, o, key, list, i, result, helpers);
@@ -371,15 +384,18 @@ fn emit_get_own_property_descriptors(
     emit_load_type_byte(function, v);
     wasm!(function;
         I32Const(TYPE_ARRAY), I32Eq, LocalSet(length),
-        LocalGet(v), I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
-        I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n),
+        LocalGet(v), I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalSet(ks),
     );
+    return_if_trap_threw(function, helpers);
+    wasm!(function; LocalGet(ks), I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(n));
     // Define res[key] = the descriptor of the interned key pushed by `push`.
     let add = |function: &mut FnBuilder<'_>, push: &dyn Fn(&mut FnBuilder<'_>)| {
         wasm!(function; LocalGet(v));
         push(function);
+        wasm!(function; Call(helpers.own_desc()), LocalSet(d));
+        return_if_trap_threw(function, helpers);
         wasm!(function;
-            Call(helpers.own_desc()), LocalTee(d), I64Const(UNDEFINED_BITS), I64Ne,
+            LocalGet(d), I64Const(UNDEFINED_BITS), I64Ne,
             If(BlockType::Empty),
             LocalGet(res),
         );
@@ -426,25 +442,39 @@ fn emit_get_own_property_descriptors(
 }
 
 /// `Object.preventExtensions` / `seal` / `freeze` (`level`): an object takes
-/// the integrity level (`__set_integrity`); any other value is returned as is.
-fn emit_set_level(level: i32, function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
-    let v = frame.i64(0);
+/// the integrity level (`__set_integrity`; a proxy that refuses throws
+/// `PROXY_FALSISH_OP`, DESIGN.md §6.11); any other value is returned as is.
+fn emit_set_level(
+    level: i32,
+    function: &mut FnBuilder<'_>,
+    frame: Frame,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    let (v, r) = (frame.i64(0), frame.i32(0));
     frame.arg(function, 0);
     wasm!(function; LocalSet(v));
     emit_is_object(function, v);
     wasm!(function;
         If(BlockType::Empty),
-        LocalGet(v), I32Const(level), Call(helpers.set_integrity()),
+        LocalGet(v), I32Const(level), Call(helpers.set_integrity()), LocalSet(r),
     );
     return_if_pending(function);
-    wasm!(function; End, LocalGet(v));
+    wasm!(function; LocalGet(r), I32Eqz, If(BlockType::Empty));
+    prop_throw(
+        function,
+        |function| push_str(function, strings, "preventExtensions"),
+        |function| wasm!(function; I32Const(PROP_THROW_PROXY_FALSISH_OP)),
+        helpers,
+    );
+    wasm!(function; End, End, LocalGet(v));
 }
 
 /// `Object.isExtensible` / `isSealed` / `isFrozen` (`level`): an object is
 /// tested (`__test_integrity`); any other value is not extensible, so it is
 /// sealed and frozen.
 fn emit_test_level(level: i32, function: &mut FnBuilder<'_>, frame: Frame, helpers: Helpers<'_>) {
-    let v = frame.i64(0);
+    let (v, r) = (frame.i64(0), frame.i32(0));
     let primitive = if level == INTEGRITY_NON_EXTENSIBLE {
         FALSE_BITS
     } else {
@@ -454,11 +484,13 @@ fn emit_test_level(level: i32, function: &mut FnBuilder<'_>, frame: Frame, helpe
     wasm!(function; LocalSet(v));
     emit_is_object(function, v);
     wasm!(function;
-        If(BlockType::Result(ValType::I64)),
-        I64Const(TRUE_BITS), I64Const(FALSE_BITS),
-        LocalGet(v), I32Const(level), Call(helpers.test_integrity()), Select,
-        Else, I64Const(primitive),
-        End,
+        I32Eqz, If(BlockType::Empty), I64Const(primitive), Return, End,
+        LocalGet(v), I32Const(level), Call(helpers.test_integrity()), LocalSet(r),
+    );
+    // A proxy's trap may throw (DESIGN.md §6.11).
+    return_if_pending(function);
+    wasm!(function;
+        I64Const(TRUE_BITS), I64Const(FALSE_BITS), LocalGet(r), Select,
     );
 }
 
@@ -519,8 +551,8 @@ fn emit_create(
     wasm!(function; End, LocalGet(o));
 }
 
-/// `Object.getPrototypeOf(O)`: the `proto` of `ToObject(O)` (a primitive's
-/// realm prototype).
+/// `Object.getPrototypeOf(O)`: `[[GetPrototypeOf]]` of `ToObject(O)` (a
+/// primitive's realm prototype; a proxy's trap).
 fn emit_get_prototype_of(
     function: &mut FnBuilder<'_>,
     frame: Frame,
@@ -529,7 +561,7 @@ fn emit_get_prototype_of(
 ) {
     let v = frame.i64(0);
     arg_to_object(function, frame, 0, v, strings, helpers);
-    wasm!(function; LocalGet(v), I32WrapI64, I64Load(m64(OBJ_PROTO_OFFSET)));
+    wasm!(function; LocalGet(v), Call(helpers.get_proto()));
 }
 
 /// `Object.setPrototypeOf(O, proto)`: `RequireObjectCoercible(O)`, `proto`
@@ -552,16 +584,32 @@ fn emit_set_prototype_of(
     emit_is_object(function, o);
     wasm!(function;
         If(BlockType::Empty),
-        LocalGet(o), I32WrapI64, LocalGet(proto), Call(helpers.set_proto()), LocalTee(r),
-        If(BlockType::Empty),
+        LocalGet(o), I32WrapI64, LocalGet(proto), Call(helpers.set_proto()), LocalSet(r),
     );
+    return_if_pending(function);
+    wasm!(function; LocalGet(r), If(BlockType::Empty));
+    throw_proto_rejection(function, r, strings, helpers);
+    wasm!(function; End, End, LocalGet(o));
+}
+
+/// Throw the `TypeError` of the `__set_proto` rejection mode in i32 `r`
+/// (keyed by `""`, or by the trap name for a refusing proxy) and return.
+pub(super) fn throw_proto_rejection(
+    function: &mut FnBuilder<'_>,
+    r: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     prop_throw(
         function,
-        |function| push_str(function, strings, ""),
+        |function| {
+            push_str(function, strings, "");
+            push_str(function, strings, "setPrototypeOf");
+            wasm!(function; LocalGet(r), I32Const(PROP_THROW_PROXY_FALSISH_OP), I32Ne, Select);
+        },
         |function| wasm!(function; LocalGet(r)),
         helpers,
     );
-    wasm!(function; End, End, LocalGet(o));
 }
 
 /// `Object.getOwnPropertyNames(O)`: every own string key of `ToObject(O)`,
@@ -668,8 +716,11 @@ fn emit_assign(
         I32Eqz,
         If(BlockType::Empty),
         LocalGet(from), Call(helpers.to_object()), LocalTee(from),
-        I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalTee(ks),
-        I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(len),
+        I32Const(OWN_ALL_KEYS), Call(helpers.own_keys), I32WrapI64, LocalSet(ks),
+    );
+    return_if_trap_threw(function, helpers);
+    wasm!(function;
+        LocalGet(ks), I32Load(m32(ARRAY_LEN_OFFSET)), LocalSet(len),
         I32Const(0), LocalSet(at),
         Block(BlockType::Empty), Loop(BlockType::Empty),
         LocalGet(at), LocalGet(len), I32GeU, BrIf(1),
@@ -681,6 +732,9 @@ fn emit_assign(
         LocalGet(at), I32Const(3), I32Shl, I32Add, I64Load(elem_slot(0)),
         I32Const(1), Call(helpers.to_key), I64ExtendI32U, I64Const(HEAP_BITS), I64Or, LocalSet(kv),
         LocalGet(from), LocalGet(kv), I32WrapI64, Call(helpers.own_enum()),
+    );
+    return_if_trap_threw(function, helpers);
+    wasm!(function;
         If(BlockType::Empty),
         LocalGet(from), LocalGet(kv), I32WrapI64, Call(helpers.get), LocalSet(v),
     );
