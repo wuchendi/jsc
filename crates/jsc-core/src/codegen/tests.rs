@@ -351,6 +351,22 @@ fn lowers_typeof_operator() {
 }
 
 #[test]
+fn lowers_bigint_literals_canonically() {
+    let big = |neg, limbs: &[u32]| IrNode::BigInt {
+        neg,
+        limbs: Box::from(limbs),
+    };
+    assert_eq!(lower_expr("0n").expect("lowers"), big(false, &[]));
+    assert_eq!(lower_expr("-0n").expect("lowers"), big(false, &[]));
+    assert_eq!(lower_expr("-1n").expect("lowers"), big(true, &[1]));
+    assert_eq!(lower_expr("-(-1n)").expect("lowers"), big(false, &[1]));
+    assert_eq!(
+        lower_expr("0x1_00000002n").expect("lowers"),
+        big(false, &[2, 1])
+    );
+}
+
+#[test]
 fn lowers_logical_not() {
     let node = lower_expr("!true").expect("should lower");
     assert_eq!(node, IrNode::Not(Box::new(IrNode::Bool(true))));

@@ -72,7 +72,7 @@ pub(super) fn emit_coerce_number(function: &mut impl Sink, local: u32, helpers: 
 /// Emit the `__to_number(v: i64) -> i64` helper backing [`emit_coerce_number`]
 /// and `Number(x)`: `ToPrimitive` (hint number, in the guest) then
 /// `__to_number_prim` on the primitive (`StringToNumber` rules); a
-/// symbol throws the `TypeError`. A throw from a user `valueOf`/`toString`
+/// symbol or a `BigInt` throws the `TypeError`. A throw from a user `valueOf`/`toString`
 /// stays pending and yields `NaN`.
 pub(super) fn emit_to_number_helper(
     strings: &StrOffsets,
@@ -99,6 +99,15 @@ pub(super) fn emit_to_number_helper(
         &mut function,
         v,
         SYMBOL_TO_NUMBER,
+        &Instruction::I64Const(QNAN_BITS),
+        scratch,
+        strings,
+        helpers,
+    );
+    throw_if_bigint(
+        &mut function,
+        v,
+        bigint::BIGINT_TO_NUMBER,
         &Instruction::I64Const(QNAN_BITS),
         scratch,
         strings,
@@ -194,6 +203,23 @@ pub(super) fn emit_is_symbol(function: &mut impl Sink, local: u32) {
     emit_load_type_byte(function, local);
     function.instruction(&Instruction::I32Const(TYPE_SYMBOL));
     function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::Else);
+    function.instruction(&Instruction::I32Const(0));
+    function.instruction(&Instruction::End);
+}
+
+/// Push `1` if the jsval in `local` is a heap string or a `BigInt` (the two
+/// primitives compared by value), else `0`. Same shape as [`emit_is_string`].
+pub(super) fn emit_is_str_or_bigint(function: &mut impl Sink, local: u32) {
+    emit_is_pointer(function, local);
+    function.instruction(&Instruction::If(BlockType::Result(ValType::I32)));
+    emit_load_type_byte(function, local);
+    function.instruction(&Instruction::I32Const(TYPE_STRING));
+    function.instruction(&Instruction::I32Eq);
+    emit_load_type_byte(function, local);
+    function.instruction(&Instruction::I32Const(TYPE_BIGINT));
+    function.instruction(&Instruction::I32Eq);
+    function.instruction(&Instruction::I32Or);
     function.instruction(&Instruction::Else);
     function.instruction(&Instruction::I32Const(0));
     function.instruction(&Instruction::End);

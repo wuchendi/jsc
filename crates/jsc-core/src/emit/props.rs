@@ -1187,7 +1187,13 @@ fn emit_get_from(
     );
     let bits = intrinsic_bits(SYMBOL_PROTOTYPE, helpers);
     wasm!(f; I32Const(u32::try_from(bits & 0xffff_ffff).unwrap_or(0).cast_signed()), LocalSet(o));
+    // A BigInt receiver starts at `%BigInt.prototype%`.
+    let bits = intrinsic_bits(Intrinsic::BigIntPrototype, helpers);
     wasm!(f;
+        End,
+        LocalGet(o), I32Load8U(m8(0)), I32Const(TYPE_BIGINT), I32Eq,
+        If(BlockType::Empty),
+        I32Const(u32::try_from(bits & 0xffff_ffff).unwrap_or(0).cast_signed()), LocalSet(o),
         End,
         Else,
     );
@@ -1279,6 +1285,8 @@ pub(super) fn emit_symbol_get(helpers: Helpers<'_>, leaves: &LeafSet) -> Functio
     f.instruction(&proto_base(realm::prototype_of(BuiltinCtor::String)));
     wasm!(f; LocalSet(o), End, LocalGet(p), I32Const(TYPE_SYMBOL), I32Eq, If(BlockType::Empty));
     f.instruction(&proto_base(SYMBOL_PROTOTYPE));
+    wasm!(f; LocalSet(o), End, LocalGet(p), I32Const(TYPE_BIGINT), I32Eq, If(BlockType::Empty));
+    f.instruction(&proto_base(Intrinsic::BigIntPrototype));
     wasm!(f; LocalSet(o), End, Else);
     emit_is_number(&mut f, v);
     wasm!(f; If(BlockType::Empty));
@@ -1591,7 +1599,10 @@ fn emit_has_lookup(
     emit_is_pointer(&mut f, obj);
     wasm!(f;
         I32Eqz, If(BlockType::Empty), I32Const(0), Return, End,
-        LocalGet(obj), I32WrapI64, LocalSet(o),
+        LocalGet(obj), I32WrapI64, LocalTee(o),
+        // A BigInt has no own properties (and no `props` slot).
+        I32Load8U(m8(0)), I32Const(TYPE_BIGINT), I32Eq,
+        If(BlockType::Empty), I32Const(0), Return, End,
         Loop(BlockType::Empty),
         LocalGet(o), I32Load8U(m8(0)), LocalSet(t),
     );
@@ -1657,7 +1668,7 @@ fn emit_has_lookup(
 /// in-range index becomes a hole and `length` (non-configurable) throws; its
 /// named keys (and a `SPARSE` array's elements past its store) are table
 /// entries. A `String` wrapper's index (non-configurable) throws. A primitive
-/// (a string or symbol included) is left unchanged. A delete on a watched
+/// (a string, symbol or `BigInt` included) is left unchanged. A delete on a watched
 /// table sets its dirty bit when the program tracks them.
 pub(super) fn emit_delete(
     strings: &StrOffsets,
@@ -1676,6 +1687,7 @@ pub(super) fn emit_delete(
         LocalGet(key), I32Eqz, If(BlockType::Empty), Return, End,
         LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalTee(t),
         I32Const(TYPE_STRING), I32Eq, LocalGet(t), I32Const(TYPE_SYMBOL), I32Eq, I32Or,
+        LocalGet(t), I32Const(TYPE_BIGINT), I32Eq, I32Or,
         If(BlockType::Empty), Return, End,
         LocalGet(t), I32Const(TYPE_ARRAY), I32Eq,
         If(BlockType::Empty),
@@ -2488,9 +2500,12 @@ pub(super) fn emit_own_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Function 
         entry_loop_tail(f);
     };
 
+    // A non-heap value or a BigInt (no `props` slot) has no own keys.
     emit_is_pointer(&mut f, obj);
+    wasm!(f; I32Eqz);
+    bigint::emit_is_bigint(&mut f, obj);
     wasm!(f;
-        I32Eqz,
+        I32Or,
         If(BlockType::Empty), I32Const(0), Call(new_array),
     );
     emit_box_heap(&mut f);
@@ -2810,13 +2825,14 @@ pub(super) fn emit_for_in_keys(helpers: Helpers<'_>, leaves: &LeafSet) -> Functi
     let (out, seen, cur, k) = (7, 8, 9, 10);
     let cursor = 11;
     let new_array = helpers.new_array();
-    // A primitive (a symbol included) has no enumerable keys of its own or on
+    // A primitive (a symbol or BigInt included) has no enumerable keys of its own or on
     // its prototype chain.
     emit_is_pointer(&mut f, obj);
     wasm!(f;
         If(BlockType::Result(ValType::I32)),
         LocalGet(obj), I32WrapI64, LocalTee(o), I32Load8U(m8(0)), LocalTee(i),
         I32Const(TYPE_SYMBOL), I32Ne,
+        LocalGet(i), I32Const(TYPE_BIGINT), I32Ne, I32And,
         Else, I32Const(0), End,
         If(BlockType::Empty),
     );

@@ -1435,7 +1435,7 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         raw(&mut f, abi::DV_BUFFER_OFFSET);
         wasm!(f; Return, End);
     }
-    // Strings, raw buffers and free slots are leaves; the rest of the object
+    // Strings, raw buffers, BigInts and free slots are leaves; the rest of the object
     // family (`1..=3`, `6..=10`) starts with `props` and `proto`.
     wasm!(f;
         LocalGet(ty), I32Eqz, LocalGet(ty), I32Const(i32::from(abi::TYPE_DATE)), I32GtU, I32Or,
@@ -1472,6 +1472,7 @@ fn emit_trace(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
         LocalGet(b), I32Load8U(m8(abi::HEADER_CLASS_OFFSET)), LocalTee(ty),
         I32Const(i32::from(abi::CLASS_BOOLEAN)), I32Sub, I32Const(2), I32LeU,
         LocalGet(ty), I32Const(i32::from(abi::CLASS_SYMBOL)), I32Eq, I32Or,
+        LocalGet(ty), I32Const(i32::from(abi::CLASS_BIGINT)), I32Eq, I32Or,
         If(BlockType::Empty),
     );
     jsval(&mut f, abi::WRAPPER_VALUE_OFFSET);

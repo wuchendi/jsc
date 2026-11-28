@@ -115,6 +115,33 @@ pub(super) fn throw_if_symbol(
     helpers: Helpers<'_>,
 ) {
     emit_is_symbol(f, v);
+    throw_if(f, text, ret, scratch, strings, helpers);
+}
+
+/// [`throw_if_symbol`] for a `BigInt` `v`.
+pub(super) fn throw_if_bigint(
+    f: &mut impl Sink,
+    v: u32,
+    text: CalleeErrorText<'_>,
+    ret: &Instruction<'_>,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
+    bigint::emit_is_bigint(f, v);
+    throw_if(f, text, ret, scratch, strings, helpers);
+}
+
+/// When the i32 condition on the stack is set, leave the `TypeError` `text`
+/// pending and return the value `ret` pushes.
+fn throw_if(
+    f: &mut impl Sink,
+    text: CalleeErrorText<'_>,
+    ret: &Instruction<'_>,
+    scratch: u32,
+    strings: &StrOffsets,
+    helpers: Helpers<'_>,
+) {
     wasm!(f; If(BlockType::Empty));
     emit_node(&callee_type_error(text), f, scratch, strings, helpers);
     emit_set_exc_value(f, helpers);

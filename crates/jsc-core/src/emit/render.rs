@@ -91,7 +91,7 @@ const OPEN_TRAILING: &str = " { ";
 const CLOSE_OBJECT: &str = " }";
 
 /// The static strings the renderer writes or looks properties up by.
-pub(super) const STRINGS: [&str; 60] = [
+pub(super) const STRINGS: [&str; 61] = [
     "",
     "true",
     "false",
@@ -130,6 +130,7 @@ pub(super) const STRINGS: [&str; 60] = [
     "[Number: ",
     "[Boolean: ",
     "[Symbol: ",
+    "[BigInt: ",
     "Promise { <pending> }",
     "Promise { ",
     "Promise { <rejected> ",
@@ -684,6 +685,14 @@ fn render_leaf(
     is(f, TYPE_SYMBOL);
     render_symbol(f, strings, helpers, p, tmp);
     wasm!(f; Return, End);
+    // A BigInt: its decimal digits and `n` (DESIGN.md §6.10.2).
+    is(f, i32::from(abi::TYPE_BIGINT));
+    box_heap(f, p);
+    wasm!(f;
+        I32Const(10), Call(helpers.bigint(super::registry::Big::ToString)), Call(helpers.out_str()),
+    );
+    lit(f, strings, helpers, super::bigint::SUFFIX);
+    wasm!(f; Return, End);
     for (kind, open) in [(TYPE_MAP, "Map("), (TYPE_SET, "Set(")] {
         is(f, kind);
         lit(f, strings, helpers, open);
@@ -994,8 +1003,12 @@ fn render_wrapper(
     wasm!(f; If(BlockType::Empty));
     bracketed(f, "[Symbol: ");
     wasm!(f; Else);
+    class_is(f, abi::CLASS_BIGINT);
+    wasm!(f; If(BlockType::Empty));
+    bracketed(f, "[BigInt: ");
+    wasm!(f; Else);
     bracketed(f, "[Boolean: ");
-    wasm!(f; End, End, End);
+    wasm!(f; End, End, End, End);
     props_call(f, strings, helpers, (p, depth, first), 0, OPEN_TRAILING);
     wasm!(f; LocalGet(first), I32Eqz, If(BlockType::Empty));
     lit(f, strings, helpers, CLOSE_OBJECT);
@@ -1030,10 +1043,11 @@ fn emit_render_object(strings: &StrOffsets, helpers: Helpers<'_>, leaves: &LeafS
     props_call(&mut f, strings, helpers, (p, depth, first), 1, OPEN_OBJECT);
     close_list(&mut f, strings, helpers, first, "{}", CLOSE_OBJECT);
     wasm!(f; Return, End);
-    // The four wrapper classes: `BOOLEAN`/`NUMBER`/`STRING` are consecutive.
+    // The five wrapper classes: `BOOLEAN`/`NUMBER`/`STRING` are consecutive.
     wasm!(f;
         LocalGet(class), I32Const(i32::from(abi::CLASS_BOOLEAN)), I32Sub, I32Const(3), I32LtU,
         LocalGet(class), I32Const(i32::from(abi::CLASS_SYMBOL)), I32Eq, I32Or,
+        LocalGet(class), I32Const(i32::from(abi::CLASS_BIGINT)), I32Eq, I32Or,
         If(BlockType::Empty),
     );
     render_wrapper(&mut f, strings, helpers, (p, depth, class, first, prim));
@@ -1356,7 +1370,7 @@ fn emit_render_lookup(helpers: Helpers<'_>, leaves: &LeafSet) -> Function {
 }
 
 /// `__heap_object(v) -> p`: the base of an object-family heap value that
-/// carries a `props` slot (not a string, array or symbol), or `0`.
+/// carries a `props` slot (not a string, array, symbol or `BigInt`), or `0`.
 fn emit_heap_object(leaves: &LeafSet) -> Function {
     let mut f = helper_builder(leaves, &[ROOT_JS], &[RAW_I32]);
     let (v, ty) = (0, 1);
@@ -1366,6 +1380,7 @@ fn emit_heap_object(leaves: &LeafSet) -> Function {
         LocalGet(v), I32WrapI64, I32Load8U(m8(0)), LocalTee(ty), I32Const(TYPE_STRING), I32Ne,
         LocalGet(ty), I32Const(TYPE_ARRAY), I32Ne, I32And,
         LocalGet(ty), I32Const(TYPE_SYMBOL), I32Ne, I32And,
+        LocalGet(ty), I32Const(i32::from(abi::TYPE_BIGINT)), I32Ne, I32And,
         If(BlockType::Empty), LocalGet(v), I32WrapI64, Return, End,
         End,
         I32Const(0),

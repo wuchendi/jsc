@@ -1,7 +1,7 @@
 //! The binary-data helpers (DESIGN.md §5.8): the byte-block allocator
 //! `__ab_alloc`, the console renderer arm `__render_binary`, and the
 //! `DataView` helpers `__dv_length`, `__dv_get`, `__dv_set`, a helper group
-//! of their own after every other ([`super::registry::Group::Binary`]).
+//! of their own after `Extra` ([`super::registry::Group::Binary`]).
 
 use wasm_encoder::{BlockType, Function, Ieee64, Instruction, MemArg, ValType};
 
