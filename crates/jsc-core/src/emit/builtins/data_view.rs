@@ -1,6 +1,6 @@
 //! `DataView` (DESIGN.md §5.8): the constructor and the
 //! `%DataView.prototype%` getters (`buffer`, `byteLength`, `byteOffset`) and
-//! get / set methods of the number element kinds.
+//! get / set methods of the number and `BigInt` element kinds.
 //!
 //! A view is a [`abi::TYPE_DATAVIEW`] block over an `ArrayBuffer`. It caches
 //! nothing: every access re-reads the buffer's state through `__dv_length`
@@ -14,6 +14,7 @@ use super::*;
 
 use crate::emit::binary::{DV_STRINGS, RAW_DATA};
 use crate::emit::realm::DataViewOp;
+use crate::emit::registry::Big;
 
 /// `[message, stack]` of a `TypeError` with `message`.
 macro_rules! type_error {
@@ -51,7 +52,7 @@ macro_rules! op_texts {
 
 /// The receiver and out-of-bounds `TypeError`s of every prototype builtin,
 /// by property key.
-const OP_TEXTS: [(&str, CalleeErrorText<'static>, CalleeErrorText<'static>); 21] = [
+const OP_TEXTS: [(&str, CalleeErrorText<'static>, CalleeErrorText<'static>); 25] = [
     op_texts!("buffer"),
     op_texts!("byteLength"),
     op_texts!("byteOffset"),
@@ -73,6 +74,10 @@ const OP_TEXTS: [(&str, CalleeErrorText<'static>, CalleeErrorText<'static>); 21]
     op_texts!("setFloat64"),
     op_texts!("getFloat16"),
     op_texts!("setFloat16"),
+    op_texts!("getBigInt64"),
+    op_texts!("setBigInt64"),
+    op_texts!("getBigUint64"),
+    op_texts!("setBigUint64"),
 ];
 
 /// The constructor's first argument is not an `ArrayBuffer`.
@@ -469,7 +474,8 @@ fn emit_getter(
 
 /// `GetViewValue` / `SetViewValue` (DESIGN.md §5.8.7) for a get / set
 /// method: the receiver check, `ToIndex(requestIndex)`, a setter's
-/// `ToNumber(value)`, `ToBoolean(littleEndian)`, then an out-of-bounds or
+/// `ToNumber(value)` (`ToBigInt(value)` for a `BigInt` kind),
+/// `ToBoolean(littleEndian)`, then an out-of-bounds or
 /// detached view throws a `TypeError`, an element past the view's end a
 /// `RangeError`, else `__raw_load` / `__raw_store` at `data + byte_offset +
 /// index` with `swap = !littleEndian`. The arguments are read on entry,
@@ -517,7 +523,12 @@ fn emit_access(
         helpers,
     );
     if set {
-        wasm!(function; LocalGet(value_v), Call(helpers.to_number), LocalSet(value));
+        let convert = if kind.is_bigint() {
+            helpers.bigint(Big::ToBigInt)
+        } else {
+            helpers.to_number
+        };
+        wasm!(function; LocalGet(value_v), Call(convert), LocalSet(value));
         return_if_pending(function);
     }
     let truthy = IrNode::ConvertCall {

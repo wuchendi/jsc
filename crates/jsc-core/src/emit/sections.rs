@@ -114,11 +114,8 @@ pub(super) fn build_type_and_function_sections<'a>(
         } else {
             BinaryData::Unreachable
         },
-        proxy_gate: if program_has_proxies(program) {
-            ProxyGate::Open
-        } else {
-            ProxyGate::Closed
-        },
+        proxy_gate: proxy_gate(program),
+        reflect_gate: reflect_gate(program),
         bigint_gate: bigint_gate(program),
         unicode: layout.unicode,
         fn_info: layout.info,
@@ -1416,6 +1413,38 @@ fn program_has_proxies(program: &IrProgram) -> bool {
     })
 }
 
+/// The [`ProxyGate`] of `program` ([`program_has_proxies`]).
+fn proxy_gate(program: &IrProgram) -> ProxyGate {
+    if program_has_proxies(program) {
+        ProxyGate::Open
+    } else {
+        ProxyGate::Closed
+    }
+}
+
+/// The [`ReflectGate`] of `program` ([`program_has_reflect`]).
+fn reflect_gate(program: &IrProgram) -> ReflectGate {
+    if program_has_reflect(program) {
+        ReflectGate::Open
+    } else {
+        ReflectGate::Closed
+    }
+}
+
+/// Whether the program can hold `%Reflect%` (DESIGN.md §6.11): it names
+/// `Reflect` as a global, a member or property key or a string literal, or
+/// it holds the global object (which can find `Reflect` by a run-time key).
+fn program_has_reflect(program: &IrProgram) -> bool {
+    program_any(program, |n| match n {
+        IrNode::Str(s) => s == "Reflect",
+        IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
+            global.name == "Reflect"
+        }
+        IrNode::Intrinsic(GlobalIntrinsic::Global) => true,
+        _ => false,
+    })
+}
+
 fn program_has_accessors(program: &IrProgram) -> bool {
     let computed = |key: &IrNode| !matches!(key, IrNode::Str(_) | IrNode::Num(_));
     program_any(program, |n| match n {
@@ -1461,7 +1490,7 @@ fn program_has_accessors(program: &IrProgram) -> bool {
 }
 
 /// The globals of the binary-data constructors (DESIGN.md §5.8.5).
-const BINARY_NAMES: [&str; 12] = [
+const BINARY_NAMES: [&str; 14] = [
     "ArrayBuffer",
     "DataView",
     "Int8Array",
@@ -1474,6 +1503,8 @@ const BINARY_NAMES: [&str; 12] = [
     "Float16Array",
     "Float32Array",
     "Float64Array",
+    "BigInt64Array",
+    "BigUint64Array",
 ];
 
 /// Whether `program` can reach binary data (DESIGN.md §5.8.5): it names a
@@ -1499,8 +1530,9 @@ fn program_has_binary(program: &IrProgram) -> bool {
 
 /// The names through which a program can obtain a `BigInt` without a
 /// literal (DESIGN.md §6.10.9): the `BigInt` global, the `BigInt` typed
-/// arrays and the `DataView` `BigInt` accessors.
-const BIGINT_NAMES: [&str; 7] = [
+/// arrays and the `DataView` `BigInt` accessors, and `DataView` itself (its
+/// prototype, reached by reflection, holds those accessors).
+const BIGINT_NAMES: [&str; 8] = [
     "BigInt",
     "BigInt64Array",
     "BigUint64Array",
@@ -1508,6 +1540,7 @@ const BIGINT_NAMES: [&str; 7] = [
     "getBigUint64",
     "setBigInt64",
     "setBigUint64",
+    "DataView",
 ];
 
 /// The [`BigIntGate`] of `program` ([`program_has_bigint`]).
@@ -1527,9 +1560,11 @@ fn bigint_gate(program: &IrProgram) -> BigIntGate {
 pub(super) fn program_has_bigint(program: &IrProgram) -> bool {
     program_any(program, |n| match n {
         IrNode::BigInt { .. }
-        | IrNode::Intrinsic(GlobalIntrinsic::Global | GlobalIntrinsic::Ctor(BuiltinCtor::BigInt)) => {
-            true
-        }
+        | IrNode::Intrinsic(
+            GlobalIntrinsic::Global
+            | GlobalIntrinsic::Ctor(BuiltinCtor::BigInt | BuiltinCtor::DataView),
+        ) => true,
+        IrNode::Intrinsic(GlobalIntrinsic::Ctor(BuiltinCtor::Typed(kind))) => kind.is_bigint(),
         IrNode::GlobalGet { global, .. } | IrNode::GlobalSet { global, .. } => {
             BIGINT_NAMES.contains(&global.name.as_str())
         }

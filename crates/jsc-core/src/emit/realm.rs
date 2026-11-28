@@ -460,7 +460,7 @@ pub(super) fn intrinsics() -> impl Iterator<Item = Intrinsic> {
 /// The binary-data constructors (DESIGN.md §5.8.7), whose constructor and
 /// prototype intrinsics follow every other intrinsic in the image but
 /// `%BigInt.prototype%`.
-const BINARY_CTORS: [BuiltinCtor; 13] = [
+const BINARY_CTORS: [BuiltinCtor; 15] = [
     BuiltinCtor::ArrayBuffer,
     BuiltinCtor::DataView,
     BuiltinCtor::TypedArray,
@@ -474,6 +474,8 @@ const BINARY_CTORS: [BuiltinCtor; 13] = [
     BuiltinCtor::Typed(ElementKind::Float16),
     BuiltinCtor::Typed(ElementKind::Float32),
     BuiltinCtor::Typed(ElementKind::Float64),
+    BuiltinCtor::Typed(ElementKind::BigInt64),
+    BuiltinCtor::Typed(ElementKind::BigUint64),
 ];
 
 /// A builtin function body with the uniform ABI (see [`super::builtins`]).
@@ -758,9 +760,8 @@ pub(super) enum DataViewOp {
 
 impl DataViewOp {
     /// The element kinds with get / set methods: `(kind, getter name, setter
-    /// name)`, in §5.8.6 kind order (no `Uint8Clamped`; no `BigInt` kinds
-    /// yet).
-    pub(super) const KINDS: [(ElementKind, &'static str, &'static str); 9] = [
+    /// name)`, in §5.8.6 kind order (no `Uint8Clamped`).
+    pub(super) const KINDS: [(ElementKind, &'static str, &'static str); 11] = [
         (ElementKind::Int8, "getInt8", "setInt8"),
         (ElementKind::Uint8, "getUint8", "setUint8"),
         (ElementKind::Int16, "getInt16", "setInt16"),
@@ -770,6 +771,8 @@ impl DataViewOp {
         (ElementKind::Float16, "getFloat16", "setFloat16"),
         (ElementKind::Float32, "getFloat32", "setFloat32"),
         (ElementKind::Float64, "getFloat64", "setFloat64"),
+        (ElementKind::BigInt64, "getBigInt64", "setBigInt64"),
+        (ElementKind::BigUint64, "getBigUint64", "setBigUint64"),
     ];
 
     /// The getters, with their property keys, in installation order.
@@ -2388,7 +2391,7 @@ impl StringOp {
 
 impl Builtin {
     /// Every builtin, in funcref-table (and `__fn_info`) order.
-    pub(super) const ALL: [Builtin; 478] = [
+    pub(super) const ALL: [Builtin; 484] = [
         Self::FunctionPrototype,
         Self::HasOwnProperty,
         Self::ObjectToString,
@@ -2953,6 +2956,12 @@ impl Builtin {
         Self::TypedArray(TypedArrayOp::ALL[34]),
         Self::TypedArray(TypedArrayOp::ALL[35]),
         Self::TypedArray(TypedArrayOp::ALL[36]),
+        Self::Ctor(BuiltinCtor::Typed(ElementKind::BigInt64)),
+        Self::Ctor(BuiltinCtor::Typed(ElementKind::BigUint64)),
+        Self::DataView(DataViewOp::Get(ElementKind::BigInt64)),
+        Self::DataView(DataViewOp::Set(ElementKind::BigInt64)),
+        Self::DataView(DataViewOp::Get(ElementKind::BigUint64)),
+        Self::DataView(DataViewOp::Set(ElementKind::BigUint64)),
         Self::Ctor(BuiltinCtor::Typed(ElementKind::Float16)),
         Self::DataView(DataViewOp::Get(ElementKind::Float16)),
         Self::DataView(DataViewOp::Set(ElementKind::Float16)),
@@ -3427,7 +3436,7 @@ const NUMBER_CONSTANTS: [(&str, f64); 8] = [
 
 /// The global object's own properties, one line per global binding (design
 /// 4.2).
-const GLOBALS: [(&str, u32, Value); 50] = [
+const GLOBALS: [(&str, u32, Value); 52] = [
     (
         "globalThis",
         METHOD_ATTRS,
@@ -3647,6 +3656,16 @@ const GLOBALS: [(&str, u32, Value); 50] = [
         "BigInt",
         METHOD_ATTRS,
         Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::BigInt)),
+    ),
+    (
+        "BigInt64Array",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::BigInt64))),
+    ),
+    (
+        "BigUint64Array",
+        METHOD_ATTRS,
+        Value::Intrinsic(Intrinsic::Ctor(BuiltinCtor::Typed(ElementKind::BigUint64))),
     ),
 ];
 

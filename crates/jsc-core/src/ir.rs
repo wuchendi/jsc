@@ -585,16 +585,14 @@ pub enum BuiltinCtor {
     DataView,
     /// `%TypedArray%` (DESIGN.md §5.8.7): abstract, not a global.
     TypedArray,
-    /// A concrete typed-array constructor (`Int8Array` .. `Float64Array`,
-    /// `Float16Array` included).
+    /// A concrete typed-array constructor (`Int8Array` .. `BigUint64Array`).
     Typed(ElementKind),
     /// `BigInt` (DESIGN.md §6.10.7): callable, `new` throws.
     BigInt,
 }
 
 /// A typed-array element kind (DESIGN.md §5.8.6), in the spec's Table 71
-/// order. The `BigInt` kinds (`10`, `11`) are not installed yet; their kind
-/// numbers stay reserved.
+/// order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElementKind {
     /// `Int8Array`.
@@ -617,11 +615,15 @@ pub enum ElementKind {
     Float32,
     /// `Float64Array`.
     Float64,
+    /// `BigInt64Array`.
+    BigInt64,
+    /// `BigUint64Array`.
+    BigUint64,
 }
 
 impl ElementKind {
     /// Every installed kind, in kind order.
-    pub(crate) const ALL: [ElementKind; 10] = [
+    pub(crate) const ALL: [ElementKind; 12] = [
         Self::Int8,
         Self::Uint8,
         Self::Uint8Clamped,
@@ -632,6 +634,8 @@ impl ElementKind {
         Self::Float16,
         Self::Float32,
         Self::Float64,
+        Self::BigInt64,
+        Self::BigUint64,
     ];
 
     /// The kind number stored in a typed array's `kind` byte.
@@ -647,6 +651,8 @@ impl ElementKind {
             Self::Float16 => 7,
             Self::Float32 => 8,
             Self::Float64 => 9,
+            Self::BigInt64 => 10,
+            Self::BigUint64 => 11,
         }
     }
 
@@ -663,6 +669,8 @@ impl ElementKind {
             Self::Float16 => "Float16Array",
             Self::Float32 => "Float32Array",
             Self::Float64 => "Float64Array",
+            Self::BigInt64 => "BigInt64Array",
+            Self::BigUint64 => "BigUint64Array",
         }
     }
 
@@ -672,7 +680,7 @@ impl ElementKind {
             Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 0,
             Self::Int16 | Self::Uint16 | Self::Float16 => 1,
             Self::Int32 | Self::Uint32 | Self::Float32 => 2,
-            Self::Float64 => 3,
+            Self::Float64 | Self::BigInt64 | Self::BigUint64 => 3,
         }
     }
 
@@ -680,11 +688,16 @@ impl ElementKind {
     pub(crate) fn size(self) -> u32 {
         1 << self.shift()
     }
+
+    /// Whether the kind has the `BigInt` content type (DESIGN.md §5.8.6).
+    pub(crate) fn is_bigint(self) -> bool {
+        matches!(self, Self::BigInt64 | Self::BigUint64)
+    }
 }
 
 impl BuiltinCtor {
     /// Every constructor, in realm-image order.
-    pub(crate) const ALL: [BuiltinCtor; 38] = [
+    pub(crate) const ALL: [BuiltinCtor; 40] = [
         Self::Object,
         Self::Function,
         Self::Array,
@@ -723,6 +736,8 @@ impl BuiltinCtor {
         Self::Typed(ElementKind::Float32),
         Self::Typed(ElementKind::Float64),
         Self::BigInt,
+        Self::Typed(ElementKind::BigInt64),
+        Self::Typed(ElementKind::BigUint64),
     ];
 
     /// The constructor's global name (also its `name`).

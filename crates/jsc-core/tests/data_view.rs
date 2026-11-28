@@ -441,8 +441,7 @@ fn coercion_order() {
 }
 
 /// The getters' and methods' receiver checks, their descriptors, `name` and
-/// `length`, and `@@toStringTag`; the `BigInt` pairs are not installed
-/// yet.
+/// `length`, and `@@toStringTag`.
 #[test]
 fn prototype_shape_and_receivers() {
     assert_string(
@@ -471,12 +470,11 @@ fn prototype_shape_and_receivers() {
             const d = Object.getOwnPropertyDescriptor(P, k);
             return [k, typeof d.get, d.set === undefined, d.enumerable, d.configurable,
                     d.get.name, d.get.length].join(':');
-          }).concat([t.value, t.writable, t.enumerable, t.configurable,
-                     typeof P.getBigInt64, typeof P.setBigUint64]).join(' ')",
+          }).concat([t.value, t.writable, t.enumerable, t.configurable]).join(' ')",
         "buffer:function:true:false:true:get buffer:0 \
          byteLength:function:true:false:true:get byteLength:0 \
          byteOffset:function:true:false:true:get byteOffset:0 \
-         DataView false false true undefined undefined",
+         DataView false false true",
     );
     assert_string(
         &with_err(
